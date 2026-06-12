@@ -23,3 +23,13 @@ add_library(detours STATIC
 )
 target_include_directories(detours PUBLIC ${DETOURS_DIR})
 target_compile_definitions(detours PRIVATE WIN32_LEAN_AND_MEAN)
+
+# --- M0 PoC: hook one CreateFileW in cl.exe and log it ----------------------
+add_library(interceptor SHARED
+  poc/interceptor.cpp
+  poc/interceptor.def
+)
+target_link_libraries(interceptor PRIVATE detours)
+
+add_executable(launcher poc/launcher.cpp)
+target_link_libraries(launcher PRIVATE detours)
