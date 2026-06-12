@@ -169,21 +169,35 @@ The `sembazuru-trace` reader derives, per process tree:
 - **inputs** — paths from successful read/read-write opens (`FILE` op 1, 3),
   **all** probes including failed ones (op 4; a failed include-path probe
   is real dependency information — the build's behavior depends on that
-  file *not* existing), enumeration patterns (op 5), registry reads, and
-  env reads.
-- **outputs** — paths from write opens (op 2, 3), move destinations,
-  deletes, created directories.
+  file *not* existing), enumeration patterns (op 5), move sources, registry
+  reads, and env reads.
+- **outputs** — files the build produced and **left behind**: write opens
+  (op 2, 3), move destinations, created directories.
+- **deletions** — files the build deleted or directories it removed
+  (op 6, 9) without otherwise producing them. These are dependency
+  information but **not** surviving outputs, so they are reported in a
+  separate set. A deleted file does not exist after the build, so a
+  transient with a run-varying name (e.g. a compiler temp file) must not
+  break output-set comparison — separating deletions is what prevents that.
 
-Failed *read opens* (op 1 with nonzero `status`) count as probes.
+Failed *read opens* (op 1 with nonzero `status`) count as probe-misses.
 
-Normalization (applied by the reader before set comparison, never by the
-writer): case-fold and resolve each path against the recording process's
-working directory where the raw record is relative. Files under the
-traced session's `%TMP%` are tagged `intermediate` and excluded from the
-input/output sets used for run-to-run comparison; telemetry processes
-(currently `vctip.exe`) are tagged and excluded by default but kept in
-the raw trace. These rules will be tightened by measurement during M1/M2;
-this section is the single place they are defined.
+Exclusions applied by the reader before any path enters a file set:
+
+- **Device and pipe paths** (`\\.\pipe\...`, `\\.\PhysicalDrive0`, console
+  handles) are not files and are dropped entirely.
+- **Intermediates** under the traced session's `%TMP%`/`%TEMP%` are dropped
+  from the comparison sets.
+- **Telemetry processes** (currently `vctip.exe`) are tagged and their
+  accesses excluded by default, though the raw per-process trace is kept.
+
+Normalization (applied by the reader, never by the writer): strip a `\\?\`
+long-path prefix, fold separators and case. Resolving relative paths
+against the recording process's working directory is a known gap (the
+interceptor does not yet record a per-call CWD); until then a relative
+path is compared verbatim, which is stable run-to-run for a fixed working
+directory. These rules will be tightened by measurement during M1/M2; this
+section is the single place they are defined.
 
 ## 7. JSON export
 
@@ -205,6 +219,7 @@ this section is the single place they are defined.
   ],
   "inputs":  [ { "path": "C:\\src\\hello.c", "kinds": ["read"], "pids": [1234] } ],
   "outputs": [ { "path": "C:\\src\\hello.obj", "kinds": ["write"], "pids": [1234] } ],
+  "deletions": [ { "path": "C:\\build\\_cl_0001.tmp", "kinds": ["delete"], "pids": [1234] } ],
   "registry": [ { "key": "HKLM\\...", "value": "...", "pids": [1234] } ],
   "env": [ { "name": "INCLUDE", "found": true, "pids": [1234] } ],
   "warnings": [ "child 9999 has no trace file (injection failed?)" ]
