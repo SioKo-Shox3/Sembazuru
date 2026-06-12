@@ -62,12 +62,19 @@ int wmain(int argc, wchar_t** argv) {
         AppendQuoted(cmd, argv[i]);
     }
 
+    // Forward our standard handles so the traced tool's stdout/stderr (e.g.
+    // cl /showIncludes) flow through transparently; a tracer must not eat the
+    // wrapped tool's output. Requires bInheritHandles = TRUE below.
     STARTUPINFOW si{};
     si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
 
     if (!DetourCreateProcessWithDllExW(nullptr, cmd.data(), nullptr, nullptr,
-                                       FALSE, 0, nullptr, nullptr, &si, &pi,
+                                       TRUE, 0, nullptr, nullptr, &si, &pi,
                                        dllFullA, nullptr)) {
         fwprintf(stderr, L"error: failed to launch '%s' (GetLastError=%lu)\n",
                  cmd.c_str(), GetLastError());
