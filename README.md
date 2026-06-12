@@ -6,7 +6,7 @@
 
 *A thousand workers fold a single build, like a thousand cranes fold into one.*
 
-[![status](https://img.shields.io/badge/status-pre--alpha%20(M0)-orange)]()
+[![status](https://img.shields.io/badge/status-pre--alpha%20(M1)-orange)]()
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)]()
 [![platform](https://img.shields.io/badge/platform-Windows-lightgrey)]()
 
@@ -47,6 +47,48 @@ Local machine                                    Remote
 ```
 
 The technical core is **not** distributed compilation — it is making any process's I/O transparently remote. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full architecture and rationale.
+
+## The tracer (M1) — usable today
+
+The first milestone ships as a standalone **build-dependency tracer**. It
+injects an observe-only DLL into a compiler process (and its children),
+records every file, child-process, registry, and environment access at the
+Win32 layer, and reconstructs the complete input/output dependency graph.
+Nothing is modified — it only watches.
+
+Build it (needs Visual Studio with the C++ toolset, CMake, and Rust):
+
+```powershell
+cmake -S hooks -B hooks/build -A x64
+cmake --build hooks/build --config Release
+cargo build -p sembazuru-tracer --release
+```
+
+Trace a compile and read back the dependency graph (run from a VS developer
+shell so `cl.exe` is on PATH):
+
+```powershell
+$env:SEMBAZURU_TRACE_DIR = "$PWD\trace"
+hooks\build\Release\launcher.exe hooks\build\Release\sbz_interceptor64.dll `
+    cl /nologo main.c
+
+target\release\sembazuru-trace.exe export --trace-dir "$PWD\trace" --json
+```
+
+The JSON contains the process tree, the `inputs` set (sources, headers,
+libraries — including failed include-path probes, which are real
+dependencies), the `outputs` set (surviving artifacts), separated
+`deletions` (transients), and registry/environment reads. `sembazuru-trace
+diff --trace-dir A --trace-dir B` compares two runs and exits non-zero if
+their input/output sets differ — the reproducibility check at the heart of
+the milestone.
+
+The on-disk trace format is specified in
+[`docs/trace-format.md`](docs/trace-format.md). Known limitation: only the
+Win32 API layer is hooked, so toolchains that issue `Nt*` syscalls directly
+(msys2/Cygwin) are out of scope for M1; the bundled smoke harness
+cross-checks completeness against `cl /showIncludes` to prove the Win32
+surface is sufficient for MSVC and clang-cl.
 
 ## Roadmap
 
