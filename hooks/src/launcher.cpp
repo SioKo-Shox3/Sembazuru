@@ -1,11 +1,12 @@
-// Sembazuru M0 PoC launcher.
+// Sembazuru trace launcher.
 //
 // Starts a target process with the interceptor DLL injected, using the
 // documented Detours injection path (DetourCreateProcessWithDllExW) rather
 // than anything that pattern-matches to malware TTPs. Waits for the target
-// and propagates its exit code.
+// and propagates its exit code. Child processes are propagated to by the
+// interceptor's own CreateProcess hooks, not by this launcher.
 //
-// Usage: launcher.exe <path\to\interceptor.dll> <command> [args...]
+// Usage: launcher.exe <path\to\sbz_interceptor64.dll> <command> [args...]
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>

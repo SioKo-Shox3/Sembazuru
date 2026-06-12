@@ -85,8 +85,8 @@ Every record has the same shape:
 | `path` | string | primary subject (path, key, or variable name) |
 | `aux` | string | op-defined secondary string; empty when unused |
 
-A record is written in one buffered `WriteFile` call under the writer
-lock, so records from different threads never interleave bytes.
+All bytes of a record are written while holding the writer lock, so
+records from different threads never interleave.
 
 ### 5.1 Record types
 
@@ -112,10 +112,14 @@ lock, so records from different threads never interleave bytes.
 | 9 | remove directory | as passed | — | — |
 
 The read/write/read-write classification of `CreateFile*` is derived from
-`dwDesiredAccess` (any of `GENERIC_WRITE | FILE_WRITE_DATA |
-FILE_APPEND_DATA | DELETE` ⇒ write intent; any of `GENERIC_READ |
-FILE_READ_DATA | GENERIC_EXECUTE` ⇒ read intent; both ⇒ op 3). The raw
-access mask is preserved in `extra` so the reader can re-derive its own
+`dwDesiredAccess` and `dwCreationDisposition`: any of `GENERIC_WRITE |
+GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA | DELETE`, **or** a
+disposition that can create or truncate the file (`CREATE_NEW`,
+`CREATE_ALWAYS`, `OPEN_ALWAYS`, `TRUNCATE_EXISTING`) ⇒ write intent; any
+of `GENERIC_READ | GENERIC_ALL | FILE_READ_DATA | GENERIC_EXECUTE |
+FILE_EXECUTE` ⇒ read intent; both ⇒ op 3; neither (a metadata-only open)
+⇒ recorded as op 4 with the op-1-style `extra`. The raw access mask and
+disposition are preserved in `extra` so the reader can re-derive its own
 classification if these rules turn out to be wrong.
 
 ### 5.3 `PROCESS` ops
@@ -147,10 +151,16 @@ saw opened. Predefined roots are rendered `HKLM`, `HKCU`, `HKCR`, `HKU`,
 | `op` | Meaning | `path` | `aux` | `extra` |
 |---|---|---|---|---|
 | 1 | variable read | variable name | value (empty if not found) | — |
+| 2 | environment block read (`GetEnvironmentStringsW`) | — | — | — |
 
 `status` is `0` if the variable existed, `ERROR_ENVVAR_NOT_FOUND`
 otherwise. Reads of `SEMBAZURU_TRACE_DIR` itself by the interceptor are
 not recorded.
+
+Op 2 exists because CRT runtimes snapshot the whole environment block at
+startup and serve `getenv()` from the copy; a process that did this
+depends on the *entire* environment, and the reader must treat it that
+way.
 
 ## 6. Reader obligations (dependency-graph semantics)
 
