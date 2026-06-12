@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "m0/**"]
+    branches: [main, "m0/**", "m1/**"]
   pull_request:
 
 jobs:
@@ -19,12 +19,18 @@ jobs:
       - run: cargo test --workspace
 
   hooks:
-    name: C++ hooks (MSVC)
+    name: C++ hooks + tracer (MSVC)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - run: cmake -S hooks -B hooks/build -A x64
       - run: cmake --build hooks/build --config Release
+      - run: cargo build -p sembazuru-tracer --release
       - uses: ilammy/msvc-dev-cmd@v1
-      - name: Hook PoC smoke (CreateFileW from cl.exe)
-        run: pwsh -NoProfile -File hooks/poc/smoke.ps1
+      # Gates the M1 "Done when": completeness (every /showIncludes header is
+      # captured), child propagation (cl -> link), and reproducibility (two
+      # runs produce identical input/output sets). clang-cl runs too (the
+      # runner ships LLVM on PATH).
+      - name: M1 tracer smoke (completeness, propagation, reproducibility)
+        run: pwsh -NoProfile -File hooks/test/smoke.ps1
