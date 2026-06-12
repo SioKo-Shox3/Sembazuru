@@ -160,7 +160,10 @@ not recorded.
 Op 2 exists because CRT runtimes snapshot the whole environment block at
 startup and serve `getenv()` from the copy; a process that did this
 depends on the *entire* environment, and the reader must treat it that
-way.
+way. The reader surfaces a block read as a single synthetic env entry
+named `<environment-block>` (a name no real variable can have, since `=`
+is forbidden in variable names) so the signal is not lost among the
+individual variable reads.
 
 ## 6. Reader obligations (dependency-graph semantics)
 
