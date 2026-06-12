@@ -1,88 +1,90 @@
-# 0001 — Worker-side VFS approach: user-mode hooking vs minifilter driver vs ProjFS
+# 0001 — ワーカー側 VFS 方式: ユーザーモードフック vs ミニフィルタドライバ vs ProjFS
 
-- Status: **PENDING — decision owner: project lead.** This document frames the
-  trade-offs; it deliberately does not decide.
-- Date framed: 2026-06-12 (evidence gathered via primary sources; confidence
-  levels noted inline)
-- Decides: the single most load-bearing M0 choice (DESIGN.md §7 M0). Everything
-  in M3+ (on-demand file supply) sits on top of this.
+- ステータス: **未決定（PENDING）— 決定者: プロジェクトリード。** この文書は
+  トレードオフを整理するものであり、意図的に決定はしない。
+- 整理日: 2026-06-12（一次ソースから証拠を収集。確度は本文中に注記）
+- 決めること: M0 で最も影響の大きい選択（DESIGN.md §7 M0）。M3 以降の
+  オンデマンドファイル供給はすべてこの上に載る。
 
-## Question
+## 問い
 
-When a hooked process (e.g. `cl.exe`) runs on a remote worker, how do we make
-it see the local machine's filesystem? Three candidate mechanisms:
+フックされたプロセス（例: `cl.exe`）がリモートワーカー上で動くとき、
+手元マシンのファイルシステムをどうやって見せるか。候補は 3 つ:
 
-- **A. Pure user-mode VFS** — the same Detours hooks we already inject
-  intercept `CreateFileW`/`GetFileAttributes`/`NtQueryDirectoryFile`-level
-  calls and redirect them to the agent's file-supply session.
-- **B. Filesystem minifilter driver** — a kernel component materializes a
-  virtual volume/directory; every process sees it, hooked or not.
-- **C. ProjFS (Windows Projected File System)** — a user-mode provider API
-  backed by the Microsoft-shipped `prjflt.sys` minifilter; files hydrate on
-  first access into a real NTFS directory.
+- **A. 純粋ユーザーモード VFS** — すでに注入している Detours フックで
+  `CreateFileW` / `GetFileAttributes` / `NtQueryDirectoryFile` 級の呼び出しを
+  横取りし、エージェントのファイル供給セッションへリダイレクトする。
+- **B. ファイルシステム・ミニフィルタドライバ** — カーネルコンポーネントが
+  仮想ボリューム／ディレクトリを実体化する。フックの有無に関係なく
+  すべてのプロセスから見える。
+- **C. ProjFS（Windows Projected File System）** — Microsoft 製の
+  `prjflt.sys` ミニフィルタを土台にしたユーザーモードプロバイダ API。
+  初回アクセス時にファイルが実 NTFS ディレクトリへハイドレート（実体化）される。
 
-## Comparison
+## 比較
 
-| Axis | A. User-mode hooks | B. Own minifilter | C. ProjFS |
+| 軸 | A. ユーザーモードフック | B. 自前ミニフィルタ | C. ProjFS |
 |---|---|---|---|
-| Signing burden | Authenticode only; no EV requirement; SmartScreen reputation accrues over time | **EV cert required even for attestation signing; EV is issued to registered legal entities only — not obtainable as an individual** (~$250–500/yr, org vetting). Server SKUs additionally need HLK/WHQL for filter drivers | None beyond normal binaries (driver is Microsoft's, ships in Windows) |
-| Distribution | xcopy; no admin rights needed for the mechanism itself | Driver install: admin, reboot risk, cross-signing path closed as of Win11 24H2 (WHCP-only); HVCI/Memory-Integrity compliance required | Optional Windows feature, **disabled by default; enabling requires admin once** (Win10 1809+) |
-| Completeness | Known gaps: direct Nt/Zw syscalls (BuildXL issue #680 — msys2/Cygwin bypass entirely), statically-linked code calling ntdll directly, breakaway child processes (BuildXL PR #1175 compensates manually), memory-mapped access after open (inference, medium confidence), CFG/anti-tamper/PPL targets resist injection | Complete: sits under all user-mode I/O paths regardless of how the syscall is made | Complete for file *content* access under the virtualization root (kernel-enforced); semantics limited to hydrate-on-read of a projected tree — not a general I/O redirection layer |
-| Performance | Hook overhead ~tens–hundreds of ns per call; network round-trip dominates. BuildXL reports 1–5% sandbox overhead overall | All I/O on the volume pays the filter path; AV-research folklore says OPEN ops hurt most; no public quantitative data (workload-dependent) | ≥2 kernel↔user transitions per first-touch hydration, per file; fine after hydration. Microsoft explicitly says ProjFS targets *fast* backing stores, recommends Cloud Files API for slow/remote ones. Dev Drive excludes `prjflt` by default for perf — telling |
-| EDR/AV optics | Injection + inline patching = classic malware TTPs; mitigated by documented Detours path, signing, allowlisting (M7) | Kernel driver = highest scrutiny but also the "legitimate product" path; EV+WHQL is itself the trust signal | Cleanest: documented OS feature, MS-signed driver; provider is an ordinary process |
-| Who uses it (design level) | **UBA (confirmed: Epic engineer, "virtualizing using detours"), IncrediBuild (docs describe DLL injection + API interception; no kernel driver documented — medium confidence), BuildXL sandbox, and XiaoBuild by inheritance from UBA** | No direct competitor found using one for build distribution | VFS for Git (now maintenance mode; superseded by Scalar/sparse-checkout — partly a perf-at-scale story) |
-| Fit with our architecture | We must inject hooks **anyway** (child-process capture, output interception). VFS reuses the layer we already own | Second mechanism beside the hooks; doubles the surface we maintain and sign | Hybrid: hooks still needed for process/output capture; ProjFS would replace only the read-path |
+| 署名の負担 | 通常の Authenticode のみ。EV 不要。SmartScreen の評判は時間で蓄積 | **アテステーション署名でも EV 証明書が必須。EV は登録済み法人にしか発行されず、個人では取得不可**（年 $250–500 程度＋組織審査）。Server SKU はさらにフィルタドライバの HLK/WHQL が必要 | 通常のバイナリ以上の負担なし（ドライバは Microsoft 製で Windows に同梱） |
+| 配布 | xcopy で済む。機構自体に管理者権限不要 | ドライバインストール: 管理者権限、再起動リスク。Win11 24H2 以降クロス署名の道は閉鎖（WHCP のみ）。HVCI／メモリ整合性への準拠が必要 | Windows のオプション機能で**既定では無効。有効化に一度だけ管理者権限が必要**（Win10 1809+） |
+| 網羅性 | 既知の穴: 直接の Nt/Zw syscall（BuildXL issue #680 — msys2/Cygwin は丸ごとすり抜ける）、ntdll を直接呼ぶ静的リンクコード、breakaway 子プロセス（BuildXL PR #1175 が手動で補償）、オープン後のメモリマップアクセス（推測、確度中）、CFG／アンチタンパ／PPL なプロセスは注入に抵抗 | 完全: syscall の発行方法によらず、すべてのユーザーモード I/O 経路の下に位置する | 仮想化ルート配下のファイル*内容*アクセスについては完全（カーネル強制）。ただし意味論は「投影ツリーの read 時ハイドレート」に限られ、汎用の I/O リダイレクト層ではない |
+| 性能 | フックのオーバーヘッドは 1 呼び出しあたり数十〜数百 ns。支配項はネットワーク往復。BuildXL はサンドボックス全体で 1–5% のオーバーヘッドと報告 | そのボリューム上の全 I/O がフィルタ経路のコストを払う。AV 研究界隈の経験則では OPEN 操作が最も痛い。公開された定量データなし（ワークロード依存） | 初回タッチのハイドレートごとに**ファイル 1 つあたりカーネル↔ユーザー遷移 2 回以上**。ハイドレート後は速い。Microsoft 自身が ProjFS は*高速な*バッキングストア向けと明言し、低速／リモートには Cloud Files API を推奨。Dev Drive が既定で `prjflt` を除外しているのも示唆的 |
+| EDR/AV からの見え方 | 注入＋インラインパッチは古典的なマルウェア TTP。文書化された Detours 経路・署名・許可リスト（M7）で緩和 | カーネルドライバは最も厳しく見られるが、同時に「正規製品」の道でもある。EV＋WHQL 自体が信頼のシグナル | 最もクリーン: 文書化された OS 機能、MS 署名ドライバ。プロバイダは普通のプロセス |
+| 採用例（設計レベル） | **UBA（Epic のエンジニアが「detours で仮想化」と明言）、IncrediBuild（ドキュメントは DLL 注入＋API インターセプトを記述。カーネルドライバの記載なし — 確度中）、BuildXL サンドボックス、XiaoBuild は UBA 由来** | ビルド分散にミニフィルタを使う直接競合は見つからず | VFS for Git（現在メンテナンスモード。Scalar/sparse-checkout に置換 — 一因はスケール時の性能） |
+| 本アーキテクチャとの整合 | フック注入は**どのみち必須**（子プロセス捕捉・出力横取り）。VFS は既に持っているレイヤの再利用になる | フックと並ぶ第二の機構。保守・署名する表面積が倍になる | ハイブリッド: プロセス／出力捕捉にフックは依然必要。ProjFS が置き換えるのは read 経路のみ |
 
-Key citations (full set in the research log):
-- Signing: learn.microsoft.com/en-us/windows-hardware/drivers/dashboard/code-signing-reqs; …/driver-signing-offerings
-- BuildXL gaps: github.com/microsoft/BuildXL/issues/680; …/pull/1175; …/blob/main/Documentation/Specs/Sandboxing.md
-- ProjFS mechanics/positioning: learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system; …/enabling-windows-projected-file-system; huntress.com/blog/windows-projected-file-system-mechanics
-- UBA approach: x.com/honk_dice/status/1730353497877680376 (Epic engineer)
+主な出典（全量は調査ログ参照）:
+- 署名要件: learn.microsoft.com/en-us/windows-hardware/drivers/dashboard/code-signing-reqs; …/driver-signing-offerings
+- BuildXL の穴: github.com/microsoft/BuildXL/issues/680; …/pull/1175; …/blob/main/Documentation/Specs/Sandboxing.md
+- ProjFS の機構と位置づけ: learn.microsoft.com/en-us/windows/win32/projfs/projected-file-system; …/enabling-windows-projected-file-system; huntress.com/blog/windows-projected-file-system-mechanics
+- UBA の方式: x.com/honk_dice/status/1730353497877680376（Epic のエンジニア）
 - IncrediBuild: docs.incredibuild.com/win/latest/windows/process_virtualization_flow.html
 
-## When each option wins
+## それぞれが有利になる条件
 
-**A wins if** we accept the same completeness envelope as every shipping
-competitor (UBA, IncrediBuild, BuildXL all live with it), value xcopy
-distribution and individual-developer-compatible signing, and treat the known
-gaps (direct syscalls, msys2-style toolchains) as detectable-and-fallback
-cases rather than correctness holes. Strong prior: the entire competitive
-field converged here.
+**A が勝つのは**: 出荷済み競合（UBA・IncrediBuild・BuildXL）と同じ網羅性の
+範囲で妥協できる場合。xcopy 配布と個人開発者でも可能な署名を重視し、
+既知の穴（直接 syscall、msys2 系ツールチェーン）を「検知してローカル
+フォールバック」で扱える事例とみなし、正しさの欠陥とはみなさない場合。
+強い事前確率: 競合は全員ここに収斂した。
 
-**B wins if** correctness-by-construction outweighs everything: no process can
-bypass it, no toolchain quirk matters. The price is incorporated-entity EV
-signing (currently **unavailable to a solo individual developer**), WHQL for
-server SKUs, admin+reboot installs, and a kernel codebase to keep safe. B is
-effectively foreclosed until the project has a legal entity behind it.
+**B が勝つのは**: 構成による正しさ（correctness-by-construction）が他の
+すべてに優る場合。どのプロセスも回避できず、ツールチェーンの癖も関係ない。
+代償は法人格を前提とする EV 署名（現状**個人開発者には入手不可能**）、
+Server SKU の WHQL、管理者権限＋再起動のインストール、そして安全に保ち
+続けるべきカーネルコードベース。**B はプロジェクトが法人格を持つまで
+事実上選択肢から外れる。**
 
-**C wins if** first-build hydration latency proves acceptable in measurement
-and we want kernel-enforced read-path completeness without owning a driver.
-Risks: admin-once feature enablement contradicts "zero configuration", the
-≥2-transition-per-file hydration cost lands exactly on our critical path
-(M3's many-small-files problem), and we still need the hook layer for
-everything that isn't file reads.
+**C が勝つのは**: 初回ビルドのハイドレートレイテンシが実測で許容範囲と
+わかり、かつドライバを自前で持たずにカーネル強制の read 経路網羅性が
+欲しい場合。リスク: 機能有効化に一度の管理者権限が要る点は「ゼロ設定」と
+矛盾し、ファイルごとの遷移 2 回以上のハイドレートコストはちょうど本命の
+急所（M3 の小ファイル大量問題）に直撃し、さらにファイル読み取り以外の
+すべてにフック層が依然として必要。
 
-## What this interacts with
+## 影響し合うもの
 
-- **Local fallback (non-negotiable #2):** A's completeness gaps need a
-  detect-and-fallback story (e.g. unknown-syscall processes run locally).
-- **EDR/M7:** A concentrates all scrutiny on the injection path we already
-  carry; B adds the heaviest-but-most-legitimate trust artifact; C adds none.
-- **Protocol v0 §4.1:** the op set is mechanism-agnostic, but A may need
-  extra ops for child-handle sync; C would push us toward whole-file
-  hydration rather than ranged reads (see v0.md §7.5).
+- **ローカルフォールバック（非交渉事項 #2）:** A の網羅性の穴には
+  「検知してフォールバック」の筋書きが必要（例: 未知 syscall を発行する
+  プロセスはローカル実行に回す）。
+- **EDR/M7:** A はすでに背負っている注入経路に監視の目を集中させる。
+  B は最も重いが最も正規の信頼物を加える。C は何も加えない。
+- **プロトコル v0 §4.1:** 操作セットは機構非依存だが、A は子プロセスの
+  ハンドル同期に追加の操作が要るかもしれない。C はレンジ読みではなく
+  ファイル丸ごとハイドレートの方向へ押す（v0.md §7.5 参照）。
 
-## Measurements recommended before/alongside the decision
+## 決定の前／並行に推奨する実測
 
-1. 10k-file open/stat microbenchmark against an unhydrated ProjFS root vs the
-   same workload through a Detours redirect shim (no public data exists; this
-   is the deciding number for C).
-2. Census of real-world build tools that issue direct Nt* syscalls (how big is
-   A's gap in practice for *our* target workloads — MSVC/clang-cl, not msys2?).
-3. (Only if B stays on the table) attestation-signed minifilter load test on
-   an HVCI-enabled Win11 box.
+1. 未ハイドレートの ProjFS ルートに対する 1 万ファイル open/stat
+   マイクロベンチマーク vs 同じワークロードを Detours リダイレクトシムに
+   通したもの（公開データが存在しない。C の採否を決める数字はこれ）。
+2. 直接 Nt* syscall を発行する実在ビルドツールの調査（*我々の*対象
+   ワークロード — MSVC/clang-cl であって msys2 ではない — で A の穴は
+   実際どれだけ大きいか）。
+3. （B を残す場合のみ）HVCI 有効な Win11 機での
+   アテステーション署名ミニフィルタのロードテスト。
 
-## Decision
+## 決定
 
-**PENDING.** Recorded here once made, with rationale and the dissenting
-considerations preserved.
+**未決定（PENDING）。** 決定したらここに理由と、採らなかった選択肢の
+考慮点を残したまま記録する。

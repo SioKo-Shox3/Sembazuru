@@ -5,7 +5,12 @@ Keep it short. When a plan exposes a wrong assumption, fix it *here* so the next
 
 ## Language
 
-Converse with me in **Japanese** — explanations, plans, questions, and proposals all in Japanese, even when I prompt you in English. Keep all **repository artifacts in English**: code, comments, commit messages, branch names, and docs. The split is intentional: the conversation is for me; the artifacts are for an international OSS audience.
+Converse with me in **Japanese** — explanations, plans, questions, and proposals all in Japanese, even when I prompt you in English.
+
+- **Japanese:** anything the project lead must read to decide or confirm — decision documents (`docs/decisions/`), plans, review requests — and **commit messages**. A decision document the decider can't read is not evidence.
+- **English:** code, comments, branch names, and outward-facing docs (README, protocol specs) for the OSS audience.
+
+(Corrected 2026-06-12: the original "all repo artifacts in English" rule made the VFS decision doc unreadable to the decision owner.)
 
 ## What this project is
 
