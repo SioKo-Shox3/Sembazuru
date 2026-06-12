@@ -16,16 +16,19 @@ HANDLE(WINAPI* TrueCreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES,
                                 DWORD, DWORD, HANDLE) = CreateFileW;
 
 HANDLE g_log = INVALID_HANDLE_VALUE;
-LONG g_logInitDone = 0;
+bool g_logInitDone = false;
 SRWLOCK g_logLock = SRWLOCK_INIT;
 
 // Opens the log lazily on the first hooked call instead of in DllMain, to
-// keep loader-lock work minimal. Must only call APIs that are not hooked
-// (or true trampolines) so logging can never re-enter the hook.
-void EnsureLogOpen() {
-    if (InterlockedCompareExchange(&g_logInitDone, 1, 0) != 0) {
+// keep loader-lock work minimal. Caller must hold g_logLock: init and handle
+// publication stay under the same lock so no thread can observe a torn or
+// stale g_log. Must only call APIs that are not hooked (or true trampolines)
+// so logging can never re-enter the hook.
+void EnsureLogOpenLocked() {
+    if (g_logInitDone) {
         return;
     }
+    g_logInitDone = true;
     wchar_t path[MAX_PATH];
     DWORD n = GetEnvironmentVariableW(L"SEMBAZURU_POC_LOG", path, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) {
@@ -37,8 +40,7 @@ void EnsureLogOpen() {
 }
 
 void LogCreateFile(LPCWSTR fileName) {
-    EnsureLogOpen();
-    if (g_log == INVALID_HANDLE_VALUE || fileName == nullptr) {
+    if (fileName == nullptr) {
         return;
     }
 
@@ -54,8 +56,11 @@ void LogCreateFile(LPCWSTR fileName) {
     line[len++] = '\n';
 
     AcquireSRWLockExclusive(&g_logLock);
-    DWORD written = 0;
-    WriteFile(g_log, line, static_cast<DWORD>(len), &written, nullptr);
+    EnsureLogOpenLocked();
+    if (g_log != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(g_log, line, static_cast<DWORD>(len), &written, nullptr);
+    }
     ReleaseSRWLockExclusive(&g_logLock);
 }
 
@@ -73,7 +78,7 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess,
 
 }  // namespace
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID reserved) {
     // Detours re-launches this DLL inside a helper process when bitness
     // differs; that instance must do nothing.
     if (DetourIsHelperProcess()) {
@@ -84,22 +89,34 @@ BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
         DetourRestoreAfterWith();
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
-        DetourAttach(&reinterpret_cast<PVOID&>(TrueCreateFileW),
-                     HookedCreateFileW);
-        if (DetourTransactionCommit() != NO_ERROR) {
-            // A failed commit rolls the transaction back; refuse to load
-            // rather than run half-instrumented.
+        LONG err = DetourAttach(&reinterpret_cast<PVOID&>(TrueCreateFileW),
+                                HookedCreateFileW);
+        if (err == NO_ERROR) {
+            err = DetourTransactionCommit();  // failure rolls back the TX
+        } else {
+            DetourTransactionAbort();
+        }
+        if (err != NO_ERROR) {
+            // Refuse to load rather than run half-instrumented.
             return FALSE;
         }
     } else if (reason == DLL_PROCESS_DETACH) {
+        if (reserved != nullptr) {
+            // Process termination: other threads may be frozen mid-write.
+            // Let the OS reclaim hooks and handles instead of racing them.
+            return TRUE;
+        }
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
         DetourDetach(&reinterpret_cast<PVOID&>(TrueCreateFileW),
                      HookedCreateFileW);
         DetourTransactionCommit();
+        AcquireSRWLockExclusive(&g_logLock);
         if (g_log != INVALID_HANDLE_VALUE) {
             CloseHandle(g_log);
+            g_log = INVALID_HANDLE_VALUE;
         }
+        ReleaseSRWLockExclusive(&g_logLock);
     }
     return TRUE;
 }
