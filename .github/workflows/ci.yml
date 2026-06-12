@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "m0/**"]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  hooks:
+    name: C++ hooks (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S hooks -B hooks/build -A x64
+      - run: cmake --build hooks/build --config Release
