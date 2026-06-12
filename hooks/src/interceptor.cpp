@@ -84,7 +84,10 @@ class WideArg {
             return;
         }
         int needed = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
-        if (needed <= 0) {
+        if (needed <= 0 || needed > kMaxChars) {
+            // Reject absurd lengths: keeps `needed * 2` from overflowing a
+            // 32-bit SIZE_T on a future 32-bit interceptor build. Real paths,
+            // command lines, and env values are far below this bound.
             return;
         }
         wchar_t* dst = stack_;
@@ -115,6 +118,7 @@ class WideArg {
 
    private:
     static const int kStackCap = 512;
+    static const int kMaxChars = 1 << 20;  // 1M wchars; far above any real arg
     wchar_t stack_[kStackCap];
     wchar_t* heap_ = nullptr;
     const wchar_t* ptr_ = nullptr;
@@ -655,7 +659,9 @@ LSTATUS APIENTRY HookedRegGetValueA(HKEY key, LPCSTR subKey, LPCSTR value,
 
 LSTATUS APIENTRY HookedRegCloseKey(HKEY key) {
     // Remove before closing so a concurrent open that reuses the handle
-    // value can't be mis-attributed to the old path.
+    // value can't be mis-attributed to the old path. TrueRegCloseKey runs
+    // last, so the caller's GetLastError reflects the close, not the heap
+    // free in RegMapRemove; no save/restore needed here.
     RegMapRemove(key);
     return TrueRegCloseKey(key);
 }

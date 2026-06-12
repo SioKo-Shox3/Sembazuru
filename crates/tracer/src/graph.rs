@@ -15,6 +15,11 @@ use crate::model::{AccessKind, EnvOp, EventKind, FileOp, RegistryOp, Trace};
 /// comparison sets by default (`docs/trace-format.md` §6).
 const TELEMETRY_EXES: &[&str] = &["vctip.exe"];
 
+/// Synthetic env-entry name for a whole-environment-block read
+/// (`GetEnvironmentStringsW`). `=` cannot appear in a real variable name, so
+/// this never collides with a genuine variable.
+const ENV_BLOCK_NAME: &str = "<environment-block>";
+
 #[derive(Debug, Clone)]
 pub struct ProcessNode {
     pub pid: u32,
@@ -293,6 +298,25 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
                         entry.pids.insert(t.pid);
                     }
                 }
+                EventKind::Env {
+                    op: EnvOp::BlockRead,
+                } => {
+                    // A CRT that snapshots the whole environment block depends
+                    // on *all* of it. Surface that as one synthetic entry under
+                    // a reserved name (env var names cannot contain '='), so
+                    // the signal reaches the graph rather than being dropped.
+                    if !is_telemetry {
+                        let entry =
+                            acc.env
+                                .entry(ENV_BLOCK_NAME.to_string())
+                                .or_insert_with(|| EnvAccess {
+                                    name: ENV_BLOCK_NAME.to_string(),
+                                    found: true,
+                                    pids: BTreeSet::new(),
+                                });
+                        entry.pids.insert(t.pid);
+                    }
+                }
                 _ => {}
             }
         }
@@ -487,6 +511,26 @@ mod tests {
         let g = build_graph(&[t]);
         assert!(g.outputs.is_empty(), "a pipe is not a file output");
         assert!(g.inputs.is_empty());
+    }
+
+    #[test]
+    fn env_block_read_surfaces_as_synthetic_entry() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events.push(Event {
+            kind: EventKind::Env {
+                op: EnvOp::BlockRead,
+            },
+            status: 0,
+            tid: 1,
+            qpc: 0,
+            path: String::new(),
+            aux: String::new(),
+        });
+        let g = build_graph(&[t]);
+        assert_eq!(g.env.len(), 1);
+        assert_eq!(g.env[0].name, ENV_BLOCK_NAME);
+        assert!(g.env[0].found);
+        assert!(g.env[0].pids.contains(&10));
     }
 
     #[test]

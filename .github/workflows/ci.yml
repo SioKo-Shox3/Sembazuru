@@ -33,4 +33,4 @@ jobs:
       # runs produce identical input/output sets). clang-cl runs too (the
       # runner ships LLVM on PATH).
       - name: M1 tracer smoke (completeness, propagation, reproducibility)
-        run: pwsh -NoProfile -File hooks/test/smoke.ps1
+        run: pwsh -NoProfile -File hooks/test/smoke.ps1 -RequireClangCl

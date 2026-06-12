@@ -20,7 +20,11 @@ param(
     [string]$TracerExe = (Join-Path $PSScriptRoot '..\..\target\release\sembazuru-trace.exe'),
     # Work area must NOT be under %TEMP%: the reader tags temp paths as
     # intermediates, which would hide real build artifacts in this test.
-    [string]$WorkRoot  = (Join-Path $PSScriptRoot '..\build\smoke-work')
+    [string]$WorkRoot  = (Join-Path $PSScriptRoot '..\build\smoke-work'),
+    # CI sets this (the runner ships LLVM on PATH): turn the clang-cl gate from
+    # a soft skip into a hard failure so clang-cl staying first-class
+    # (CLAUDE.md) is actually enforced, not assumed.
+    [switch]$RequireClangCl
 )
 $ErrorActionPreference = 'Stop'
 
@@ -157,7 +161,11 @@ if ($LASTEXITCODE -ne 0) {
 # --- Gate 4: clang-cl (first-class target) ----------------------------------
 $clang = Get-Command clang-cl -ErrorAction SilentlyContinue
 if ($null -eq $clang) {
-    Write-Host 'GATE 4 SKIP  clang-cl not on PATH'
+    if ($RequireClangCl) {
+        $failures += 'clang-cl: required (-RequireClangCl) but not found on PATH'
+    } else {
+        Write-Host 'GATE 4 SKIP  clang-cl not on PATH'
+    }
 } else {
     $traceClang = Invoke-Traced 'clang' @('clang-cl', '/nologo', '/c', 'main.c')
     $graphClang = Export-Graph $traceClang
