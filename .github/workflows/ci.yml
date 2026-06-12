@@ -25,3 +25,6 @@ jobs:
       - uses: actions/checkout@v4
       - run: cmake -S hooks -B hooks/build -A x64
       - run: cmake --build hooks/build --config Release
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Hook PoC smoke (CreateFileW from cl.exe)
+        run: pwsh -NoProfile -File hooks/poc/smoke.ps1
