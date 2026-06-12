@@ -267,36 +267,36 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
     // --- Fold events into access sets ------------------------------------
     let mut acc = Accumulator::new();
     for t in traces {
-        let is_telemetry = TELEMETRY_EXES.contains(&t.exe_name().as_str());
+        // Telemetry processes are tagged in the tree but contribute nothing to
+        // the comparison sets; skip folding their accesses entirely.
+        if TELEMETRY_EXES.contains(&t.exe_name().as_str()) {
+            continue;
+        }
         for ev in &t.events {
             match &ev.kind {
                 EventKind::File { op, .. } => {
-                    fold_file(&mut acc, t.pid, *op, ev, &temp_dirs, is_telemetry);
+                    fold_file(&mut acc, t.pid, *op, ev, &temp_dirs);
                 }
                 EventKind::Registry {
                     op: RegistryOp::QueryValue,
                     ..
                 } => {
-                    if !is_telemetry {
-                        let key = (ev.path.clone(), ev.aux.clone());
-                        let entry = acc.registry.entry(key).or_insert_with(|| RegistryAccess {
-                            key: ev.path.clone(),
-                            value: ev.aux.clone(),
-                            pids: BTreeSet::new(),
-                        });
-                        entry.pids.insert(t.pid);
-                    }
+                    let key = (ev.path.clone(), ev.aux.clone());
+                    let entry = acc.registry.entry(key).or_insert_with(|| RegistryAccess {
+                        key: ev.path.clone(),
+                        value: ev.aux.clone(),
+                        pids: BTreeSet::new(),
+                    });
+                    entry.pids.insert(t.pid);
                 }
                 EventKind::Env { op: EnvOp::Read } => {
-                    if !is_telemetry {
-                        let entry = acc.env.entry(ev.path.clone()).or_insert_with(|| EnvAccess {
-                            name: ev.path.clone(),
-                            found: false,
-                            pids: BTreeSet::new(),
-                        });
-                        entry.found |= ev.succeeded();
-                        entry.pids.insert(t.pid);
-                    }
+                    let entry = acc.env.entry(ev.path.clone()).or_insert_with(|| EnvAccess {
+                        name: ev.path.clone(),
+                        found: false,
+                        pids: BTreeSet::new(),
+                    });
+                    entry.found |= ev.succeeded();
+                    entry.pids.insert(t.pid);
                 }
                 EventKind::Env {
                     op: EnvOp::BlockRead,
@@ -305,17 +305,15 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
                     // on *all* of it. Surface that as one synthetic entry under
                     // a reserved name (env var names cannot contain '='), so
                     // the signal reaches the graph rather than being dropped.
-                    if !is_telemetry {
-                        let entry =
-                            acc.env
-                                .entry(ENV_BLOCK_NAME.to_string())
-                                .or_insert_with(|| EnvAccess {
-                                    name: ENV_BLOCK_NAME.to_string(),
-                                    found: true,
-                                    pids: BTreeSet::new(),
-                                });
-                        entry.pids.insert(t.pid);
-                    }
+                    let entry = acc
+                        .env
+                        .entry(ENV_BLOCK_NAME.to_string())
+                        .or_insert_with(|| EnvAccess {
+                            name: ENV_BLOCK_NAME.to_string(),
+                            found: true,
+                            pids: BTreeSet::new(),
+                        });
+                    entry.pids.insert(t.pid);
                 }
                 _ => {}
             }
@@ -337,11 +335,7 @@ fn fold_file(
     op: FileOp,
     ev: &crate::model::Event,
     temp_dirs: &BTreeSet<String>,
-    is_telemetry: bool,
 ) {
-    if is_telemetry {
-        return; // tagged and excluded from comparison sets
-    }
     let norm = normalize_path(&ev.path);
     if is_device(&norm) {
         return; // named pipe / device, not a file
