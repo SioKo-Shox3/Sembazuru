@@ -24,12 +24,15 @@ add_library(detours STATIC
 target_include_directories(detours PUBLIC ${DETOURS_DIR})
 target_compile_definitions(detours PRIVATE WIN32_LEAN_AND_MEAN)
 
-# --- M0 PoC: hook one CreateFileW in cl.exe and log it ----------------------
-add_library(interceptor SHARED
-  poc/interceptor.cpp
-  poc/interceptor.def
+# --- M1 tracer: observe-only interceptor + injection launcher ---------------
+# The DLL name must end in "64" (or "32"): Detours' cross-bitness child
+# injection derives the sibling DLL name from that suffix.
+add_library(sbz_interceptor64 SHARED
+  src/interceptor.cpp
+  src/trace_writer.cpp
+  src/interceptor.def
 )
-target_link_libraries(interceptor PRIVATE detours)
+target_link_libraries(sbz_interceptor64 PRIVATE detours)
 
-add_executable(launcher poc/launcher.cpp)
+add_executable(launcher src/launcher.cpp)
 target_link_libraries(launcher PRIVATE detours)

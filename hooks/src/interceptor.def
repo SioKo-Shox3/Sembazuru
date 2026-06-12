@@ -1,5 +1,5 @@
 ; DetourCreateProcessWithDllEx requires the injected DLL to export
 ; DetourFinishHelperProcess (provided by detours.lib) as ordinal 1.
-LIBRARY interceptor
+LIBRARY sbz_interceptor64
 EXPORTS
     DetourFinishHelperProcess @1 NONAME
