@@ -1,69 +1,18 @@
-# Prerequisites
-*.d
+# Rust
+/target/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
+# C++ / CMake build output (out-of-source builds only)
+/hooks/build/
+
+# Visual Studio / MSVC artifacts outside build dirs
+.vs/
+*.user
 *.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
 *.pdb
+*.ilk
+*.idb
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-*.so.*
-
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# Build directories
-build/
-Build/
-build-*/
-
-# CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-install_manifest.txt
-compile_commands.json
-
-# Temporary files
-*.tmp
-*.log
-*.bak
+# Editor / OS noise
 *.swp
-
-# vcpkg
-vcpkg_installed/
-
-# debug information files
-*.dwo
-
-# test output & cache
-Testing/
-.cache/
+*.tmp
+Thumbs.db
