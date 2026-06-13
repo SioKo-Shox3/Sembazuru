@@ -179,6 +179,52 @@ fn no_outputs_is_a_failure_not_a_vacuous_pass() {
 }
 
 #[test]
+fn explicit_output_handles_untracked_temp_rename() {
+    // Reproduces the clang/lld pattern: the compiler writes a run-varying temp
+    // (`a-<rand>.obj.tmp`) and renames it to `a.obj` via a call our Win32 hooks
+    // don't see, so the trace records only the temp. With `--output a.obj` the
+    // gate compares the real surviving artifact and excludes the temp from the
+    // input hash, so two runs verify clean despite differing temp names.
+    let make = |tag: &str, temp: &str| -> (PathBuf, PathBuf) {
+        let root = unique_dir(&format!("{tag}-root"));
+        std::fs::write(root.join("a.obj"), coff(0, 0xab)).unwrap(); // final artifact
+        let tdir = unique_dir(&format!("{tag}-trace"));
+        let cwd = root.to_str().unwrap();
+        let temp_path = format!("{cwd}\\{temp}"); // the trace-recorded write
+        write_trace(&tdir, &trace_bytes(cwd, "cc a.cpp", &[&temp_path], &[]));
+        (tdir, root)
+    };
+    let (ta, ra) = make("tmpA", "a-915f50da.obj.tmp");
+    let (tb, rb) = make("tmpB", "a-ba719e45.obj.tmp");
+    let out = Command::new(env!("CARGO_BIN_EXE_sembazuru-trace"))
+        .args([
+            "verify-determinism",
+            "--trace-a",
+            ta.to_str().unwrap(),
+            "--root-a",
+            ra.to_str().unwrap(),
+            "--trace-b",
+            tb.to_str().unwrap(),
+            "--root-b",
+            rb.to_str().unwrap(),
+            "--output",
+            "a.obj",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "explicit --output should compare the real artifact and pass; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("input-hash match: yes"),
+        "stdout:\n{stdout}"
+    );
+    assert!(stdout.contains("identical"), "stdout:\n{stdout}");
+}
+
+#[test]
 fn output_outside_build_root_is_flagged() {
     // An output written outside the build root can't be mapped by relative
     // correspondence; reading it would read the same file twice. It must be
