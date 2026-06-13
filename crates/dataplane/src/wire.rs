@@ -41,8 +41,8 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The data-plane operations (`docs/protocol/v0.md` §4.1). WriteBack and
-/// PrefetchHint arrive with M3.3 / M5; the read ops are M3.2.
+/// The data-plane operations (`docs/protocol/v0.md` §4.1). `Has` is the M4
+/// batch existence probe (§4.3); PrefetchHint arrives with M5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OpCode {
@@ -51,6 +51,7 @@ pub enum OpCode {
     Read = 3,
     DirList = 4,
     WriteBack = 5,
+    Has = 6,
 }
 
 impl OpCode {
@@ -61,6 +62,7 @@ impl OpCode {
             3 => Ok(OpCode::Read),
             4 => Ok(OpCode::DirList),
             5 => Ok(OpCode::WriteBack),
+            6 => Ok(OpCode::Has),
             other => Err(Error::UnknownOp(other)),
         }
     }

@@ -15,6 +15,7 @@ path = "src/bin/sembazuru_agent.rs"
 sembazuru-proto = { path = "../proto" }
 sembazuru-dataplane = { path = "../dataplane", features = ["tokio"] }
 sembazuru-tracer = { path = "../tracer" }
+sembazuru-cas = { path = "../cas" }
 tonic = "0.14"
 tokio = { version = "1", features = [
     "rt-multi-thread",

@@ -1,22 +1,28 @@
 //! Worker-side data-plane client (`docs/protocol/v0.md` §4): the worker's view
-//! of the agent filesystem. It issues StatBatch / OpenRead / Read / DirList and,
-//! via [`FileClient::fetch`], pulls a whole file's bytes for hydrate-on-open
-//! (M3.2) — verifying the content digest end-to-end (§5: integrity is free).
+//! of the agent filesystem. It issues StatBatch / OpenRead / Read / DirList /
+//! Has and pulls file content for hydrate-on-open — verifying the content
+//! digest end-to-end (§5: integrity is free; ADR 0003: BLAKE3).
+//!
+//! **Digest-first fetch (M4).** [`FileClient::probe_digest`] resolves a path to
+//! its digest *without* transferring bytes (`want_inline = false`), so the
+//! worker can consult its local cache and fetch only on a miss. [`FileClient::
+//! fetch`] keeps the inline-first-chunk fast path for callers that always want
+//! the bytes.
 //!
 //! **M3.2 scope.** Calls are sequential (one request, await its response). The
 //! frame format already carries request ids for out-of-order completion; the
-//! pipelining that exploits that is M3.5 latency work.
+//! pipelining that exploits that is M5 latency work.
 
 use std::io;
 use std::time::{Duration, Instant};
 
+use sembazuru_cas::Digest;
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
-    DirListRequest, DirListResponse, OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse,
-    StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
+    DirListRequest, DirListResponse, HasRequest, HasResponse, OpenReadRequest, OpenReadResponse,
+    ReadRequest, ReadResponse, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
-use sembazuru_tracer::determinism::sha256_hex;
 use tokio::net::{TcpStream, ToSocketAddrs};
 
 /// How much to request per Read after the inlined first chunk.
@@ -94,23 +100,25 @@ impl FileClient {
         StatResponse::decode(&resp).map_err(to_io)
     }
 
-    pub async fn open_read(&mut self, path: &str) -> io::Result<OpenReadResponse> {
+    /// Resolves `path`, optionally inlining its first chunk. With
+    /// `want_inline = false` this is a cheap *digest probe* (no content bytes).
+    pub async fn open_read(
+        &mut self,
+        path: &str,
+        want_inline: bool,
+    ) -> io::Result<OpenReadResponse> {
         let payload = OpenReadRequest {
             path: path.to_string(),
+            want_inline,
         }
         .encode();
         let resp = self.call(OpCode::OpenRead, &payload).await?;
         OpenReadResponse::decode(&resp).map_err(to_io)
     }
 
-    pub async fn read(
-        &mut self,
-        digest_hex: &str,
-        offset: u64,
-        len: u32,
-    ) -> io::Result<ReadResponse> {
+    pub async fn read(&mut self, digest: &str, offset: u64, len: u32) -> io::Result<ReadResponse> {
         let payload = ReadRequest {
-            digest_hex: digest_hex.to_string(),
+            digest_hex: digest.to_string(),
             offset,
             len,
         }
@@ -119,13 +127,24 @@ impl FileClient {
         ReadResponse::decode(&resp).map_err(to_io)
     }
 
+    /// Asks the agent which of `digests` it already holds (`§4.3`). Used before
+    /// uploading outputs so a rebuild re-sends nothing the agent already has.
+    pub async fn has(&mut self, digests: &[String]) -> io::Result<Vec<bool>> {
+        let payload = HasRequest {
+            digests: digests.to_vec(),
+        }
+        .encode();
+        let resp = self.call(OpCode::Has, &payload).await?;
+        Ok(HasResponse::decode(&resp).map_err(to_io)?.present)
+    }
+
     /// Returns a produced output to the agent for atomic publication at `path`.
     /// The agent verifies the digest, so a corrupted transfer is rejected rather
     /// than published.
     pub async fn write_back(&mut self, path: &str, bytes: &[u8]) -> io::Result<WriteBackResponse> {
         let payload = WriteBackRequest {
             path: path.to_string(),
-            digest_hex: sha256_hex(bytes),
+            digest_hex: Digest::of(bytes).canonical(),
             bytes: bytes.to_vec(),
         }
         .encode();
@@ -143,21 +162,30 @@ impl FileClient {
         DirListResponse::decode(&resp).map_err(to_io)
     }
 
-    /// Pulls the full contents of `path` for hydration. Returns `None` if the
-    /// file does not exist on the agent. The fetched bytes are verified against
-    /// the digest the agent reported; a mismatch is an integrity error.
-    pub async fn fetch(&mut self, path: &str) -> io::Result<Option<(Vec<u8>, String)>> {
-        let open = self.open_read(path).await?;
+    /// Digest-first resolve: the path's `(digest, size)` with **no content
+    /// transfer** (`want_inline = false`), or `None` if it does not exist. The
+    /// caller checks its local cache against the digest and fetches only on a
+    /// miss — the core of the no-re-transfer worker cache (M4).
+    pub async fn probe_digest(&mut self, path: &str) -> io::Result<Option<(Digest, u64)>> {
+        let open = self.open_read(path, false).await?;
         if !open.exists {
             return Ok(None);
         }
-        let size = open.size as usize;
-        let mut bytes = open.first_chunk;
+        let digest = Digest::parse(&open.digest_hex)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad digest: {e}")))?;
+        Ok(Some((digest, open.size)))
+    }
+
+    /// Fetches the full content of `digest` (whose size is `size`) by ranged
+    /// `Read`, verifying the assembled bytes against the digest. For the cache
+    /// path: probe first, then fetch only on a miss.
+    pub async fn fetch_by_digest(&mut self, digest: &Digest, size: u64) -> io::Result<Vec<u8>> {
+        let size = size as usize;
+        let mut bytes = Vec::with_capacity(size);
+        let digest_str = digest.canonical();
         while bytes.len() < size {
             let want = READ_CHUNK.min((size - bytes.len()) as u32);
-            let chunk = self
-                .read(&open.digest_hex, bytes.len() as u64, want)
-                .await?;
+            let chunk = self.read(&digest_str, bytes.len() as u64, want).await?;
             if chunk.bytes.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -166,18 +194,51 @@ impl FileClient {
             }
             bytes.extend_from_slice(&chunk.bytes);
         }
-        let actual = sha256_hex(&bytes);
-        if actual != open.digest_hex {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "digest mismatch fetching {path}: agent said {}, got {actual}",
-                    open.digest_hex
-                ),
-            ));
-        }
-        Ok(Some((bytes, open.digest_hex)))
+        verify(&bytes, digest)?;
+        Ok(bytes)
     }
+
+    /// Pulls the full contents of `path` for hydration, using the inline-first-
+    /// chunk fast path. Returns `None` if the file does not exist on the agent.
+    /// The fetched bytes are verified against the agent-reported digest.
+    pub async fn fetch(&mut self, path: &str) -> io::Result<Option<(Vec<u8>, Digest)>> {
+        let open = self.open_read(path, true).await?;
+        if !open.exists {
+            return Ok(None);
+        }
+        let digest = Digest::parse(&open.digest_hex)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad digest: {e}")))?;
+        let size = open.size as usize;
+        let mut bytes = open.first_chunk;
+        let digest_str = open.digest_hex;
+        while bytes.len() < size {
+            let want = READ_CHUNK.min((size - bytes.len()) as u32);
+            let chunk = self.read(&digest_str, bytes.len() as u64, want).await?;
+            if chunk.bytes.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "agent returned no bytes before the file was fully read",
+                ));
+            }
+            bytes.extend_from_slice(&chunk.bytes);
+        }
+        verify(&bytes, &digest)?;
+        Ok(Some((bytes, digest)))
+    }
+}
+
+/// Integrity check: the assembled bytes must hash to the digest the agent
+/// reported. A mismatch is a corrupted transfer (or a lying peer), never
+/// silently accepted.
+fn verify(bytes: &[u8], digest: &Digest) -> io::Result<()> {
+    let actual = Digest::of(bytes);
+    if &actual != digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("digest mismatch: agent said {digest}, got {actual}"),
+        ));
+    }
+    Ok(())
 }
 
 fn to_io(e: sembazuru_dataplane::wire::Error) -> io::Error {
