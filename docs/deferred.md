@@ -163,6 +163,29 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **worker の Abort 未配線（acknowledge のみ）。** reassign 時に元 worker のプロセスを能動 kill しない
   （タイムアウトのみ）。graceful drain は M7。出所: security(M5.5 Info)、M3.1 注。
 
+## M6（ビルドシステム統合 / Integrations）
+
+### M6.0 実装後の既知の残リスク（quality gates 2026-06-14）
+- **解消（M6.0 で fix）: LocalIntake の非ループバック bind 拒否。** intake は提出された任意コマンドを
+  実行し無認証（M7）。`SEMBAZURU_INTAKE=0.0.0.0:...` で無認証リモート RCE になりうるため、daemon 起動時に
+  `resolve_loopback_intake` で非ループバックを拒否（ランチャは常に 127.0.0.1 を叩くため無コスト）。
+  Coordination/fileserver は worker 用 LAN 到達が要るため非ガード。出所: security(M6.0 MEDIUM)。
+- **worker が stdout/stderr を捕捉しない（実コンパイラ診断が消える）。** `crates/worker/src/lib.rs` の
+  `run_action` は stdin のみ null 化し stdout/stderr は継承。リモート実行時、警告/エラーが worker コンソールへ
+  出て開発者に見えない。M6.0 自明ゲート（`cmd /c exit N`）では無害だが、**M6.1 の実コンパイルで診断ミラーが必須**
+  （Execution proto への stdout/stderr ストリーム追加＋worker 捕捉）。出所: verifier(M6.0 #3)、author 開示。
+- **ランチャが全環境変数を転送（off-box シークレット流出の M6.1 リスク）。** `sembazuru_launcher.rs` は
+  `std::env::vars()` 全体を Command.env に載せる。M6.0 は loopback＋ローカルフォールバック忠実性のため受容だが、
+  M6.1 で dispatch が実リモート worker（無認証・M7）へ到達した瞬間、開発者のトークン/鍵が wire に乗る。
+  M6.1（リモート到達前）に「コンパイラ関連 env のみ」allowlist/denylist を検討。出所: security(M6.0 LOW)。
+- **intake 直 dispatch に admission 上限なし。** `IntakeService::submit_action` は per-call の `mpsc::channel(8)` の
+  外側に同時 SubmitAction 数の上限を持たず、各 dispatch が（worker 不在時）`run_local` で実 OS プロセスを起こす。
+  intake flood → ローカルプロセス storm。loopback 強制で攻撃面はローカルに限定されるため M7（または非ループバック化
+  時に必須）で `run_build` 同様の semaphore ゲートを intake 層に。出所: security(M6.0 LOW)。
+- **ランチャの run_local 失敗が bare -1 で原因を握り潰す。** daemon 不達＋コンパイラ不在時、メッセージが
+  daemon を誤って責め、`run_local` の実エラー（program not found 等）が捨てられ exit -1。ビルドは正しく失敗するが
+  診断が誤誘導。M6.1 で run_local エラーを surface。出所: verifier(M6.0 #2)。
+
 ## M7（堅牢化・セキュリティ）
 
 - **データプレーン/制御プレーンに認証・TLS 無し。** worker の Execute、agent の

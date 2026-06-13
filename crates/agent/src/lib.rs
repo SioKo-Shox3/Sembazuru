@@ -15,6 +15,7 @@ use sembazuru_proto::v0::{
 pub mod action_cache;
 pub mod coordination;
 pub mod fileserver;
+pub mod intake;
 pub mod scheduler;
 
 /// What a remote action reported back: the lifecycle states it passed through

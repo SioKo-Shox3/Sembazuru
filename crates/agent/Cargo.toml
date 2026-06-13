@@ -11,6 +11,18 @@ publish.workspace = true
 name = "sembazuru-agent"
 path = "src/bin/sembazuru_agent.rs"
 
+# The long-lived agent daemon (M6.0): Coordination + file server + Scheduler +
+# LocalIntake in one process.
+[[bin]]
+name = "sembazuru-daemon"
+path = "src/bin/sembazuru_daemon.rs"
+
+# The compiler launcher (M6.0): invoked by the build system as
+# `sembazuru <compiler> <args...>`; hands the action to the daemon over loopback.
+[[bin]]
+name = "sembazuru"
+path = "src/bin/sembazuru_launcher.rs"
+
 [dependencies]
 sembazuru-proto = { path = "../proto" }
 sembazuru-dataplane = { path = "../dataplane", features = ["tokio"] }

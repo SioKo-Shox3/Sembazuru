@@ -155,3 +155,44 @@ message AbortRequest {
 message AbortResponse {
   bool acknowledged = 1;
 }
+
+// ---- LocalIntake: build-system launcher -> agent daemon (M6) --------------
+
+// A compiler launcher (e.g. set as CMAKE_<LANG>_COMPILER_LAUNCHER, or an MSBuild
+// CLToolExe shim) is a short-lived process the build system invokes as
+// `sembazuru <compiler> <args...>`. It hands that one action to the long-lived
+// agent daemon, which schedules it across workers (or runs it locally on
+// fallback), then mirrors the result so the launcher exits exactly as the
+// compiler would have.
+//
+// This plane is LOCAL-ONLY (loopback to the daemon on the same machine). Unlike
+// Execution (agent -> worker, which names only the input *root* because inputs
+// are discovered on demand, §3.2), SubmitAction carries the full command the
+// build system would have run — the launcher already has it on its argv.
+service LocalIntake {
+  // Launcher -> daemon: run this compiler invocation and stream its lifecycle
+  // and final exit. The stream ends after exactly one ExitStatus.
+  rpc SubmitAction(SubmitActionRequest) returns (stream SubmitActionEvent);
+}
+
+message SubmitActionRequest {
+  // The full command, with argv[0] = the real compiler (the launcher strips its
+  // own argv[0]). cwd is the launcher's working directory — the basis the agent
+  // uses to identify the input root (§3.2).
+  Command command = 1;
+  // Output paths the build system expects this action to produce, when the
+  // launcher can infer them from the command line (e.g. clang-cl /Fo). Empty
+  // means "discover the outputs from the action trace" (M6.1). Advisory only.
+  repeated string declared_outputs = 2;
+}
+
+message SubmitActionEvent {
+  oneof event {
+    // Lifecycle mirror. For a remote action these echo the worker's
+    // ActionState transitions; for a local fallback the detail carries the
+    // fallback reason so the developer can see why it ran locally.
+    StateChange state = 1;
+    // The exit code the launcher must exit with. Emitted exactly once, last.
+    ExitStatus exit = 2;
+  }
+}
