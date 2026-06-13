@@ -119,6 +119,17 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   HTTP/2 keepalive timeout(10s) まで滞留しうる（リークではない）。M7 の堅牢化で sanitize。
   出所: verifier(M5.1 B3/B4)。
 
+### M5.2 実装後の既知の残リスク（security-reviewer 2026-06-14、詳細は ADR 0004 追補）
+- **無認証 Register による誤結果注入／アクション吸引。** 緩和は M7 mTLS/attestation。暫定で
+  `cpu_count` を clamp(1,256) 済み。出所: security(M5.2 M3)。
+- **孫プロセスの孤児。** `kill_on_drop` は直接の子のみ。Job Object でツリー一括 kill は M7 サンドボックス。
+  出所: security(M5.2 L3)。
+- **再割り当て境界の重複 WriteBack。** WriteBack 実装（M3.3/将来）時に content-addressed 冪等を
+  テスト固定。現状 WriteBack 未実装で顕在化せず。出所: security(M5.2 M4)。
+- **heartbeat の running_actions を least-loaded に未使用。** スケジューラは agent 自身の in_flight
+  のみ参照（単一 agent 前提で正確）。複数 agent/別経路の負荷は見落とす。複数 agent 化時に再検討。
+  出所: verifier(M5.2 懸念3)。
+
 ## M7（堅牢化・セキュリティ）
 
 - **データプレーン/制御プレーンに認証・TLS 無し。** worker の Execute、agent の

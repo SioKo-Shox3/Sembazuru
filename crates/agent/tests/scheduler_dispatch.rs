@@ -1,0 +1,192 @@
+//! M5.2 scheduler dispatch end-to-end test: the agent-side [`Scheduler`] places
+//! actions on live workers from a [`WorkerTable`], reassigns past a dead worker,
+//! and falls back to local execution when no remote path works. In-process
+//! Execution workers (as in `loopback.rs`) stand in for worker processes.
+//!
+//! Together with the unit tests in `scheduler.rs` (affinity stability, ring
+//! determinism, load-spread ordering) this is the M5.2 evidence: actions reach
+//! workers, a worker death does not lose an action, and the build still
+//! completes locally in the worst case (DESIGN.md §2).
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use sembazuru_agent::Execution;
+use sembazuru_agent::coordination::WorkerTable;
+use sembazuru_agent::scheduler::Scheduler;
+use sembazuru_proto::v0::{Capabilities, Command};
+use sembazuru_worker::WorkerService;
+
+/// Starts an in-process Execution worker (capacity 2), returning its `http://`
+/// endpoint and a handle to its cumulative served-action count (so a test can
+/// assert work actually landed on it).
+async fn start_worker() -> (String, Arc<AtomicU64>) {
+    let service = WorkerService::with_capacity(2);
+    let served = service.served_handle();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        sembazuru_worker::serve_on_listener_with(listener, service)
+            .await
+            .unwrap();
+    });
+    (format!("http://{addr}"), served)
+}
+
+/// A table with the given workers registered (endpoint + cpu_count), live for a
+/// generous window so they stay schedulable through the test.
+fn table_with(workers: &[(&str, &str, u32)]) -> WorkerTable {
+    let table = WorkerTable::new(Duration::from_secs(60));
+    for (id, endpoint, cpu) in workers {
+        table.upsert_register(
+            (*id).to_string(),
+            (*endpoint).to_string(),
+            Capabilities {
+                cpu_count: *cpu,
+                ..Default::default()
+            },
+        );
+    }
+    table
+}
+
+fn cmd(argv: &[&str]) -> Command {
+    Command {
+        argv: argv.iter().map(|s| s.to_string()).collect(),
+        env: Default::default(),
+        cwd: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_runs_remotely_with_live_workers() {
+    let (w1, _) = start_worker().await;
+    let (w2, _) = start_worker().await;
+    let table = table_with(&[("w1", &w1, 2), ("w2", &w2, 2)]);
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "4"]),
+            "act-1".into(),
+            "sess".into(),
+        )
+        .await;
+    match exec {
+        Execution::Remote(o) => assert_eq!(o.exit_code, Some(4), "ran on a worker"),
+        other => panic!("expected remote execution, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_reassigns_past_a_dead_worker() {
+    // One dead endpoint, one live worker. Whichever the ring prefers, dispatch
+    // must try both and land the action on the live one — not fall back to local.
+    let (live, _) = start_worker().await;
+    let table = table_with(&[("dead", "http://127.0.0.1:1", 2), ("live", &live, 2)]);
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "7"]),
+            "act-2".into(),
+            "sess".into(),
+        )
+        .await;
+    match exec {
+        Execution::Remote(o) => assert_eq!(o.exit_code, Some(7), "reassigned to the live worker"),
+        other => panic!("expected remote execution after reassignment, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_falls_back_to_local_when_all_workers_dead() {
+    let table = table_with(&[
+        ("dead1", "http://127.0.0.1:1", 2),
+        ("dead2", "http://127.0.0.1:2", 2),
+    ]);
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "9"]),
+            "act-3".into(),
+            "sess".into(),
+        )
+        .await;
+    match exec {
+        Execution::LocalFallback { exit_code, reason } => {
+            assert_eq!(
+                exit_code, 9,
+                "local fallback ran the command; reason: {reason}"
+            );
+        }
+        other => panic!("expected local fallback, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_falls_back_to_local_with_no_workers() {
+    let table = WorkerTable::new(Duration::from_secs(60)); // empty
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "2"]),
+            "act-4".into(),
+            "sess".into(),
+        )
+        .await;
+    match exec {
+        Execution::LocalFallback { exit_code, reason } => {
+            assert_eq!(exit_code, 2);
+            assert_eq!(reason, "no live workers");
+        }
+        other => panic!("expected local fallback with no workers, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dispatch_spreads_distinct_actions_across_workers() {
+    // A burst of *distinct* actions (different argv = different TUs) must both
+    // complete remotely AND actually land on more than one worker — affinity
+    // hashes distinct TUs to different workers, and load spill covers the rest.
+    // (Identical argv would correctly pin to one worker, so the TUs differ here.)
+    let (w1, served1) = start_worker().await;
+    let (w2, served2) = start_worker().await;
+    let table = table_with(&[("w1", &w1, 2), ("w2", &w2, 2)]);
+    let sched = Scheduler::new(table);
+
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let s = sched.clone();
+        handles.push(tokio::spawn(async move {
+            // `cmd /c set SBZ_TU=tuN` varies argv per action and exits 0.
+            s.dispatch(
+                cmd(&["cmd", "/c", "set", &format!("SBZ_TU=tu{i}")]),
+                format!("act-burst-{i}"),
+                "sess".into(),
+            )
+            .await
+        }));
+    }
+    for h in handles {
+        match h.await.unwrap() {
+            Execution::Remote(o) => assert_eq!(o.exit_code, Some(0)),
+            other => panic!("expected all remote, got {other:?}"),
+        }
+    }
+
+    let s1 = served1.load(Ordering::SeqCst);
+    let s2 = served2.load(Ordering::SeqCst);
+    assert_eq!(
+        s1 + s2,
+        16,
+        "every action ran exactly once across the workers"
+    );
+    assert!(
+        s1 > 0 && s2 > 0,
+        "work must spread across both workers, got w1={s1} w2={s2}"
+    );
+}

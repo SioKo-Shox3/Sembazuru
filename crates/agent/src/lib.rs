@@ -15,6 +15,7 @@ use sembazuru_proto::v0::{
 pub mod action_cache;
 pub mod coordination;
 pub mod fileserver;
+pub mod scheduler;
 
 /// What a remote action reported back: the lifecycle states it passed through
 /// (raw `ActionState` discriminants, in order) and, if it ran to completion,
@@ -57,26 +58,55 @@ impl From<tonic::Status> for ExecuteError {
     }
 }
 
-/// Connects to a worker's `Execution` endpoint, retrying briefly so a
-/// just-spawned worker (loopback) has time to start listening. Readiness is
-/// established by a successful connect rather than a separate probe — M3.1 has
-/// no discovery/registration yet (that is the agent-hosted `Coordination`
-/// service, implemented later).
-async fn connect_with_retry(
+/// How hard to try to connect to a worker's `Execution` endpoint before giving
+/// up. Two callers want very different behaviour: a just-spawned loopback worker
+/// needs patient retries to win the startup race, while the scheduler dispatches
+/// to *already-registered* workers — a connect failure there means the worker is
+/// gone and the action should be reassigned fast, not after seconds of retries.
+#[derive(Clone, Copy)]
+pub struct ConnectPolicy {
+    pub attempts: u32,
+    pub per_attempt_timeout: Duration,
+    pub retry_sleep: Duration,
+}
+
+impl ConnectPolicy {
+    /// Patient: tolerate a worker that is still starting its listener (loopback,
+    /// the bin, tests). Up to ~5 s of retries.
+    pub const PATIENT: ConnectPolicy = ConnectPolicy {
+        attempts: 20,
+        per_attempt_timeout: Duration::from_millis(200),
+        retry_sleep: Duration::from_millis(50),
+    };
+
+    /// Fast: a registered worker that does not answer promptly is treated as
+    /// dead so the scheduler reassigns within a fraction of a second instead of
+    /// burning seconds per dead candidate.
+    pub const FAST: ConnectPolicy = ConnectPolicy {
+        attempts: 2,
+        per_attempt_timeout: Duration::from_millis(250),
+        retry_sleep: Duration::from_millis(25),
+    };
+}
+
+/// Connects to a worker's `Execution` endpoint under `policy`. Readiness is
+/// established by a successful connect rather than a separate probe.
+async fn connect_with_policy(
     endpoint: String,
+    policy: ConnectPolicy,
 ) -> Result<ExecutionClient<tonic::transport::Channel>, ExecuteError> {
-    // A bounded per-attempt connect timeout so a dead endpoint fails the whole
-    // budget in ~1s (fast fallback) instead of hanging on the OS connect.
     let ep = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(ExecuteError::Transport)?
-        .connect_timeout(Duration::from_millis(200));
+        .connect_timeout(policy.per_attempt_timeout);
     let mut last: Option<tonic::transport::Error> = None;
-    for _ in 0..20 {
+    for i in 0..policy.attempts.max(1) {
         match ep.connect().await {
             Ok(channel) => return Ok(ExecutionClient::new(channel)),
             Err(e) => {
                 last = Some(e);
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                if i + 1 < policy.attempts {
+                    tokio::time::sleep(policy.retry_sleep).await;
+                }
             }
         }
     }
@@ -84,14 +114,33 @@ async fn connect_with_retry(
 }
 
 /// Runs `command` on the worker at `endpoint` (e.g. `"http://127.0.0.1:50061"`)
-/// and returns its outcome once the event stream closes.
+/// and returns its outcome once the event stream closes. Uses patient connect
+/// retries; the scheduler uses [`execute_remote_with`] with [`ConnectPolicy::FAST`].
 pub async fn execute_remote(
     endpoint: String,
     command: Command,
     action_id: String,
     session_id: String,
 ) -> Result<ActionOutcome, ExecuteError> {
-    let mut client = connect_with_retry(endpoint).await?;
+    execute_remote_with(
+        endpoint,
+        command,
+        action_id,
+        session_id,
+        ConnectPolicy::PATIENT,
+    )
+    .await
+}
+
+/// Like [`execute_remote`], but with an explicit [`ConnectPolicy`].
+pub async fn execute_remote_with(
+    endpoint: String,
+    command: Command,
+    action_id: String,
+    session_id: String,
+    connect: ConnectPolicy,
+) -> Result<ActionOutcome, ExecuteError> {
+    let mut client = connect_with_policy(endpoint, connect).await?;
 
     let request = ExecuteRequest {
         action_id,

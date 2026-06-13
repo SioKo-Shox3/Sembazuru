@@ -23,21 +23,79 @@ use sembazuru_proto::v0::{
     StateChange, execute_event::Event, execution_server::Execution,
 };
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
-/// The worker's gRPC service. Carries a shared count of in-flight actions so the
-/// Coordination heartbeat can push real capacity to the agent (ADR 0004); the
-/// same counter becomes the basis for the M5.2 admission `Semaphore`.
-#[derive(Clone, Default)]
+/// Default admission capacity when none is given: the machine's parallelism.
+fn default_capacity() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+/// How many actions may be *accepted* (queued + running) per running slot before
+/// the worker sheds load. Bounds the memory a flood of `Execute`s can pin in
+/// queued tasks (security: admission caps running processes, this caps the
+/// waiting backlog so the worker cannot be memory-flooded).
+const QUEUE_FACTOR: u32 = 8;
+
+/// Hard ceiling on a single action's wall time when none is configured. This is
+/// a runaway/hung-child backstop (a process the agent never reaps still frees
+/// its slot), NOT the latency budget — it is generous so it never kills a real
+/// compile. Override with `SEMBAZURU_ACTION_TIMEOUT_SECS`.
+const DEFAULT_ACTION_CEILING_SECS: u64 = 3600;
+
+fn default_action_ceiling() -> std::time::Duration {
+    let secs = std::env::var("SEMBAZURU_ACTION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_ACTION_CEILING_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// The worker's gRPC service. Bounds concurrent actions with an admission
+/// `Semaphore` (a single un-virtualized worker must not fork-bomb under a flood
+/// of `Execute`s — the DoS fix), sheds excess accepted work past `QUEUE_FACTOR ×
+/// capacity` (so the queued backlog cannot memory-flood the worker), and tracks
+/// the in-flight count so the Coordination heartbeat pushes real capacity to the
+/// agent (ADR 0004).
+#[derive(Clone)]
 pub struct WorkerService {
     running: Arc<AtomicU32>,
+    served: Arc<std::sync::atomic::AtomicU64>,
+    limit: Arc<Semaphore>,
+    accept: Arc<Semaphore>,
+    capacity: u32,
+    ceiling: std::time::Duration,
+}
+
+impl Default for WorkerService {
+    fn default() -> Self {
+        Self::with_capacity(default_capacity())
+    }
 }
 
 impl WorkerService {
+    /// A worker admitting up to `available_parallelism()` concurrent actions.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A worker admitting up to `capacity` concurrent actions; up to
+    /// `QUEUE_FACTOR × capacity` more may queue (reported as `QUEUED`), beyond
+    /// which `Execute` is rejected with `RESOURCE_EXHAUSTED`. `capacity` ≥ 1.
+    pub fn with_capacity(capacity: u32) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            running: Arc::new(AtomicU32::new(0)),
+            served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            limit: Arc::new(Semaphore::new(capacity as usize)),
+            accept: Arc::new(Semaphore::new((capacity * QUEUE_FACTOR) as usize)),
+            capacity,
+            ceiling: default_action_ceiling(),
+        }
     }
 
     /// A handle to the in-flight-action counter, shared with every clone of the
@@ -45,6 +103,17 @@ impl WorkerService {
     /// reads this to report `running_actions` / `idle_slots`.
     pub fn running_handle(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.running)
+    }
+
+    /// A handle to the cumulative count of actions this worker has admitted
+    /// (run), for telemetry and for tests that assert work actually spread here.
+    pub fn served_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.served)
+    }
+
+    /// The admission capacity (max concurrent actions).
+    pub fn capacity(&self) -> u32 {
+        self.capacity
     }
 }
 
@@ -80,12 +149,46 @@ fn exit_event(code: i32, wall_us: u64) -> Result<ExecuteEvent, Status> {
 
 /// Drives one action to completion, emitting lifecycle events into `tx`.
 ///
+/// Admission: the action is `QUEUED` until it acquires a permit from `limit`,
+/// bounding concurrency to the worker's capacity. Once admitted it counts toward
+/// `running` (the capacity the heartbeat reports) for exactly the run's duration.
+///
 /// A nonzero exit code is a normal result (a compiler legitimately fails a
 /// compile) and is reported via `ExitStatus` under a `COMPLETED` state. `FAILED`
 /// is reserved for the worker being unable to run the process at all — that
 /// distinction is what lets the agent decide whether to fall back (§3.2).
-async fn run_action(cmd: Command, tx: mpsc::Sender<Result<ExecuteEvent, Status>>) {
+#[allow(clippy::too_many_arguments)]
+async fn run_action(
+    cmd: Command,
+    tx: mpsc::Sender<Result<ExecuteEvent, Status>>,
+    limit: Arc<Semaphore>,
+    running: Arc<AtomicU32>,
+    served: Arc<std::sync::atomic::AtomicU64>,
+    ceiling: std::time::Duration,
+    // Held for the whole task (queued + running) so the accepted-work backlog
+    // stays bounded; released on drop when the action leaves the worker.
+    _accept: tokio::sync::OwnedSemaphorePermit,
+) {
     let _ = tx.send(state_event(ActionState::Queued, "")).await;
+
+    // Admission control: wait for a free slot. The owned permit is held for the
+    // whole run and released on drop (normal end, early return, or panic).
+    let _permit = match limit.acquire_owned().await {
+        Ok(p) => p,
+        // Only happens if the semaphore is closed (worker shutting down).
+        Err(_) => {
+            let _ = tx
+                .send(state_event(ActionState::Failed, "worker shutting down"))
+                .await;
+            return;
+        }
+    };
+    // Now genuinely running: count it for capacity reporting until the guard
+    // drops. Queued (un-admitted) actions are deliberately not counted.
+    running.fetch_add(1, Ordering::SeqCst);
+    served.fetch_add(1, Ordering::SeqCst);
+    let _guard = RunningGuard(running);
+
     let _ = tx.send(state_event(ActionState::Preparing, "")).await;
 
     // Self-guard the invariant the indexing below relies on, rather than trust a
@@ -109,6 +212,11 @@ async fn run_action(cmd: Command, tx: mpsc::Sender<Result<ExecuteEvent, Status>>
         command.env(k, v);
     }
     command.stdin(Stdio::null());
+    // Kill the child if its task is dropped. Combined with the `tx.closed()` arm
+    // below, this guarantees that when the agent gives up on an action (drops the
+    // Execute stream — the fallback path) the worker does not leak an orphaned
+    // process holding an admission slot (DoS hardening).
+    command.kill_on_drop(true);
 
     let start = Instant::now();
     let mut child = match command.spawn() {
@@ -125,25 +233,36 @@ async fn run_action(cmd: Command, tx: mpsc::Sender<Result<ExecuteEvent, Status>>
     };
     let _ = tx.send(state_event(ActionState::Running, "")).await;
 
-    match child.wait().await {
-        Ok(status) => {
-            // On Windows a process always has an exit code; unwrap_or guards the
-            // signal-terminated case that does not occur here.
-            let code = status.code().unwrap_or(-1);
-            // Saturate explicitly rather than let `as u64` wrap; this is the
-            // pattern that will be copied for user/kernel time accounting later,
-            // where the values are not bounded by a wall clock.
-            let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let _ = tx.send(exit_event(code, wall)).await;
-            let _ = tx.send(state_event(ActionState::Completed, "")).await;
-        }
-        Err(e) => {
+    tokio::select! {
+        // The agent cancelled or disconnected: the receiver is gone, so nobody
+        // will read further events. Return; `child` drops here and `kill_on_drop`
+        // terminates it rather than leaving an orphan.
+        _ = tx.closed() => {}
+        // Runaway/hung-process backstop: a process the agent never reaps (no
+        // budget on the direct-Execute path) must not pin its slot forever.
+        // `child` drops on return and `kill_on_drop` terminates it.
+        _ = tokio::time::sleep(ceiling) => {
             let _ = tx
-                .send(state_event(
-                    ActionState::Failed,
-                    &format!("wait failed: {e}"),
-                ))
+                .send(state_event(ActionState::Failed, "exceeded execution ceiling"))
                 .await;
+        }
+        result = child.wait() => match result {
+            Ok(status) => {
+                // On Windows a process always has an exit code; unwrap_or guards
+                // the signal-terminated case that does not occur here.
+                let code = status.code().unwrap_or(-1);
+                // Saturate explicitly rather than let `as u64` wrap; this is the
+                // pattern that will be copied for user/kernel time accounting
+                // later, where the values are not bounded by a wall clock.
+                let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let _ = tx.send(exit_event(code, wall)).await;
+                let _ = tx.send(state_event(ActionState::Completed, "")).await;
+            }
+            Err(e) => {
+                let _ = tx
+                    .send(state_event(ActionState::Failed, &format!("wait failed: {e}")))
+                    .await;
+            }
         }
     }
 }
@@ -164,17 +283,34 @@ impl Execution for WorkerService {
             return Err(Status::invalid_argument("command.argv must be non-empty"));
         }
 
+        // Shed load before spawning anything: if the accepted-work backlog is
+        // already at QUEUE_FACTOR × capacity, reject rather than pin more memory
+        // in a queued task (DoS hardening). The permit is held by the task for
+        // its whole lifetime.
+        let accept = match Arc::clone(&self.accept).try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(Status::resource_exhausted(
+                    "worker accepted-work backlog is full",
+                ));
+            }
+        };
+
         // Bounded channel: the lifecycle producer is slow relative to gRPC, so a
         // small buffer is plenty and bounds memory if the client stalls.
         let (tx, rx) = mpsc::channel(16);
-        // Count this action as in-flight for capacity reporting. The guard moves
-        // into the spawned task so the count drops exactly when the task ends.
-        self.running.fetch_add(1, Ordering::SeqCst);
-        let guard = RunningGuard(Arc::clone(&self.running));
-        tokio::spawn(async move {
-            run_action(cmd, tx).await;
-            drop(guard);
-        });
+        // Admission + capacity accounting happen inside the task (an action is
+        // QUEUED until it acquires a permit), so the gRPC call returns its stream
+        // immediately and queued actions are visible as QUEUED events.
+        tokio::spawn(run_action(
+            cmd,
+            tx,
+            Arc::clone(&self.limit),
+            Arc::clone(&self.running),
+            Arc::clone(&self.served),
+            self.ceiling,
+            accept,
+        ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
