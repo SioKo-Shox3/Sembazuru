@@ -55,6 +55,7 @@ fn spawn_worker(agent: &str, worker_id: &str, running: u32, interval: Duration) 
             agent,
             worker_id,
             "http://127.0.0.1:50061".to_string(),
+            4, // advertised capacity (cpu_count)
             counter,
             interval,
             stop,

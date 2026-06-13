@@ -140,8 +140,36 @@ pub async fn execute_remote_with(
     session_id: String,
     connect: ConnectPolicy,
 ) -> Result<ActionOutcome, ExecuteError> {
-    let mut client = connect_with_policy(endpoint, connect).await?;
+    let client = connect_with_policy(endpoint, connect).await?;
+    drive_execute(client, command, action_id, session_id).await
+}
 
+/// Runs an action on an already-connected channel. The scheduler caches one
+/// channel per worker and calls this per action, so the control plane pays no
+/// per-action connection handshake — actions multiplex over the worker's one
+/// HTTP/2 connection (the control-plane analogue of the M5.3 data-plane pool).
+pub async fn execute_on_channel(
+    channel: tonic::transport::Channel,
+    command: Command,
+    action_id: String,
+    session_id: String,
+) -> Result<ActionOutcome, ExecuteError> {
+    drive_execute(
+        ExecutionClient::new(channel),
+        command,
+        action_id,
+        session_id,
+    )
+    .await
+}
+
+/// Sends the `ExecuteRequest` and folds its event stream into an [`ActionOutcome`].
+async fn drive_execute(
+    mut client: ExecutionClient<tonic::transport::Channel>,
+    command: Command,
+    action_id: String,
+    session_id: String,
+) -> Result<ActionOutcome, ExecuteError> {
     let request = ExecuteRequest {
         action_id,
         command: Some(command),

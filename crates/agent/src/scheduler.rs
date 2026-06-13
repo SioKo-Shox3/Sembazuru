@@ -26,7 +26,7 @@ use std::time::Duration;
 use sembazuru_proto::v0::Command;
 
 use crate::coordination::{WorkerEntry, WorkerTable};
-use crate::{ConnectPolicy, Execution, execute_remote_with, run_local};
+use crate::{ExecuteError, Execution, execute_on_channel, run_local};
 
 /// Upper bound on a worker's self-reported `cpu_count` when used for load
 /// math. A worker is untrusted until M7 (ADR 0004 §6); clamping stops a single
@@ -107,6 +107,9 @@ pub struct Scheduler {
     table: WorkerTable,
     /// Agent's own in-flight assignment count per worker_id (authoritative load).
     in_flight: Arc<Mutex<HashMap<String, u32>>>,
+    /// One lazily-connected gRPC channel per worker Execution endpoint, reused
+    /// across actions so the control plane pays no per-action handshake.
+    channels: Arc<Mutex<HashMap<String, tonic::transport::Channel>>>,
     remote_budget: Duration,
 }
 
@@ -135,19 +138,32 @@ impl Drop for AssignGuard {
 
 impl Scheduler {
     pub fn new(table: WorkerTable) -> Self {
-        Self {
-            table,
-            in_flight: Arc::new(Mutex::new(HashMap::new())),
-            remote_budget: DEFAULT_REMOTE_BUDGET,
-        }
+        Self::with_remote_budget(table, DEFAULT_REMOTE_BUDGET)
     }
 
     pub fn with_remote_budget(table: WorkerTable, remote_budget: Duration) -> Self {
         Self {
             table,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            channels: Arc::new(Mutex::new(HashMap::new())),
             remote_budget,
         }
+    }
+
+    /// A cached, lazily-connected channel to `endpoint`. `connect_lazy` never
+    /// fails here (it connects on first use); a dead worker surfaces as an error
+    /// on the Execute call, which dispatch then reassigns past.
+    fn channel_for(&self, endpoint: &str) -> Result<tonic::transport::Channel, ExecuteError> {
+        let mut chans = self.channels.lock().expect("channels poisoned");
+        if let Some(c) = chans.get(endpoint) {
+            return Ok(c.clone());
+        }
+        let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+            .map_err(ExecuteError::Transport)?
+            .connect_timeout(Duration::from_millis(250))
+            .connect_lazy();
+        chans.insert(endpoint.to_string(), channel.clone());
+        Ok(channel)
     }
 
     /// Effective free slots on a worker = its advertised capacity (clamped, as
@@ -161,47 +177,55 @@ impl Scheduler {
             .saturating_sub(used)
     }
 
-    /// Orders the live workers for an action: the affinity-preferred worker
-    /// first (if it has a free slot), then the rest by most-free-first. This is
-    /// the reassignment order — each is tried until one accepts the action.
-    fn order_candidates(&self, key: u64) -> Vec<WorkerEntry> {
+    /// Atomically choose the best live worker for `key` (excluding `tried`) AND
+    /// reserve a slot on it — pick and increment under the *same* `in_flight`
+    /// lock. This is load-bearing for fan-out: if the pick and the reservation
+    /// were separate (read load, release, then increment), the many dispatch
+    /// tasks `run_build` spawns at once would all read the same stale "all idle"
+    /// load and herd onto one affinity-preferred worker, leaving the rest idle
+    /// (measured: ~half the cluster running). Reserving under the lock makes each
+    /// dispatcher see the others' reservations and spread.
+    ///
+    /// Returns the chosen worker and a guard that frees the reservation on drop,
+    /// or `None` when no live, untried worker remains.
+    fn pick_and_reserve(
+        &self,
+        key: u64,
+        tried: &std::collections::HashSet<String>,
+    ) -> Option<(WorkerEntry, AssignGuard)> {
         let snapshot = self.table.live_snapshot();
-        if snapshot.is_empty() {
-            return Vec::new();
+        let live: Vec<WorkerEntry> = snapshot
+            .into_iter()
+            .filter(|w| !tried.contains(&w.worker_id))
+            .collect();
+        if live.is_empty() {
+            return None;
         }
-        let m = self.in_flight.lock().expect("in_flight poisoned");
 
-        let preferred = preferred_index(&snapshot, key);
-        let preferred_free = self.effective_idle(&snapshot[preferred], &m) > 0;
+        let mut m = self.in_flight.lock().expect("in_flight poisoned");
 
-        // Sort all workers by most-effective-idle first (stable by worker_id for
-        // determinism). Then, if the affinity-preferred worker still has a slot,
-        // float it to the front so affinity wins over a marginally-freer peer.
-        let mut ordered = snapshot.clone();
-        ordered.sort_by(|a, b| {
-            self.effective_idle(b, &m)
-                .cmp(&self.effective_idle(a, &m))
-                .then_with(|| a.worker_id.cmp(&b.worker_id))
-        });
-        if preferred_free {
-            let pid = &snapshot[preferred].worker_id;
-            if let Some(pos) = ordered.iter().position(|w| &w.worker_id == pid) {
-                let p = ordered.remove(pos);
-                ordered.insert(0, p);
-            }
-        }
-        ordered
-    }
+        // Affinity-preferred worker, used if it still has a free slot; otherwise
+        // the least-loaded (most effective-idle, stable by id) worker.
+        let preferred = preferred_index(&live, key);
+        let chosen_idx = if self.effective_idle(&live[preferred], &m) > 0 {
+            preferred
+        } else {
+            (0..live.len())
+                .max_by(|&a, &b| {
+                    self.effective_idle(&live[a], &m)
+                        .cmp(&self.effective_idle(&live[b], &m))
+                        .then_with(|| live[b].worker_id.cmp(&live[a].worker_id))
+                })
+                .unwrap_or(preferred)
+        };
+        let chosen = live[chosen_idx].clone();
 
-    fn assign(&self, worker_id: &str) -> AssignGuard {
-        {
-            let mut m = self.in_flight.lock().expect("in_flight poisoned");
-            *m.entry(worker_id.to_string()).or_insert(0) += 1;
-        }
-        AssignGuard {
+        *m.entry(chosen.worker_id.clone()).or_insert(0) += 1;
+        let guard = AssignGuard {
             map: Arc::clone(&self.in_flight),
-            worker_id: worker_id.to_string(),
-        }
+            worker_id: chosen.worker_id.clone(),
+        };
+        Some((chosen, guard))
     }
 
     /// Runs a whole build phase: every action is dispatched concurrently across
@@ -263,26 +287,29 @@ impl Scheduler {
         session_id: String,
     ) -> Execution {
         let key = affinity_key(&command.argv);
-        let candidates = self.order_candidates(key);
+        let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut reason = "no live workers".to_string();
 
-        let mut reason = if candidates.is_empty() {
-            "no live workers".to_string()
-        } else {
-            String::new()
-        };
-
-        for w in &candidates {
-            let _guard = self.assign(&w.worker_id);
+        // Try workers one at a time (reassignment), reserving each atomically so
+        // concurrent dispatchers balance. The guard holds the reservation for the
+        // duration of the attempt and frees it on the next iteration / on return.
+        while let Some((w, guard)) = self.pick_and_reserve(key, &tried) {
+            tried.insert(w.worker_id.clone());
+            let channel = match self.channel_for(&w.execution_endpoint) {
+                Ok(c) => c,
+                Err(e) => {
+                    reason = format!("worker {} unreachable: {e}", w.worker_id);
+                    drop(guard);
+                    continue;
+                }
+            };
             let attempt = tokio::time::timeout(
                 self.remote_budget,
-                execute_remote_with(
-                    w.execution_endpoint.clone(),
+                execute_on_channel(
+                    channel,
                     command.clone(),
                     action_id.clone(),
                     session_id.clone(),
-                    // Registered workers should answer at once; a slow connect
-                    // means dead → reassign fast (verifier 欠陥2).
-                    ConnectPolicy::FAST,
                 ),
             )
             .await;
@@ -300,7 +327,7 @@ impl Scheduler {
                     reason = format!("worker {} exceeded latency budget", w.worker_id);
                 }
             }
-            // Fall through to the next candidate (reassignment).
+            drop(guard); // release the reservation before trying the next worker
         }
 
         // Every remote path is exhausted: run locally so the build still finishes.
@@ -433,35 +460,45 @@ mod tests {
     }
 
     #[test]
-    fn order_floats_preferred_then_spreads_by_load() {
+    fn pick_prefers_affinity_then_spills_when_full() {
+        use std::collections::HashSet;
         let table = WorkerTable::new(Duration::from_secs(60));
-        for (id, cpu) in [("w1", 2u32), ("w2", 2), ("w3", 2)] {
+        for id in ["w1", "w2", "w3"] {
             table.upsert_register(
                 id.to_string(),
                 format!("http://{id}"),
                 Capabilities {
-                    cpu_count: cpu,
+                    cpu_count: 2,
                     ..Default::default()
                 },
             );
         }
         let sched = Scheduler::new(table);
-
-        // With no load, the preferred worker for a key leads the candidate order.
         let key = affinity_key(&["cc".into(), "x.cpp".into()]);
         let snap = sched.table.live_snapshot();
         let pref = snap[preferred_index(&snap, key)].worker_id.clone();
-        let ordered = sched.order_candidates(key);
-        assert_eq!(ordered[0].worker_id, pref, "affinity-preferred leads");
+        let none = HashSet::new();
 
-        // Saturate the preferred worker (cpu_count assignments): it must drop out
-        // of the lead, and a different (least-loaded) worker takes first. Hold the
-        // guards alive so the in-flight count stays raised for the assertion.
-        let _guards: Vec<_> = (0..2).map(|_| sched.assign(&pref)).collect();
-        let ordered2 = sched.order_candidates(key);
-        assert_ne!(
-            ordered2[0].worker_id, pref,
-            "a full preferred worker spills to least-loaded"
+        // Reserving (and holding) consecutively: the affinity-preferred worker is
+        // chosen until it fills to capacity (2), then the pick spills elsewhere.
+        let (w0, g0) = sched.pick_and_reserve(key, &none).unwrap();
+        assert_eq!(w0.worker_id, pref, "affinity-preferred is chosen first");
+        let (w1, g1) = sched.pick_and_reserve(key, &none).unwrap();
+        assert_eq!(
+            w1.worker_id, pref,
+            "second slot still fits on preferred (cap 2)"
         );
+        let (w2, _g2) = sched.pick_and_reserve(key, &none).unwrap();
+        assert_ne!(
+            w2.worker_id, pref,
+            "a full preferred worker spills to a least-loaded peer"
+        );
+        drop((g0, g1));
+
+        // Excluding a worker via `tried` never returns it (reassignment honors it).
+        let mut tried = HashSet::new();
+        tried.insert(pref.clone());
+        let (w, _g) = sched.pick_and_reserve(key, &tried).unwrap();
+        assert_ne!(w.worker_id, pref, "a tried worker is skipped");
     }
 }
