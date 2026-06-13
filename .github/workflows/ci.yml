@@ -50,3 +50,8 @@ jobs:
       # observe->virtualize flip end to end.
       - name: M3.2 read-VFS redirect
         run: pwsh -NoProfile -File hooks/test/vfs_redirect.ps1
+      # The M3 "Done when" compile path: a compiler runs under the read VFS with
+      # inputs supplied by the agent; for clang-cl the remote .obj must be
+      # byte-identical to a local build (required here -- the runner ships LLVM).
+      - name: M3 remote compile under VFS (clang-cl byte-identical)
+        run: pwsh -NoProfile -File hooks/test/vfs_compile.ps1 -RequireClangCl
