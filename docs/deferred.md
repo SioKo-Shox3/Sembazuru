@@ -96,7 +96,28 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   QUIC を再評価（`sembazuru-dataplane` のトランスポート境界に差し込む）。出所:
   ADR 0002、m3-prestudy §2。
 - **フォールバック判定の閾値（レイテンシ予算タイマ・worker 死/分断タイマ）未調整。**
-  M3.4 チューニング側。出所: v0 §7 #4、計画 M3.4。
+  M3.4 チューニング側。worker 死/分断タイマは ADR 0004 で 15s に確定（実装済み: WorkerTable
+  の last_ping 経過で導出）。レイテンシ予算タイマは M5.2 で機構導入・M5.5 で値調整。
+  出所: v0 §7 #4、計画 M3.4、ADR 0004。
+
+### M5.1 実装後の既知の限界（verifier 2026-06-14）
+- **in-process 死テストは graceful-drain 経路のみ。** `tests/coordination.rs` の「死」は
+  ping ストリーム終端（agent ハンドラの `Ok(None)` 出口）で、急死（transport error＝プロセス
+  kill/ソケット RST）のトリガ自体は通らない。tonic はクライアント outbound を接続タスクが
+  駆動するため、in-process タスクの abort ではソケットが閉じない。dead 検知タイマと
+  ハンドラ終了ロジックは同一出口で共有のため検証済みだが、急死トリガの実証は実 daemon の
+  プロセス死のみ。実プロセス起動の死テストは将来（worker bin の死活）。出所: verifier(M5.1 A1)。
+- **実 Execute→running カウンタ→容量 push の結合が未検証。** heartbeat の `running_actions`/
+  `idle_slots` はテストでハードコード値を流すのみ。`WorkerService` の fetch_add／RunningGuard
+  decrement は単体では健全だが、Execute 駆動での増減反映は M5.2（スケジューラが idle_slots を
+  消費）で結合テストする。出所: verifier(M5.1 B1)。
+- **WorkerTable は単調増大（reaper 無し）。** worker 再起動は pid 違いで別エントリ化し、旧エントリは
+  dead_timeout で live フィルタから外れるが map からは消えない。セッション境界の eviction は
+  deferred #8（M5.3）と併せて対応。出所: verifier(M5.1 B2)、deferred #8。
+- **可用性の単一障害点（LAN 前提で許容）。** WorkerTable の `std::sync::Mutex` poisoning 時に
+  `.expect` で Coordination 全体が落ちる。heartbeat ハンドラの pong 送信は half-open 時に
+  HTTP/2 keepalive timeout(10s) まで滞留しうる（リークではない）。M7 の堅牢化で sanitize。
+  出所: verifier(M5.1 B3/B4)。
 
 ## M7（堅牢化・セキュリティ）
 

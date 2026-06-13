@@ -9,10 +9,13 @@
 //! later; keeping the worker filesystem-agnostic here avoids baking in an
 //! assumption that M3.2 would have to tear out.
 
+pub mod coordination;
 pub mod fileclient;
 pub mod vfs_pipe;
 
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use sembazuru_proto::v0::{
@@ -24,9 +27,36 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
-/// The worker's gRPC service. Stateless in M3.1.
+/// The worker's gRPC service. Carries a shared count of in-flight actions so the
+/// Coordination heartbeat can push real capacity to the agent (ADR 0004); the
+/// same counter becomes the basis for the M5.2 admission `Semaphore`.
 #[derive(Clone, Default)]
-pub struct WorkerService;
+pub struct WorkerService {
+    running: Arc<AtomicU32>,
+}
+
+impl WorkerService {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A handle to the in-flight-action counter, shared with every clone of the
+    /// service (tonic clones the service per connection). The heartbeat task
+    /// reads this to report `running_actions` / `idle_slots`.
+    pub fn running_handle(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.running)
+    }
+}
+
+/// Decrements the in-flight counter when an action's task ends, however it ends
+/// (normal completion, early return, or a panic unwinding the spawned task).
+struct RunningGuard(Arc<AtomicU32>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn state_event(state: ActionState, detail: &str) -> Result<ExecuteEvent, Status> {
     Ok(ExecuteEvent {
@@ -137,7 +167,14 @@ impl Execution for WorkerService {
         // Bounded channel: the lifecycle producer is slow relative to gRPC, so a
         // small buffer is plenty and bounds memory if the client stalls.
         let (tx, rx) = mpsc::channel(16);
-        tokio::spawn(run_action(cmd, tx));
+        // Count this action as in-flight for capacity reporting. The guard moves
+        // into the spawned task so the count drops exactly when the task ends.
+        self.running.fetch_add(1, Ordering::SeqCst);
+        let guard = RunningGuard(Arc::clone(&self.running));
+        tokio::spawn(async move {
+            run_action(cmd, tx).await;
+            drop(guard);
+        });
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -157,11 +194,23 @@ impl Execution for WorkerService {
 pub async fn serve_on_listener(
     listener: TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_on_listener_with(listener, WorkerService::new()).await
+}
+
+/// Like [`serve_on_listener`], but with a caller-provided service so the worker
+/// daemon can share the service's in-flight counter with a Coordination
+/// heartbeat task (the binary registers and heartbeats; tests do not need to).
+pub async fn serve_on_listener_with(
+    listener: TcpListener,
+    service: WorkerService,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use sembazuru_proto::v0::execution_server::ExecutionServer;
 
     let incoming = TcpListenerStream::new(listener);
     tonic::transport::Server::builder()
-        .add_service(ExecutionServer::new(WorkerService))
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(20)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(10)))
+        .add_service(ExecutionServer::new(service))
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
