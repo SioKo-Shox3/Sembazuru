@@ -6,6 +6,7 @@
 //! classification, path normalization, intermediate/telemetry tagging — lives
 //! here so it can be changed without touching the hook layer.
 
+pub mod action_key;
 pub mod determinism;
 pub mod format;
 pub mod graph;

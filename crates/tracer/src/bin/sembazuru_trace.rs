@@ -251,8 +251,8 @@ fn diff_help() -> &'static str {
 // `verify-determinism` subcommand
 // ---------------------------------------------------------------------------
 
+use sembazuru_tracer::action_key;
 use sembazuru_tracer::determinism::{self, Verdict};
-use sembazuru_tracer::{DependencyGraph, build_graph, normalize_for_compare};
 
 /// One run: where its trace files are and where its output files live on disk.
 struct Run {
@@ -332,14 +332,14 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
         work_root: rb,
     };
 
-    let (graph_a, cwd_a) = match load_run(&run_a.trace_dir) {
+    let (graph_a, cwd_a) = match action_key::load_run_from_dir(&run_a.trace_dir) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let (graph_b, cwd_b) = match load_run(&run_b.trace_dir) {
+    let (graph_b, cwd_b) = match action_key::load_run_from_dir(&run_b.trace_dir) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: {e}");
@@ -350,8 +350,8 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
     // Trace-derived outputs, keyed by logical path relative to the *build*
     // root (the run's recorded cwd). Used to exclude generated artifacts —
     // including run-varying temp files — from the input hash.
-    let trace_out_a = logical_outputs(&graph_a, &cwd_a);
-    let trace_out_b = logical_outputs(&graph_b, &cwd_b);
+    let trace_out_a = action_key::logical_outputs(&graph_a, &cwd_a);
+    let trace_out_b = action_key::logical_outputs(&graph_b, &cwd_b);
 
     // The comparison set: explicit --output artifacts when given (both runs are
     // expected to have each), else the trace-derived outputs per run.
@@ -366,10 +366,10 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
     // both runs. Generated outputs (trace-derived, including temp artifacts)
     // are excluded — only true sources count. Kept as component lists so a
     // mismatch can be diffed for the operator.
-    let comp_a = input_components(&graph_a, &cwd_a, &trace_out_a);
-    let comp_b = input_components(&graph_b, &cwd_b, &trace_out_b);
-    let in_a = hash_components(&comp_a);
-    let in_b = hash_components(&comp_b);
+    let comp_a = action_key::input_components(&graph_a, &cwd_a, &trace_out_a);
+    let comp_b = action_key::input_components(&graph_b, &cwd_b, &trace_out_b);
+    let in_a = action_key::hash_components(&comp_a);
+    let in_b = action_key::hash_components(&comp_b);
     let input_match = in_a == in_b;
 
     // Compare each logical output present in both runs; flag set mismatches.
@@ -504,75 +504,6 @@ fn join_root(read_root: &str, logical: &str) -> String {
     format!("{}\\{}", read_root.trim_end_matches(['\\', '/']), logical)
 }
 
-/// The set of output logical paths (relative to the run's build root `cwd`).
-fn logical_outputs(graph: &DependencyGraph, cwd: &str) -> BTreeSet<String> {
-    graph
-        .outputs
-        .iter()
-        .map(|o| determinism::relativize(&o.path, cwd))
-        .collect()
-}
-
-/// A logical path that `relativize` left relative (no drive, no UNC) lives
-/// under the build root; an absolute path lives outside it.
-fn is_under_build_root(logical: &str) -> bool {
-    let b = logical.as_bytes();
-    let drive = b.len() >= 2 && b[1] == b':';
-    !drive && !logical.starts_with("\\\\")
-}
-
-/// The sorted, hashable components of a run's input key: one
-/// `"logical\0content-hash"` line per source input, then a `--cmd--` marker,
-/// then the build-root-relativized command lines. Returned as a list so two
-/// runs can be diffed on mismatch rather than just compared by hash.
-///
-/// Exclusions keep the key stable: generated outputs (`outputs`, trace-derived,
-/// including run-varying temps) never count as inputs; and an *unreadable*
-/// input under the build root is a build transient (e.g. a temp file probed
-/// then renamed away by clang) whose run-varying name would wreck the key — it
-/// is dropped, whereas an absent input *outside* the root (a real
-/// include-search miss) keeps its `absent` marker.
-fn input_components(graph: &DependencyGraph, cwd: &str, outputs: &BTreeSet<String>) -> Vec<String> {
-    let mut entries: Vec<String> = Vec::new();
-    for inp in &graph.inputs {
-        let logical = determinism::relativize(&inp.path, cwd);
-        if outputs.contains(&logical) {
-            continue; // a generated artifact, not a source input
-        }
-        let content = match std::fs::read(&inp.path) {
-            Ok(bytes) => determinism::sha256_hex(&bytes),
-            Err(_) => {
-                if is_under_build_root(&logical) {
-                    continue; // build transient with a run-varying name
-                }
-                "absent".to_string()
-            }
-        };
-        entries.push(format!("{logical}\u{0}{content}"));
-    }
-    entries.sort();
-
-    let mut cmds: Vec<String> = graph
-        .processes
-        .iter()
-        .map(|p| p.command_line.to_ascii_lowercase().replace(cwd, "."))
-        .collect();
-    cmds.sort();
-
-    entries.push("--cmd--".to_string());
-    entries.extend(cmds);
-    entries
-}
-
-fn hash_components(components: &[String]) -> String {
-    let mut blob = String::new();
-    for c in components {
-        blob.push_str(c);
-        blob.push('\n');
-    }
-    determinism::sha256_hex(blob.as_bytes())
-}
-
 /// Prints which input components differ between the two runs, so an input-hash
 /// mismatch (a warning, not a failure) is diagnosable.
 fn print_input_diff(comp_a: &[String], comp_b: &[String]) {
@@ -696,20 +627,6 @@ fn verify_help() -> &'static str {
         "  --json           Emit a machine-readable report\n",
         "  --help           Print this help\n",
     )
-}
-
-/// Loads a run's traces, builds its graph, and returns the graph plus the root
-/// process's build directory (its recorded cwd), normalized the same way the
-/// graph normalizes paths so it prefixes the output entries.
-fn load_run(dir: &str) -> Result<(DependencyGraph, String), String> {
-    let traces = load_traces_from_dir(dir)?;
-    let graph = build_graph(&traces);
-    let cwd = traces
-        .iter()
-        .find(|t| t.pid == graph.root_pid)
-        .map(|t| normalize_for_compare(&t.cwd))
-        .unwrap_or_default();
-    Ok((graph, cwd))
 }
 
 // ---------------------------------------------------------------------------

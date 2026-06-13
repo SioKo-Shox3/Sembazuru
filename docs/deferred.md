@@ -65,10 +65,16 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   初回タッチ ingest した blob（temp 下の連番 CAS）と `pinned` マップが単調増加する。eviction は worker CAS
   向けで agent セッション CAS には掛からない。短命セッションでは無害だが長寿命 agent で膨らむ。M4.3/M5 で
   セッション境界の破棄／eviction を設計。出所: verifier(M4.2 懸念2)。
-- **アクションキャッシュ未実装。** 入力ハッシュ→出力。同一コンパイルをスキップ。
-  土台は `verify-determinism --json` が出す入力ハッシュ→出力ハッシュ写像
-  （determinism.md「Input-hash → output-hash mapping」）。鍵に command line＋env＋
-  入力 digest 集合を含める設計。出所: DESIGN §7 M4、determinism.md。
+- **アクションキャッシュ — 解消（コミット M4.3）。** 二段階フィンガープリント:
+  weak=BLAKE3(argv＋非volatile env＋toolchain content-hash)→観測入力マニフェスト、
+  strong=weak＋観測入力の現在内容ハッシュ（tracer の manifest_hash、verify-determinism の
+  input_hash と同種）→ ActionResult（出力 digest 群＋exit）。命中時は CAS から出力を
+  アトミック公開し実行スキップ。crates/{tracer/action_key, cas/action_cache, agent/action_cache}。
+  なお agent が実トレースを取り record/resolve を実コンパイルに結線するのは M4.6 ゲートで実証。
+- **アクションキャッシュの cross-dir（入力パスが変わる）再利用は未対応。** strong キーは入力の
+  absolute パスを再読込するため、別ディレクトリへ移ったチェックアウトでは miss する（同一マシン・
+  同一パスの rebuild は命中）。cross-dir/cross-machine 再利用は論理パス相対化＋MSVC パス独立
+  （M4.5）と併せて将来対応。出所: verifier(M4.3 付随所見)。
 - **WriteBack は単一メッセージで全量送信。** 大出力向けのチャンク化は未実装（CAS の
   チャンク戦略と整合させる）。出所: ops.rs WriteBack 注。
 
