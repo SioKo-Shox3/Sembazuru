@@ -708,6 +708,10 @@ name = "sembazuru-cas"
 version = "0.0.1"
 
 [[package]]
+name = "sembazuru-dataplane"
+version = "0.0.1"
+
+[[package]]
 name = "sembazuru-proto"
 version = "0.0.1"
 dependencies = [

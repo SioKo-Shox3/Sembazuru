@@ -1,0 +1,15 @@
+[package]
+name = "sembazuru-dataplane"
+description = "File-supply data plane: hand-rolled length-prefixed framing and batch-first op codecs (no protobuf on the hot path)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Intentionally dependency-free: the data-plane codec is std-only hand-rolled
+# binary (docs/protocol/v0.md §4.2 forbids protobuf on the hot path), in the
+# same spirit as the tracer's std-only SHA-256. The async transport that carries
+# these frames lives with the agent/worker, behind a trait, so the codec stays
+# pure and unit-testable without a runtime.
+[dependencies]
