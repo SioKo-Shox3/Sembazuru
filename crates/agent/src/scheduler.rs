@@ -92,6 +92,15 @@ fn preferred_index(workers: &[WorkerEntry], key: u64) -> usize {
     best
 }
 
+/// One unit of work for [`Scheduler::run_build`]: a command plus the identity
+/// the worker reports it under and the data-plane file session it binds to.
+#[derive(Clone, Debug)]
+pub struct BuildAction {
+    pub command: Command,
+    pub action_id: String,
+    pub session_id: String,
+}
+
 /// The agent-side scheduler over a shared worker table.
 #[derive(Clone)]
 pub struct Scheduler {
@@ -193,6 +202,54 @@ impl Scheduler {
             map: Arc::clone(&self.in_flight),
             worker_id: worker_id.to_string(),
         }
+    }
+
+    /// Runs a whole build phase: every action is dispatched concurrently across
+    /// the live workers (each with reassignment + local fallback), and the
+    /// outcomes are returned once all complete. Fan-out is bounded per worker by
+    /// the agent's in-flight accounting and the worker's admission semaphore, so
+    /// a thousand actions do not stampede a four-core worker. This is the M5.5
+    /// scheduler entry point; `run_build`'s wall time over `actions.len()` actions
+    /// against W workers is what the parallel-efficiency measurement divides.
+    pub async fn run_build(&self, actions: Vec<BuildAction>) -> Vec<Execution> {
+        // Throttle fan-out to roughly the cluster's capacity (×2 so a worker
+        // finishing one action always has the next already queued, never idling
+        // between dispatches). Excess actions wait HERE, on the agent, instead of
+        // being flung at workers that reject past their backlog and bounce to
+        // slow local fallback — which would wreck parallel efficiency.
+        let cap = (self.cluster_capacity() * 2).max(1);
+        let gate = Arc::new(tokio::sync::Semaphore::new(cap));
+
+        let mut tasks = Vec::with_capacity(actions.len());
+        for a in actions {
+            let permit = Arc::clone(&gate)
+                .acquire_owned()
+                .await
+                .expect("build gate semaphore is never closed");
+            let s = self.clone();
+            tasks.push(tokio::spawn(async move {
+                let outcome = s.dispatch(a.command, a.action_id, a.session_id).await;
+                drop(permit); // free a slot for the next queued action
+                outcome
+            }));
+        }
+        let mut outcomes = Vec::with_capacity(tasks.len());
+        for t in tasks {
+            // A panicked dispatch task is a bug, not a build outcome; surface it.
+            outcomes.push(t.await.expect("dispatch task panicked"));
+        }
+        outcomes
+    }
+
+    /// Total admission capacity across the live workers (clamped cpu_count sum) —
+    /// how many actions the cluster can run at once, the basis for `run_build`'s
+    /// fan-out throttle.
+    fn cluster_capacity(&self) -> usize {
+        self.table
+            .live_snapshot()
+            .iter()
+            .map(|w| w.caps.cpu_count.clamp(1, MAX_TRUSTED_CPU) as usize)
+            .sum()
     }
 
     /// Dispatches one action: try the affinity-preferred worker, then other live

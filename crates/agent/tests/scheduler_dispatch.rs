@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use sembazuru_agent::Execution;
 use sembazuru_agent::coordination::WorkerTable;
-use sembazuru_agent::scheduler::Scheduler;
+use sembazuru_agent::scheduler::{BuildAction, Scheduler};
 use sembazuru_proto::v0::{Capabilities, Command};
 use sembazuru_worker::WorkerService;
 
@@ -188,5 +188,59 @@ async fn dispatch_spreads_distinct_actions_across_workers() {
     assert!(
         s1 > 0 && s2 > 0,
         "work must spread across both workers, got w1={s1} w2={s2}"
+    );
+}
+
+#[tokio::test]
+async fn run_build_fans_out_a_whole_phase_across_workers() {
+    // M5.5 CI correctness gate (non-flaky: no timing threshold). A full "build
+    // phase" of many distinct actions, run via run_build across W workers, must:
+    // every action completes remotely, work spreads across all workers, and the
+    // exact set of actions is accounted for. This is the integration the parallel-
+    // efficiency harness measures; here we assert correctness, not speed.
+    let workers = [
+        start_worker().await,
+        start_worker().await,
+        start_worker().await,
+    ];
+    let table = table_with(&[
+        ("w1", &workers[0].0, 2),
+        ("w2", &workers[1].0, 2),
+        ("w3", &workers[2].0, 2),
+    ]);
+    let sched = Scheduler::new(table);
+
+    let n = 60;
+    let actions: Vec<BuildAction> = (0..n)
+        .map(|i| BuildAction {
+            // Distinct argv per TU so affinity spreads them across the ring.
+            command: cmd(&["cmd", "/c", "set", &format!("SBZ_TU=tu{i}")]),
+            action_id: format!("tu{i}"),
+            session_id: "build".into(),
+        })
+        .collect();
+
+    let outcomes = sched.run_build(actions).await;
+
+    assert_eq!(outcomes.len(), n, "every action produced an outcome");
+    for (i, o) in outcomes.iter().enumerate() {
+        match o {
+            Execution::Remote(out) => assert_eq!(out.exit_code, Some(0), "action {i} ok"),
+            other => panic!("action {i} did not run remotely: {other:?}"),
+        }
+    }
+
+    let served: Vec<u64> = workers
+        .iter()
+        .map(|(_, s)| s.load(Ordering::SeqCst))
+        .collect();
+    assert_eq!(
+        served.iter().sum::<u64>(),
+        n as u64,
+        "all actions accounted for across workers, got {served:?}"
+    );
+    assert!(
+        served.iter().all(|&s| s > 0),
+        "every worker got a share of the build, got {served:?}"
     );
 }
