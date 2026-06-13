@@ -75,8 +75,10 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   absolute パスを再読込するため、別ディレクトリへ移ったチェックアウトでは miss する（同一マシン・
   同一パスの rebuild は命中）。cross-dir/cross-machine 再利用は論理パス相対化＋MSVC パス独立
   （M4.5）と併せて将来対応。出所: verifier(M4.3 付随所見)。
-- **WriteBack は単一メッセージで全量送信。** 大出力向けのチャンク化は未実装（CAS の
-  チャンク戦略と整合させる）。出所: ops.rs WriteBack 注。
+- **WriteBack チャンク化 — 解消（コミット M4.4）。** WriteBack を offset＋last のストリームに拡張。
+  worker は固定チャンク（1 MiB、ADR 0003）で送信、agent は temp に追記しながら BLAKE3 を逐次計算
+  （`DigestHasher`）、last で全体 digest 検証＋アトミック rename 公開。大 .pdb/.exe を全量メモリに
+  載せない。小出力は単一チャンク。出所: ops.rs、fileserver.rs。
 
 ## M5（スケジューラ・多ワーカー・レイテンシ最適化）
 

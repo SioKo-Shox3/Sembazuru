@@ -28,6 +28,10 @@ use tokio::net::{TcpStream, ToSocketAddrs};
 /// How much to request per Read after the inlined first chunk.
 const READ_CHUNK: u32 = 256 * 1024;
 
+/// WriteBack chunk size for streaming outputs (ADR 0003: large files stream in
+/// fixed chunks). A small output fits in a single chunk.
+const WRITEBACK_CHUNK: usize = 1024 * 1024;
+
 pub struct FileClient {
     stream: TcpStream,
     next_id: u64,
@@ -138,18 +142,34 @@ impl FileClient {
         Ok(HasResponse::decode(&resp).map_err(to_io)?.present)
     }
 
-    /// Returns a produced output to the agent for atomic publication at `path`.
-    /// The agent verifies the digest, so a corrupted transfer is rejected rather
-    /// than published.
+    /// Returns a produced output to the agent for atomic publication at `path`,
+    /// streamed in fixed chunks so a large output is never buffered whole on
+    /// either side. The agent verifies the full digest on the final chunk, so a
+    /// corrupted transfer is rejected rather than published. A small output is a
+    /// single chunk.
     pub async fn write_back(&mut self, path: &str, bytes: &[u8]) -> io::Result<WriteBackResponse> {
-        let payload = WriteBackRequest {
-            path: path.to_string(),
-            digest_hex: Digest::of(bytes).canonical(),
-            bytes: bytes.to_vec(),
+        let digest = Digest::of(bytes).canonical();
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + WRITEBACK_CHUNK).min(bytes.len());
+            let last = end == bytes.len();
+            let payload = WriteBackRequest {
+                path: path.to_string(),
+                digest_hex: digest.clone(),
+                offset: offset as u64,
+                bytes: bytes[offset..end].to_vec(),
+                last,
+            }
+            .encode();
+            let resp = self.call(OpCode::WriteBack, &payload).await?;
+            let resp = WriteBackResponse::decode(&resp).map_err(to_io)?;
+            // Stop on the last chunk or on any agent-side rejection (the agent
+            // drops its temp, so nothing is left half-published).
+            if last || !resp.ok {
+                return Ok(resp);
+            }
+            offset = end;
         }
-        .encode();
-        let resp = self.call(OpCode::WriteBack, &payload).await?;
-        WriteBackResponse::decode(&resp).map_err(to_io)
     }
 
     pub async fn dir_list(&mut self, path: &str, depth: u32) -> io::Result<DirListResponse> {

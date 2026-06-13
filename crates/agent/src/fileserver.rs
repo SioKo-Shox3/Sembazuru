@@ -46,7 +46,7 @@ impl ServerStats {
     }
 }
 
-use sembazuru_cas::{BlobStore, Digest};
+use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
     DirEntry, DirListRequest, DirListResponse, HasRequest, HasResponse, OpenReadRequest,
@@ -96,13 +96,24 @@ impl PathMap {
     }
 }
 
-/// The per-session file-supply state: the agent's content store and the
-/// first-touch pin map that gives snapshot consistency.
+/// In-progress streamed WriteBack for one output path: the temp file being
+/// appended to, how many bytes have landed (the next expected offset), and the
+/// running digest so the whole output is verified without buffering it.
+struct WritebackState {
+    tmp: PathBuf,
+    written: u64,
+    hasher: DigestHasher,
+}
+
+/// The per-session file-supply state: the agent's content store, the first-touch
+/// pin map that gives snapshot consistency, and any in-progress streamed outputs.
 struct Session {
     cas: BlobStore,
     /// Requested logical path → the digest pinned at its first OpenRead. Once a
     /// path is here, its content is frozen for the session.
     pinned: Mutex<HashMap<String, Digest>>,
+    /// Output path → in-progress streamed WriteBack.
+    writebacks: Mutex<HashMap<String, WritebackState>>,
     stats: Arc<ServerStats>,
 }
 
@@ -113,6 +124,7 @@ impl Session {
         Ok(Session {
             cas: BlobStore::open(root)?,
             pinned: Mutex::new(HashMap::new()),
+            writebacks: Mutex::new(HashMap::new()),
             stats,
         })
     }
@@ -239,7 +251,7 @@ async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Session>, map: &Path
             Err(_) => HasResponse { present: vec![] }.encode(),
         },
         OpCode::WriteBack => match WriteBackRequest::decode(payload) {
-            Ok(req) => write_back(req).await.encode(),
+            Ok(req) => write_back(req, session).await.encode(),
             Err(_) => WriteBackResponse {
                 ok: false,
                 detail: "malformed WriteBack request".to_string(),
@@ -249,48 +261,107 @@ async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Session>, map: &Path
     }
 }
 
-/// Publishes a worker-returned output at its agent-side path: verify the digest,
-/// write to a temp sibling, then atomically rename onto the final name so the
-/// build system never sees a torn output (§3.2). WriteBack is NOT remapped — the
-/// agent publishes where it wants the artifact, independent of the read PathMap.
-async fn write_back(req: WriteBackRequest) -> WriteBackResponse {
-    let actual = Digest::of(&req.bytes).canonical();
-    if actual != req.digest_hex {
-        return WriteBackResponse {
-            ok: false,
-            detail: format!("digest mismatch: declared {}, got {actual}", req.digest_hex),
-        };
-    }
-    let final_path = PathBuf::from(&req.path);
-    if let Some(parent) = final_path.parent()
-        && let Err(e) = tokio::fs::create_dir_all(parent).await
-    {
-        return WriteBackResponse {
-            ok: false,
-            detail: format!("create output dir: {e}"),
-        };
-    }
-    // Temp sibling in the same directory so the rename is same-volume (atomic).
-    let mut tmp = final_path.clone();
+fn wb_err(detail: String) -> WriteBackResponse {
+    WriteBackResponse { ok: false, detail }
+}
+
+/// A same-directory temp sibling, so the eventual rename is same-volume (atomic).
+fn tmp_sibling(final_path: &std::path::Path) -> PathBuf {
+    let mut tmp = final_path.to_path_buf();
     let mut name = final_path
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_default();
     name.push(".sbz-writeback-tmp");
     tmp.set_file_name(name);
+    tmp
+}
 
-    if let Err(e) = tokio::fs::write(&tmp, &req.bytes).await {
+/// Receives a streamed worker output (`docs/protocol/v0.md` §4.1): each chunk is
+/// appended to a temp sibling and hashed incrementally; the final chunk verifies
+/// the whole output against `digest_hex` and atomically renames the temp onto
+/// the final name, so the build never sees a torn output (§3.2) and a large
+/// `.pdb`/`.exe` is never buffered whole in memory (M4.4). WriteBack is NOT
+/// remapped — the agent publishes where it wants the artifact.
+async fn write_back(req: WriteBackRequest, session: &Session) -> WriteBackResponse {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let final_path = PathBuf::from(&req.path);
+    let mut wbs = session.writebacks.lock().await;
+
+    // offset 0 (re)starts the stream: ensure the dir, create a fresh temp.
+    if req.offset == 0 {
+        if let Some(parent) = final_path.parent()
+            && let Err(e) = tokio::fs::create_dir_all(parent).await
+        {
+            return wb_err(format!("create output dir: {e}"));
+        }
+        let tmp = tmp_sibling(&final_path);
+        if let Err(e) = tokio::fs::File::create(&tmp).await {
+            return wb_err(format!("create temp: {e}"));
+        }
+        wbs.insert(
+            req.path.clone(),
+            WritebackState {
+                tmp,
+                written: 0,
+                hasher: DigestHasher::new(),
+            },
+        );
+    }
+
+    // Append this chunk to the temp and fold it into the running digest.
+    {
+        let Some(state) = wbs.get_mut(&req.path) else {
+            return wb_err("WriteBack chunk arrived without a begin (offset 0)".into());
+        };
+        if req.offset != state.written {
+            return wb_err(format!(
+                "out-of-order WriteBack chunk: offset {} but {} bytes written",
+                req.offset, state.written
+            ));
+        }
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&state.tmp)
+            .await
+        {
+            Ok(mut f) => {
+                if let Err(e) = f.seek(std::io::SeekFrom::Start(req.offset)).await {
+                    return wb_err(format!("seek temp: {e}"));
+                }
+                if let Err(e) = f.write_all(&req.bytes).await {
+                    return wb_err(format!("write temp: {e}"));
+                }
+            }
+            Err(e) => return wb_err(format!("open temp: {e}")),
+        }
+        state.hasher.update(&req.bytes);
+        state.written += req.bytes.len() as u64;
+    }
+
+    if !req.last {
         return WriteBackResponse {
-            ok: false,
-            detail: format!("write temp: {e}"),
+            ok: true,
+            detail: String::new(),
         };
     }
-    if let Err(e) = tokio::fs::rename(&tmp, &final_path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return WriteBackResponse {
-            ok: false,
-            detail: format!("atomic publish: {e}"),
-        };
+
+    // Final chunk: verify the whole output and publish atomically.
+    let state = wbs
+        .remove(&req.path)
+        .expect("state present (just appended)");
+    let actual = state.hasher.finalize().canonical();
+    if actual != req.digest_hex {
+        let _ = tokio::fs::remove_file(&state.tmp).await;
+        return wb_err(format!(
+            "digest mismatch: declared {}, got {actual}",
+            req.digest_hex
+        ));
+    }
+    if let Err(e) = tokio::fs::rename(&state.tmp, &final_path).await {
+        let _ = tokio::fs::remove_file(&state.tmp).await;
+        return wb_err(format!("atomic publish: {e}"));
     }
     WriteBackResponse {
         ok: true,

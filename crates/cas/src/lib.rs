@@ -162,6 +162,32 @@ impl fmt::Display for Digest {
     }
 }
 
+/// Incremental digest computation, for hashing a stream (e.g. a large output
+/// arriving in chunks) without holding the whole content in memory. Always
+/// BLAKE3 (ADR 0003), matching [`Digest::of`].
+#[derive(Default)]
+pub struct DigestHasher(blake3::Hasher);
+
+impl DigestHasher {
+    pub fn new() -> DigestHasher {
+        DigestHasher(blake3::Hasher::new())
+    }
+
+    /// Feeds the next chunk of content.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// The digest of everything fed so far. Equal to `Digest::of(whole)` when
+    /// the same bytes were fed in any chunking.
+    pub fn finalize(&self) -> Digest {
+        Digest {
+            algo: DigestAlgo::Blake3,
+            hex: self.0.finalize().to_hex().to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +282,17 @@ mod tests {
         let s = d.canonical();
         assert!(s.starts_with("blake3:"));
         assert_eq!(Digest::parse(&s).unwrap(), d);
+    }
+
+    #[test]
+    fn streaming_hasher_matches_one_shot() {
+        let whole = b"the quick brown fox jumps over the lazy dog, repeatedly".repeat(100);
+        let mut h = DigestHasher::new();
+        // Feed in uneven chunks; the digest must equal the one-shot hash.
+        for chunk in whole.chunks(7) {
+            h.update(chunk);
+        }
+        assert_eq!(h.finalize(), Digest::of(&whole));
     }
 
     #[test]
