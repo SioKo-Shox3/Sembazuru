@@ -45,3 +45,8 @@ jobs:
       # the runner ships LLVM). See docs/determinism.md.
       - name: M2 determinism harness (byte reproducibility)
         run: pwsh -NoProfile -File hooks/test/determinism.ps1 -RequireClangCl
+      # Gates M3.2: a hooked read-open under the VFS root is redirected to the
+      # agent-supplied bytes (hydrated to a local scratch copy), proving the
+      # observe->virtualize flip end to end.
+      - name: M3.2 read-VFS redirect
+        run: pwsh -NoProfile -File hooks/test/vfs_redirect.ps1

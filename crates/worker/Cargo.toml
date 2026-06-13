@@ -11,6 +11,15 @@ publish.workspace = true
 name = "sembazuru-worker"
 path = "src/bin/sembazuru_worker.rs"
 
+# Dev-only harness that co-locates the agent file server with the worker VFS
+# pipe for the end-to-end redirect test. Uses agent as a dev-dependency, so it
+# does not pull the agent into the worker's production dependencies.
+[[example]]
+name = "vfs_host"
+
+[dev-dependencies]
+sembazuru-agent = { path = "../agent" }
+
 [dependencies]
 sembazuru-proto = { path = "../proto" }
 sembazuru-dataplane = { path = "../dataplane", features = ["tokio"] }
