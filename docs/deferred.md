@@ -188,12 +188,16 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   診断が誤誘導。M6.1 で run_local エラーを surface。出所: verifier(M6.0 #2)。
 
 ### M6.1 実装後の既知の残リスク（2026-06-14）
-- **解消（原因特定）: clang-cl の .obj は isatty（stdout/stderr が console か否か）に依存する。** M6.1f で worker が
-  子の stdio を pipe 化（非 tty）したところ、参照ビルドを raw console（tty）で取っていたためバイト不一致が顕在化
-  （CI 実測。以前のフォールバック byte 差も同根＝fallback は非 tty、参照は tty）。実ビルドシステム（ninja/msbuild）は
-  コンパイラ出力を pipe する＝非 tty なので、**参照を非 tty（ファイルリダイレクト）でビルド**するのが現実に即した
-  正しい比較。修正後は分散・action cache republish・ローカルフォールバックの全てが clang-cl バイト一致
-  （`m6_daemon_compile.ps1` の参照を非 tty 化、3 経路ともバイト一致ゲート）。出所: verifier(M6.1)、CI 実測。
+- **clang-cl の .obj は isatty（stdout/stderr が console か否か）に依存する。** M6.1f で worker が子の stdio を
+  pipe 化（非 tty）したところ、参照ビルドを raw console（tty）で取っていたためバイト不一致が顕在化（CI 実測）。
+  実ビルドシステム（ninja/msbuild）はコンパイラ出力を pipe する＝非 tty なので、**参照を非 tty（ファイルリダイレクト）で
+  ビルド**するのが現実に即した正しい比較。修正後、**分散ビルドと action cache republish は clang-cl バイト一致**
+  （CI ゲートで実証）。出所: verifier(M6.1)、CI 実測。
+- **ローカルフォールバックの .obj は clang-cl で参照とバイト一致しない（残差・要調査）。** distributed（worker・
+  launcher 注入・env_clear）と参照（非 tty）は一致するが、`run_local` フォールバック（launcher 直 spawn・継承 env）は
+  同一 source/cwd/非 tty にも関わらず参照と clang-cl バイトが一致しない残差がある。機能的には正当な .obj で、M6
+  Done-when（フォールバックは「完了」）は満たす。ゲートはフォールバックを「exit 0＋非空 .obj」で検証し、バイト一致は
+  distributed＋cached に限定。run_local の起動条件（env レイヤリング/PATH 解決の clang-cl 差）を要調査。出所: CI(M6.1)。
 - **action cache の trace は単機共有 FS 前提（VfsExecution.trace_dir）。** worker が書いた trace を daemon が
   直接読む。2 台分割では trace を data plane で返す必要。実 LAN（決定者承認）で対応。出所: ADR 0005、M6.1c。
 - **launcher の出力推論は /Fo ベースの最小ヒューリスティック。** `/Fo` 無し・複数出力・非標準フラグは
