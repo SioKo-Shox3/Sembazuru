@@ -13,8 +13,18 @@ path = "src/bin/sembazuru_agent.rs"
 
 [dependencies]
 sembazuru-proto = { path = "../proto" }
+sembazuru-dataplane = { path = "../dataplane", features = ["tokio"] }
+sembazuru-tracer = { path = "../tracer" }
 tonic = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "net",
+    "fs",
+    "io-util",
+    "sync",
+] }
 
 [dev-dependencies]
 sembazuru-worker = { path = "../worker" }

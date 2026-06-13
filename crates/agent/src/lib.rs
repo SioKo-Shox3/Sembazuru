@@ -12,6 +12,8 @@ use sembazuru_proto::v0::{
     Command, ExecuteRequest, execute_event::Event, execution_client::ExecutionClient,
 };
 
+pub mod fileserver;
+
 /// What a remote action reported back: the lifecycle states it passed through
 /// (raw `ActionState` discriminants, in order) and, if it ran to completion,
 /// the process exit code and worker-measured wall time.

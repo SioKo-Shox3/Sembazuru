@@ -697,7 +697,9 @@ dependencies = [
 name = "sembazuru-agent"
 version = "0.0.1"
 dependencies = [
+ "sembazuru-dataplane",
  "sembazuru-proto",
+ "sembazuru-tracer",
  "sembazuru-worker",
  "tokio",
  "tonic",
@@ -710,6 +712,9 @@ version = "0.0.1"
 [[package]]
 name = "sembazuru-dataplane"
 version = "0.0.1"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "sembazuru-proto"
@@ -734,7 +739,9 @@ dependencies = [
 name = "sembazuru-worker"
 version = "0.0.1"
 dependencies = [
+ "sembazuru-dataplane",
  "sembazuru-proto",
+ "sembazuru-tracer",
  "tokio",
  "tokio-stream",
  "tonic",

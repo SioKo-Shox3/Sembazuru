@@ -19,4 +19,7 @@
 pub mod ops;
 pub mod wire;
 
+#[cfg(feature = "tokio")]
+pub mod async_io;
+
 pub use wire::{Error, FrameHeader, OpCode, decode_frame, decode_frame_body, encode_frame};
