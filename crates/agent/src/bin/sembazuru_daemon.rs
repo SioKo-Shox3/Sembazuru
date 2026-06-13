@@ -19,9 +19,12 @@
 
 use std::sync::Arc;
 
+use sembazuru_agent::action_cache::AgentCache;
 use sembazuru_agent::coordination::{DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination};
 use sembazuru_agent::fileserver::{ServerStats, serve_files_with_stats};
-use sembazuru_agent::intake::{resolve_loopback_intake, serve_intake};
+use sembazuru_agent::intake::{
+    IntakeService, IntakeVfsContext, resolve_loopback_intake, serve_intake_service,
+};
 use sembazuru_agent::scheduler::Scheduler;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -53,13 +56,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // File supply: workers pull inputs on demand over the data plane. Hosted now
-    // so the wiring exists; the compile path that exercises it is M6.1.
+    // File supply: workers pull inputs on demand over the data plane. The bound
+    // address is what VFS-mode workers dial, so capture it for VfsExecution.
     let file_listener = tokio::net::TcpListener::bind(&file_addr).await?;
-    eprintln!(
-        "sembazuru-daemon: file server on {}",
-        file_listener.local_addr()?
-    );
+    let fileserver_addr = file_listener.local_addr()?;
+    eprintln!("sembazuru-daemon: file server on {fileserver_addr}");
     {
         let stats = Arc::new(ServerStats::default());
         tokio::spawn(async move {
@@ -68,6 +69,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
     }
+
+    // Action cache (M4): a 2nd identical build skips the worker. Opt-in via
+    // SEMBAZURU_CACHE_ROOT (persisted across builds); absent → compile without
+    // caching. Per-action trace dirs go under SEMBAZURU_TRACE_ROOT (or a temp).
+    let cache = match std::env::var_os("SEMBAZURU_CACHE_ROOT") {
+        Some(root) => match AgentCache::open(&root) {
+            Ok(c) => {
+                eprintln!(
+                    "sembazuru-daemon: action cache at {}",
+                    root.to_string_lossy()
+                );
+                Some(std::sync::Arc::new(c))
+            }
+            Err(e) => {
+                eprintln!("sembazuru-daemon: action cache disabled (open failed: {e})");
+                None
+            }
+        },
+        None => None,
+    };
+    let trace_root = env_or(
+        "SEMBAZURU_TRACE_ROOT",
+        &std::env::temp_dir()
+            .join("sembazuru-trace")
+            .to_string_lossy(),
+    );
+
+    // Intake runs submissions under the read-VFS, pointing workers at this
+    // daemon's file server. The daemon always has a file server, so VFS is always
+    // available; the cache is opt-in above.
+    let intake = IntakeService::with_vfs(
+        scheduler,
+        IntakeVfsContext {
+            agent_fileserver: fileserver_addr.to_string(),
+            cache,
+            scratch_root: std::path::PathBuf::from(trace_root),
+        },
+    );
 
     // LocalIntake: the blocking server. The daemon runs until killed; the
     // launcher submits actions here over loopback. Intake runs arbitrary
@@ -80,6 +119,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "sembazuru-daemon: LocalIntake on {}",
         intake_listener.local_addr()?
     );
-    serve_intake(intake_listener, scheduler).await?;
+    serve_intake_service(intake_listener, intake).await?;
     Ok(())
 }

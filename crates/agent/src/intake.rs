@@ -12,13 +12,14 @@
 //! root) is safe here precisely because it never leaves the machine — the
 //! launcher already has the command on its argv.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sembazuru_proto::v0::{
     ActionState, Command, ExitStatus, StateChange, SubmitActionEvent, SubmitActionRequest,
-    local_intake_client::LocalIntakeClient, local_intake_server::LocalIntake,
+    VfsExecution, local_intake_client::LocalIntakeClient, local_intake_server::LocalIntake,
     submit_action_event::Event,
 };
 use tokio::net::TcpListener;
@@ -26,6 +27,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
+use crate::action_cache::{AgentCache, CacheLookup};
 use crate::scheduler::Scheduler;
 use crate::{ExecOptions, ExecuteError, Execution};
 
@@ -49,6 +51,22 @@ fn exit_ev(code: i32, wall_us: u64) -> SubmitActionEvent {
     }
 }
 
+/// Read-VFS + action-cache context for the daemon's intake (M6.1). With it, each
+/// submitted compile runs under the read-VFS — inputs supplied on demand by the
+/// agent file server at `agent_fileserver` — and, when `cache` is set, is checked
+/// against the action cache (a 2nd identical build skips the worker) and recorded
+/// after a successful run. Without a context, intake plain-dispatches (M6.0 path
+/// and tests).
+#[derive(Clone)]
+pub struct IntakeVfsContext {
+    /// host:port of the agent data-plane file server (goes into `VfsExecution`).
+    pub agent_fileserver: String,
+    /// Action cache; `None` runs VFS compiles without resolve/record (no cache).
+    pub cache: Option<Arc<AgentCache>>,
+    /// Where per-action trace dirs are created (only used when `cache` is set).
+    pub scratch_root: PathBuf,
+}
+
 /// The LocalIntake gRPC service. Wraps the daemon's [`Scheduler`]; every
 /// submitted action is dispatched (affinity → least-loaded → local fallback)
 /// and its terminal outcome is mirrored back as a [`SubmitActionEvent`] stream.
@@ -58,13 +76,27 @@ pub struct IntakeService {
     /// Per-daemon action counter, so each submission gets a unique action_id /
     /// session_id without a clock or RNG (keeps the daemon reproducible).
     seq: Arc<AtomicU64>,
+    /// Read-VFS + cache context; `None` → plain dispatch (M6.0/tests).
+    vfs: Option<Arc<IntakeVfsContext>>,
 }
 
 impl IntakeService {
+    /// Plain intake: submissions are dispatched directly (no VFS, no cache).
     pub fn new(scheduler: Scheduler) -> Self {
         Self {
             scheduler,
             seq: Arc::new(AtomicU64::new(0)),
+            vfs: None,
+        }
+    }
+
+    /// Intake that runs submissions under the read-VFS (and the action cache when
+    /// `ctx.cache` is set) — the production daemon's compile front door (M6.1).
+    pub fn with_vfs(scheduler: Scheduler, ctx: IntakeVfsContext) -> Self {
+        Self {
+            scheduler,
+            seq: Arc::new(AtomicU64::new(0)),
+            vfs: Some(Arc::new(ctx)),
         }
     }
 }
@@ -85,39 +117,169 @@ impl LocalIntake for IntakeService {
             return Err(Status::invalid_argument("command.argv must be non-empty"));
         }
 
-        // A unique id per submission. session_id binds the (future, M6.1) file
-        // session; for M6.0 the trivial action needs no file supply, but the id
-        // is still distinct so it is ready to key a session.
+        // A unique id per submission; session_id binds the data-plane file
+        // session and `n` names the per-action trace dir.
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let action_id = format!("intake-{n}");
-        let session_id = format!("intake-{n}");
+        let session_id = action_id.clone();
 
-        let scheduler = self.scheduler.clone();
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(async move {
-            // M6.0: plain dispatch. The action-cache resolve/record and the
-            // read-VFS config (ExecOptions) are wired in M6.1c.
-            let outcome = scheduler
-                .dispatch(command, action_id, session_id, ExecOptions::default())
-                .await;
-            // dispatch already guarantees completion (remote or local fallback),
-            // so we always have an exit code to mirror. The launcher only needs
-            // the exit; the state event is for observability / a fallback note.
-            let (code, wall, note) = match outcome {
-                Execution::Remote(o) => (
-                    o.exit_code.unwrap_or(-1),
-                    o.wall_time_us,
-                    "remote".to_string(),
-                ),
-                Execution::LocalFallback { exit_code, reason } => {
-                    (exit_code, 0, format!("local fallback: {reason}"))
-                }
-            };
-            let _ = tx.send(Ok(state_ev(ActionState::Completed, &note))).await;
-            let _ = tx.send(Ok(exit_ev(code, wall))).await;
-        });
+        tokio::spawn(run_submission(
+            self.scheduler.clone(),
+            self.vfs.clone(),
+            command,
+            req.declared_outputs,
+            action_id,
+            session_id,
+            n,
+            tx,
+        ));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
+}
+
+/// Drives one submission to completion and mirrors its terminal events. Without
+/// a VFS context this is a plain dispatch (M6.0). With one, the compile runs
+/// under the read-VFS; with a cache it is resolved first (a hit skips the worker)
+/// and recorded after a successful run so the next identical build hits.
+#[allow(clippy::too_many_arguments)]
+async fn run_submission(
+    scheduler: Scheduler,
+    vfs: Option<Arc<IntakeVfsContext>>,
+    command: Command,
+    declared_outputs: Vec<String>,
+    action_id: String,
+    session_id: String,
+    n: u64,
+    tx: mpsc::Sender<Result<SubmitActionEvent, Status>>,
+) {
+    let Some(ctx) = vfs else {
+        // Plain dispatch (M6.0 / tests): no VFS config, no cache.
+        let outcome = scheduler
+            .dispatch(command, action_id, session_id, ExecOptions::default())
+            .await;
+        emit_outcome(&tx, outcome).await;
+        return;
+    };
+
+    let build_root = PathBuf::from(&command.cwd);
+
+    // The weak key keys resolve, predicted_paths, and record. Computed off the
+    // async runtime: weak_key hashes the toolchain binary from disk.
+    let weak = match &ctx.cache {
+        Some(cache) => {
+            let cache = cache.clone();
+            let argv = command.argv.clone();
+            let mut env: Vec<(String, String)> = command
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            env.sort();
+            tokio::task::spawn_blocking(move || cache.weak_key(&argv, &env))
+                .await
+                .ok()
+        }
+        None => None,
+    };
+
+    // Cache resolve: a hit republishes the outputs and skips the worker entirely.
+    if let (Some(cache), Some(weak)) = (&ctx.cache, &weak) {
+        let cache = cache.clone();
+        let weak = weak.clone();
+        let br = build_root.clone();
+        if let Ok(Ok(CacheLookup::Hit { exit_code })) =
+            tokio::task::spawn_blocking(move || cache.resolve(&weak, &br)).await
+        {
+            let _ = tx
+                .send(Ok(state_ev(ActionState::Completed, "cache hit")))
+                .await;
+            let _ = tx.send(Ok(exit_ev(exit_code, 0))).await;
+            return;
+        }
+    }
+
+    // Prior build's inputs to warm ahead of process I/O (M5.4 prefetch).
+    let predicted_paths = match (&ctx.cache, &weak) {
+        (Some(cache), Some(weak)) => {
+            let cache = cache.clone();
+            let weak = weak.clone();
+            tokio::task::spawn_blocking(move || cache.predicted_paths(&weak))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    // Per-action trace dir (only needed when recording to the cache). The worker
+    // points the injected DLL's trace at it; on a single machine the daemon reads
+    // it back to build the input manifest (VfsExecution.trace_dir is single-
+    // machine-only, see control.proto).
+    let trace_dir = if ctx.cache.is_some() {
+        let d = ctx.scratch_root.join(format!("trace-{n}"));
+        let _ = tokio::fs::create_dir_all(&d).await;
+        d.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
+
+    let opts = ExecOptions {
+        predicted_paths,
+        vfs: Some(VfsExecution {
+            agent_fileserver: ctx.agent_fileserver.clone(),
+            // Single-machine: reads under the build dir redirect through the VFS;
+            // anything outside resolves to the same local bytes (correct either
+            // way). A 2-machine split would scope this to the project source root.
+            vfs_root: command.cwd.clone(),
+            trace_dir: trace_dir.clone(),
+        }),
+    };
+
+    let outcome = scheduler
+        .dispatch(command, action_id, session_id, opts)
+        .await;
+
+    // Record a successful remote run so the next identical build hits. Needs the
+    // trace (from the DLL) and the declared outputs (from the launcher); without
+    // either, recording is skipped (the build is still correct, just uncached).
+    if let (Some(cache), Some(weak)) = (&ctx.cache, &weak)
+        && matches!(&outcome, Execution::Remote(o) if o.exit_code == Some(0))
+        && !trace_dir.is_empty()
+        && !declared_outputs.is_empty()
+    {
+        let cache = cache.clone();
+        let weak = weak.clone();
+        let br = build_root.clone();
+        let outs = declared_outputs.clone();
+        let td = trace_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(manifest) = cache.manifest_from_trace_dir(&td) {
+                let _ = cache.record(&weak, &manifest, &br, &outs, 0);
+            }
+        })
+        .await;
+    }
+
+    emit_outcome(&tx, outcome).await;
+}
+
+/// Mirrors a dispatch outcome as the terminal `state` + `exit` events. dispatch
+/// always completes (remote or local fallback), so there is always an exit code.
+async fn emit_outcome(tx: &mpsc::Sender<Result<SubmitActionEvent, Status>>, outcome: Execution) {
+    let (code, wall, note) = match outcome {
+        Execution::Remote(o) => (
+            o.exit_code.unwrap_or(-1),
+            o.wall_time_us,
+            "remote".to_string(),
+        ),
+        Execution::LocalFallback { exit_code, reason } => {
+            (exit_code, 0, format!("local fallback: {reason}"))
+        }
+    };
+    let _ = tx.send(Ok(state_ev(ActionState::Completed, &note))).await;
+    let _ = tx.send(Ok(exit_ev(code, wall))).await;
 }
 
 /// Resolves `addr` for the LocalIntake listener, **refusing any non-loopback
@@ -151,31 +313,43 @@ pub fn resolve_loopback_intake(addr: &str) -> Result<std::net::SocketAddr, Strin
     Ok(first)
 }
 
-/// Serves LocalIntake on an already-bound listener (the daemon binds an explicit
-/// loopback port; tests bind an ephemeral one and learn it before serving).
+/// Serves a plain LocalIntake (no VFS, no cache) on an already-bound listener.
+/// The daemon binds an explicit loopback port; tests bind an ephemeral one and
+/// learn it before serving.
 pub async fn serve_intake(
     listener: TcpListener,
     scheduler: Scheduler,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_intake_service(listener, IntakeService::new(scheduler)).await
+}
+
+/// Serves a caller-built [`IntakeService`] — used by the daemon to enable
+/// read-VFS execution and the action cache ([`IntakeService::with_vfs`]).
+pub async fn serve_intake_service(
+    listener: TcpListener,
+    service: IntakeService,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use sembazuru_proto::v0::local_intake_server::LocalIntakeServer;
 
     let incoming = TcpListenerStream::new(listener);
     tonic::transport::Server::builder()
-        .add_service(LocalIntakeServer::new(IntakeService::new(scheduler)))
+        .add_service(LocalIntakeServer::new(service))
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
 }
 
 /// Launcher side: submit `command` to the daemon at `endpoint` and return the
-/// exit code once the stream closes. A transport/RPC error here is exactly the
-/// signal the launcher turns into a local fallback (the daemon may be down) —
-/// the build must still complete (DESIGN.md §2).
+/// exit code plus the daemon's terminal state note ("remote", "cache hit", or
+/// "local fallback: …") once the stream closes. A transport/RPC error here is
+/// exactly the signal the launcher turns into a local fallback (the daemon may be
+/// down) — the build must still complete (DESIGN.md §2). The note is surfaced so
+/// a developer (and the M6.1 gate) can see how the action ran.
 pub async fn submit_to_daemon(
     endpoint: String,
     command: Command,
     declared_outputs: Vec<String>,
-) -> Result<i32, ExecuteError> {
+) -> Result<(i32, String), ExecuteError> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(ExecuteError::Transport)?
         .connect_timeout(Duration::from_millis(500))
@@ -188,12 +362,15 @@ pub async fn submit_to_daemon(
     };
     let mut stream = client.submit_action(request).await?.into_inner();
     let mut exit_code: Option<i32> = None;
+    let mut note = String::new();
     while let Some(ev) = stream.message().await? {
-        if let Some(Event::Exit(e)) = ev.event {
-            exit_code = Some(e.exit_code);
+        match ev.event {
+            Some(Event::Exit(e)) => exit_code = Some(e.exit_code),
+            Some(Event::State(s)) if !s.detail.is_empty() => note = s.detail,
+            _ => {}
         }
     }
-    exit_code.ok_or_else(|| {
+    exit_code.map(|c| (c, note)).ok_or_else(|| {
         ExecuteError::Rpc(Status::internal(
             "daemon closed the stream with no exit status",
         ))

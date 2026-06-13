@@ -22,6 +22,48 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Best-effort inference of the action's output files from a clang-cl/cl command
+/// line, so the daemon can record them in the action cache (a 2nd identical build
+/// then republishes them and skips the compile). Recognizes `/Fo<path>` (the
+/// object output); a `/Fo<dir>\` form names the object after the `/c` source.
+/// Returns paths as written (relative to cwd = the cache's build root). A wrong
+/// or empty guess only disables caching for that action — never a wrong build.
+fn infer_outputs(compiler_argv: &[String]) -> Vec<String> {
+    let mut source: Option<String> = None;
+    let mut fo: Option<String> = None;
+    for a in &compiler_argv[1..] {
+        if let Some(rest) = a.strip_prefix("/Fo").or_else(|| a.strip_prefix("-Fo")) {
+            fo = Some(rest.trim_start_matches(':').to_string());
+        } else if !a.starts_with('/') && !a.starts_with('-') {
+            let lower = a.to_ascii_lowercase();
+            if lower.ends_with(".cpp")
+                || lower.ends_with(".cc")
+                || lower.ends_with(".cxx")
+                || lower.ends_with(".c")
+            {
+                source = Some(a.clone());
+            }
+        }
+    }
+    let obj_from_source = || {
+        source.as_ref().map(|s| {
+            let stem = std::path::Path::new(s)
+                .file_stem()
+                .map(|x| x.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "out".into());
+            format!("{stem}.obj")
+        })
+    };
+    match fo {
+        Some(p) if p.ends_with('\\') || p.ends_with('/') => match obj_from_source() {
+            Some(obj) => vec![format!("{p}{obj}")],
+            None => Vec::new(),
+        },
+        Some(p) => vec![p],
+        None => obj_from_source().into_iter().collect(),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // argv[0] is `sembazuru` itself; argv[1..] is the real compiler command.
@@ -40,9 +82,15 @@ async fn main() {
     let command = Command { argv, env, cwd };
 
     let endpoint = env_or("SEMBAZURU_DAEMON", "http://127.0.0.1:50071");
+    let declared_outputs = infer_outputs(&command.argv);
 
-    let code = match submit_to_daemon(endpoint, command.clone(), Vec::new()).await {
-        Ok(code) => code,
+    let code = match submit_to_daemon(endpoint, command.clone(), declared_outputs).await {
+        Ok((code, note)) => {
+            if !note.is_empty() {
+                eprintln!("sembazuru: {note}");
+            }
+            code
+        }
         Err(e) => {
             eprintln!("sembazuru: daemon unavailable, running locally ({e})");
             run_local(&command).await.unwrap_or(-1)
