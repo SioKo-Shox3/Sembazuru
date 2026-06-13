@@ -41,10 +41,19 @@ async fn start_file_server() -> std::net::SocketAddr {
 
 /// Sends one hydrate request over the pipe and returns (status, local_path).
 async fn pipe_hydrate(full: &str, logical: &str) -> (u8, String) {
+    // Retry until the pipe is up, but with a deadline: `serve_vfs` swallows
+    // early start-up errors, so without one a failed server would hang the test
+    // (a CI job kill) instead of failing cleanly with a readable message.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let mut client = loop {
         match ClientOptions::new().open(full) {
             Ok(c) => break c,
-            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(e) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("vfs pipe {full} never opened within 10s: {e}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
     };
     let payload = logical.as_bytes();
@@ -79,9 +88,16 @@ async fn pipe_hydrates_file_into_scratch() {
     {
         let pn = pipe_name.clone();
         let sc = scratch.clone();
+        let cas = dir.join("worker-cas");
         tokio::spawn(async move {
-            let _ = sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc, std::time::Duration::ZERO)
-                .await;
+            let _ = sembazuru_worker::vfs_pipe::serve_vfs(
+                &pn,
+                addr,
+                sc,
+                cas,
+                std::time::Duration::ZERO,
+            )
+            .await;
         });
     }
 
@@ -105,4 +121,82 @@ async fn pipe_hydrates_file_into_scratch() {
     let missing = dir.join("nope.h").to_string_lossy().into_owned();
     let (status, _) = pipe_hydrate(&full, &missing).await;
     assert_eq!(status, 1, "missing file is reported not-found");
+}
+
+/// M4.2 "Done when" core: a second build transfers no file content for a path
+/// the worker has already cached. Two VFS sessions (separate pipes, simulating
+/// two builds) share one worker CAS root; the agent's [`ServerStats`] proves the
+/// second hydrate pushes **zero** additional content bytes over the data plane.
+#[tokio::test]
+async fn worker_cache_eliminates_retransfer_on_second_build() {
+    use sembazuru_agent::fileserver::ServerStats;
+    use std::sync::Arc;
+
+    let dir = TempDir::new("recache");
+    // Content larger than a trivial header, so a real fetch is non-zero bytes.
+    let content: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    let logical = dir.join("proj/big.h");
+    std::fs::create_dir_all(logical.parent().unwrap()).unwrap();
+    std::fs::write(&logical, &content).unwrap();
+    let logical_str = logical.to_string_lossy().into_owned();
+
+    // Agent file server with a stats handle we keep.
+    let stats = Arc::new(ServerStats::default());
+    let addr = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = listener.local_addr().unwrap();
+        let s = stats.clone();
+        tokio::spawn(async move {
+            let _ = sembazuru_agent::fileserver::serve_files_with_stats(listener, s).await;
+        });
+        a
+    };
+
+    // One worker CAS shared across both "builds".
+    let cas_root = dir.join("worker-cas");
+
+    // --- Build 1: cold cache → the file is fetched once. ---
+    let pipe1 = format!("sbz-recache-1-{}", std::process::id());
+    let full1 = format!(r"\\.\pipe\{pipe1}");
+    {
+        let (pn, sc, cas) = (pipe1.clone(), dir.join("scratch1"), cas_root.clone());
+        tokio::spawn(async move {
+            let _ = sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc, cas, Duration::ZERO).await;
+        });
+    }
+    let (status, local1) = pipe_hydrate(&full1, &logical_str).await;
+    assert_eq!(status, 0, "build 1 hydrate should succeed");
+    assert_eq!(
+        std::fs::read(&local1).unwrap(),
+        content,
+        "build 1 bytes match"
+    );
+    let after_build1 = stats.content_bytes();
+    assert!(
+        after_build1 >= content.len() as u64,
+        "build 1 must transfer the file content once (got {after_build1})"
+    );
+
+    // --- Build 2: warm cache (same CAS root) → zero content transfer. ---
+    let pipe2 = format!("sbz-recache-2-{}", std::process::id());
+    let full2 = format!(r"\\.\pipe\{pipe2}");
+    {
+        let (pn, sc, cas) = (pipe2.clone(), dir.join("scratch2"), cas_root.clone());
+        tokio::spawn(async move {
+            let _ = sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc, cas, Duration::ZERO).await;
+        });
+    }
+    let (status, local2) = pipe_hydrate(&full2, &logical_str).await;
+    assert_eq!(status, 0, "build 2 hydrate should succeed");
+    assert_eq!(
+        std::fs::read(&local2).unwrap(),
+        content,
+        "build 2 serves identical bytes from the worker cache"
+    );
+    let after_build2 = stats.content_bytes();
+    assert_eq!(
+        after_build2, after_build1,
+        "build 2 must transfer ZERO additional content (cache hit), \
+         but content bytes went {after_build1} -> {after_build2}"
+    );
 }

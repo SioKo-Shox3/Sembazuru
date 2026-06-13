@@ -22,6 +22,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let pipe_name = args[0].clone();
     let scratch = PathBuf::from(&args[1]);
+    // Worker-local content store. Persisted across builds when SEMBAZURU_VFS_CAS
+    // is set (the rebuild gate uses this to prove zero re-transfer); otherwise a
+    // sibling of the scratch dir, fresh per run.
+    let cas_root = std::env::var_os("SEMBAZURU_VFS_CAS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            scratch
+                .parent()
+                .map(|p| p.join("sbz-worker-cas"))
+                .unwrap_or_else(|| PathBuf::from("sbz-worker-cas"))
+        });
     let remap = if args.len() >= 4 {
         Some((args[2].clone(), PathBuf::from(&args[3])))
     } else {
@@ -46,6 +57,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _ = r;
     });
     eprintln!("vfs_host: file server on {addr}, pipe {pipe_name}, rtt {rtt:?}");
-    sembazuru_worker::vfs_pipe::serve_vfs(&pipe_name, addr, scratch, rtt).await?;
+    sembazuru_worker::vfs_pipe::serve_vfs(&pipe_name, addr, scratch, cas_root, rtt).await?;
     Ok(())
 }

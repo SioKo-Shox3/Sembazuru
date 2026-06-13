@@ -802,6 +802,7 @@ dependencies = [
 name = "sembazuru-agent"
 version = "0.0.1"
 dependencies = [
+ "sembazuru-cas",
  "sembazuru-dataplane",
  "sembazuru-proto",
  "sembazuru-tracer",
@@ -850,6 +851,7 @@ name = "sembazuru-worker"
 version = "0.0.1"
 dependencies = [
  "sembazuru-agent",
+ "sembazuru-cas",
  "sembazuru-dataplane",
  "sembazuru-proto",
  "sembazuru-tracer",

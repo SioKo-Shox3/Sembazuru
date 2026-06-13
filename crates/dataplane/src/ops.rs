@@ -1,11 +1,13 @@
 //! Op payload codecs (`docs/protocol/v0.md` §4.1). Every op is batch-first; the
 //! singular forms are just batches of one. Each request/response encodes to and
 //! decodes from a payload buffer that travels inside a framed message
-//! (`crate::wire`). A digest is carried as lowercase hex; an empty string means
-//! "no digest" (e.g. a negative stat result).
+//! (`crate::wire`). A digest is carried as its canonical `algo:hex` string
+//! (e.g. `blake3:ab12…`, ADR 0003); an empty string means "no digest" (e.g. a
+//! negative stat result).
 //!
-//! M3.2 read path: StatBatch / OpenRead / Read / DirList. WriteBack (M3.3) and
-//! PrefetchHint (M5) are added when those milestones land.
+//! M3.2 read path: StatBatch / OpenRead / Read / DirList. WriteBack is M3.3.
+//! `Has` (M4) is the batch existence probe (§4.3); PrefetchHint (M5) is added
+//! when that milestone lands.
 
 use crate::wire::{Error, Reader, Writer};
 
@@ -97,9 +99,16 @@ impl StatResponse {
 
 /// Open-for-read resolves to content identity; the first chunk MAY be inlined so
 /// `open` + first `read` is a single round-trip.
+///
+/// `want_inline` lets the caller suppress the inlined first chunk. A
+/// worker-local-cache client (M4) wants only the digest first — if it already
+/// holds that content it fetches nothing, so inlining bytes it may discard would
+/// defeat the "no re-transfer" goal. It sets `want_inline = false` (a *digest
+/// probe*) and only `Read`s on a cache miss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenReadRequest {
     pub path: String,
+    pub want_inline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,13 +125,15 @@ impl OpenReadRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.str(&self.path);
+        w.bool(self.want_inline);
         w.into_bytes()
     }
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(buf);
         let path = r.str()?;
+        let want_inline = r.bool()?;
         r.finish()?;
-        Ok(OpenReadRequest { path })
+        Ok(OpenReadRequest { path, want_inline })
     }
 }
 
@@ -332,6 +343,67 @@ impl WriteBackResponse {
     }
 }
 
+// --- Has ----------------------------------------------------------------
+
+/// Batch existence probe (`docs/protocol/v0.md` §4.3): "which of these digests
+/// do you already hold?" Before transferring a blob, the peer asks `Has` and
+/// sends only the missing ones — the upload-side dedup that keeps a rebuild's
+/// output transfer near zero. (The read-side worker cache checks its own local
+/// store directly and needs no round-trip.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HasRequest {
+    /// Canonical `algo:hex` digest strings.
+    pub digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HasResponse {
+    /// One flag per requested digest, in request order: true = present.
+    pub present: Vec<bool>,
+}
+
+impl HasRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(self.digests.len() as u32);
+        for d in &self.digests {
+            w.str(d);
+        }
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let n = r.u32()? as usize;
+        let mut digests = Vec::with_capacity(cap_hint(n));
+        for _ in 0..n {
+            digests.push(r.str()?);
+        }
+        r.finish()?;
+        Ok(HasRequest { digests })
+    }
+}
+
+impl HasResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(self.present.len() as u32);
+        for &p in &self.present {
+            w.bool(p);
+        }
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let n = r.u32()? as usize;
+        let mut present = Vec::with_capacity(cap_hint(n));
+        for _ in 0..n {
+            present.push(r.bool()?);
+        }
+        r.finish()?;
+        Ok(HasResponse { present })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,8 +446,27 @@ mod tests {
 
         let req = OpenReadRequest {
             path: "c:\\src\\a.cpp".into(),
+            want_inline: true,
         };
         assert_eq!(OpenReadRequest::decode(&req.encode()).unwrap(), req);
+        // The digest-probe form (no inline) round-trips too.
+        let probe = OpenReadRequest {
+            path: "c:\\src\\a.cpp".into(),
+            want_inline: false,
+        };
+        assert_eq!(OpenReadRequest::decode(&probe.encode()).unwrap(), probe);
+    }
+
+    #[test]
+    fn has_round_trips() {
+        let req = HasRequest {
+            digests: vec!["blake3:aa".into(), "blake3:bb".into()],
+        };
+        assert_eq!(HasRequest::decode(&req.encode()).unwrap(), req);
+        let resp = HasResponse {
+            present: vec![true, false, true],
+        };
+        assert_eq!(HasResponse::decode(&resp.encode()).unwrap(), resp);
     }
 
     #[test]
@@ -434,7 +525,11 @@ mod tests {
 
     #[test]
     fn decode_rejects_trailing_bytes() {
-        let mut bytes = OpenReadRequest { path: "x".into() }.encode();
+        let mut bytes = OpenReadRequest {
+            path: "x".into(),
+            want_inline: true,
+        }
+        .encode();
         bytes.push(0); // junk after the struct
         assert_eq!(OpenReadRequest::decode(&bytes), Err(Error::TrailingBytes));
     }

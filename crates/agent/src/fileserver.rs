@@ -1,14 +1,18 @@
 //! Agent-side file-supply server (`docs/protocol/v0.md` §4): answers a worker's
-//! StatBatch / OpenRead / Read / DirList over the data plane, reading from the
-//! agent's own filesystem. This is the supply side of the read VFS — the worker
-//! sees the agent's files on demand.
+//! StatBatch / OpenRead / Read / DirList / Has / WriteBack over the data plane.
+//! This is the supply side of the read VFS — the worker sees the agent's files
+//! on demand.
 //!
-//! **M3.2 scope.** Snapshot consistency (§4.1) is simplified: digests are
-//! computed on first OpenRead and cached for the session, which pins content for
-//! the rest of that session, but mid-build edits before first touch are not
-//! guarded (a single-action loopback worker does not hit this; full pinning is
-//! M3.x). Path scoping/auth is deferred to M7 — on a trusted LAN the agent
-//! presents its filesystem to the worker.
+//! **Snapshot consistency (M4, §4.1).** Content is *pinned at first touch*: the
+//! first OpenRead of a path ingests its bytes into the agent's content store
+//! (CAS) and records `path → digest`. Every later read of that path in the
+//! session serves the **pinned blob** from the CAS, not a fresh disk read, so a
+//! mid-build local edit cannot tear a running action. The digest is the
+//! end-to-end key (ADR 0003: BLAKE3); ranged `Read` is served by digest from
+//! the CAS, which is also where worker outputs and the action cache live (M4.3).
+//!
+//! Path scoping/auth is deferred to M7 — on a trusted LAN the agent presents
+//! its filesystem to the worker.
 //!
 //! A [`PathMap`] optionally remaps a requested *logical* path to a different
 //! *backing* file. Identity mapping is the real deployment; the remap exists so
@@ -19,18 +23,44 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Counters for content bytes the agent actually pushed over the data plane —
+/// the quantity the M4 "Done when" (transfer ≈ 0 on a rebuild) is measured by.
+/// Only *content* counts: `Read` response bytes and inlined OpenRead first
+/// chunks. Stat/probe/Has carry no content and are not counted.
+#[derive(Debug, Default)]
+pub struct ServerStats {
+    /// Number of `Read` ops served.
+    pub read_ops: AtomicU64,
+    /// Content bytes returned in `Read` responses.
+    pub read_bytes: AtomicU64,
+    /// Content bytes inlined in OpenRead first chunks.
+    pub inline_bytes: AtomicU64,
+}
+
+impl ServerStats {
+    /// Total content bytes pushed over the data plane (Read + inline).
+    pub fn content_bytes(&self) -> u64 {
+        self.read_bytes.load(Ordering::Relaxed) + self.inline_bytes.load(Ordering::Relaxed)
+    }
+}
+
+use sembazuru_cas::{BlobStore, Digest};
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
-    DirEntry, DirListRequest, DirListResponse, OpenReadRequest, OpenReadResponse, ReadRequest,
-    ReadResponse, StatEntry, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
+    DirEntry, DirListRequest, DirListResponse, HasRequest, HasResponse, OpenReadRequest,
+    OpenReadResponse, ReadRequest, ReadResponse, StatEntry, StatRequest, StatResponse,
+    WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
-use sembazuru_tracer::determinism::sha256_hex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 const INLINE_CHUNK: usize = 64 * 1024;
+
+/// Disambiguates per-server agent CAS directories within a process.
+static CAS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Resolves a requested (agent-side logical) path to the actual file to read.
 #[derive(Clone)]
@@ -66,14 +96,66 @@ impl PathMap {
     }
 }
 
-#[derive(Default)]
+/// The per-session file-supply state: the agent's content store and the
+/// first-touch pin map that gives snapshot consistency.
 struct Session {
-    by_digest: HashMap<String, PathBuf>,
+    cas: BlobStore,
+    /// Requested logical path → the digest pinned at its first OpenRead. Once a
+    /// path is here, its content is frozen for the session.
+    pinned: Mutex<HashMap<String, Digest>>,
+    stats: Arc<ServerStats>,
+}
+
+impl Session {
+    fn new(stats: Arc<ServerStats>) -> io::Result<Session> {
+        let seq = CAS_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("sbz-agent-cas.{}.{seq}", std::process::id()));
+        Ok(Session {
+            cas: BlobStore::open(root)?,
+            pinned: Mutex::new(HashMap::new()),
+            stats,
+        })
+    }
+
+    /// Returns the pinned `(digest, size)` for `requested`, ingesting its bytes
+    /// into the CAS on first touch. `None` if the file does not exist. A later
+    /// call for the same path returns the *same* digest even if the on-disk
+    /// file has since changed (snapshot consistency).
+    async fn ingest(&self, requested: &str, actual: PathBuf) -> Option<(Digest, u64)> {
+        if let Some(d) = self.pinned.lock().await.get(requested).cloned() {
+            // Already pinned: serve the frozen blob's size from the CAS.
+            let size = self.cas.get(&d).ok().flatten().map(|b| b.len() as u64)?;
+            return Some((d, size));
+        }
+        let bytes = tokio::fs::read(&actual).await.ok()?;
+        let size = bytes.len() as u64;
+        let digest = self.cas.put(&bytes).ok()?;
+        self.pinned
+            .lock()
+            .await
+            .entry(requested.to_string())
+            .or_insert_with(|| digest.clone());
+        Some((digest, size))
+    }
 }
 
 /// Serves the file session identity-mapped on an already-bound listener.
 pub async fn serve_files(listener: TcpListener) -> io::Result<()> {
-    serve_with_map(listener, PathMap::Identity).await
+    serve_with_map(
+        listener,
+        PathMap::Identity,
+        Arc::new(ServerStats::default()),
+    )
+    .await
+}
+
+/// Like [`serve_files`] but with a caller-held [`ServerStats`], so a test or the
+/// M4 rebuild gate can read how many content bytes the agent actually served.
+pub async fn serve_files_with_stats(
+    listener: TcpListener,
+    stats: Arc<ServerStats>,
+) -> io::Result<()> {
+    serve_with_map(listener, PathMap::Identity, stats).await
 }
 
 /// Serves with paths under `logical_root` remapped to `backing_root`. For tests
@@ -87,11 +169,15 @@ pub async fn serve_files_remap(
         logical_root: logical_root.replace('/', "\\").to_lowercase(),
         backing_root,
     };
-    serve_with_map(listener, map).await
+    serve_with_map(listener, map, Arc::new(ServerStats::default())).await
 }
 
-async fn serve_with_map(listener: TcpListener, map: PathMap) -> io::Result<()> {
-    let session = Arc::new(Mutex::new(Session::default()));
+async fn serve_with_map(
+    listener: TcpListener,
+    map: PathMap,
+    stats: Arc<ServerStats>,
+) -> io::Result<()> {
+    let session = Arc::new(Session::new(stats)?);
     let map = Arc::new(map);
     loop {
         let (sock, _peer) = listener.accept().await?;
@@ -105,7 +191,7 @@ async fn serve_with_map(listener: TcpListener, map: PathMap) -> io::Result<()> {
 
 async fn handle_conn(
     mut sock: TcpStream,
-    session: Arc<Mutex<Session>>,
+    session: Arc<Session>,
     map: Arc<PathMap>,
 ) -> io::Result<()> {
     loop {
@@ -124,12 +210,7 @@ async fn handle_conn(
     }
 }
 
-async fn dispatch(
-    op: OpCode,
-    payload: &[u8],
-    session: &Arc<Mutex<Session>>,
-    map: &PathMap,
-) -> Vec<u8> {
+async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Session>, map: &PathMap) -> Vec<u8> {
     match op {
         OpCode::StatBatch => match StatRequest::decode(payload) {
             Ok(req) => stat_batch(req, map).await.encode(),
@@ -151,6 +232,12 @@ async fn dispatch(
             }
             .encode(),
         },
+        OpCode::Has => match HasRequest::decode(payload) {
+            Ok(req) => has(req, session).await.encode(),
+            // A malformed probe answers "present for none" — safe (the peer
+            // will then transfer, never skip a blob the agent lacks).
+            Err(_) => HasResponse { present: vec![] }.encode(),
+        },
         OpCode::WriteBack => match WriteBackRequest::decode(payload) {
             Ok(req) => write_back(req).await.encode(),
             Err(_) => WriteBackResponse {
@@ -167,7 +254,7 @@ async fn dispatch(
 /// build system never sees a torn output (§3.2). WriteBack is NOT remapped — the
 /// agent publishes where it wants the artifact, independent of the read PathMap.
 async fn write_back(req: WriteBackRequest) -> WriteBackResponse {
-    let actual = sha256_hex(&req.bytes);
+    let actual = Digest::of(&req.bytes).canonical();
     if actual != req.digest_hex {
         return WriteBackResponse {
             ok: false,
@@ -221,7 +308,8 @@ fn not_found_open() -> OpenReadResponse {
 }
 
 /// Existence + attributes only (no digest): header resolution probes many
-/// non-existent paths, so this stays cheap. Digest/content come from OpenRead.
+/// non-existent paths, so this stays cheap and ingests nothing. Digest/content
+/// come from OpenRead (which is also where snapshot pinning happens).
 async fn stat_batch(req: StatRequest, map: &PathMap) -> StatResponse {
     let mut entries = Vec::with_capacity(req.paths.len());
     for p in &req.paths {
@@ -245,45 +333,65 @@ async fn stat_batch(req: StatRequest, map: &PathMap) -> StatResponse {
     StatResponse { entries }
 }
 
-async fn open_read(
-    req: OpenReadRequest,
-    session: &Arc<Mutex<Session>>,
-    map: &PathMap,
-) -> OpenReadResponse {
+async fn open_read(req: OpenReadRequest, session: &Session, map: &PathMap) -> OpenReadResponse {
     let actual = map.resolve(&req.path);
-    let bytes = match tokio::fs::read(&actual).await {
-        Ok(b) => b,
-        Err(_) => return not_found_open(),
+    let Some((digest, size)) = session.ingest(&req.path, actual).await else {
+        return not_found_open();
     };
-    let digest_hex = sha256_hex(&bytes);
+    // Inline the first chunk only if asked. A worker-local-cache client sends
+    // `want_inline = false` so a cache hit transfers no content at all.
+    let first_chunk = if req.want_inline {
+        match session.cas.get(&digest) {
+            Ok(Some(bytes)) => bytes[..bytes.len().min(INLINE_CHUNK)].to_vec(),
+            _ => vec![],
+        }
+    } else {
+        vec![]
+    };
     session
-        .lock()
-        .await
-        .by_digest
-        .insert(digest_hex.clone(), actual);
-    let first = &bytes[..bytes.len().min(INLINE_CHUNK)];
+        .stats
+        .inline_bytes
+        .fetch_add(first_chunk.len() as u64, Ordering::Relaxed);
     OpenReadResponse {
         exists: true,
-        size: bytes.len() as u64,
-        digest_hex,
-        first_chunk: first.to_vec(),
+        size,
+        digest_hex: digest.canonical(),
+        first_chunk,
     }
 }
 
-async fn read_range(req: ReadRequest, session: &Arc<Mutex<Session>>) -> ReadResponse {
-    let path = match session.lock().await.by_digest.get(&req.digest_hex).cloned() {
-        Some(p) => p,
-        None => return ReadResponse { bytes: vec![] }, // unknown digest
+/// Serves a ranged read from the *pinned* blob in the CAS (not a fresh disk
+/// read), so content is consistent for the whole session.
+async fn read_range(req: ReadRequest, session: &Session) -> ReadResponse {
+    let Ok(digest) = Digest::parse(&req.digest_hex) else {
+        return ReadResponse { bytes: vec![] };
     };
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(_) => return ReadResponse { bytes: vec![] },
+    let bytes = match session.cas.get(&digest) {
+        Ok(Some(b)) => b,
+        _ => return ReadResponse { bytes: vec![] }, // unknown/absent digest
     };
     let start = (req.offset as usize).min(bytes.len());
     let end = start.saturating_add(req.len as usize).min(bytes.len());
-    ReadResponse {
-        bytes: bytes[start..end].to_vec(),
-    }
+    let out = bytes[start..end].to_vec();
+    session.stats.read_ops.fetch_add(1, Ordering::Relaxed);
+    session
+        .stats
+        .read_bytes
+        .fetch_add(out.len() as u64, Ordering::Relaxed);
+    ReadResponse { bytes: out }
+}
+
+/// Answers which of the probed digests the agent's CAS already holds (§4.3).
+async fn has(req: HasRequest, session: &Session) -> HasResponse {
+    let present = req
+        .digests
+        .iter()
+        .map(|s| match Digest::parse(s) {
+            Ok(d) => session.cas.has(&d),
+            Err(_) => false,
+        })
+        .collect();
+    HasResponse { present }
 }
 
 /// Lists a directory's immediate children (depth is reserved for deeper

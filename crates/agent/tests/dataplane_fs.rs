@@ -64,11 +64,68 @@ async fn fetch_returns_exact_bytes_and_verifies_digest() {
         .expect("rpc ok")
         .expect("file exists");
     assert_eq!(bytes, big, "fetched bytes must match on disk exactly");
-    assert_eq!(digest.len(), 64, "sha-256 hex digest");
+    // BLAKE3 (ADR 0003): canonical "blake3:<64 hex>".
+    assert_eq!(digest.algo(), sembazuru_cas::DigestAlgo::Blake3);
+    assert_eq!(digest.hex().len(), 64, "blake3 hex digest");
 
     // A missing file fetches as None, not an error.
     let missing = dir.join("nope.h").to_string_lossy().into_owned();
     assert!(client.fetch(&missing).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn snapshot_pins_content_against_midbuild_edits() {
+    // §4.1 snapshot consistency: once a path is opened in a session, a later
+    // ranged Read serves the *pinned* bytes even if the on-disk file changed —
+    // a mid-build local edit must not tear a running action.
+    let dir = TempDir::new("snap");
+    let v1 = b"version-ONE-content".to_vec();
+    let path = dir.write("hdr.h", &v1);
+
+    let addr = start_server().await;
+    let mut client = FileClient::connect(addr).await.unwrap();
+
+    // Digest-first open pins v1 in the agent's CAS.
+    let (digest, size) = client
+        .probe_digest(&path)
+        .await
+        .expect("rpc ok")
+        .expect("exists");
+    assert_eq!(size, v1.len() as u64);
+
+    // Edit the file on disk after the pin (different length and bytes).
+    std::fs::write(&path, b"version-TWO-is-longer-now").unwrap();
+
+    // The pinned blob is still served verbatim, not the edited file.
+    let bytes = client
+        .fetch_by_digest(&digest, size)
+        .await
+        .expect("pinned read ok");
+    assert_eq!(
+        bytes, v1,
+        "session must serve the pinned snapshot, not the edit"
+    );
+}
+
+#[tokio::test]
+async fn has_probe_reports_agent_cas_membership() {
+    // §4.3 Has(): after a path is opened (ingested into the agent CAS), its
+    // digest probes present; an unknown digest probes absent. This is the
+    // upload-side dedup the output path uses to skip re-sending known blobs.
+    let dir = TempDir::new("has");
+    let path = dir.write("a.h", b"ingest me\n");
+
+    let addr = start_server().await;
+    let mut client = FileClient::connect(addr).await.unwrap();
+
+    let (digest, _) = client.probe_digest(&path).await.unwrap().expect("exists");
+    let absent = sembazuru_cas::Digest::of(b"never ingested").canonical();
+
+    let present = client
+        .has(&[digest.canonical(), absent])
+        .await
+        .expect("rpc ok");
+    assert_eq!(present, vec![true, false]);
 }
 
 #[tokio::test]

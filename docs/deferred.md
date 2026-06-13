@@ -41,15 +41,15 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 
 ## M4（CAS とキャッシュ）— 本バックログの主対象
 
-- **スナップショット一貫性が簡略。** agent fileserver は OpenRead 時に digest を計算し
-  セッションキャッシュするだけ（初回タッチ前のローカル編集は未ガード）。完全な
-  「セッション開始時点の fs を digest ピン留め」は未実装。出所: fileserver.rs M3.2 注、
-  v0 §4.1。M4 の CAS と併せて設計するのが自然。
-- **ワーカーローカルキャッシュ未実装。** 一度見たヘッダ/SDK を再送しない仕組み（M4
-  Done-when の核）。現状 hydrate 毎に agent から全取得。出所: DESIGN §7 M4、v0 §4.1
-  「worker-local cache consulted first, M4」。
-- **CAS の重複排除・`Has(digests[])` バッチプローブ未実装。** 転送前に既存 digest を
-  一括確認（v0 §4.3）。出所: v0 §4.3。
+- **スナップショット一貫性 — 解消（コミット M4.2）。** agent fileserver は初回タッチで内容を CAS に
+  ingest し `path→digest` を pin、以降の Read は pin した CAS blob から供給（ディスク再読みしない）。
+  セッション開始後の局所編集が走行中アクションを破壊しない。出所: fileserver.rs、v0 §4.1。
+- **ワーカーローカルキャッシュ — 解消（コミット M4.2）。** worker は cas_root 配下のローカル CAS を持ち、
+  hydrate を digest-first 化（probe で digest のみ取得→ローカル CAS ヒットなら転送ゼロ、ミスのみ fetch）。
+  2 回目ビルドで content 転送ゼロを結合テストで実証。出所: DESIGN §7 M4、v0 §4.1。
+- **CAS の重複排除・`Has(digests[])` バッチプローブ — 解消（コミット M4.2）。** `OpCode::Has` を追加し
+  agent CAS のメンバシップを一括回答。読み側の重複排除は worker ローカル CAS（ローカル has）で、
+  書き/出力側は network Has() で実現（後者は M4.3/M4.4 の出力アップロードで活用）。出所: v0 §4.3。
 - **ハッシュ方式とチャンク戦略 — 解消（ADR 0003、コミット M4.0）。** 実測で BLAKE3 採用、
   チャンクは whole-file 基準＋大ファイル(2MiB超)のみ固定チャンク、CDC 見送り。`sembazuru-cas`
   の `Digest`（algo タグ付き、既定 BLAKE3）に集約。`determinism.rs::sha256_hex` は M2 ゲート用に温存。
@@ -61,6 +61,10 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **put と evict の並行でスプリアス失敗の余地。** content-addressed ゆえ内容汚染は無いが、稀に put が
   一時的 io エラーを返し上位が永続失敗と誤認しうる。並行運用するなら `CasError` で一時/永続を区別。
   出所: security(M4.1 MEDIUM)。
+- **agent セッション CAS／pin マップが無制限に増加。** fileserver の `Session` は接続をまたいで単一で、
+  初回タッチ ingest した blob（temp 下の連番 CAS）と `pinned` マップが単調増加する。eviction は worker CAS
+  向けで agent セッション CAS には掛からない。短命セッションでは無害だが長寿命 agent で膨らむ。M4.3/M5 で
+  セッション境界の破棄／eviction を設計。出所: verifier(M4.2 懸念2)。
 - **アクションキャッシュ未実装。** 入力ハッシュ→出力。同一コンパイルをスキップ。
   土台は `verify-determinism --json` が出す入力ハッシュ→出力ハッシュ写像
   （determinism.md「Input-hash → output-hash mapping」）。鍵に command line＋env＋
