@@ -266,6 +266,12 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
     let mut trace_b: Option<String> = None;
     let mut root_b: Option<String> = None;
     let mut json = false;
+    // Explicit output artifacts to compare (work-root-relative), repeatable.
+    // When given, these replace trace-derived output discovery — necessary for
+    // toolchains (clang/lld) that write to a run-varying temp file and rename
+    // it via an NT-level call our Win32 hooks don't see, so the trace only
+    // records the transient temp name, never the final artifact.
+    let mut outputs: Vec<String> = Vec::new();
 
     // Path arguments take a value; Windows paths contain ':' and '\', so a
     // packed "dir:root" form would be ambiguous — keep four plain flags.
@@ -277,6 +283,17 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
             "--root-a" => Some(&mut root_a),
             "--trace-b" => Some(&mut trace_b),
             "--root-b" => Some(&mut root_b),
+            "--output" => match args.get(i + 1) {
+                Some(v) => {
+                    outputs.push(v.clone());
+                    i += 2;
+                    continue;
+                }
+                None => {
+                    eprintln!("error: --output requires a value");
+                    return ExitCode::from(2);
+                }
+            },
             "--json" => {
                 json = true;
                 i += 1;
@@ -330,21 +347,27 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
         }
     };
 
-    // Outputs are keyed by their logical path: relative to the *build* root
-    // (the run's recorded cwd), so the same artifact compares as one even when
-    // the two runs built in different directories. The files themselves are
-    // read from `--root-*` (the read root), which may differ from the build
-    // root — e.g. when run A's outputs were snapshotted aside before run B
-    // overwrote them in a shared build dir.
-    let outs_a = logical_outputs(&graph_a, &cwd_a);
-    let outs_b = logical_outputs(&graph_b, &cwd_b);
+    // Trace-derived outputs, keyed by logical path relative to the *build*
+    // root (the run's recorded cwd). Used to exclude generated artifacts —
+    // including run-varying temp files — from the input hash.
+    let trace_out_a = logical_outputs(&graph_a, &cwd_a);
+    let trace_out_b = logical_outputs(&graph_b, &cwd_b);
+
+    // The comparison set: explicit --output artifacts when given (both runs are
+    // expected to have each), else the trace-derived outputs per run.
+    let (outs_a, outs_b) = if outputs.is_empty() {
+        (trace_out_a.clone(), trace_out_b.clone())
+    } else {
+        let s: BTreeSet<String> = outputs.iter().cloned().collect();
+        (s.clone(), s)
+    };
 
     // Input-hash stability: the same logical inputs must hash the same in both
     // runs, which is what makes the input->output mapping meaningful. Generated
-    // outputs (even if reopened read-write) are excluded — only true sources
-    // count as inputs.
-    let in_a = compute_input_hash(&graph_a, &cwd_a, &outs_a);
-    let in_b = compute_input_hash(&graph_b, &cwd_b, &outs_b);
+    // outputs (trace-derived, even if reopened read-write, and including temp
+    // artifacts) are excluded — only true sources count as inputs.
+    let in_a = compute_input_hash(&graph_a, &cwd_a, &trace_out_a);
+    let in_b = compute_input_hash(&graph_b, &cwd_b, &trace_out_b);
     let input_match = in_a == in_b;
 
     // Compare each logical output present in both runs; flag set mismatches.
@@ -620,6 +643,10 @@ fn verify_help() -> &'static str {
         "  --root-a  <DIR>  Work root for run A (where its outputs live)\n",
         "  --trace-b <DIR>  Trace dir for run B\n",
         "  --root-b  <DIR>  Work root for run B\n",
+        "  --output  <REL>  Compare this work-root-relative artifact explicitly\n",
+        "                   (repeatable). Use when the compiler writes via a\n",
+        "                   run-varying temp file + rename the tracer can't see\n",
+        "                   (clang/lld); replaces trace-derived output discovery.\n",
         "  --json           Emit a machine-readable report\n",
         "  --help           Print this help\n",
     )

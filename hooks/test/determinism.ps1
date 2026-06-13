@@ -138,7 +138,8 @@ function Invoke-SameRootGate {
     # function's return value, leaving $LASTEXITCODE the only thing returned.
     & $TracerExe verify-determinism `
         --trace-a $traceA --root-a $snap `
-        --trace-b $traceB --root-b $root | Out-Host
+        --trace-b $traceB --root-b $root `
+        --output a.obj --output b.obj | Out-Host
     return $LASTEXITCODE
 }
 
@@ -160,7 +161,8 @@ function Invoke-DiffRootGate {
 
     & $TracerExe verify-determinism `
         --trace-a $traceA --root-a $rootA `
-        --trace-b $traceB --root-b $rootB | Out-Host
+        --trace-b $traceB --root-b $rootB `
+        --output a.obj --output b.obj | Out-Host
     return $LASTEXITCODE
 }
 
