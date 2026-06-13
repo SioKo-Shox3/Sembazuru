@@ -84,15 +84,17 @@ cl /nologo /c /Brepro a.cpp        # + /d1trimfile:<prefix> for __FILE__
 
 ## Known limitation: MSVC-native `.obj` is not byte-identical across directories
 
-Empirically (verified by `verify-determinism` on cl 14.50): a `.obj` built by
+Empirically (verified by `verify-determinism` on cl 14.x): a `.obj` built by
 `cl` in two **different** directories differs even with `/Brepro` and
 `/d1trimfile`, because the object's `.debug$S` section embeds the **absolute
-object path** in an `S_OBJNAME` record, and a content hash derived from it. No
-documented `cl` flag removes `S_OBJNAME`; `/d1trimfile` only trims `__FILE__`
-and debug *source* paths, not the object name. This matches the upstream
-position that MSVC-native reproducibility needs a post-processing tool
+object path** in an `S_OBJNAME` record (and, as M4.5 found, in other build-path
+fields too). No documented `cl` flag removes `S_OBJNAME`; `/d1trimfile` only
+trims `__FILE__` and debug *source* paths, not the object name. This matches the
+upstream position that MSVC-native reproducibility needs a post-processing tool
 ([microsoft-pdb#9](https://github.com/microsoft/microsoft-pdb/issues/9),
-[ducible](https://github.com/jasonwhite/ducible)).
+[ducible](https://github.com/jasonwhite/ducible)). M4.5 normalizes the
+`S_OBJNAME` record (see the update below); the remaining embeddings are
+deferred.
 
 Consequences for the gate:
 
@@ -108,6 +110,35 @@ Path-independent MSVC determinism (needed to relocate a remote MSVC build to a
 local path) is therefore a distribution-time concern for M3/M4 — solved either
 by normalizing the remote path to match the local one, or by an `S_OBJNAME`
 post-processing step. It is deliberately out of M2 scope.
+
+### M4.5 update: S_OBJNAME is now normalized (partial MSVC path independence)
+
+`normalize` masks the payload of S_OBJNAME records in any `.debug$S`
+DEBUG_S_SYMBOLS subsection (`REASON_COFF_OBJNAME`), so the embedded **object
+path** no longer blocks a cross-directory match. Measured on cl 14.x, however,
+S_OBJNAME is **not the only** absolute-build-path embedding, so MSVC is **still
+not fully byte-identical across directories**. Remaining sources (deferred —
+full coverage would be a ducible-class post-processor, `docs/deferred.md` M4):
+
+- **Build-info working directory** in the `.debug$S` string table (the cwd that
+  `S_BUILDINFO` / `LF_BUILDINFO` references). `/d1trimfile` does not trim it.
+- **`/Brepro` content-hash Build ID**, computed by `cl` over the *original*
+  (path-bearing) bytes, so it differs even after the path itself is masked.
+- **Different-length paths** change `S_OBJNAME`'s record length and the object
+  size, which masking (which preserves lengths) cannot equalize.
+
+The S_OBJNAME correction (one earlier blocker, now removed) was confirmed
+against real cross-directory cl objects: with `/d1trimfile` trimming the source
+path, masking S_OBJNAME removes the object-path difference; what remains is the
+build-info cwd and the `/Brepro` Build ID above. The earlier claim here that
+S_OBJNAME carries "a content hash derived from" the path was inaccurate — its
+signature word is reserved/zero; the path string is the sole S_OBJNAME variant.
+
+Consequence for the gate: **clang-cl remains the cross-directory byte-identity
+gate** (first-class, `-RequireClangCl`). MSVC keeps its same-root content gate.
+The action cache (M4.3) therefore reuses MSVC results for **same-path** rebuilds
+(the realistic 2nd build); cross-dir/cross-machine MSVC reuse waits on the
+remaining normalization above or on remote path normalization.
 
 ## Resolved in M3.1.5: clang/lld write outputs via a temp + NT rename
 

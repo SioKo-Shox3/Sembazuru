@@ -126,10 +126,16 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 
 ## 横断・既知の制約
 
-- **MSVC ネイティブのバイト一致はベストエフォート。** `.debug$S` の S_OBJNAME に絶対
-  オブジェクトパスが埋まるため cross-dir で一致せず。clang-cl が一致ゲート（CLAUDE.md /
-  determinism.md / 決定者承認）。MSVC を一致させるにはワーカーが同一論理パス
-  （ドライブ・大小文字まで）でビルドする必要。出所: determinism.md、AskUser(2026-06-13)。
+- **MSVC ネイティブのバイト一致はベストエフォート（M4.5 で S_OBJNAME のみ正規化）。**
+  M4.5 で `.debug$S` の S_OBJNAME（オブジェクトパス）を正規化し cross-dir の一阻害要因を除去。
+  ただし実測で MSVC は絶対ビルドパスを**他にも**埋め込むため依然 cross-dir バイト一致しない。
+  残る源（deferred、完全対応は ducible 相当の後処理）: (1) `.debug$S` 文字列テーブルの
+  build-info cwd（S_BUILDINFO/LF_BUILDINFO 参照、/d1trimfile で消えない）、(2) /Brepro の
+  content-hash Build ID（パス込み内容から算出のため S_OBJNAME マスク後も残る）、(3) 長さの
+  異なるパスは S_OBJNAME のレコード長・オブジェクトサイズを変え、長さ保存のマスクでは
+  一致不能。clang-cl が cross-dir 一致ゲートのまま（first-class）。MSVC はアクションキャッシュ
+  を**同一パス rebuild**で活用（cross-dir/cross-machine 再利用はリモートパス正規化 or 上記
+  残源の正規化待ち）。出所: determinism.md、実測(M4.5)、AskUser(2026-06-13)。
 - **速度実測は単一マシン＋RTT エミュレーション。** 実 2 台 LAN は未実施（決定者承認の
   M3 方針）。RTT 注入は spin-wait（Windows タイマ粒度 ~15ms 対策）。出所: ADR 0002、
   AskUser(2026-06-13)。
