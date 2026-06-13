@@ -34,3 +34,9 @@ jobs:
       # runner ships LLVM on PATH).
       - name: M1 tracer smoke (completeness, propagation, reproducibility)
         run: pwsh -NoProfile -File hooks/test/smoke.ps1 -RequireClangCl
+      # Gates the M2 "Done when": representative C++ TUs reproduce their output
+      # *bytes*. MSVC is checked for content determinism (same build root);
+      # clang-cl for path independence across different roots (required here —
+      # the runner ships LLVM). See docs/determinism.md.
+      - name: M2 determinism harness (byte reproducibility)
+        run: pwsh -NoProfile -File hooks/test/determinism.ps1 -RequireClangCl
