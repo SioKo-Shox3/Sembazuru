@@ -108,6 +108,10 @@ function Build-Run {
         Pop-Location
         Remove-Item Env:\SEMBAZURU_TRACE_DIR -ErrorAction SilentlyContinue
     }
+    # Defense in depth (the gate must compare something): a successful compile
+    # that produced no .obj would otherwise let verify-determinism pass vacuously.
+    $objCount = @(Get-ChildItem $Root -Filter *.obj).Count
+    if ($objCount -lt 1) { throw "$Cc produced no .obj in $Root" }
 }
 
 # Content-determinism gate: build twice in the SAME build root (snapshotting

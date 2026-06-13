@@ -323,11 +323,13 @@ pub fn relativize(path: &str, workroot: &str) -> String {
     let w = workroot.trim_end_matches('\\');
     if !w.is_empty()
         && let Some(rest) = path.strip_prefix(w)
+        // The match must end on a separator boundary, or `c:\work\a` would
+        // wrongly swallow the sibling `c:\work\ab\...` and collide two
+        // unrelated files into one logical entry.
+        && let Some(tail) = rest.strip_prefix('\\')
+        && !tail.is_empty()
     {
-        let rest = rest.trim_start_matches('\\');
-        if !rest.is_empty() {
-            return rest.to_string();
-        }
+        return tail.trim_start_matches('\\').to_string();
     }
     path.to_string()
 }
@@ -506,5 +508,36 @@ mod tests {
             relativize("c:\\program files\\inc\\stdio.h", "c:\\work\\a"),
             "c:\\program files\\inc\\stdio.h"
         );
+    }
+
+    #[test]
+    fn relativize_does_not_swallow_sibling_dir() {
+        // `c:\work\a` must NOT be treated as a prefix of `c:\work\ab\...`:
+        // the match has to land on a separator boundary, else two unrelated
+        // files would collide into one logical entry.
+        assert_eq!(
+            relativize("c:\\work\\ab\\x.obj", "c:\\work\\a"),
+            "c:\\work\\ab\\x.obj"
+        );
+        // Exact-equal path (the root itself) is left as-is, not emptied.
+        assert_eq!(relativize("c:\\work\\a", "c:\\work\\a"), "c:\\work\\a");
+    }
+
+    #[test]
+    fn rich_less_pe_is_not_spuriously_masked() {
+        // A PE with no Rich header (typical of lld-link output) must not have
+        // real bytes zeroed by the Rich scan. Only the file-header timestamp
+        // is touched.
+        let img = pe_image(0xcafe_f00d);
+        let n = normalize(&img);
+        assert!(!n.reasons.contains(&REASON_PE_RICH_HEADER));
+        // Everything except the masked 4-byte timestamp is preserved.
+        let coff = 0x40 + 4;
+        for (i, (&orig, &got)) in img.iter().zip(n.bytes.iter()).enumerate() {
+            if (coff + 4..coff + 8).contains(&i) {
+                continue; // the timestamp we intentionally zero
+            }
+            assert_eq!(orig, got, "byte {i} must be preserved");
+        }
     }
 }
