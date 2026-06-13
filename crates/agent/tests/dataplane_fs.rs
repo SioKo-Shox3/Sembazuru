@@ -107,6 +107,17 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     assert!(resp.ok, "write-back should succeed: {}", resp.detail);
     assert_eq!(std::fs::read(&out).unwrap(), bytes, "published bytes match");
 
+    // Re-publishing over an existing output must replace it atomically (the
+    // rename-over-existing case a rebuild hits every time).
+    let bytes2 = b"\x02REBUILT-obj\x03".to_vec();
+    let resp2 = client.write_back(&out, &bytes2).await.unwrap();
+    assert!(resp2.ok, "re-publish should replace: {}", resp2.detail);
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        bytes2,
+        "output replaced on rebuild"
+    );
+
     // A corrupted transfer (digest does not match the bytes) is rejected, and no
     // torn output is published. Send a hand-built frame with a wrong digest.
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
