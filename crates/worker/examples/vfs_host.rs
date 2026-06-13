@@ -27,6 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         None
     };
+    // Synthetic worker<->agent RTT for the latency benchmark (microseconds).
+    let rtt = std::env::var("SEMBAZURU_VFS_RTT_US")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_micros)
+        .unwrap_or(std::time::Duration::ZERO);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -39,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         };
         let _ = r;
     });
-    eprintln!("vfs_host: file server on {addr}, pipe {pipe_name}");
-    sembazuru_worker::vfs_pipe::serve_vfs(&pipe_name, addr, scratch).await?;
+    eprintln!("vfs_host: file server on {addr}, pipe {pipe_name}, rtt {rtt:?}");
+    sembazuru_worker::vfs_pipe::serve_vfs(&pipe_name, addr, scratch, rtt).await?;
     Ok(())
 }

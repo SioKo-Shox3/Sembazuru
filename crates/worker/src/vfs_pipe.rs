@@ -22,6 +22,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -59,6 +60,7 @@ pub async fn serve_vfs(
     pipe_name: &str,
     agent_addr: SocketAddr,
     scratch_root: PathBuf,
+    rtt: Duration,
 ) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     let cache: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -75,7 +77,7 @@ pub async fn serve_vfs(
         let cache = cache.clone();
         let scratch = scratch_root.clone();
         tokio::spawn(async move {
-            let _ = handle_client(connected, agent_addr, scratch, cache).await;
+            let _ = handle_client(connected, agent_addr, scratch, cache, rtt).await;
         });
     }
 }
@@ -85,6 +87,7 @@ async fn handle_client(
     agent_addr: SocketAddr,
     scratch_root: PathBuf,
     cache: Arc<Mutex<HashMap<String, String>>>,
+    rtt: Duration,
 ) -> io::Result<()> {
     loop {
         let path = match read_msg(&mut pipe).await {
@@ -99,7 +102,7 @@ async fn handle_client(
             Err(e) => return Err(e),
         };
 
-        let (status, local) = hydrate(&path, agent_addr, &scratch_root, &cache).await;
+        let (status, local) = hydrate(&path, agent_addr, &scratch_root, &cache, rtt).await;
         write_response(&mut pipe, status, &local).await?;
     }
 }
@@ -109,12 +112,13 @@ async fn hydrate(
     agent_addr: SocketAddr,
     scratch_root: &Path,
     cache: &Arc<Mutex<HashMap<String, String>>>,
+    rtt: Duration,
 ) -> (u8, String) {
     if let Some(local) = cache.lock().await.get(path) {
         return (STATUS_OK, local.clone());
     }
 
-    let mut client = match FileClient::connect(agent_addr).await {
+    let mut client = match FileClient::connect_with_rtt(agent_addr, rtt).await {
         Ok(c) => c,
         Err(_) => return (STATUS_ERROR, String::new()),
     };
