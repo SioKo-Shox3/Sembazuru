@@ -181,8 +181,11 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     let bad = dir.join("out/bad.obj").to_string_lossy().into_owned();
     let payload = WriteBackRequest {
         path: bad.clone(),
-        digest_hex: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        digest_hex: "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            .into(),
+        offset: 0,
         bytes: b"these-bytes-do-not-match-that-digest".to_vec(),
+        last: true,
     }
     .encode();
     let framed = encode_frame(
@@ -205,6 +208,34 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     assert!(
         !std::path::Path::new(&bad).exists(),
         "no torn output published"
+    );
+}
+
+#[tokio::test]
+async fn write_back_streams_large_output_in_chunks() {
+    // M4.4: an output larger than the 1 MiB WriteBack chunk is streamed across
+    // several chunks, verified against the whole-file digest, and published
+    // atomically — without buffering it whole.
+    let dir = TempDir::new("wb-big");
+    let out = dir.join("out/big.pdb").to_string_lossy().into_owned();
+    // ~3.5 MiB of non-trivial bytes → 4 chunks (1+1+1+0.5).
+    let big: Vec<u8> = (0..3_600_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+
+    let addr = start_server().await;
+    let mut client = FileClient::connect(addr).await.unwrap();
+
+    let resp = client.write_back(&out, &big).await.unwrap();
+    assert!(
+        resp.ok,
+        "chunked write-back should succeed: {}",
+        resp.detail
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        big,
+        "the streamed output is published byte-for-byte"
     );
 }
 

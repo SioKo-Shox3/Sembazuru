@@ -286,16 +286,29 @@ impl DirListResponse {
 
 // --- WriteBack -----------------------------------------------------------
 
-/// Worker -> Agent output return (`docs/protocol/v0.md` §4.1). The agent
-/// publishes the bytes atomically at `path` (temp + rename) after verifying the
-/// digest. M3.3 sends the whole artifact in one message; chunked WriteBack is a
-/// later optimization for large outputs.
+/// Worker -> Agent output return (`docs/protocol/v0.md` §4.1), streamed.
+///
+/// An output is sent as one or more chunks at increasing `offset`; `digest_hex`
+/// is the **whole file's** digest (constant across the stream). The agent
+/// appends each chunk to a temp file and, on the chunk with `last == true`,
+/// verifies the assembled file against `digest_hex` and atomically renames it
+/// onto `path` (§3.2). A small output is just a single chunk with `offset == 0`
+/// and `last == true` — so this one shape covers both the M3.3 single-shot case
+/// and the M4.4 large-output case without holding the whole blob in memory
+/// (ADR 0003: large files stream in fixed chunks).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteBackRequest {
     /// Agent-side logical path to publish the output at.
     pub path: String,
+    /// Digest of the *entire* output (every chunk of one output repeats it).
     pub digest_hex: String,
+    /// Byte offset of this chunk within the output (must equal the bytes
+    /// received so far for `path`; chunks are in order).
+    pub offset: u64,
+    /// This chunk's bytes.
     pub bytes: Vec<u8>,
+    /// True on the final chunk: triggers digest verification and atomic publish.
+    pub last: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,19 +323,25 @@ impl WriteBackRequest {
         let mut w = Writer::new();
         w.str(&self.path);
         w.str(&self.digest_hex);
+        w.u64(self.offset);
         w.bytes(&self.bytes);
+        w.bool(self.last);
         w.into_bytes()
     }
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(buf);
         let path = r.str()?;
         let digest_hex = r.str()?;
+        let offset = r.u64()?;
         let bytes = r.bytes()?;
+        let last = r.bool()?;
         r.finish()?;
         Ok(WriteBackRequest {
             path,
             digest_hex,
+            offset,
             bytes,
+            last,
         })
     }
 }
@@ -512,10 +531,21 @@ mod tests {
     fn write_back_round_trips() {
         let req = WriteBackRequest {
             path: "c:\\out\\a.obj".into(),
-            digest_hex: "feedface".into(),
+            digest_hex: "blake3:feedface".into(),
+            offset: 0,
             bytes: vec![0u8, 1, 2, 255, 128],
+            last: true,
         };
         assert_eq!(WriteBackRequest::decode(&req.encode()).unwrap(), req);
+        // A mid-stream chunk (nonzero offset, not last) round-trips too.
+        let mid = WriteBackRequest {
+            path: "c:\\out\\big.pdb".into(),
+            digest_hex: "blake3:abcd".into(),
+            offset: 1_048_576,
+            bytes: vec![7u8; 16],
+            last: false,
+        };
+        assert_eq!(WriteBackRequest::decode(&mid.encode()).unwrap(), mid);
         let resp = WriteBackResponse {
             ok: false,
             detail: "digest mismatch".into(),
