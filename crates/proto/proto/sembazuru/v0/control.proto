@@ -43,6 +43,13 @@ message Capabilities {
 message RegisterRequest {
   string worker_id = 1;
   Capabilities caps = 2;
+  // Where the agent should dial this worker's Execution service. Coordination
+  // is worker->agent push (§3.1), so the worker announces its own Execution
+  // endpoint here; the agent learns it from registration, not a static list.
+  string execution_endpoint = 3;  // e.g. "http://127.0.0.1:50061"
+  // Reserved for the zero-trust trust model (M7, DESIGN.md §9): attestation
+  // token / client-cert. Kept out of v0 so adding them is wire-compatible.
+  reserved 10, 11;
 }
 
 message RegisterResponse {
@@ -54,6 +61,11 @@ message RegisterResponse {
 message HeartbeatPing {
   string worker_id = 1;
   uint64 monotonic_qpc = 2;     // worker QueryPerformanceCounter sample
+  // Capacity pushed on every ping so the agent's least-loaded scheduling
+  // (ADR 0004) needs no separate pull RPC. idle_slots = cpu_count -
+  // running_actions, clamped at 0.
+  uint32 running_actions = 3;
+  uint32 idle_slots = 4;
 }
 
 message HeartbeatPong {

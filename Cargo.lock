@@ -808,6 +808,7 @@ dependencies = [
  "sembazuru-tracer",
  "sembazuru-worker",
  "tokio",
+ "tokio-stream",
  "tonic",
 ]
 
