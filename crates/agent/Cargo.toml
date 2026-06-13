@@ -28,4 +28,4 @@ tokio = { version = "1", features = [
 
 [dev-dependencies]
 sembazuru-worker = { path = "../worker" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
