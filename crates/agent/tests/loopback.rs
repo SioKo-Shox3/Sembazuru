@@ -7,6 +7,7 @@
 //! so the Rust CI job needs none of the C++ build artifacts: this gates the
 //! control-plane lifecycle, not virtualization.
 
+use sembazuru_agent::Execution;
 use sembazuru_proto::v0::{ActionState, Command};
 
 /// Starts an in-process worker, returns its `http://` endpoint.
@@ -24,6 +25,45 @@ fn cmd(argv: &[&str]) -> Command {
         argv: argv.iter().map(|s| s.to_string()).collect(),
         env: Default::default(),
         cwd: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn fallback_runs_locally_when_remote_is_unreachable() {
+    // No worker at this address: execute_with_fallback must still complete the
+    // action by running it locally (DESIGN.md §2: local fallback always works).
+    let dead = "http://127.0.0.1:1".to_string();
+    let exec = sembazuru_agent::execute_with_fallback(
+        dead,
+        cmd(&["cmd", "/c", "exit", "3"]),
+        "act-fb".to_string(),
+        "sess".to_string(),
+    )
+    .await;
+    match exec {
+        Execution::LocalFallback { exit_code, reason } => {
+            assert_eq!(
+                exit_code, 3,
+                "local fallback ran the command, reason: {reason}"
+            );
+        }
+        other => panic!("expected local fallback, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn remote_path_is_used_when_the_worker_is_alive() {
+    let endpoint = start_worker().await;
+    let exec = sembazuru_agent::execute_with_fallback(
+        endpoint,
+        cmd(&["cmd", "/c", "exit", "5"]),
+        "act-remote".to_string(),
+        "sess".to_string(),
+    )
+    .await;
+    match exec {
+        Execution::Remote(o) => assert_eq!(o.exit_code, Some(5)),
+        other => panic!("expected remote execution, got {other:?}"),
     }
 }
 

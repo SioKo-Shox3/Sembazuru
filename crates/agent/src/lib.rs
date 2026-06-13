@@ -63,10 +63,15 @@ impl From<tonic::Status> for ExecuteError {
 async fn connect_with_retry(
     endpoint: String,
 ) -> Result<ExecutionClient<tonic::transport::Channel>, ExecuteError> {
+    // A bounded per-attempt connect timeout so a dead endpoint fails the whole
+    // budget in ~1s (fast fallback) instead of hanging on the OS connect.
+    let ep = tonic::transport::Endpoint::from_shared(endpoint)
+        .map_err(ExecuteError::Transport)?
+        .connect_timeout(Duration::from_millis(200));
     let mut last: Option<tonic::transport::Error> = None;
     for _ in 0..20 {
-        match ExecutionClient::connect(endpoint.clone()).await {
-            Ok(c) => return Ok(c),
+        match ep.connect().await {
+            Ok(channel) => return Ok(ExecutionClient::new(channel)),
             Err(e) => {
                 last = Some(e);
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -107,4 +112,57 @@ pub async fn execute_remote(
         }
     }
     Ok(outcome)
+}
+
+/// How an action ultimately ran.
+#[derive(Debug)]
+pub enum Execution {
+    /// The worker ran it and reported an exit status.
+    Remote(ActionOutcome),
+    /// The remote path failed (or didn't complete) and the agent ran it locally.
+    /// Local fallback is the hard requirement of `docs/DESIGN.md` §2 — a build
+    /// must complete even if the network or a worker dies.
+    LocalFallback { exit_code: i32, reason: String },
+}
+
+/// Runs `command` on the local machine, returning its exit code. This is the
+/// fallback path; outputs land where the command writes them (a self-contained
+/// local build), so no write-back is involved.
+pub async fn run_local(command: &Command) -> std::io::Result<i32> {
+    if command.argv.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command.argv is empty",
+        ));
+    }
+    let mut cmd = tokio::process::Command::new(&command.argv[0]);
+    cmd.args(&command.argv[1..]);
+    if !command.cwd.is_empty() {
+        cmd.current_dir(&command.cwd);
+    }
+    for (k, v) in &command.env {
+        cmd.env(k, v);
+    }
+    let status = cmd.status().await?;
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// Tries the action on the worker; on any remote failure — transport/RPC error,
+/// or the action not completing (worker reported FAILED, no exit) — re-runs it
+/// locally. This is the "safety half" of M3.4: the build always completes. The
+/// latency-budget timer and the detect-unvirtualizable-access trigger are the
+/// tuning half (M3.5 / later); this guarantees correctness first.
+pub async fn execute_with_fallback(
+    endpoint: String,
+    command: Command,
+    action_id: String,
+    session_id: String,
+) -> Execution {
+    let reason = match execute_remote(endpoint, command.clone(), action_id, session_id).await {
+        Ok(outcome) if outcome.exit_code.is_some() => return Execution::Remote(outcome),
+        Ok(_) => "remote action did not complete (no exit status)".to_string(),
+        Err(e) => format!("remote execution failed: {e}"),
+    };
+    let exit_code = run_local(&command).await.unwrap_or(-1);
+    Execution::LocalFallback { exit_code, reason }
 }
