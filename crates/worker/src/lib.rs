@@ -10,6 +10,7 @@
 //! assumption that M3.2 would have to tear out.
 
 pub mod fileclient;
+pub mod vfs_pipe;
 
 use std::process::Stdio;
 use std::time::Instant;
