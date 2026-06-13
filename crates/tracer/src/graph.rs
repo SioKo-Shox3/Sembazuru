@@ -107,6 +107,15 @@ fn normalize_path(raw: &str, cwd: &str) -> String {
     }
 }
 
+/// Canonicalizes an already-absolute path the same way the graph normalizes
+/// the paths in its input/output sets, so a caller (e.g. the determinism gate)
+/// can derive a work-root prefix that actually matches those entries. Equivalent
+/// to normalizing with no cwd: a relative path would be left verbatim, which is
+/// not what a work root should be.
+pub fn normalize_for_compare(path: &str) -> String {
+    normalize_path(path, "")
+}
+
 /// Path shape, used to decide how (and whether) to resolve a path.
 enum PathKind {
     /// `\\server\share\…` or `\\.\device` — leading double separator.
