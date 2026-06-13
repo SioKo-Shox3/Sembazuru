@@ -9,6 +9,8 @@
 //! later; keeping the worker filesystem-agnostic here avoids baking in an
 //! assumption that M3.2 would have to tear out.
 
+pub mod fileclient;
+
 use std::process::Stdio;
 use std::time::Instant;
 
