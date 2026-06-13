@@ -116,11 +116,13 @@ $delta = $vfs1 - $vfs0
 Write-Host ('RTT delta       : {0,7:N1} ms  (1ms-RTT minus 0ms-RTT; ~= round-trips x 1ms)' -f $delta)
 
 $failures = @()
-# Round-trips do not blow it up: a 1 ms RTT adds only a few ms (~one per project
-# file fetched; the corpus has ~8), not hundreds. 80 ms still leaves ~10x slack
-# over the expected delta while catching a round-trip-count blow-up.
-if ($delta -gt 80) {
-    $failures += "round-trip latency dominates: 1ms RTT added $([int]$delta) ms (expected a few ms for a handful of project files)"
+# Round-trips do not blow it up: a 1 ms RTT (injected accurately via spin-wait)
+# adds only ~one ms per project file fetched (the corpus has ~8), i.e. ~8 ms. A
+# blow-up where the hundreds of SDK headers wrongly traversed the VFS would add
+# hundreds of ms. 100 ms cleanly separates the two while tolerating wall-clock
+# noise on a shared CI runner.
+if ($delta -gt 100) {
+    $failures += "round-trip latency dominates: 1ms RTT added $([int]$delta) ms (expected ~8 ms for a handful of project files; a blow-up would be hundreds)"
 }
 # Not catastrophically slower than local. The VFS path also pays fixed
 # injection/pipe/agent overhead, so allow generous headroom; this guards against

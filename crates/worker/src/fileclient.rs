@@ -8,7 +8,7 @@
 //! pipelining that exploits that is M3.5 latency work.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
@@ -53,7 +53,15 @@ impl FileClient {
     /// caught rather than silently mis-parsed.
     async fn call(&mut self, op: OpCode, payload: &[u8]) -> io::Result<Vec<u8>> {
         if !self.rtt.is_zero() {
-            tokio::time::sleep(self.rtt).await; // emulate one network round-trip
+            // Emulate one network round-trip. Spin-wait, not tokio::time::sleep:
+            // the OS/timer granularity on Windows (~15 ms) makes sub-15 ms sleeps
+            // wildly inaccurate, which would dwarf a true 1 ms RTT and make the
+            // measurement meaningless. This is a benchmark-only shim (rtt is ZERO
+            // in production), so the brief busy-wait is acceptable.
+            let start = Instant::now();
+            while start.elapsed() < self.rtt {
+                std::hint::spin_loop();
+            }
         }
         let id = self.next_id;
         self.next_id += 1;
