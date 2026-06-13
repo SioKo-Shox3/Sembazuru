@@ -5,6 +5,7 @@
 //! is layered on. No compiler or DLL involved.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use sembazuru_worker::fileclient::FileClient;
 
@@ -56,7 +57,7 @@ async fn fetch_returns_exact_bytes_and_verifies_digest() {
     let path = dir.write("sub/main.cpp", &big);
 
     let addr = start_server().await;
-    let mut client = FileClient::connect(addr).await.unwrap();
+    let client = FileClient::connect(addr).await.unwrap();
 
     let (bytes, digest) = client
         .fetch(&path)
@@ -83,7 +84,7 @@ async fn snapshot_pins_content_against_midbuild_edits() {
     let path = dir.write("hdr.h", &v1);
 
     let addr = start_server().await;
-    let mut client = FileClient::connect(addr).await.unwrap();
+    let client = FileClient::connect(addr).await.unwrap();
 
     // Digest-first open pins v1 in the agent's CAS.
     let (digest, size) = client
@@ -116,7 +117,7 @@ async fn has_probe_reports_agent_cas_membership() {
     let path = dir.write("a.h", b"ingest me\n");
 
     let addr = start_server().await;
-    let mut client = FileClient::connect(addr).await.unwrap();
+    let client = FileClient::connect(addr).await.unwrap();
 
     let (digest, _) = client.probe_digest(&path).await.unwrap().expect("exists");
     let absent = sembazuru_cas::Digest::of(b"never ingested").canonical();
@@ -135,7 +136,7 @@ async fn stat_batch_reports_existence_per_path() {
     let absent = dir.join("b.h").to_string_lossy().into_owned();
 
     let addr = start_server().await;
-    let mut client = FileClient::connect(addr).await.unwrap();
+    let client = FileClient::connect(addr).await.unwrap();
 
     let resp = client.stat_batch(&[present, absent]).await.expect("rpc ok");
     assert_eq!(resp.entries.len(), 2);
@@ -157,7 +158,7 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     let addr = start_server().await;
 
     // A good WriteBack publishes the bytes at the requested path.
-    let mut client = sembazuru_worker::fileclient::FileClient::connect(addr)
+    let client = sembazuru_worker::fileclient::FileClient::connect(addr)
         .await
         .unwrap();
     let resp = client.write_back(&out, &bytes).await.unwrap();
@@ -224,7 +225,7 @@ async fn write_back_streams_large_output_in_chunks() {
         .collect();
 
     let addr = start_server().await;
-    let mut client = FileClient::connect(addr).await.unwrap();
+    let client = FileClient::connect(addr).await.unwrap();
 
     let resp = client.write_back(&out, &big).await.unwrap();
     assert!(
@@ -247,7 +248,7 @@ async fn dir_list_snapshots_a_directory() {
     std::fs::create_dir_all(dir.join("inc/sys")).unwrap();
 
     let addr = start_server().await;
-    let mut client = FileClient::connect(addr).await.unwrap();
+    let client = FileClient::connect(addr).await.unwrap();
 
     let inc = dir.join("inc").to_string_lossy().into_owned();
     let resp = client.dir_list(&inc, 0).await.expect("rpc ok");
@@ -257,4 +258,75 @@ async fn dir_list_snapshots_a_directory() {
     assert_eq!(names, vec!["stdio.h", "stdlib.h", "sys"]);
     let sys = resp.entries.iter().find(|e| e.rel_path == "sys").unwrap();
     assert!(sys.is_dir);
+}
+
+#[tokio::test]
+async fn one_connection_multiplexes_concurrent_ops() {
+    // M5.3 pipelining: many ops issued concurrently over a single (cloned)
+    // FileClient must all complete correctly. The shared connection correlates
+    // each response to its caller by request id, so in-flight requests overlap
+    // instead of serializing one round-trip at a time.
+    let dir = TempDir::new("mux");
+    let mut paths = Vec::new();
+    for i in 0..32 {
+        // Distinct contents so a mis-routed response (wrong digest/bytes) fails.
+        let body = format!("translation-unit-{i}-contents").repeat(i + 1);
+        paths.push((dir.write(&format!("tu{i}.cpp"), body.as_bytes()), body));
+    }
+
+    let addr = start_server().await;
+    let client = FileClient::connect(addr).await.unwrap();
+
+    // Fire all fetches concurrently on clones of the one connection.
+    let mut handles = Vec::new();
+    for (path, expected) in paths {
+        let c = client.clone();
+        handles.push(tokio::spawn(async move {
+            let (bytes, _digest) = c.fetch(&path).await.expect("rpc ok").expect("exists");
+            assert_eq!(
+                bytes,
+                expected.as_bytes(),
+                "each concurrent fetch got its own correct bytes"
+            );
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn calls_fail_fast_when_the_connection_dies() {
+    // M5.3 liveness: if the agent connection dies, in-flight and subsequent calls
+    // must surface an error promptly, never hang forever waiting on a response
+    // the dead reader task will never deliver (which would wedge a hydrate with
+    // no chance of fallback).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Accept one connection, then drop it — the worker's reader sees EOF.
+        if let Ok((sock, _)) = listener.accept().await {
+            drop(sock);
+        }
+    });
+
+    let client = FileClient::connect(addr).await.unwrap();
+
+    // In-flight call: the server closed, so this errors (does not hang).
+    let first =
+        tokio::time::timeout(Duration::from_secs(5), client.open_read("c:\\x", false)).await;
+    assert!(first.is_ok(), "a call on a dead connection must not hang");
+    assert!(
+        first.unwrap().is_err(),
+        "a dead connection surfaces an error"
+    );
+
+    // Subsequent call after the reader exited: must fail fast via the closed
+    // flag, not register a waiter nobody will wake.
+    let second =
+        tokio::time::timeout(Duration::from_secs(5), client.open_read("c:\\y", false)).await;
+    assert!(
+        second.is_ok() && second.unwrap().is_err(),
+        "calls after the connection died fail fast, not hang"
+    );
 }

@@ -82,10 +82,18 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 
 ## M5（スケジューラ・多ワーカー・レイテンシ最適化）
 
-- **接続プール無し。** フックは redirected open 毎に新規パイプ接続、worker は hydrate
-  毎に agent へ新規 TCP 接続。出所: vfs_pipe.rs / fileclient.rs 注、ADR 0002。
-- **パイプライン化未活用。** wire は request_id で out-of-order 多重化に対応するが、
-  クライアントは逐次。出所: fileclient.rs 注。
+- ~~**接続プール無し。**~~ **M5.3 で解決（worker→agent）。** VfsState がセッション 1 接続を
+  OnceCell で遅延共有し、hydrate 毎の新規 TCP 接続を廃止（`FileClient` は `Arc<Mux>` で Clone 可）。
+  残: フック→worker パイプは依然 redirected open 毎に新規接続（C++ 側、M5.3 では未対応）。
+  出所: vfs_pipe.rs(M5.3)。
+- ~~**パイプライン化未活用。**~~ **M5.3 で解決。** `FileClient` の `Mux`（reader タスク＋pending
+  マップ）で 1 接続上の並行 in-flight を実現、agent `fileserver` の handle_conn も per-request
+  spawn で並行 dispatch（応答は request_id で相関、out-of-order 可）。出所: fileclient.rs/fileserver.rs(M5.3)。
+- **agent セッション CAS の境界破棄は部分対応（deferred #8 は未解決）。** M5.3 で Session に Drop を
+  足し temp CAS を掃除するが、現状 serve ループが `Arc<Session>` を保持し続けるため**発火は
+  agent プロセス終了時のみ**（run をまたぐ temp 残留は解消）。長寿命・多セッション agent での
+  ビルド単位 eviction は daemon のセッション寿命（M5.5 統合）が必要。pinned/writebacks マップは
+  in-memory で Session と共に drop。出所: verifier(M5.3 b1)、deferred #8。
 - **バッチ/先読み未実装:** StatBatch のヘッダ解決一括、DirList のディレクトリ先読み、
   ネガティブプローブ・キャッシュ（ディレクトリ membership fingerprint）、timestamp
   偽装（mtime 起因の再 fetch 回避）。BuildXL 由来。出所: m3-prestudy §3。

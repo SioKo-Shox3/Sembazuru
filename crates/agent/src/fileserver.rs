@@ -109,6 +109,12 @@ struct WritebackState {
 /// pin map that gives snapshot consistency, and any in-progress streamed outputs.
 struct Session {
     cas: BlobStore,
+    /// Where `cas` lives, so the session scrubs it on drop (M5.3). NOTE: today
+    /// one `Session` lives for the whole agent process (the serve loop holds it),
+    /// so this fires at process exit and stops the per-run temp tree from leaking
+    /// across runs. True mid-life per-session eviction in a long-lived multi-
+    /// session agent (deferred #8) needs the daemon's session lifecycle (M5.5).
+    cas_root: PathBuf,
     /// Requested logical path → the digest pinned at its first OpenRead. Once a
     /// path is here, its content is frozen for the session.
     pinned: Mutex<HashMap<String, Digest>>,
@@ -120,9 +126,11 @@ struct Session {
 impl Session {
     fn new(stats: Arc<ServerStats>) -> io::Result<Session> {
         let seq = CAS_SEQ.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("sbz-agent-cas.{}.{seq}", std::process::id()));
+        let cas_root =
+            std::env::temp_dir().join(format!("sbz-agent-cas.{}.{seq}", std::process::id()));
         Ok(Session {
-            cas: BlobStore::open(root)?,
+            cas: BlobStore::open(&cas_root)?,
+            cas_root,
             pinned: Mutex::new(HashMap::new()),
             writebacks: Mutex::new(HashMap::new()),
             stats,
@@ -148,6 +156,15 @@ impl Session {
             .entry(requested.to_string())
             .or_insert_with(|| digest.clone());
         Some((digest, size))
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Scrub the session's temp CAS tree. Best-effort: a leaked temp dir is
+        // not a correctness problem, so a failure here is ignored rather than
+        // surfaced from a destructor.
+        let _ = std::fs::remove_dir_all(&self.cas_root);
     }
 }
 
@@ -201,24 +218,33 @@ async fn serve_with_map(
     }
 }
 
-async fn handle_conn(
-    mut sock: TcpStream,
-    session: Arc<Session>,
-    map: Arc<PathMap>,
-) -> io::Result<()> {
+async fn handle_conn(sock: TcpStream, session: Arc<Session>, map: Arc<PathMap>) -> io::Result<()> {
+    // Pipelining (M5.3): read requests off the connection and dispatch each on
+    // its own task, writing responses (tagged with the request id) as they
+    // finish — possibly out of order. The client correlates by request id, so a
+    // slow op no longer head-of-line-blocks the ones behind it. The write half is
+    // mutex-shared because a frame must be written whole.
+    let (mut rd, wr) = sock.into_split();
+    let wr = Arc::new(Mutex::new(wr));
     loop {
-        let (header, payload) = match read_frame(&mut sock).await {
+        let (header, payload) = match read_frame(&mut rd).await {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        let resp_payload = dispatch(header.op, &payload, &session, &map).await;
-        let resp_header = FrameHeader {
-            request_id: header.request_id,
-            op: header.op,
-            is_response: true,
-        };
-        write_frame(&mut sock, resp_header, &resp_payload).await?;
+        let session = session.clone();
+        let map = map.clone();
+        let wr = wr.clone();
+        tokio::spawn(async move {
+            let resp_payload = dispatch(header.op, &payload, &session, &map).await;
+            let resp_header = FrameHeader {
+                request_id: header.request_id,
+                op: header.op,
+                is_response: true,
+            };
+            let mut w = wr.lock().await;
+            let _ = write_frame(&mut *w, resp_header, &resp_payload).await;
+        });
     }
 }
 
@@ -530,6 +556,18 @@ mod tests {
         assert_eq!(
             PathMap::Identity.resolve("c:\\x\\y.h"),
             PathBuf::from("c:\\x\\y.h")
+        );
+    }
+
+    #[test]
+    fn dropping_a_session_scrubs_its_temp_cas() {
+        let session = Session::new(Arc::new(ServerStats::default())).unwrap();
+        let root = session.cas_root.clone();
+        assert!(root.exists(), "Session::new creates the CAS dir");
+        drop(session);
+        assert!(
+            !root.exists(),
+            "dropping the session removes its temp CAS tree (M5.3 cleanup)"
         );
     }
 }
