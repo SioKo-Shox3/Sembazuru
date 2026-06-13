@@ -201,7 +201,25 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   出所: M6.1c。
 - **Job Object 割当に spawn→assign の小窓。** launcher が DLL パス解決中に assign されるため通常は間に合うが、
   極端な競合で孫がツリー外に出る理論的余地。完全排除は CREATE_SUSPENDED→assign→resume（tokio 非対応）。
-  出所: Plan(M6.1 risk5)、M6.1e。
+  従来の kill_on_drop のみ（常に孫を孤児化）より厳密に良い。出所: Plan(M6.1 risk5)、M6.1e、security(M6.1)。
+
+### M6.1/M6.2 security-reviewer 所見（2026-06-14、PASS-with-findings・BLOCK 無し）
+- **action cache の trace 過少申告による stale 提供（worker 信頼境界）。** strong key は manifest の入力パスを
+  resolve 時に**現在内容で再ハッシュ**するため内容改竄は防げる（誤バイト提供は構造的に不可）。だが悪意/バグ
+  worker が trace から入力を**落とす**と、その入力変更が strong key を動かさず stale な cache 命中を招く。
+  単機では worker はローカル信頼プロセス。緩和は M7 の Register 認証（mTLS/attestation）と同根。出所: security(M6.1 Low)。
+- **launcher の full-env 転送：LAN 分割の直前が今。** M6.0 LOW（開発者シークレットの off-box）の「リモート到達前に
+  allowlist 検討」のチェックポイントは M6.1 で到来。単機 loopback では未流出（intake loopback ロック）だが、
+  実 2 台 LAN を入れる前に env allowlist を必須化する。worker 側 env_clear は worker 内部 var の漏洩を防ぐ正の効果。
+  出所: security(M6.1 Low、M6.0 LOW の再タグ)。
+- **per-action scratch/trace ディレクトリの無制限増加（disk DoS）。** in-flight 資源（pipe/job/task）は admission で
+  有界かつ終了時清掃。だが worker の hydrated scratch（`lib.rs` 注: M3.3/M7）と daemon の per-action `trace-{n}`
+  （`SEMBAZURU_TRACE_ROOT` 下）はビルド毎に残置・累積。長寿命 daemon/worker で disk 枯渇。セッション境界 eviction
+  （deferred #8）と併せ M7。出所: security(M6.1 Low)。
+- **注入が production コンパイル経路に。** worker の DLL 注入（launcher.exe＋DetourCreateProcessWithDll）は M3 と
+  同一機構だが、M6.1 で**テスト足場でなく常時動作**に。新たなマルウェア的シグナル（RWX/直接 syscall/スレッド
+  注入）は無く署名可能。M7 のベンダ許可リスト申請は steady-state の挙動（injector が cl.exe を子に注入）を明記。
+  出所: security(M6.1 Info)、deferred EDR メモ。
 
 ## M7（堅牢化・セキュリティ）
 
