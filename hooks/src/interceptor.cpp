@@ -14,6 +14,12 @@
 
 #include "detours.h"
 
+// winternl.h gives NTSTATUS / PIO_STATUS_BLOCK / FILE_INFORMATION_CLASS for the
+// one NT function this layer observes (see the NT-layer hooks section below).
+#include <winternl.h>
+
+#include <cstddef>
+
 namespace {
 
 // --- Trampolines (defaults are the real functions; Detours rewrites) ----
@@ -72,6 +78,39 @@ LSTATUS(APIENTRY* TrueRegCloseKey)(HKEY) = RegCloseKey;
 DWORD(WINAPI* TrueGetEnvironmentVariableA)(LPCSTR, LPSTR, DWORD) =
     GetEnvironmentVariableA;
 LPWCH(WINAPI* TrueGetEnvironmentStringsW)(void) = GetEnvironmentStringsW;
+
+// NtSetInformationFile is resolved at runtime (it is not a static import of
+// this DLL), so its trampoline starts null and is filled in DllMain.
+using NtSetInformationFile_t = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID,
+                                                ULONG, FILE_INFORMATION_CLASS);
+NtSetInformationFile_t TrueNtSetInformationFile = nullptr;
+
+// FILE_INFORMATION_CLASS values we act on. winternl.h's enum is minimal and
+// does not name these, so they are spelled out (values are stable ABI).
+constexpr int kFileRenameInformation = 10;
+constexpr int kFileDispositionInformation = 13;
+constexpr int kFileDispositionInformationEx = 64;
+constexpr int kFileRenameInformationEx = 65;
+constexpr ULONG kFileDispositionDelete = 0x1;  // FILE_DISPOSITION_DELETE
+
+// Layouts per ntifs.h (absent from the user-mode SDK). The classic and *Ex
+// rename forms share this layout for the fields we read; the leading union is
+// ReplaceIfExists (classic) / Flags (Ex).
+struct FileRenameInformationLayout {
+    union {
+        BOOLEAN ReplaceIfExists;
+        ULONG Flags;
+    };
+    HANDLE RootDirectory;
+    ULONG FileNameLength;  // bytes, not WCHARs
+    WCHAR FileName[1];     // FileNameLength bytes; NOT NUL-terminated
+};
+struct FileDispositionInformationLayout {
+    BOOLEAN DeleteFile;
+};
+struct FileDispositionInformationExLayout {
+    ULONG Flags;
+};
 
 // --- Helpers -------------------------------------------------------------
 
@@ -719,6 +758,114 @@ LPWCH WINAPI HookedGetEnvironmentStringsW() {
     return block;
 }
 
+// --- NT-layer hooks ------------------------------------------------------
+//
+// Only NtSetInformationFile, and only for the rename and disposition classes.
+// clang-cl/lld write each output to a run-varying temp and then rename it onto
+// the final name with NtSetInformationFile(FileRenameInformation), bypassing
+// the Win32 MoveFile family -- invisible to the Win32 hooks and the documented
+// gap of docs/trace-format.md §8. MSVC cl/link do not import ntdll at all
+// (verified with dumpbin /imports) and their reads/enumerations go through the
+// Win32 layer, so this is the only NT hook the target toolchains require.
+
+// Resolves a handle to its full DOS path into buf (NUL-terminated). Returns the
+// WCHAR length (excluding NUL), or 0 on failure/would-truncate. Uses only
+// GetFinalPathNameByHandleW, which queries the existing handle and opens
+// nothing, so it honors the re-entrancy contract (no path back into a hook).
+int PathFromHandle(HANDLE h, wchar_t* buf, DWORD cap) {
+    if (h == nullptr || h == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    DWORD n = GetFinalPathNameByHandleW(h, buf, cap,
+                                        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (n == 0 || n >= cap) {
+        return 0;  // failure, or the path would not fit (avoid truncation)
+    }
+    return static_cast<int>(n);
+}
+
+NTSTATUS NTAPI HookedNtSetInformationFile(HANDLE handle, PIO_STATUS_BLOCK iosb,
+                                          PVOID info, ULONG length,
+                                          FILE_INFORMATION_CLASS infoClass) {
+    const int cls = static_cast<int>(infoClass);
+    const bool isRename =
+        cls == kFileRenameInformation || cls == kFileRenameInformationEx;
+    const bool isDispose =
+        cls == kFileDispositionInformation || cls == kFileDispositionInformationEx;
+
+    // A rename retargets the handle, so the source path must be captured BEFORE
+    // the real call runs. Capturing is a read-only query; it does not change the
+    // call's outcome (observe-only). GetFinalPathNameByHandleW clobbers the
+    // thread's last error here, but that is harmless: the error the caller sees
+    // is saved AFTER True* below and restored on every return path.
+    wchar_t src[1024];
+    int srcLen = 0;
+    if (isRename || isDispose) {
+        srcLen = PathFromHandle(handle, src, 1024);
+    }
+
+    NTSTATUS st = TrueNtSetInformationFile(handle, iosb, info, length, infoClass);
+    DWORD saved = GetLastError();
+
+    // NT_SUCCESS(st): the status high bit (sign bit) is clear.
+    if (st >= 0 && srcLen > 0 && info != nullptr) {
+        if (isRename &&
+            length >= offsetof(FileRenameInformationLayout, FileName)) {
+            const auto* ri = static_cast<const FileRenameInformationLayout*>(info);
+            const ULONG nameBytes = ri->FileNameLength;
+            // Bound the variable-length name read to the caller-provided buffer.
+            const ULONG avail =
+                length - offsetof(FileRenameInformationLayout, FileName);
+            if (nameBytes > 0 && nameBytes <= avail) {
+                const int nameChars = static_cast<int>(nameBytes / sizeof(WCHAR));
+                if (ri->RootDirectory == nullptr) {
+                    // Fully-qualified NT path in FileName (\??\C:\...).
+                    trace::Record(trace::kFile, trace::kMove, 0, 0, src, srcLen,
+                                  ri->FileName, nameChars);
+                } else {
+                    // Relative to RootDirectory: resolve the dir and compose
+                    // base + "\" + FileName into a bounded buffer.
+                    wchar_t base[1024];
+                    int baseLen = PathFromHandle(ri->RootDirectory, base, 1024);
+                    if (baseLen > 0) {
+                        wchar_t dest[2048];
+                        int p = 0;
+                        for (int i = 0; i < baseLen && p < 2046; i++) {
+                            dest[p++] = base[i];
+                        }
+                        if (p < 2046) {
+                            dest[p++] = L'\\';
+                        }
+                        for (int i = 0; i < nameChars && p < 2047; i++) {
+                            dest[p++] = ri->FileName[i];
+                        }
+                        trace::Record(trace::kFile, trace::kMove, 0, 0, src,
+                                      srcLen, dest, p);
+                    }
+                }
+            }
+        } else if (isDispose) {
+            bool deleting = false;
+            if (cls == kFileDispositionInformation &&
+                length >= sizeof(FileDispositionInformationLayout)) {
+                deleting = static_cast<const FileDispositionInformationLayout*>(info)
+                               ->DeleteFile != 0;
+            } else if (cls == kFileDispositionInformationEx &&
+                       length >= sizeof(FileDispositionInformationExLayout)) {
+                deleting =
+                    (static_cast<const FileDispositionInformationExLayout*>(info)
+                         ->Flags &
+                     kFileDispositionDelete) != 0;
+            }
+            if (deleting) {
+                trace::Record(trace::kFile, trace::kDelete, 0, 0, src, srcLen);
+            }
+        }
+    }
+    SetLastError(saved);
+    return st;
+}
+
 // --- Hook table and DllMain ----------------------------------------------
 
 struct HookPair {
@@ -793,6 +940,21 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
                 break;
             }
         }
+        // NT-layer hook, resolved at runtime (not a static import). Attach only
+        // if the table above succeeded and ntdll exposes the function; a missing
+        // NtSetInformationFile is not fatal (the Win32 hooks still load).
+        if (err == NO_ERROR) {
+            if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll")) {
+                TrueNtSetInformationFile = reinterpret_cast<NtSetInformationFile_t>(
+                    reinterpret_cast<void*>(
+                        GetProcAddress(ntdll, "NtSetInformationFile")));
+            }
+            if (TrueNtSetInformationFile != nullptr) {
+                err = DetourAttach(
+                    &reinterpret_cast<PVOID&>(TrueNtSetInformationFile),
+                    reinterpret_cast<PVOID>(HookedNtSetInformationFile));
+            }
+        }
         if (err == NO_ERROR) {
             err = DetourTransactionCommit();
         } else {
@@ -811,6 +973,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         DetourUpdateThread(GetCurrentThread());
         for (const HookPair& h : kHooks) {
             DetourDetach(h.trampoline, h.hook);
+        }
+        if (TrueNtSetInformationFile != nullptr) {
+            DetourDetach(&reinterpret_cast<PVOID&>(TrueNtSetInformationFile),
+                         reinterpret_cast<PVOID>(HookedNtSetInformationFile));
         }
         DetourTransactionCommit();
         trace::Shutdown();

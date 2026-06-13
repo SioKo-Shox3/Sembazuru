@@ -247,11 +247,22 @@ event list (omitted here for size).
 
 ## 8. Known limitations of v0 (deliberate)
 
-- Win32-layer hooks only. Processes that issue `Nt*` syscalls directly
-  (msys2/Cygwin toolchains) are not captured; this is the documented gap
-  of the user-mode approach (see `docs/decisions/0001-vfs-approach.md`)
-  and is compensated in M1 by the `/showIncludes` completeness check.
-  NT-layer hooks arrive with the M3 VFS.
+- Win32-layer hooks, plus one NT hook: `NtSetInformationFile` (since M3.1.5).
+  Processes that issue *other* `Nt*` syscalls directly for reads/enumeration
+  (msys2/Cygwin toolchains) are still not captured; this is the documented gap
+  of the user-mode approach (see `docs/decisions/0001-vfs-approach.md`) and is
+  compensated in M1 by the `/showIncludes` completeness check. The target
+  toolchains do not need those: MSVC `cl`/`link` import no `ntdll` at all, and
+  `cl`/`clang-cl` resolve reads and directory enumeration through the Win32
+  layer. The one NT path they *do* take that Win32 misses is the output
+  temp->rename (next bullet), which `NtSetInformationFile` now records.
+- The output `temp -> final` rename that clang-cl/lld perform via
+  `NtSetInformationFile(FileRenameInformation)` (and the delete-on-close via
+  `FileDispositionInformation`) is recorded as a `FILE` move (op 7) / delete
+  (op 6). The hook resolves the source handle to its path with
+  `GetFinalPathNameByHandleW` before the real call retargets it, and reads the
+  destination from the information buffer. This closes the M2 gap where only the
+  run-varying temp write was seen, never the surviving artifact.
 - Memory-mapped reads after an open are attributed to the open, not
   tracked per-page.
 - `FindNextFile` results are not recorded individually; the enumeration

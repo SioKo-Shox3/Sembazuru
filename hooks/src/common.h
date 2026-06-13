@@ -1,9 +1,13 @@
 // Shared declarations between the hook bodies (interceptor.cpp) and the
 // trace writer (trace_writer.cpp).
 //
-// Re-entrancy contract: everything in the trace:: namespace may only call
-// True* trampolines or APIs that this DLL never hooks. Breaking this rule
-// recurses straight back into a hook.
+// Re-entrancy contract: everything in the trace:: namespace -- and any helper a
+// hook body calls before/around recording (e.g. GetFinalPathNameByHandleW in the
+// NtSetInformationFile hook) -- may only call True* trampolines or APIs that this
+// DLL never hooks. Breaking this rule recurses straight back into a hook (and can
+// deadlock on the writer lock). In particular, do NOT add hooks for the NT query
+// functions GetFinalPathNameByHandleW relies on (NtQueryInformationFile,
+// NtQueryObject) without first breaking that dependency.
 
 #pragma once
 

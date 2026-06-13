@@ -34,6 +34,11 @@ jobs:
       # runner ships LLVM on PATH).
       - name: M1 tracer smoke (completeness, propagation, reproducibility)
         run: pwsh -NoProfile -File hooks/test/smoke.ps1 -RequireClangCl
+      # Gates M3.1.5: the NtSetInformationFile hook makes clang/lld's
+      # temp->rename visible (docs/trace-format.md §8), so the surviving output
+      # is discovered from the trace and the run-varying temp is excluded.
+      - name: M3.1.5 NT-rename observability
+        run: pwsh -NoProfile -File hooks/test/nt_rename.ps1
       # Gates the M2 "Done when": representative C++ TUs reproduce their output
       # *bytes*. MSVC is checked for content determinism (same build root);
       # clang-cl for path independence across different roots (required here —
