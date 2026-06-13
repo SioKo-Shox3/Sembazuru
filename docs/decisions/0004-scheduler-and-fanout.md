@@ -84,6 +84,34 @@ M5 実装後の security-reviewer 所見を本 ADR の追補として残す。
 - **正直な但し書き:** 単機ではコアピン留めしても物理コア競合・キャッシュ共有が残るため、E(W) は
   「分配オーバーヘッド＋RTT＋キャッシュウォーム」を測る代理指標。実機 LAN との差は決定者承認で別途検証。
 
+## セキュリティ追補（M5.2 security-reviewer、2026-06-14）
+§6 で予告した「M5 実装後の security-reviewer 所見」を集約する。M5 は LAN 前提・無認証 start の
+ため以下は受容するが、認証/サンドボックス強化（M7）の前提として明記する。
+
+- **対処済み（M5.2 で fix）:**
+  - DoS — admission Semaphore で実行中の子プロセス数を capacity に制限。さらに **accept Semaphore**
+    （`QUEUE_FACTOR=8 × capacity`）で待機タスクの backlog を上限化し、超過分は `RESOURCE_EXHAUSTED`
+    で即拒否（待機タスクのメモリ枯渇を防止）。
+  - 孤児プロセス — `kill_on_drop(true)`＋`tx.closed()` 検知で、agent がフォールバックで Execute
+    ストリームを drop した時に子を kill。さらに **hung-child 上限タイマ**（`SEMBAZURU_ACTION_TIMEOUT_SECS`、
+    既定 3600s）で agent 経由でない hung 子も slot を解放。
+  - 偽 capabilities の部分緩和 — agent は worker 申告の `cpu_count` を `clamp(1, 256)` してスケジュール
+    （巨大 cpu_count による全アクション吸引を緩和）。
+- **受容（M5 LAN 前提・M7 で対処）:**
+  - **無認証 Register。** 悪意 worker が登録し (1) 誤った出力を返す (2) アクションを吸引してブラック
+    ホール化（各アクションは budget 経由でフォールバックするが遅延）。緩和は M7 の mTLS/attestation
+    （`RegisterRequest` の予約フィールド 10–11）。
+  - **孫プロセス孤児。** `kill_on_drop` は直接の子のみ kill し、孫（`cmd /c <compiler>` の compiler）は
+    残りうる。Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）によるプロセスツリー一括 kill は M7
+    サンドボックス境界で導入。署名可能な標準 Win32 手法で EDR 的に問題なし。
+  - **重複 WriteBack（M4/将来）。** 再割り当て境界で元 worker と再割り当て先が同一出力を WriteBack
+    しうる。v0 §3.2 の「副作用フリー＋出力バイト一致 CAS」前提で正しさは保たれるが、WriteBack 実装時に
+    content-addressed 冪等をテストで固定すること。
+  - **Mutex poisoning の連鎖 abort（L1）。** `WorkerTable`/`in_flight` の `.expect` は内部パニック時のみ。
+    M7 品質改善で `lock().unwrap_or_else(into_inner)` 等へ。
+- **EDR/署名:** 本変更はプロセス spawn と kill のみで、RWX・直接 syscall・スレッド注入等のマルウェア的
+  シグナルは増えていない（security-reviewer 確認済み）。
+
 ## 影響
 - v0 §3.3 の未解決（worker discovery / scheduling placement）を static-list + agent-side で解消。
 - `docs/protocol/v0.md` §3.1 の `RegisterRequest` に attestation 予約、`HeartbeatPing` に容量フィールドを追加
