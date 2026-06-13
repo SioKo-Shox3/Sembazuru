@@ -160,8 +160,9 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **同一 path への真の並行 WriteBack は path ロック未実装。** 現状の逐次 reassignment では発生せず、
   発生しても content-addressed＋digest 検証＋atomic publish で誤バイト publish は構造的に不可（fail-closed）。
   将来 worker 起因の投機的重複実行を入れるなら write_back の path 単位ロックを検討。出所: determinism(M5.5)。
-- **worker の Abort 未配線（acknowledge のみ）。** reassign 時に元 worker のプロセスを能動 kill しない
-  （タイムアウトのみ）。graceful drain は M7。出所: security(M5.5 Info)、M3.1 注。
+- ~~**worker の Abort 未配線（acknowledge のみ）。**~~ **M6.1e で解消。** VFS アクションは launcher を
+  kill-on-close Job Object に割当て、孫（実コンパイラ）まで含むツリーを kill。reassign（ストリーム drop）
+  ／Abort RPC（`TerminateJobObject`）どちらでも能動 kill。`crates/worker/src/job.rs`。graceful drain は M7。
 
 ## M6（ビルドシステム統合 / Integrations）
 
@@ -185,6 +186,22 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **ランチャの run_local 失敗が bare -1 で原因を握り潰す。** daemon 不達＋コンパイラ不在時、メッセージが
   daemon を誤って責め、`run_local` の実エラー（program not found 等）が捨てられ exit -1。ビルドは正しく失敗するが
   診断が誤誘導。M6.1 で run_local エラーを surface。出所: verifier(M6.0 #2)。
+
+### M6.1 実装後の既知の残リスク（2026-06-14）
+- **ローカルフォールバックの .obj が分散/ローカル参照とバイト不一致（clang-cl、CI 実測）。** 分散ビルド
+  （worker・env_clear＋厳密 env）と action cache republish は clang-cl バイト一致。だがランチャの `run_local`
+  フォールバック（継承 env に command.env を重ねる）は参照ビルドと clang-cl バイトが一致しない。機能的には
+  正当な .obj（フォールバックは「完了」を満たす）。原因候補は run_local の env レイヤリングが clang-cl 出力に
+  影響する点。`m6_daemon_compile.ps1` はフォールバックを「exit 0＋非空 .obj」で検証し、バイト一致ゲートは
+  分散＋キャッシュに限定。要調査（run_local の env を分散経路と同様 env_clear＋厳密化するか）。出所: CI(M6.1d)。
+- **action cache の trace は単機共有 FS 前提（VfsExecution.trace_dir）。** worker が書いた trace を daemon が
+  直接読む。2 台分割では trace を data plane で返す必要。実 LAN（決定者承認）で対応。出所: ADR 0005、M6.1c。
+- **launcher の出力推論は /Fo ベースの最小ヒューリスティック。** `/Fo` 無し・複数出力・非標準フラグは
+  取りこぼし、その場合は無キャッシュ（誤ビルドにはならない）。MSBuild/UE 等は宣言出力を別途与える要あり。
+  出所: M6.1c。
+- **Job Object 割当に spawn→assign の小窓。** launcher が DLL パス解決中に assign されるため通常は間に合うが、
+  極端な競合で孫がツリー外に出る理論的余地。完全排除は CREATE_SUSPENDED→assign→resume（tokio 非対応）。
+  出所: Plan(M6.1 risk5)、M6.1e。
 
 ## M7（堅牢化・セキュリティ）
 

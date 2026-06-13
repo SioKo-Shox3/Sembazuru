@@ -11,14 +11,18 @@
 
 pub mod coordination;
 pub mod fileclient;
+mod job;
 pub mod vfs_pipe;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use job::JobObject;
 
 use sembazuru_proto::v0::{
     AbortRequest, AbortResponse, ActionState, Command, ExecuteEvent, ExecuteRequest, ExitStatus,
@@ -95,6 +99,10 @@ pub struct WorkerService {
     /// Read-VFS install config; `None` → the worker only plain-spawns and
     /// rejects VFS-mode requests (M5 scale worker). Set via [`with_vfs`].
     vfs: Option<Arc<WorkerVfsConfig>>,
+    /// Per-action Job Objects for in-flight VFS actions, so `Abort` can kill the
+    /// whole process tree (launcher + the real compiler grandchild). Keyed by
+    /// action_id; entry removed when the action ends (M6.1e).
+    aborts: Arc<Mutex<HashMap<String, Arc<JobObject>>>>,
 }
 
 impl Default for WorkerService {
@@ -122,6 +130,7 @@ impl WorkerService {
             capacity,
             ceiling: default_action_ceiling(),
             vfs: None,
+            aborts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -195,9 +204,11 @@ fn exit_event(code: i32, wall_us: u64) -> Result<ExecuteEvent, Status> {
 #[allow(clippy::too_many_arguments)]
 async fn run_action(
     cmd: Command,
+    action_id: String,
     vfs_req: Option<VfsExecution>,
     predicted_paths: Vec<String>,
     vfs_cfg: Option<Arc<WorkerVfsConfig>>,
+    aborts: Arc<Mutex<HashMap<String, Arc<JobObject>>>>,
     tx: mpsc::Sender<Result<ExecuteEvent, Status>>,
     limit: Arc<Semaphore>,
     running: Arc<AtomicU32>,
@@ -260,14 +271,26 @@ async fn run_action(
 
     let start = Instant::now();
     // For VFS mode, `pipe_task` keeps the per-action pipe server alive for the
-    // run; it is aborted after the child exits so it does not leak a task.
-    let (mut child, pipe_task) = match build_child(&cmd, vfs_plan, predicted_paths).await {
-        Ok(pair) => pair,
+    // run; `job` is the process-tree kill handle. Both are cleaned up after the
+    // child exits.
+    let (mut child, pipe_task, job) = match build_child(&cmd, vfs_plan, predicted_paths).await {
+        Ok(triple) => triple,
         Err(detail) => {
             let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
             return;
         }
     };
+
+    // Register the job so `Abort` (or a reassign that drops the stream) kills the
+    // whole tree. Both the map and this scope hold an Arc; the action's processes
+    // die only once BOTH are gone, so the entry is removed at the end below.
+    if let Some(j) = job {
+        aborts
+            .lock()
+            .expect("aborts map poisoned")
+            .insert(action_id.clone(), Arc::new(j));
+    }
+
     let _ = tx.send(state_event(ActionState::Running, "")).await;
 
     tokio::select! {
@@ -310,6 +333,13 @@ async fn run_action(
     if let Some(t) = pipe_task {
         t.abort();
     }
+    // Drop the Job Object handle (removing the last Arc): closing it kills any
+    // process still in the job — so a normal completion reaps stragglers and a
+    // cancelled action (stream dropped / Abort) kills the whole compiler tree.
+    aborts
+        .lock()
+        .expect("aborts map poisoned")
+        .remove(&action_id);
 }
 
 /// Builds the child process for an action. Plain mode spawns the command
@@ -326,6 +356,7 @@ async fn build_child(
     (
         tokio::process::Child,
         Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+        Option<JobObject>,
     ),
     String,
 > {
@@ -341,10 +372,11 @@ async fn build_child(
         }
         command.stdin(Stdio::null());
         // Kill the child if its task is dropped (agent gave up / fallback), so
-        // the worker never leaks an orphan holding an admission slot.
+        // the worker never leaks an orphan holding an admission slot. The plain
+        // path has no grandchild to orphan, so no Job Object is needed here.
         command.kill_on_drop(true);
         let child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
-        return Ok((child, None));
+        return Ok((child, None, None));
     };
 
     // VFS mode. Per-action unique pipe + scratch so concurrent actions never
@@ -417,13 +449,33 @@ async fn build_child(
     }
     command.stdin(Stdio::null());
     command.kill_on_drop(true);
-    match command.spawn() {
-        Ok(child) => Ok((child, Some(pipe_task))),
+    let child = match command.spawn() {
+        Ok(child) => child,
         Err(e) => {
             pipe_task.abort();
-            Err(format!("launcher spawn failed: {e}"))
+            return Err(format!("launcher spawn failed: {e}"));
         }
-    }
+    };
+
+    // Assign the launcher to a kill-on-close Job Object so the grandchild (the
+    // real compiler the launcher injects into) dies with it — kill_on_drop alone
+    // would orphan it (M6.1e). The grandchild auto-joins the job. A small window
+    // exists between spawn and assign; the launcher resolves the DLL path before
+    // it spawns the compiler, so assignment normally wins.
+    let job = match JobObject::new_kill_on_close().and_then(|j| {
+        match child.raw_handle() {
+            Some(h) => j.assign(h).map(|()| j),
+            None => Ok(j), // child already exited; nothing to assign
+        }
+    }) {
+        Ok(j) => j,
+        Err(e) => {
+            pipe_task.abort();
+            // `child` drops here; kill_on_drop terminates at least the launcher.
+            return Err(format!("job object setup failed: {e}"));
+        }
+    };
+    Ok((child, Some(pipe_task), Some(job)))
 }
 
 #[tonic::async_trait]
@@ -443,9 +495,11 @@ impl Execution for WorkerService {
         }
         // M6.1: VFS config and prefetch hint ride the request; the worker's own
         // install config decides whether VFS mode is even possible.
+        let action_id = req.action_id;
         let vfs_req = req.vfs;
         let predicted_paths = req.predicted_paths;
         let vfs_cfg = self.vfs.clone();
+        let aborts = Arc::clone(&self.aborts);
 
         // Shed load before spawning anything: if the accepted-work backlog is
         // already at QUEUE_FACTOR × capacity, reject rather than pin more memory
@@ -468,9 +522,11 @@ impl Execution for WorkerService {
         // immediately and queued actions are visible as QUEUED events.
         tokio::spawn(run_action(
             cmd,
+            action_id,
             vfs_req,
             predicted_paths,
             vfs_cfg,
+            aborts,
             tx,
             Arc::clone(&self.limit),
             Arc::clone(&self.running),
@@ -483,10 +539,23 @@ impl Execution for WorkerService {
 
     async fn abort(
         &self,
-        _request: Request<AbortRequest>,
+        request: Request<AbortRequest>,
     ) -> Result<Response<AbortResponse>, Status> {
-        // M3.1: acknowledge only. Real cancellation (kill the child, guarantee
-        // no torn output) lands with the fallback work in M3.4.
+        // M6.1e: real cancellation. Terminate the action's Job Object, killing
+        // the whole process tree (launcher + the injected compiler grandchild).
+        // The run_action select then observes the child exit and cleans up. A
+        // plain (non-VFS) action has no job; its stream-drop + kill_on_drop still
+        // covers it, and the reassign path drops the stream rather than calling
+        // Abort, so this acknowledges either way.
+        let action_id = request.into_inner().action_id;
+        if let Some(job) = self
+            .aborts
+            .lock()
+            .expect("aborts map poisoned")
+            .get(&action_id)
+        {
+            job.terminate();
+        }
         Ok(Response::new(AbortResponse { acknowledged: true }))
     }
 }
