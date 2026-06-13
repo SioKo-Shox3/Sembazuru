@@ -113,6 +113,7 @@ pub fn parse(buf: &[u8]) -> Result<Trace, ParseError> {
     let start_filetime = cur.u64().ok_or(ParseError::ShortHeader)?;
     let exe_path = cur.string().ok_or(ParseError::ShortHeader)?;
     let command_line = cur.string().ok_or(ParseError::ShortHeader)?;
+    let cwd = cur.string().ok_or(ParseError::ShortHeader)?;
 
     let mut events = Vec::new();
     let mut truncated = false;
@@ -144,6 +145,7 @@ pub fn parse(buf: &[u8]) -> Result<Trace, ParseError> {
         start_filetime,
         exe_path,
         command_line,
+        cwd,
         events,
         truncated,
     })
@@ -212,6 +214,7 @@ mod tests {
         b.extend_from_slice(&2u64.to_le_bytes()); // start_filetime
         push_string(&mut b, "C:\\cl.exe");
         push_string(&mut b, "cl /c a.c");
+        push_string(&mut b, "C:\\work"); // cwd
         // one FILE/OpenRead record
         b.push(record_type::FILE);
         b.push(1); // OpenRead
@@ -240,6 +243,7 @@ mod tests {
         assert_eq!(t.parent_pid, 50);
         assert_eq!(t.exe_path, "C:\\cl.exe");
         assert_eq!(t.command_line, "cl /c a.c");
+        assert_eq!(t.cwd, "C:\\work");
         assert_eq!(t.events.len(), 1);
         assert_eq!(t.events[0].path, "C:\\src\\a.c");
         assert!(!t.truncated);
