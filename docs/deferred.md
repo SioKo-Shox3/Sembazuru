@@ -97,7 +97,13 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **バッチ/先読み未実装:** StatBatch のヘッダ解決一括、DirList のディレクトリ先読み、
   ネガティブプローブ・キャッシュ（ディレクトリ membership fingerprint）、timestamp
   偽装（mtime 起因の再 fetch 回避）。BuildXL 由来。出所: m3-prestudy §3。
-- **PrefetchHint（依存予測先読み）未実装。** v0 §4.1。出所: v0。
+- ~~**PrefetchHint（依存予測先読み）未実装。**~~ **M5.4 でメカニズム実装。** 制御プレーンに
+  `ExecuteRequest.predicted_paths`（v0 §4.1 は「agent-pushed」だが pull モデルのためヒントは
+  制御プレーンに載せ既存データ op で温める）、agent `AgentCache::predicted_paths`（マニフェスト
+  から予測パス抽出）、worker `prefetch_warm`／`serve_vfs_with_prefetch`（M5.3 多重化で N パスを
+  並行先読み＝実質 1 RTT で温め、後続 open は無往復ヒット）。残: **Execute→prefetch の daemon 配線は
+  M5.5**（execute_remote は現状 `predicted_paths: Vec::new()`）。logical↔agent パス整合も M5.5。
+  出所: v0 §4.1、M5.4。
 - **DirList の depth は直下のみ。** 深い先読みは未対応。出所: fileserver.rs 注。
 - **トランスポート 3 者ベイクオフ未実施。** ADR 0002 は TCP 採用（QUIC/gRPC 未実装、
   prior と「TCP が判定基準を満たした」で繰り延べ）。WAN/ロス環境が要件化したら

@@ -146,7 +146,11 @@ pub async fn execute_remote_with(
         action_id,
         command: Some(command),
         session_id,
-        predicted_inputs: None, // prefetch manifest is M5
+        predicted_inputs: None,
+        // M5.4 plumbs the field and the worker-side warming; populating it from
+        // the cached manifest (AgentCache::predicted_paths) is wired when the
+        // daemon ties cache + scheduler + worker together (M5.5).
+        predicted_paths: Vec::new(),
     };
 
     let mut stream = client.execute(request).await?.into_inner();
