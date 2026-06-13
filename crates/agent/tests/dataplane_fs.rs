@@ -88,6 +88,59 @@ async fn stat_batch_reports_existence_per_path() {
 }
 
 #[tokio::test]
+async fn write_back_publishes_atomically_and_verifies_digest() {
+    use sembazuru_dataplane::ops::{WriteBackRequest, WriteBackResponse};
+    use sembazuru_dataplane::wire::{FrameHeader, OpCode, decode_frame, encode_frame};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = TempDir::new("wb");
+    let out = dir.join("out/a.obj").to_string_lossy().into_owned();
+    let bytes = b"\x00\x01OBJ-bytes\xff".to_vec();
+
+    let addr = start_server().await;
+
+    // A good WriteBack publishes the bytes at the requested path.
+    let mut client = sembazuru_worker::fileclient::FileClient::connect(addr)
+        .await
+        .unwrap();
+    let resp = client.write_back(&out, &bytes).await.unwrap();
+    assert!(resp.ok, "write-back should succeed: {}", resp.detail);
+    assert_eq!(std::fs::read(&out).unwrap(), bytes, "published bytes match");
+
+    // A corrupted transfer (digest does not match the bytes) is rejected, and no
+    // torn output is published. Send a hand-built frame with a wrong digest.
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let bad = dir.join("out/bad.obj").to_string_lossy().into_owned();
+    let payload = WriteBackRequest {
+        path: bad.clone(),
+        digest_hex: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+        bytes: b"these-bytes-do-not-match-that-digest".to_vec(),
+    }
+    .encode();
+    let framed = encode_frame(
+        FrameHeader {
+            request_id: 1,
+            op: OpCode::WriteBack,
+            is_response: false,
+        },
+        &payload,
+    );
+    sock.write_all(&framed).await.unwrap();
+    let mut len = [0u8; 4];
+    sock.read_exact(&mut len).await.unwrap();
+    let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+    sock.read_exact(&mut body).await.unwrap();
+    let full = [&len[..], &body[..]].concat();
+    let (_h, rp, _n) = decode_frame(&full).unwrap();
+    let wbr = WriteBackResponse::decode(rp).unwrap();
+    assert!(!wbr.ok, "digest mismatch must be rejected");
+    assert!(
+        !std::path::Path::new(&bad).exists(),
+        "no torn output published"
+    );
+}
+
+#[tokio::test]
 async fn dir_list_snapshots_a_directory() {
     let dir = TempDir::new("dir");
     dir.write("inc/stdio.h", b"x");

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
     DirEntry, DirListRequest, DirListResponse, OpenReadRequest, OpenReadResponse, ReadRequest,
-    ReadResponse, StatEntry, StatRequest, StatResponse,
+    ReadResponse, StatEntry, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use sembazuru_tracer::determinism::sha256_hex;
@@ -151,6 +151,63 @@ async fn dispatch(
             }
             .encode(),
         },
+        OpCode::WriteBack => match WriteBackRequest::decode(payload) {
+            Ok(req) => write_back(req).await.encode(),
+            Err(_) => WriteBackResponse {
+                ok: false,
+                detail: "malformed WriteBack request".to_string(),
+            }
+            .encode(),
+        },
+    }
+}
+
+/// Publishes a worker-returned output at its agent-side path: verify the digest,
+/// write to a temp sibling, then atomically rename onto the final name so the
+/// build system never sees a torn output (§3.2). WriteBack is NOT remapped — the
+/// agent publishes where it wants the artifact, independent of the read PathMap.
+async fn write_back(req: WriteBackRequest) -> WriteBackResponse {
+    let actual = sha256_hex(&req.bytes);
+    if actual != req.digest_hex {
+        return WriteBackResponse {
+            ok: false,
+            detail: format!("digest mismatch: declared {}, got {actual}", req.digest_hex),
+        };
+    }
+    let final_path = PathBuf::from(&req.path);
+    if let Some(parent) = final_path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return WriteBackResponse {
+            ok: false,
+            detail: format!("create output dir: {e}"),
+        };
+    }
+    // Temp sibling in the same directory so the rename is same-volume (atomic).
+    let mut tmp = final_path.clone();
+    let mut name = final_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".sbz-writeback-tmp");
+    tmp.set_file_name(name);
+
+    if let Err(e) = tokio::fs::write(&tmp, &req.bytes).await {
+        return WriteBackResponse {
+            ok: false,
+            detail: format!("write temp: {e}"),
+        };
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, &final_path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return WriteBackResponse {
+            ok: false,
+            detail: format!("atomic publish: {e}"),
+        };
+    }
+    WriteBackResponse {
+        ok: true,
+        detail: String::new(),
     }
 }
 

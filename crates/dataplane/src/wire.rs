@@ -50,6 +50,7 @@ pub enum OpCode {
     OpenRead = 2,
     Read = 3,
     DirList = 4,
+    WriteBack = 5,
 }
 
 impl OpCode {
@@ -59,6 +60,7 @@ impl OpCode {
             2 => Ok(OpCode::OpenRead),
             3 => Ok(OpCode::Read),
             4 => Ok(OpCode::DirList),
+            5 => Ok(OpCode::WriteBack),
             other => Err(Error::UnknownOp(other)),
         }
     }
