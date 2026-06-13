@@ -130,6 +130,12 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 pub const REASON_COFF_TIMESTAMP: &str = "coff-timestamp";
 pub const REASON_PE_TIMESTAMP: &str = "pe-timestamp";
 pub const REASON_PE_RICH_HEADER: &str = "pe-rich-header";
+/// The S_OBJNAME CodeView record in a `.debug$S` section embeds the object's
+/// **absolute** path, which differs across build directories even with
+/// `/Brepro` — the documented blocker to relocating an MSVC `.obj` (M4.5,
+/// `docs/determinism.md`). Masking its payload makes MSVC objects path-
+/// independent so the action cache can reuse them across dirs/machines.
+pub const REASON_COFF_OBJNAME: &str = "coff-objname";
 
 /// A normalized copy of an artifact and the list of regions that were masked.
 pub struct Normalized {
@@ -147,10 +153,17 @@ pub fn normalize(input: &[u8]) -> Normalized {
 
     if bytes.starts_with(b"MZ") {
         normalize_pe(&mut bytes, &mut reasons);
-    } else if let Some(off) = coff_timestamp_offset(&bytes)
-        && zero_u32(&mut bytes, off)
-    {
-        reasons.push(REASON_COFF_TIMESTAMP);
+    } else if let Some(off) = coff_timestamp_offset(&bytes) {
+        if zero_u32(&mut bytes, off) {
+            reasons.push(REASON_COFF_TIMESTAMP);
+        }
+        // A standard COFF object (timestamp at +4) may carry a `.debug$S`
+        // section with an absolute-path S_OBJNAME; mask it for path
+        // independence. bigobj (+8) uses a different header layout and is not
+        // walked here yet (the M2/M3 corpus emits standard objects).
+        if off == 4 {
+            mask_coff_objname(&mut bytes, &mut reasons);
+        }
     }
 
     reasons.sort_unstable();
@@ -206,6 +219,103 @@ fn coff_timestamp_offset(b: &[u8]) -> Option<usize> {
         return Some(4); // standard COFF object
     }
     None
+}
+
+// CodeView constants for the `.debug$S` walk (microsoft-pdb cvinfo.h; LLVM
+// CodeView docs). The section opens with CV_SIGNATURE_C13; symbol records live
+// in a DEBUG_S_SYMBOLS subsection; S_OBJNAME carries the absolute object path.
+const CV_SIGNATURE_C13: u32 = 4;
+const DEBUG_S_SYMBOLS: u32 = 0xF1;
+const S_OBJNAME: u16 = 0x1101;
+
+/// Finds a standard COFF object's `.debug$S` section(s) and zeroes every
+/// S_OBJNAME record's payload (the reserved signature word + the NUL-terminated
+/// absolute path), leaving record length/type bytes — and thus all following
+/// record offsets — intact. Pushes `REASON_COFF_OBJNAME` if anything was masked.
+fn mask_coff_objname(b: &mut [u8], reasons: &mut Vec<&'static str>) {
+    let (Some(num_sections), Some(opt_size)) = (read_u16(b, 2), read_u16(b, 16)) else {
+        return;
+    };
+    // Section table follows the 20-byte file header (+ any optional header,
+    // which objects do not have).
+    let sec_table = 20usize + opt_size as usize;
+    let mut masked = false;
+    for i in 0..num_sections as usize {
+        let sh = sec_table + i * 40;
+        if sh + 40 > b.len() {
+            break; // truncated section table
+        }
+        if &b[sh..sh + 8] != b".debug$S" {
+            continue;
+        }
+        let (Some(raw_size), Some(raw_ptr)) = (read_u32(b, sh + 16), read_u32(b, sh + 20)) else {
+            continue;
+        };
+        if mask_debug_s_symbols(b, raw_ptr as usize, raw_size as usize) {
+            masked = true;
+        }
+    }
+    if masked {
+        reasons.push(REASON_COFF_OBJNAME);
+    }
+}
+
+/// Walks the subsections of one `.debug$S` section (raw data at `[ptr, ptr+size)`)
+/// and masks S_OBJNAME records inside any DEBUG_S_SYMBOLS subsection.
+fn mask_debug_s_symbols(b: &mut [u8], ptr: usize, size: usize) -> bool {
+    let end = match ptr.checked_add(size) {
+        Some(e) if e <= b.len() => e,
+        _ => return false,
+    };
+    if size < 4 || read_u32(b, ptr) != Some(CV_SIGNATURE_C13) {
+        return false;
+    }
+    let mut pos = ptr + 4;
+    let mut masked = false;
+    while pos + 8 <= end {
+        let kind = read_u32(b, pos).unwrap();
+        let len = read_u32(b, pos + 4).unwrap() as usize;
+        let data_start = pos + 8;
+        let data_end = match data_start.checked_add(len) {
+            Some(e) if e <= end => e,
+            _ => break, // declared length runs past the section
+        };
+        if kind == DEBUG_S_SYMBOLS && mask_symbol_records(b, data_start, data_end) {
+            masked = true;
+        }
+        // Subsections are 4-byte aligned; the next one follows the padded data.
+        pos = data_start + ((len + 3) & !3);
+    }
+    masked
+}
+
+/// Within a DEBUG_S_SYMBOLS subsection `[start, end)`, masks the payload of each
+/// S_OBJNAME record. Records are `{ reclen: u16 (excludes itself), rectype: u16,
+/// data[reclen-2] }`; the next record is at `+2+reclen`.
+fn mask_symbol_records(b: &mut [u8], start: usize, end: usize) -> bool {
+    let mut rpos = start;
+    let mut masked = false;
+    while rpos + 4 <= end {
+        let reclen = read_u16(b, rpos).unwrap() as usize;
+        if reclen < 2 {
+            break; // a record must at least cover its 2-byte type
+        }
+        let rectype = read_u16(b, rpos + 2).unwrap();
+        let rec_end = rpos + 2 + reclen;
+        if rec_end > end {
+            break; // record runs past the subsection
+        }
+        if rectype == S_OBJNAME {
+            // Zero everything after the type: the reserved signature word and
+            // the absolute-path string (and any padding inside the record).
+            for x in &mut b[rpos + 4..rec_end] {
+                *x = 0;
+            }
+            masked = true;
+        }
+        rpos = rec_end;
+    }
+    masked
 }
 
 /// Masks a PE image's `IMAGE_FILE_HEADER.TimeDateStamp` and Rich header.
@@ -485,6 +595,98 @@ mod tests {
             n.bytes[span_start..rich + 8].iter().all(|&x| x == 0),
             "rich span must be fully masked"
         );
+    }
+
+    // --- COFF S_OBJNAME masking (M4.5) -----------------------------------
+
+    /// Builds a minimal standard AMD64 COFF object with one `.debug$S` section
+    /// containing a single S_OBJNAME record carrying `objname`. The section's
+    /// raw data starts at file offset 60 (20-byte file header + one 40-byte
+    /// section header).
+    fn coff_with_objname(objname: &str) -> Vec<u8> {
+        // S_OBJNAME record payload: signature(u32)=0 + NUL-terminated name.
+        let mut rec_data = vec![0u8; 4];
+        rec_data.extend_from_slice(objname.as_bytes());
+        rec_data.push(0);
+        while !rec_data.len().is_multiple_of(4) {
+            rec_data.push(0); // keep the record 4-aligned
+        }
+        let reclen = (2 + rec_data.len()) as u16; // rectype(2) + data
+        let mut sym = Vec::new();
+        sym.extend_from_slice(&reclen.to_le_bytes());
+        sym.extend_from_slice(&0x1101u16.to_le_bytes()); // S_OBJNAME
+        sym.extend_from_slice(&rec_data);
+
+        // .debug$S raw data: CV_SIGNATURE_C13 + a DEBUG_S_SYMBOLS subsection.
+        let mut dbg = Vec::new();
+        dbg.extend_from_slice(&4u32.to_le_bytes()); // CV_SIGNATURE_C13
+        dbg.extend_from_slice(&0xF1u32.to_le_bytes()); // DEBUG_S_SYMBOLS
+        dbg.extend_from_slice(&(sym.len() as u32).to_le_bytes());
+        dbg.extend_from_slice(&sym);
+
+        let mut obj = Vec::new();
+        // IMAGE_FILE_HEADER.
+        obj.extend_from_slice(&0x8664u16.to_le_bytes()); // Machine
+        obj.extend_from_slice(&1u16.to_le_bytes()); // NumberOfSections
+        obj.extend_from_slice(&0u32.to_le_bytes()); // TimeDateStamp
+        obj.extend_from_slice(&0u32.to_le_bytes()); // PointerToSymbolTable
+        obj.extend_from_slice(&0u32.to_le_bytes()); // NumberOfSymbols
+        obj.extend_from_slice(&0u16.to_le_bytes()); // SizeOfOptionalHeader
+        obj.extend_from_slice(&0u16.to_le_bytes()); // Characteristics
+        // One IMAGE_SECTION_HEADER for ".debug$S".
+        obj.extend_from_slice(b".debug$S"); // Name (exactly 8 bytes)
+        obj.extend_from_slice(&0u32.to_le_bytes()); // VirtualSize
+        obj.extend_from_slice(&0u32.to_le_bytes()); // VirtualAddress
+        obj.extend_from_slice(&(dbg.len() as u32).to_le_bytes()); // SizeOfRawData
+        obj.extend_from_slice(&60u32.to_le_bytes()); // PointerToRawData
+        obj.extend_from_slice(&0u32.to_le_bytes()); // PointerToRelocations
+        obj.extend_from_slice(&0u32.to_le_bytes()); // PointerToLinenumbers
+        obj.extend_from_slice(&0u16.to_le_bytes()); // NumberOfRelocations
+        obj.extend_from_slice(&0u16.to_le_bytes()); // NumberOfLinenumbers
+        obj.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
+        assert_eq!(obj.len(), 60, "header layout");
+        obj.extend_from_slice(&dbg);
+        obj
+    }
+
+    #[test]
+    fn objname_record_is_masked() {
+        let obj = coff_with_objname("c:\\build\\x\\a.obj");
+        let n = normalize(&obj);
+        assert!(n.reasons.contains(&REASON_COFF_OBJNAME));
+        // The path string must be gone from the normalized bytes.
+        assert!(
+            !n.bytes.windows(b"a.obj".len()).any(|w| w == b"a.obj"),
+            "objname path must be zeroed"
+        );
+    }
+
+    #[test]
+    fn objects_differing_only_in_objname_path_are_normalized_equal() {
+        // Two builds of the same source in same-length directories: the only
+        // difference is the embedded object path. After masking, equal.
+        let a = coff_with_objname("c:\\buildA\\a.obj");
+        let b = coff_with_objname("c:\\buildB\\a.obj");
+        assert_ne!(a, b, "raw objects differ by the embedded path");
+        match compare(&a, &b) {
+            Verdict::NormalizedEqual(reasons) => {
+                assert!(reasons.contains(&REASON_COFF_OBJNAME));
+            }
+            other => panic!("expected NormalizedEqual, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn objname_masking_does_not_hide_real_differences() {
+        // Same object path, but a genuinely different section attribute
+        // (NumberOfSections bumped to a bogus value flips structural bytes the
+        // mask never touches) must still Differ.
+        let a = coff_with_objname("c:\\build\\a.obj");
+        let mut b = a.clone();
+        // Flip a byte inside the S_OBJNAME *signature* word is masked; instead
+        // flip a byte in the CV signature (offset 60) which is NOT masked.
+        b[60] ^= 0xFF;
+        assert_eq!(compare(&a, &b), Verdict::Differs);
     }
 
     // --- relativize -------------------------------------------------------
