@@ -72,3 +72,10 @@ jobs:
       # execution path (not just the vfs_host harness) redirects to agent bytes.
       - name: M6.1b worker VFS execution (Execute redirects to agent bytes)
         run: pwsh -NoProfile -File hooks/test/m6_worker_vfs_redirect.ps1
+      # Gates the M6.1 "Done when" for CMake/Ninja+clang-cl: a compile through the
+      # production launcher->daemon->worker path is byte-identical to a local
+      # build (clang-cl), falls back locally when the daemon is down, and a 2nd
+      # identical build HITS the action cache (compile skipped). clang-cl is the
+      # byte-identity gate (the runner ships LLVM).
+      - name: M6.1 daemon compile (distributed byte-identical, fallback, cache hit)
+        run: pwsh -NoProfile -File hooks/test/m6_daemon_compile.ps1 -RequireClangCl
