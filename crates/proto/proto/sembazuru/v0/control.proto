@@ -163,11 +163,20 @@ message ExitStatus {
   uint64 kernel_time_us = 4;
 }
 
+// A chunk of the process's console output (M6.1). The compiler's diagnostics run
+// on the worker; without streaming them back, a developer driving the build via
+// the launcher would see no warnings/errors. is_stderr selects the stream.
+message OutputChunk {
+  bool is_stderr = 1;  // false = stdout
+  bytes data = 2;
+}
+
 message ExecuteEvent {
   oneof event {
     StateChange state = 1;
     OutputAvailable output = 2;
     ExitStatus exit = 3;
+    OutputChunk stdio = 4;  // streamed compiler console output (M6.1)
   }
 }
 
@@ -218,5 +227,8 @@ message SubmitActionEvent {
     StateChange state = 1;
     // The exit code the launcher must exit with. Emitted exactly once, last.
     ExitStatus exit = 2;
+    // The compiler's console output, forwarded so the launcher can replay it to
+    // the developer's stdout/stderr (M6.1).
+    OutputChunk stdio = 3;
   }
 }

@@ -68,15 +68,23 @@ service LocalIntake {
 - **フォールバック:** daemon 不在・worker 全死・ネットワーク断のいずれでもビルドが**ローカルで完走**（非交渉 #2）。
 - **キャッシュ:** 2 回目ビルドで action cache 命中（コンパイル実行ゼロ、出力バイト一致）。
 
-## 実装状況（M6.0、2026-06-14）
+## 実装状況（2026-06-14、CI green）
 
 - **済（M6.0）:** `LocalIntake` proto、`IntakeService`/`serve_intake`/`submit_to_daemon`、常駐 daemon bin
   （Coordination＋fileserver＋Scheduler＋LocalIntake 統合）、ランチャ bin `sembazuru`（loopback 投入・
-  ローカルフォールバック）、非ループバック intake bind 拒否。証拠: 結線テスト 3＋ガードユニット 2、
-  実バイナリ smoke（remote exit ミラー／fallback／非ループバック拒否）、全 workspace テスト green。
-- **計画中:** M6.1（CMake/Ninja＋clang-cl の e2e 無設定ビルド：実コンパイル結線・Execute→prefetch・
-  logical↔agent パス整合・stdout/stderr ミラー・実 2 台 LAN 測定）、M6.2（MSBuild/VS：CLToolExe シム＋
-  Detours 横取り、security-reviewer 必須）、M6.3（UBT 設計観察のみ・繰り延べ）。
+  ローカルフォールバック）、非ループバック intake bind 拒否。
+- **済（M6.1）:** CMake/Ninja＋clang-cl の e2e 無設定ビルド。worker の VFS 注入実行（launcher＋DLL＋
+  per-action パイプ＋agent fileserver 供給）、daemon の action cache resolve/record、predicted_paths
+  prefetch、Execute→prefetch 配線、Abort 実 kill（Job Object でツリー kill）。CI（hooks ジョブ）で
+  分散ビルド＝ローカル clang-cl バイト一致／ローカルフォールバック完走／2 回目 action cache 命中を実証
+  （`m6_worker_vfs_redirect.ps1`／`m6_daemon_compile.ps1 -RequireClangCl`）。単機モデル（書込み非リダイレクト
+  ＝出力ローカル、trace_dir 共有 FS）。実 2 台 LAN 測定・2 台 writeback は決定者承認で繰り延べ。
+- **済（M6.2）:** MSBuild/VS の CLToolExe ランチャシム。launcher のシムモード（`SEMBAZURU_SHIM_CC` で実
+  コンパイラ前置）、`Directory.Build.targets` ドロップイン、`docs/integrations/README.md`。CI（`m6_msbuild.ps1`）で
+  MSBuild の CL タスクが daemon 経由（remote）＋ローカルフォールバックを実証。MSVC cl はベストエフォート
+  （バイト一致は CMake/Ninja＋clang-cl が担保）。security-reviewer 済（PASS、注入は M3 と同機構・新シグナル無し）。
+  Detours プロセス起動横取りは CLToolExe で覆えない経路向けに将来（EDR シグナル増・M7 寄り）。
+- **繰り延べ:** M6.3（UBT 設計観察のみ）、stdout/stderr ミラー（M6.1 残）、実 2 台 LAN 測定・writeback。
 
 ## 影響
 

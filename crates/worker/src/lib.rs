@@ -26,8 +26,9 @@ use job::JobObject;
 
 use sembazuru_proto::v0::{
     AbortRequest, AbortResponse, ActionState, Command, ExecuteEvent, ExecuteRequest, ExitStatus,
-    StateChange, VfsExecution, execute_event::Event, execution_server::Execution,
+    OutputChunk, StateChange, VfsExecution, execute_event::Event, execution_server::Execution,
 };
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -191,6 +192,39 @@ fn exit_event(code: i32, wall_us: u64) -> Result<ExecuteEvent, Status> {
     })
 }
 
+/// Streams a child's stdout/stderr to the agent as `OutputChunk` events so the
+/// developer driving the build via the launcher sees the compiler's diagnostics
+/// (M6.1). Reads continuously, which also prevents the child from blocking on a
+/// full pipe buffer. Ends on EOF (child exit) or when the receiver is gone.
+fn spawn_stdio_reader<R>(
+    mut reader: R,
+    is_stderr: bool,
+    tx: mpsc::Sender<Result<ExecuteEvent, Status>>,
+) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let ev = Ok(ExecuteEvent {
+                        event: Some(Event::Stdio(OutputChunk {
+                            is_stderr,
+                            data: buf[..n].to_vec(),
+                        })),
+                    });
+                    if tx.send(ev).await.is_err() {
+                        break; // agent went away
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Drives one action to completion, emitting lifecycle events into `tx`.
 ///
 /// Admission: the action is `QUEUED` until it acquires a permit from `limit`,
@@ -291,6 +325,17 @@ async fn run_action(
             .insert(action_id.clone(), Arc::new(j));
     }
 
+    // Stream the child's console output to the agent. Reading continuously also
+    // stops the child from blocking on a full pipe buffer (M6.1).
+    let mut stdout_reader = child
+        .stdout
+        .take()
+        .map(|s| spawn_stdio_reader(s, false, tx.clone()));
+    let mut stderr_reader = child
+        .stderr
+        .take()
+        .map(|s| spawn_stdio_reader(s, true, tx.clone()));
+
     let _ = tx.send(state_event(ActionState::Running, "")).await;
 
     tokio::select! {
@@ -308,6 +353,10 @@ async fn run_action(
         }
         result = child.wait() => match result {
             Ok(status) => {
+                // Flush all console output BEFORE the exit event, so the launcher
+                // has the full diagnostics in hand when it sees the exit code.
+                if let Some(h) = stdout_reader.take() { let _ = h.await; }
+                if let Some(h) = stderr_reader.take() { let _ = h.await; }
                 // On Windows a process always has an exit code; unwrap_or guards
                 // the signal-terminated case that does not occur here.
                 let code = status.code().unwrap_or(-1);
@@ -326,6 +375,14 @@ async fn run_action(
         }
     }
 
+    // Abort any stdio readers still running (the non-wait exits: cancel/ceiling).
+    // On the normal wait path they were already awaited and taken.
+    if let Some(h) = stdout_reader.take() {
+        h.abort();
+    }
+    if let Some(h) = stderr_reader.take() {
+        h.abort();
+    }
     // Stop the per-action VFS pipe server (if any). The serve loop runs forever
     // by design, so it must be aborted once the action is done or it leaks one
     // task (and one listening pipe instance) per action. The hydrated scratch
@@ -371,6 +428,9 @@ async fn build_child(
             command.env(k, val);
         }
         command.stdin(Stdio::null());
+        // Capture stdout/stderr so they can be streamed to the agent (M6.1).
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
         // Kill the child if its task is dropped (agent gave up / fallback), so
         // the worker never leaks an orphan holding an admission slot. The plain
         // path has no grandchild to orphan, so no Job Object is needed here.
@@ -448,6 +508,10 @@ async fn build_child(
         command.env("SEMBAZURU_TRACE_DIR", &v.trace_dir);
     }
     command.stdin(Stdio::null());
+    // Capture the launcher's stdout/stderr — which are the injected compiler's,
+    // since launcher.exe forwards its std handles — to stream to the agent (M6.1).
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     command.kill_on_drop(true);
     let child = match command.spawn() {
         Ok(child) => child,
