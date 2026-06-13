@@ -273,6 +273,65 @@ impl DirListResponse {
     }
 }
 
+// --- WriteBack -----------------------------------------------------------
+
+/// Worker -> Agent output return (`docs/protocol/v0.md` §4.1). The agent
+/// publishes the bytes atomically at `path` (temp + rename) after verifying the
+/// digest. M3.3 sends the whole artifact in one message; chunked WriteBack is a
+/// later optimization for large outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteBackRequest {
+    /// Agent-side logical path to publish the output at.
+    pub path: String,
+    pub digest_hex: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteBackResponse {
+    pub ok: bool,
+    /// Cause when `ok == false` (digest mismatch, write/rename failure).
+    pub detail: String,
+}
+
+impl WriteBackRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(&self.path);
+        w.str(&self.digest_hex);
+        w.bytes(&self.bytes);
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let path = r.str()?;
+        let digest_hex = r.str()?;
+        let bytes = r.bytes()?;
+        r.finish()?;
+        Ok(WriteBackRequest {
+            path,
+            digest_hex,
+            bytes,
+        })
+    }
+}
+
+impl WriteBackResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bool(self.ok);
+        w.str(&self.detail);
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let ok = r.bool()?;
+        let detail = r.str()?;
+        r.finish()?;
+        Ok(WriteBackResponse { ok, detail })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +415,21 @@ mod tests {
             ],
         };
         assert_eq!(DirListResponse::decode(&resp.encode()).unwrap(), resp);
+    }
+
+    #[test]
+    fn write_back_round_trips() {
+        let req = WriteBackRequest {
+            path: "c:\\out\\a.obj".into(),
+            digest_hex: "feedface".into(),
+            bytes: vec![0u8, 1, 2, 255, 128],
+        };
+        assert_eq!(WriteBackRequest::decode(&req.encode()).unwrap(), req);
+        let resp = WriteBackResponse {
+            ok: false,
+            detail: "digest mismatch".into(),
+        };
+        assert_eq!(WriteBackResponse::decode(&resp.encode()).unwrap(), resp);
     }
 
     #[test]

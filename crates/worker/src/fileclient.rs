@@ -12,7 +12,7 @@ use std::io;
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
     DirListRequest, DirListResponse, OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse,
-    StatRequest, StatResponse,
+    StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use sembazuru_tracer::determinism::sha256_hex;
@@ -90,6 +90,20 @@ impl FileClient {
         .encode();
         let resp = self.call(OpCode::Read, &payload).await?;
         ReadResponse::decode(&resp).map_err(to_io)
+    }
+
+    /// Returns a produced output to the agent for atomic publication at `path`.
+    /// The agent verifies the digest, so a corrupted transfer is rejected rather
+    /// than published.
+    pub async fn write_back(&mut self, path: &str, bytes: &[u8]) -> io::Result<WriteBackResponse> {
+        let payload = WriteBackRequest {
+            path: path.to_string(),
+            digest_hex: sha256_hex(bytes),
+            bytes: bytes.to_vec(),
+        }
+        .encode();
+        let resp = self.call(OpCode::WriteBack, &payload).await?;
+        WriteBackResponse::decode(&resp).map_err(to_io)
     }
 
     pub async fn dir_list(&mut self, path: &str, depth: u32) -> io::Result<DirListResponse> {
