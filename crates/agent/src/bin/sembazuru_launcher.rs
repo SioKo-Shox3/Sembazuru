@@ -67,9 +67,23 @@ fn infer_outputs(compiler_argv: &[String]) -> Vec<String> {
 #[tokio::main]
 async fn main() {
     // argv[0] is `sembazuru` itself; argv[1..] is the real compiler command.
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // MSBuild/VS shim mode (M6.2). CMake/Ninja prepend the launcher to the
+    // compiler (`sembazuru cl /c a.cpp`), so argv[0] is already the compiler.
+    // MSBuild's CL task instead runs `<CLToolPath>\<CLToolExe> <CL-args>`; pointing
+    // CLToolExe at this launcher gives it only the CL args, with no compiler. When
+    // SEMBAZURU_SHIM_CC names the real compiler, prepend it so the action is the
+    // same `<compiler> <args>` shape the CMake path produces. A Directory.Build.props
+    // drop-in sets CLToolExe + this env var (docs/integrations/msbuild).
+    if let Ok(cc) = std::env::var("SEMBAZURU_SHIM_CC")
+        && !cc.is_empty()
+    {
+        argv.insert(0, cc);
+    }
+
     if argv.is_empty() {
-        eprintln!("usage: sembazuru <compiler> <args...>");
+        eprintln!("usage: sembazuru <compiler> <args...>  (or set SEMBAZURU_SHIM_CC)");
         std::process::exit(2);
     }
 

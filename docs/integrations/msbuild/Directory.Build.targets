@@ -1,0 +1,27 @@
+<Project>
+  <!-- Sembazuru MSBuild / Visual Studio integration (M6.2).
+
+       Routes every C/C++ compile through the Sembazuru agent daemon by pointing
+       MSBuild's CL task at the `sembazuru` launcher shim (CLToolExe/CLToolPath).
+       This is the MSBuild equivalent of CMAKE_<LANG>_COMPILER_LAUNCHER for the
+       CMake/Ninja path — no project-file edits, just this drop-in.
+
+       Setup (minimal config):
+         1. Copy this file to your solution/repo root as `Directory.Build.targets`.
+         2. Before running msbuild, set:
+              SEMBAZURU_LAUNCHER_DIR = directory containing sembazuru.exe
+              SEMBAZURU_SHIM_CC      = the real compiler ("cl.exe" or "clang-cl.exe")
+              SEMBAZURU_DAEMON       = daemon endpoint (default http://127.0.0.1:50071)
+            and start a daemon + at least one worker (see docs/integrations).
+
+       The launcher hands each compile to the daemon, which distributes it; if the
+       daemon is unreachable it falls back to a normal local compile, so the build
+       always completes. Set SEMBAZURU_DISABLE=true to bypass the shim entirely.
+
+       This file is imported after the C++ toolset (Directory.Build.targets is the
+       last import), so it overrides the toolset's default CL.exe. -->
+  <PropertyGroup Condition="'$(SEMBAZURU_DISABLE)' != 'true' and '$(SEMBAZURU_LAUNCHER_DIR)' != ''">
+    <CLToolPath>$(SEMBAZURU_LAUNCHER_DIR)</CLToolPath>
+    <CLToolExe>sembazuru.exe</CLToolExe>
+  </PropertyGroup>
+</Project>
