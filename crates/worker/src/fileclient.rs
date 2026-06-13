@@ -9,11 +9,17 @@
 //! fetch`] keeps the inline-first-chunk fast path for callers that always want
 //! the bytes.
 //!
-//! **M3.2 scope.** Calls are sequential (one request, await its response). The
-//! frame format already carries request ids for out-of-order completion; the
-//! pipelining that exploits that is M5 latency work.
+//! **Multiplexed connection (M5.3).** One persistent connection is shared (it is
+//! `Clone`, an `Arc` inside) and supports many concurrent in-flight ops: a reader
+//! task fans each response back to the waiting caller by request id, so calls no
+//! longer serialize one round-trip at a time. This is both the connection pool
+//! (one socket per session instead of one per hydrate) and the pipelining that
+//! the request-id wire format was built for.
 
+use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use sembazuru_cas::Digest;
@@ -23,7 +29,9 @@ use sembazuru_dataplane::ops::{
     ReadRequest, ReadResponse, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio::sync::{Mutex, oneshot};
 
 /// How much to request per Read after the inlined first chunk.
 const READ_CHUNK: u32 = 256 * 1024;
@@ -32,36 +40,53 @@ const READ_CHUNK: u32 = 256 * 1024;
 /// fixed chunks). A small output fits in a single chunk.
 const WRITEBACK_CHUNK: usize = 1024 * 1024;
 
-pub struct FileClient {
-    stream: TcpStream,
-    next_id: u64,
+/// A decoded frame (header + payload), handed from the reader task to a waiter.
+type Frame = (FrameHeader, Vec<u8>);
+/// Outstanding requests by id, each awaiting its correlated response frame.
+type PendingMap = HashMap<u64, oneshot::Sender<Frame>>;
+
+/// The multiplexed connection state behind a [`FileClient`]. The write half is
+/// mutex-guarded (frames are written whole); the reader task owns the read half
+/// and routes each response to its waiting caller via `pending`.
+struct Mux {
+    write: Mutex<OwnedWriteHalf>,
+    pending: Mutex<PendingMap>,
+    /// Set once the reader task exits (connection dead). Checked under the
+    /// `pending` lock so a call cannot register a waiter that will never be woken
+    /// — without it, a request issued after the reader stopped would hang forever.
+    closed: AtomicBool,
+    next_id: AtomicU64,
     /// Synthetic per-op latency for benchmarking against a single machine, where
     /// clumsy/QoS cannot shape loopback (docs/research/m3-prestudy.md §2). Zero
-    /// in production. Applied identically to every op so it measures
-    /// round-trips x RTT, the quantity the data plane is judged on.
+    /// in production. Applied per op so it measures round-trips x RTT, the
+    /// quantity the data plane is judged on — and pipelined ops overlap it.
     rtt: Duration,
 }
 
-impl FileClient {
-    pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        Self::connect_with_rtt(addr, Duration::ZERO).await
+impl Mux {
+    /// Reads responses forever, waking the matching waiter. On a read error or
+    /// EOF the connection is dead: drop all waiters (their `recv` errors, which
+    /// callers surface as a broken-pipe `io::Error`).
+    async fn read_loop(self: Arc<Self>, mut rd: OwnedReadHalf) {
+        // Until the connection errors/EOFs, route each response to its waiter.
+        // A response with no waiter (duplicate / unsolicited) is dropped.
+        while let Ok((header, payload)) = read_frame(&mut rd).await {
+            let waiter = self.pending.lock().await.remove(&header.request_id);
+            if let Some(tx) = waiter {
+                let _ = tx.send((header, payload));
+            }
+        }
+        // Connection dead. Mark closed *before* draining, then drain under the
+        // lock: any call that already registered is woken (with an error) here,
+        // and any call that has not yet locked `pending` will see `closed` and
+        // bail instead of registering a waiter nobody will ever wake.
+        self.closed.store(true, Ordering::SeqCst);
+        self.pending.lock().await.clear();
     }
 
-    /// Connects with a synthetic per-op RTT injected at the framing layer (for
-    /// the M3.5 latency benchmark; pass `Duration::ZERO` in production).
-    pub async fn connect_with_rtt<A: ToSocketAddrs>(addr: A, rtt: Duration) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        Ok(FileClient {
-            stream,
-            next_id: 1,
-            rtt,
-        })
-    }
-
-    /// One request/response round-trip. Verifies the response correlates to the
-    /// request (same id, response flag, same op) so a desynchronized stream is
-    /// caught rather than silently mis-parsed.
-    async fn call(&mut self, op: OpCode, payload: &[u8]) -> io::Result<Vec<u8>> {
+    /// One request/response over the multiplexed connection. Registers a waiter
+    /// under a fresh id, writes the request, and awaits its correlated response.
+    async fn call(&self, op: OpCode, payload: &[u8]) -> io::Result<Vec<u8>> {
         if !self.rtt.is_zero() {
             // Emulate one network round-trip. Spin-wait, not tokio::time::sleep:
             // the OS/timer granularity on Windows (~15 ms) makes sub-15 ms sleeps
@@ -73,19 +98,40 @@ impl FileClient {
                 std::hint::spin_loop();
             }
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        write_frame(
-            &mut self.stream,
-            FrameHeader {
-                request_id: id,
-                op,
-                is_response: false,
-            },
-            payload,
-        )
-        .await?;
-        let (header, resp) = read_frame(&mut self.stream).await?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "data-plane connection closed",
+                ));
+            }
+            pending.insert(id, tx);
+        }
+        let write_result = {
+            let mut w = self.write.lock().await;
+            write_frame(
+                &mut *w,
+                FrameHeader {
+                    request_id: id,
+                    op,
+                    is_response: false,
+                },
+                payload,
+            )
+            .await
+        };
+        if let Err(e) = write_result {
+            // The request never went out: remove our waiter so a failed write
+            // does not leave a dangling pending entry until the connection dies.
+            self.pending.lock().await.remove(&id);
+            return Err(e);
+        }
+        let (header, resp) = rx.await.map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "data-plane connection closed")
+        })?;
         if header.request_id != id || !header.is_response || header.op != op {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -94,8 +140,42 @@ impl FileClient {
         }
         Ok(resp)
     }
+}
 
-    pub async fn stat_batch(&mut self, paths: &[String]) -> io::Result<StatResponse> {
+/// A handle to a multiplexed data-plane connection. Cheap to [`Clone`] (it is an
+/// `Arc` inside); every clone shares the one socket and can issue ops
+/// concurrently, so a whole session's hydrates pool onto a single connection.
+#[derive(Clone)]
+pub struct FileClient {
+    mux: Arc<Mux>,
+}
+
+impl FileClient {
+    pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        Self::connect_with_rtt(addr, Duration::ZERO).await
+    }
+
+    /// Connects with a synthetic per-op RTT injected at the framing layer (for
+    /// the M3.5 latency benchmark; pass `Duration::ZERO` in production).
+    pub async fn connect_with_rtt<A: ToSocketAddrs>(addr: A, rtt: Duration) -> io::Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        let (rd, wr) = stream.into_split();
+        let mux = Arc::new(Mux {
+            write: Mutex::new(wr),
+            pending: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            rtt,
+        });
+        tokio::spawn(Arc::clone(&mux).read_loop(rd));
+        Ok(FileClient { mux })
+    }
+
+    async fn call(&self, op: OpCode, payload: &[u8]) -> io::Result<Vec<u8>> {
+        self.mux.call(op, payload).await
+    }
+
+    pub async fn stat_batch(&self, paths: &[String]) -> io::Result<StatResponse> {
         let payload = StatRequest {
             paths: paths.to_vec(),
         }
@@ -106,11 +186,7 @@ impl FileClient {
 
     /// Resolves `path`, optionally inlining its first chunk. With
     /// `want_inline = false` this is a cheap *digest probe* (no content bytes).
-    pub async fn open_read(
-        &mut self,
-        path: &str,
-        want_inline: bool,
-    ) -> io::Result<OpenReadResponse> {
+    pub async fn open_read(&self, path: &str, want_inline: bool) -> io::Result<OpenReadResponse> {
         let payload = OpenReadRequest {
             path: path.to_string(),
             want_inline,
@@ -120,7 +196,7 @@ impl FileClient {
         OpenReadResponse::decode(&resp).map_err(to_io)
     }
 
-    pub async fn read(&mut self, digest: &str, offset: u64, len: u32) -> io::Result<ReadResponse> {
+    pub async fn read(&self, digest: &str, offset: u64, len: u32) -> io::Result<ReadResponse> {
         let payload = ReadRequest {
             digest_hex: digest.to_string(),
             offset,
@@ -133,7 +209,7 @@ impl FileClient {
 
     /// Asks the agent which of `digests` it already holds (`§4.3`). Used before
     /// uploading outputs so a rebuild re-sends nothing the agent already has.
-    pub async fn has(&mut self, digests: &[String]) -> io::Result<Vec<bool>> {
+    pub async fn has(&self, digests: &[String]) -> io::Result<Vec<bool>> {
         let payload = HasRequest {
             digests: digests.to_vec(),
         }
@@ -147,7 +223,7 @@ impl FileClient {
     /// either side. The agent verifies the full digest on the final chunk, so a
     /// corrupted transfer is rejected rather than published. A small output is a
     /// single chunk.
-    pub async fn write_back(&mut self, path: &str, bytes: &[u8]) -> io::Result<WriteBackResponse> {
+    pub async fn write_back(&self, path: &str, bytes: &[u8]) -> io::Result<WriteBackResponse> {
         let digest = Digest::of(bytes).canonical();
         let mut offset = 0usize;
         loop {
@@ -172,7 +248,7 @@ impl FileClient {
         }
     }
 
-    pub async fn dir_list(&mut self, path: &str, depth: u32) -> io::Result<DirListResponse> {
+    pub async fn dir_list(&self, path: &str, depth: u32) -> io::Result<DirListResponse> {
         let payload = DirListRequest {
             path: path.to_string(),
             depth,
@@ -186,7 +262,7 @@ impl FileClient {
     /// transfer** (`want_inline = false`), or `None` if it does not exist. The
     /// caller checks its local cache against the digest and fetches only on a
     /// miss — the core of the no-re-transfer worker cache (M4).
-    pub async fn probe_digest(&mut self, path: &str) -> io::Result<Option<(Digest, u64)>> {
+    pub async fn probe_digest(&self, path: &str) -> io::Result<Option<(Digest, u64)>> {
         let open = self.open_read(path, false).await?;
         if !open.exists {
             return Ok(None);
@@ -199,7 +275,7 @@ impl FileClient {
     /// Fetches the full content of `digest` (whose size is `size`) by ranged
     /// `Read`, verifying the assembled bytes against the digest. For the cache
     /// path: probe first, then fetch only on a miss.
-    pub async fn fetch_by_digest(&mut self, digest: &Digest, size: u64) -> io::Result<Vec<u8>> {
+    pub async fn fetch_by_digest(&self, digest: &Digest, size: u64) -> io::Result<Vec<u8>> {
         let size = size as usize;
         let mut bytes = Vec::with_capacity(size);
         let digest_str = digest.canonical();
@@ -221,7 +297,7 @@ impl FileClient {
     /// Pulls the full contents of `path` for hydration, using the inline-first-
     /// chunk fast path. Returns `None` if the file does not exist on the agent.
     /// The fetched bytes are verified against the agent-reported digest.
-    pub async fn fetch(&mut self, path: &str) -> io::Result<Option<(Vec<u8>, Digest)>> {
+    pub async fn fetch(&self, path: &str) -> io::Result<Option<(Vec<u8>, Digest)>> {
         let open = self.open_read(path, true).await?;
         if !open.exists {
             return Ok(None);

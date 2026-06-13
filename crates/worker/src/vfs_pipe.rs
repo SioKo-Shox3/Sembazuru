@@ -20,8 +20,10 @@
 //!   * response payload = 1 status byte (0=ok, 1=not-found, 2=error) followed by
 //!     the UTF-8 local path to open (empty unless status==0).
 //!
-//! **M3.2 scope.** A fresh agent connection is made per hydrate (pooling is M5
-//! latency work); the scratch tree persists for the session and is not yet
+//! **Connection pooling (M5.3).** The agent connection is established once per
+//! session and shared (lazily, so worker/agent startup order does not matter):
+//! every hydrate reuses the one multiplexed [`FileClient`] instead of dialing a
+//! fresh TCP connection. The scratch tree persists for the session and is not yet
 //! scrubbed (M3.3 owns output fencing/cleanup).
 
 use std::collections::HashMap;
@@ -34,7 +36,7 @@ use std::time::Duration;
 use sembazuru_cas::BlobStore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OnceCell};
 
 use crate::fileclient::FileClient;
 
@@ -44,7 +46,8 @@ const STATUS_ERROR: u8 = 2;
 const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 
 /// Shared state for the VFS server: the per-session path→scratch cache (so a
-/// re-open is a pipe round-trip with no work) and the cross-build content store.
+/// re-open is a pipe round-trip with no work), the cross-build content store, and
+/// the one pooled agent connection shared by every hydrate this session.
 struct VfsState {
     scratch_root: PathBuf,
     /// Logical path → materialized scratch path, for this session.
@@ -52,6 +55,23 @@ struct VfsState {
     /// Content-addressed store, persisting across builds: a blob seen once is
     /// never re-fetched.
     cas: BlobStore,
+    agent_addr: SocketAddr,
+    rtt: Duration,
+    /// The session's pooled, multiplexed agent connection, dialed on first
+    /// hydrate. `OnceCell::get_or_try_init` retries if the first dial fails, so a
+    /// worker that starts before the agent is listening recovers on a later open.
+    client: OnceCell<FileClient>,
+}
+
+impl VfsState {
+    /// The shared agent connection, dialed once and reused. A clone is an `Arc`
+    /// bump; all hydrates issue ops concurrently over the one socket.
+    async fn client(&self) -> io::Result<FileClient> {
+        self.client
+            .get_or_try_init(|| FileClient::connect_with_rtt(self.agent_addr, self.rtt))
+            .await
+            .cloned()
+    }
 }
 
 /// Maps an agent-side logical path to its location in the scratch tree by
@@ -87,6 +107,9 @@ pub async fn serve_vfs(
         scratch_root,
         hydrated: Mutex::new(HashMap::new()),
         cas: BlobStore::open(cas_root)?,
+        agent_addr,
+        rtt,
+        client: OnceCell::new(),
     });
 
     let mut server = ServerOptions::new()
@@ -100,17 +123,12 @@ pub async fn serve_vfs(
 
         let state = state.clone();
         tokio::spawn(async move {
-            let _ = handle_client(connected, agent_addr, state, rtt).await;
+            let _ = handle_client(connected, state).await;
         });
     }
 }
 
-async fn handle_client(
-    mut pipe: NamedPipeServer,
-    agent_addr: SocketAddr,
-    state: Arc<VfsState>,
-    rtt: Duration,
-) -> io::Result<()> {
+async fn handle_client(mut pipe: NamedPipeServer, state: Arc<VfsState>) -> io::Result<()> {
     loop {
         let path = match read_msg(&mut pipe).await {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
@@ -124,22 +142,19 @@ async fn handle_client(
             Err(e) => return Err(e),
         };
 
-        let (status, local) = hydrate(&path, agent_addr, &state, rtt).await;
+        let (status, local) = hydrate(&path, &state).await;
         write_response(&mut pipe, status, &local).await?;
     }
 }
 
-async fn hydrate(
-    path: &str,
-    agent_addr: SocketAddr,
-    state: &VfsState,
-    rtt: Duration,
-) -> (u8, String) {
+async fn hydrate(path: &str, state: &VfsState) -> (u8, String) {
     if let Some(local) = state.hydrated.lock().await.get(path) {
         return (STATUS_OK, local.clone());
     }
 
-    let mut client = match FileClient::connect_with_rtt(agent_addr, rtt).await {
+    // Reuse the session's pooled connection (dialed once); a clone shares the
+    // one socket and multiplexes with other in-flight hydrates.
+    let client = match state.client().await {
         Ok(c) => c,
         Err(_) => return (STATUS_ERROR, String::new()),
     };
