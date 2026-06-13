@@ -80,7 +80,8 @@ async fn pipe_hydrates_file_into_scratch() {
         let pn = pipe_name.clone();
         let sc = scratch.clone();
         tokio::spawn(async move {
-            let _ = sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc).await;
+            let _ = sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc, std::time::Duration::ZERO)
+                .await;
         });
     }
 

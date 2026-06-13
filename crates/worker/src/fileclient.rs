@@ -8,6 +8,7 @@
 //! pipelining that exploits that is M3.5 latency work.
 
 use std::io;
+use std::time::Duration;
 
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
@@ -24,18 +25,36 @@ const READ_CHUNK: u32 = 256 * 1024;
 pub struct FileClient {
     stream: TcpStream,
     next_id: u64,
+    /// Synthetic per-op latency for benchmarking against a single machine, where
+    /// clumsy/QoS cannot shape loopback (docs/research/m3-prestudy.md §2). Zero
+    /// in production. Applied identically to every op so it measures
+    /// round-trips x RTT, the quantity the data plane is judged on.
+    rtt: Duration,
 }
 
 impl FileClient {
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        Self::connect_with_rtt(addr, Duration::ZERO).await
+    }
+
+    /// Connects with a synthetic per-op RTT injected at the framing layer (for
+    /// the M3.5 latency benchmark; pass `Duration::ZERO` in production).
+    pub async fn connect_with_rtt<A: ToSocketAddrs>(addr: A, rtt: Duration) -> io::Result<Self> {
         let stream = TcpStream::connect(addr).await?;
-        Ok(FileClient { stream, next_id: 1 })
+        Ok(FileClient {
+            stream,
+            next_id: 1,
+            rtt,
+        })
     }
 
     /// One request/response round-trip. Verifies the response correlates to the
     /// request (same id, response flag, same op) so a desynchronized stream is
     /// caught rather than silently mis-parsed.
     async fn call(&mut self, op: OpCode, payload: &[u8]) -> io::Result<Vec<u8>> {
+        if !self.rtt.is_zero() {
+            tokio::time::sleep(self.rtt).await; // emulate one network round-trip
+        }
         let id = self.next_id;
         self.next_id += 1;
         write_frame(

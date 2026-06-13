@@ -55,3 +55,8 @@ jobs:
       # byte-identical to a local build (required here -- the runner ships LLVM).
       - name: M3 remote compile under VFS (clang-cl byte-identical)
         run: pwsh -NoProfile -File hooks/test/vfs_compile.ps1 -RequireClangCl
+      # M3.5 speed "Done when": injected RTT barely moves the compile time
+      # (few project-file round-trips; SDK is worker-local), and the VFS compile
+      # is not catastrophically slower than local. See docs/decisions/0002.
+      - name: M3.5 VFS speed (round-trips do not break the compile)
+        run: pwsh -NoProfile -File hooks/test/vfs_bench.ps1
