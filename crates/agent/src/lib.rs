@@ -38,6 +38,11 @@ pub struct ActionOutcome {
     pub states: Vec<i32>,
     pub exit_code: Option<i32>,
     pub wall_time_us: u64,
+    /// The remote process's console output, collected for replay to the
+    /// developer (M6.1): the compiler ran on the worker, so its diagnostics must
+    /// be streamed back or they are invisible.
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
 }
 
 /// Errors the agent surfaces to its caller. A `Transport` or `Rpc` error is
@@ -230,6 +235,15 @@ async fn drive_execute(
             Some(Event::Exit(e)) => {
                 outcome.exit_code = Some(e.exit_code);
                 outcome.wall_time_us = e.wall_time_us;
+            }
+            Some(Event::Stdio(c)) => {
+                // Collect the compiler's console output to replay to the
+                // developer (M6.1). Buffered here, re-streamed to the launcher.
+                if c.is_stderr {
+                    outcome.stderr.extend_from_slice(&c.data);
+                } else {
+                    outcome.stdout.extend_from_slice(&c.data);
+                }
             }
             Some(Event::Output(_)) => { /* write-back is M3.3 */ }
             None => {}

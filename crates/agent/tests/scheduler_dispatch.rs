@@ -81,6 +81,36 @@ async fn dispatch_runs_remotely_with_live_workers() {
 }
 
 #[tokio::test]
+async fn dispatch_captures_remote_stdout() {
+    // M6.1: the process runs on the worker, so its console output must be streamed
+    // back (else a developer sees no compiler diagnostics). Assert a remote
+    // action's stdout is captured in the outcome.
+    let (w1, _) = start_worker().await;
+    let table = table_with(&[("w1", &w1, 2)]);
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "echo", "hello-from-worker"]),
+            "act-stdout".into(),
+            "sess".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    match exec {
+        Execution::Remote(o) => {
+            assert_eq!(o.exit_code, Some(0));
+            let out = String::from_utf8_lossy(&o.stdout);
+            assert!(
+                out.contains("hello-from-worker"),
+                "remote stdout must be captured, got {out:?}"
+            );
+        }
+        other => panic!("expected remote execution, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn dispatch_reassigns_past_a_dead_worker() {
     // One dead endpoint, one live worker. Whichever the ring prefers, dispatch
     // must try both and land the action on the live one — not fall back to local.

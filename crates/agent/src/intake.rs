@@ -18,9 +18,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sembazuru_proto::v0::{
-    ActionState, Command, ExitStatus, StateChange, SubmitActionEvent, SubmitActionRequest,
-    VfsExecution, local_intake_client::LocalIntakeClient, local_intake_server::LocalIntake,
-    submit_action_event::Event,
+    ActionState, Command, ExitStatus, OutputChunk, StateChange, SubmitActionEvent,
+    SubmitActionRequest, VfsExecution, local_intake_client::LocalIntakeClient,
+    local_intake_server::LocalIntake, submit_action_event::Event,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -48,6 +48,12 @@ fn exit_ev(code: i32, wall_us: u64) -> SubmitActionEvent {
             user_time_us: 0,
             kernel_time_us: 0,
         })),
+    }
+}
+
+fn stdio_ev(is_stderr: bool, data: Vec<u8>) -> SubmitActionEvent {
+    SubmitActionEvent {
+        event: Some(Event::Stdio(OutputChunk { is_stderr, data })),
     }
 }
 
@@ -265,15 +271,26 @@ async fn run_submission(
     emit_outcome(&tx, outcome).await;
 }
 
-/// Mirrors a dispatch outcome as the terminal `state` + `exit` events. dispatch
-/// always completes (remote or local fallback), so there is always an exit code.
+/// Mirrors a dispatch outcome as the terminal events. dispatch always completes
+/// (remote or local fallback), so there is always an exit code. For a remote run
+/// the compiler's captured stdout/stderr are forwarded first so the launcher can
+/// replay them before exiting (M6.1). A local fallback inherits the developer's
+/// console directly, so there is nothing to forward.
 async fn emit_outcome(tx: &mpsc::Sender<Result<SubmitActionEvent, Status>>, outcome: Execution) {
     let (code, wall, note) = match outcome {
-        Execution::Remote(o) => (
-            o.exit_code.unwrap_or(-1),
-            o.wall_time_us,
-            "remote".to_string(),
-        ),
+        Execution::Remote(o) => {
+            if !o.stdout.is_empty() {
+                let _ = tx.send(Ok(stdio_ev(false, o.stdout))).await;
+            }
+            if !o.stderr.is_empty() {
+                let _ = tx.send(Ok(stdio_ev(true, o.stderr))).await;
+            }
+            (
+                o.exit_code.unwrap_or(-1),
+                o.wall_time_us,
+                "remote".to_string(),
+            )
+        }
         Execution::LocalFallback { exit_code, reason } => {
             (exit_code, 0, format!("local fallback: {reason}"))
         }
@@ -367,6 +384,16 @@ pub async fn submit_to_daemon(
         match ev.event {
             Some(Event::Exit(e)) => exit_code = Some(e.exit_code),
             Some(Event::State(s)) if !s.detail.is_empty() => note = s.detail,
+            Some(Event::Stdio(c)) => {
+                // Replay the remote compiler's output to this launcher's console
+                // so the developer sees diagnostics as if the build ran locally.
+                use std::io::Write;
+                if c.is_stderr {
+                    let _ = std::io::stderr().write_all(&c.data);
+                } else {
+                    let _ = std::io::stdout().write_all(&c.data);
+                }
+            }
             _ => {}
         }
     }

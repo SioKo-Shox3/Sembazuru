@@ -59,7 +59,10 @@ New-Item -ItemType Directory -Force $WorkRoot | Out-Null
 $proj = Join-Path $WorkRoot 'proj'
 New-Item -ItemType Directory -Force $proj | Out-Null
 Set-Content (Join-Path $proj 'shared.h') "#define SHARED_VALUE 42`n" -Encoding ascii
-Set-Content (Join-Path $proj 'a.cpp') "#include `"shared.h`"`nint f(){ return SHARED_VALUE; }`n" -Encoding ascii
+# The #pragma message prints a marker during compilation; we assert it reaches the
+# launcher's console, proving remote stdout/stderr mirroring end to end (M6.1).
+$diag = 'SBZ-REMOTE-DIAG-MARKER'
+Set-Content (Join-Path $proj 'a.cpp') "#include `"shared.h`"`n#pragma message(`"$diag`")`nint f(){ return SHARED_VALUE; }`n" -Encoding ascii
 
 $scratchRoot = Join-Path $WorkRoot 'wscratch'
 $casRoot = Join-Path $WorkRoot 'wcas'
@@ -136,6 +139,9 @@ try {
     if ($r.exit -ne 0) { $failures += "distributed build did not exit 0 (exit=$($r.exit))" }
     if ($r.note -notmatch 'remote') { $failures += 'build 1 never ran remotely (worker did not come up?)' }
     if (-not (Test-Path $aObj)) { $failures += 'distributed build produced no .obj' }
+    # Remote stdout/stderr mirroring: the compiler's #pragma message must reach
+    # the launcher's console (it ran on the worker, not here).
+    if ($r.note -notmatch [regex]::Escape($diag)) { $failures += 'remote compiler diagnostics were NOT mirrored to the launcher (stdout/stderr streaming)' }
     if ($byteGate -and -not (Same-Bytes $aObj $refObj)) { $failures += 'distributed .obj is NOT byte-identical to the local build' }
 } finally {
     foreach ($p in @($workerProc, $daemon)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
