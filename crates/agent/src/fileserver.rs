@@ -4,12 +4,16 @@
 //! sees the agent's files on demand.
 //!
 //! **M3.2 scope.** Snapshot consistency (§4.1) is simplified: digests are
-//! computed on first OpenRead and cached for the session, which pins content
-//! for the rest of that session, but mid-build edits before first touch are not
+//! computed on first OpenRead and cached for the session, which pins content for
+//! the rest of that session, but mid-build edits before first touch are not
 //! guarded (a single-action loopback worker does not hit this; full pinning is
 //! M3.x). Path scoping/auth is deferred to M7 — on a trusted LAN the agent
-//! presents its filesystem to the worker; here it serves the absolute paths the
-//! hooked process requests.
+//! presents its filesystem to the worker.
+//!
+//! A [`PathMap`] optionally remaps a requested *logical* path to a different
+//! *backing* file. Identity mapping is the real deployment; the remap exists so
+//! a single-machine test can serve bytes that differ from whatever happens to
+//! sit at the logical path locally (proving content provenance).
 
 use std::collections::HashMap;
 use std::io;
@@ -26,39 +30,91 @@ use sembazuru_tracer::determinism::sha256_hex;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-/// Bytes of a file inlined in an OpenRead response so open + first read is one
-/// round-trip (§4.1).
 const INLINE_CHUNK: usize = 64 * 1024;
 
-/// Per-session content map: digest -> the path it was hashed from, so a later
-/// `Read(digest, ...)` can serve ranges. Populated on OpenRead.
+/// Resolves a requested (agent-side logical) path to the actual file to read.
+#[derive(Clone)]
+pub enum PathMap {
+    /// Read the requested path as-is (the real deployment).
+    Identity,
+    /// Read paths under `logical_root` from `backing_root` instead.
+    Remap {
+        logical_root: String, // lowercased, no trailing separator
+        backing_root: PathBuf,
+    },
+}
+
+impl PathMap {
+    fn resolve(&self, requested: &str) -> PathBuf {
+        match self {
+            PathMap::Identity => PathBuf::from(requested),
+            PathMap::Remap {
+                logical_root,
+                backing_root,
+            } => {
+                let req = requested.replace('/', "\\").to_lowercase();
+                let root = logical_root.trim_end_matches('\\');
+                if let Some(rest) = req.strip_prefix(root) {
+                    let tail = rest.trim_start_matches('\\');
+                    if rest.is_empty() || rest.starts_with('\\') {
+                        return backing_root.join(tail);
+                    }
+                }
+                PathBuf::from(requested)
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Session {
     by_digest: HashMap<String, PathBuf>,
 }
 
-/// Serves the file session on an already-bound listener until it errors. One
-/// shared content map backs every connection of the session.
+/// Serves the file session identity-mapped on an already-bound listener.
 pub async fn serve_files(listener: TcpListener) -> io::Result<()> {
+    serve_with_map(listener, PathMap::Identity).await
+}
+
+/// Serves with paths under `logical_root` remapped to `backing_root`. For tests
+/// that need agent-served bytes to differ from the local original.
+pub async fn serve_files_remap(
+    listener: TcpListener,
+    logical_root: &str,
+    backing_root: PathBuf,
+) -> io::Result<()> {
+    let map = PathMap::Remap {
+        logical_root: logical_root.replace('/', "\\").to_lowercase(),
+        backing_root,
+    };
+    serve_with_map(listener, map).await
+}
+
+async fn serve_with_map(listener: TcpListener, map: PathMap) -> io::Result<()> {
     let session = Arc::new(Mutex::new(Session::default()));
+    let map = Arc::new(map);
     loop {
         let (sock, _peer) = listener.accept().await?;
         let s = session.clone();
+        let m = map.clone();
         tokio::spawn(async move {
-            // A connection error just ends that connection; the server lives on.
-            let _ = handle_conn(sock, s).await;
+            let _ = handle_conn(sock, s, m).await;
         });
     }
 }
 
-async fn handle_conn(mut sock: TcpStream, session: Arc<Mutex<Session>>) -> io::Result<()> {
+async fn handle_conn(
+    mut sock: TcpStream,
+    session: Arc<Mutex<Session>>,
+    map: Arc<PathMap>,
+) -> io::Result<()> {
     loop {
         let (header, payload) = match read_frame(&mut sock).await {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        let resp_payload = dispatch(header.op, &payload, &session).await;
+        let resp_payload = dispatch(header.op, &payload, &session, &map).await;
         let resp_header = FrameHeader {
             request_id: header.request_id,
             op: header.op,
@@ -68,18 +124,19 @@ async fn handle_conn(mut sock: TcpStream, session: Arc<Mutex<Session>>) -> io::R
     }
 }
 
-/// Decodes the request for `op`, serves it, and returns the encoded response
-/// payload. A malformed request payload yields an empty response rather than
-/// tearing down the connection (the worker sees a missing/empty result and can
-/// fall back).
-async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Mutex<Session>>) -> Vec<u8> {
+async fn dispatch(
+    op: OpCode,
+    payload: &[u8],
+    session: &Arc<Mutex<Session>>,
+    map: &PathMap,
+) -> Vec<u8> {
     match op {
         OpCode::StatBatch => match StatRequest::decode(payload) {
-            Ok(req) => stat_batch(req).await.encode(),
+            Ok(req) => stat_batch(req, map).await.encode(),
             Err(_) => StatResponse { entries: vec![] }.encode(),
         },
         OpCode::OpenRead => match OpenReadRequest::decode(payload) {
-            Ok(req) => open_read(req, session).await.encode(),
+            Ok(req) => open_read(req, session, map).await.encode(),
             Err(_) => not_found_open().encode(),
         },
         OpCode::Read => match ReadRequest::decode(payload) {
@@ -87,7 +144,7 @@ async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Mutex<Session>>) -> 
             Err(_) => ReadResponse { bytes: vec![] }.encode(),
         },
         OpCode::DirList => match DirListRequest::decode(payload) {
-            Ok(req) => dir_list(req).await.encode(),
+            Ok(req) => dir_list(req, map).await.encode(),
             Err(_) => DirListResponse {
                 exists: false,
                 entries: vec![],
@@ -107,12 +164,12 @@ fn not_found_open() -> OpenReadResponse {
 }
 
 /// Existence + attributes only (no digest): header resolution probes many
-/// non-existent paths, so this must stay cheap. Digest/content come from
-/// OpenRead.
-async fn stat_batch(req: StatRequest) -> StatResponse {
+/// non-existent paths, so this stays cheap. Digest/content come from OpenRead.
+async fn stat_batch(req: StatRequest, map: &PathMap) -> StatResponse {
     let mut entries = Vec::with_capacity(req.paths.len());
     for p in &req.paths {
-        let entry = match tokio::fs::metadata(p).await {
+        let actual = map.resolve(p);
+        let entry = match tokio::fs::metadata(&actual).await {
             Ok(md) => StatEntry {
                 exists: true,
                 is_dir: md.is_dir(),
@@ -131,8 +188,13 @@ async fn stat_batch(req: StatRequest) -> StatResponse {
     StatResponse { entries }
 }
 
-async fn open_read(req: OpenReadRequest, session: &Arc<Mutex<Session>>) -> OpenReadResponse {
-    let bytes = match tokio::fs::read(&req.path).await {
+async fn open_read(
+    req: OpenReadRequest,
+    session: &Arc<Mutex<Session>>,
+    map: &PathMap,
+) -> OpenReadResponse {
+    let actual = map.resolve(&req.path);
+    let bytes = match tokio::fs::read(&actual).await {
         Ok(b) => b,
         Err(_) => return not_found_open(),
     };
@@ -141,7 +203,7 @@ async fn open_read(req: OpenReadRequest, session: &Arc<Mutex<Session>>) -> OpenR
         .lock()
         .await
         .by_digest
-        .insert(digest_hex.clone(), PathBuf::from(&req.path));
+        .insert(digest_hex.clone(), actual);
     let first = &bytes[..bytes.len().min(INLINE_CHUNK)];
     OpenReadResponse {
         exists: true,
@@ -169,8 +231,9 @@ async fn read_range(req: ReadRequest, session: &Arc<Mutex<Session>>) -> ReadResp
 
 /// Lists a directory's immediate children (depth is reserved for deeper
 /// prefetch; M3.2 serves one level, which covers the include-dir snapshot case).
-async fn dir_list(req: DirListRequest) -> DirListResponse {
-    let mut rd = match tokio::fs::read_dir(&req.path).await {
+async fn dir_list(req: DirListRequest, map: &PathMap) -> DirListResponse {
+    let actual = map.resolve(&req.path);
+    let mut rd = match tokio::fs::read_dir(&actual).await {
         Ok(rd) => rd,
         Err(_) => {
             return DirListResponse {
@@ -197,5 +260,40 @@ async fn dir_list(req: DirListRequest) -> DirListResponse {
     DirListResponse {
         exists: true,
         entries,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remap_redirects_under_logical_root() {
+        let map = PathMap::Remap {
+            logical_root: "c:\\virtual\\proj".to_string(),
+            backing_root: PathBuf::from("d:\\backing"),
+        };
+        assert_eq!(
+            map.resolve("c:\\virtual\\proj\\src\\a.cpp"),
+            PathBuf::from("d:\\backing\\src\\a.cpp")
+        );
+        // A path outside the logical root is read as-is.
+        assert_eq!(
+            map.resolve("c:\\other\\b.h"),
+            PathBuf::from("c:\\other\\b.h")
+        );
+        // The boundary must be a separator: a sibling is not remapped.
+        assert_eq!(
+            map.resolve("c:\\virtual\\projector\\x"),
+            PathBuf::from("c:\\virtual\\projector\\x")
+        );
+    }
+
+    #[test]
+    fn identity_passes_paths_through() {
+        assert_eq!(
+            PathMap::Identity.resolve("c:\\x\\y.h"),
+            PathBuf::from("c:\\x\\y.h")
+        );
     }
 }

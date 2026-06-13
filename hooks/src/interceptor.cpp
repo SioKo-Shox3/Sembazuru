@@ -19,6 +19,8 @@
 #include <winternl.h>
 
 #include <cstddef>
+#include <cwchar>
+#include <cwctype>
 
 namespace {
 
@@ -111,6 +113,242 @@ struct FileDispositionInformationLayout {
 struct FileDispositionInformationExLayout {
     ULONG Flags;
 };
+
+// --- VFS redirect mode (M3.2) --------------------------------------------
+//
+// When SEMBAZURU_MODE=vfs, a read-only open whose path is under
+// SEMBAZURU_VFS_ROOT is redirected: the hook asks the worker (over the named
+// pipe SEMBAZURU_VFS_PIPE) to hydrate the file and opens the returned local
+// scratch copy instead. Writes, paths outside the root, and the worker's own
+// toolchain/SDK pass straight through to the real filesystem. If the worker
+// cannot supply the file, the hook falls through to a normal local open
+// (local fallback, non-negotiable #2). All pipe and scratch I/O uses True* /
+// never-hooked APIs, honoring the re-entrancy contract.
+
+bool g_vfsMode = false;
+wchar_t g_vfsRoot[1024];  // lowercased, no trailing backslash
+int g_vfsRootLen = 0;
+wchar_t g_vfsPipe[260];     // full \\.\pipe\<name>
+wchar_t g_vfsScratch[1024]; // lowercased scratch root, no trailing backslash
+int g_vfsScratchLen = 0;    // 0 = not configured (no scratch guard)
+
+// Lowercases [0,len) in place and strips trailing backslashes, returning the
+// new length. Shared by the root/scratch config readers.
+int LowerAndTrim(wchar_t* s, DWORD len) {
+    for (DWORD i = 0; i < len; i++) {
+        s[i] = towlower(s[i]);
+    }
+    while (len > 0 && s[len - 1] == L'\\') {
+        s[--len] = L'\0';
+    }
+    return static_cast<int>(len);
+}
+
+// Reads the VFS configuration from the environment. Called once at attach,
+// BEFORE the hooks are installed, so it uses the real GetEnvironmentVariableW.
+void InitVfsConfig() {
+    wchar_t mode[16];
+    DWORD n = GetEnvironmentVariableW(L"SEMBAZURU_MODE", mode, 16);
+    if (n == 0 || n >= 16 || _wcsicmp(mode, L"vfs") != 0) {
+        return;
+    }
+    wchar_t root[1024];
+    DWORD rn = GetEnvironmentVariableW(L"SEMBAZURU_VFS_ROOT", root, 1024);
+    if (rn == 0 || rn >= 1024) {
+        return;
+    }
+    wchar_t name[200];
+    DWORD pn = GetEnvironmentVariableW(L"SEMBAZURU_VFS_PIPE", name, 200);
+    if (pn == 0 || pn >= 200) {
+        return;
+    }
+    int rootLen = LowerAndTrim(root, rn);
+    memcpy(g_vfsRoot, root, (static_cast<size_t>(rootLen) + 1) * sizeof(wchar_t));
+    g_vfsRootLen = rootLen;
+    if (_snwprintf_s(g_vfsPipe, 260, _TRUNCATE, L"\\\\.\\pipe\\%s", name) < 0) {
+        return;
+    }
+    // Scratch root (optional but always set by the worker): redirected reads are
+    // served from here, so opens under it must NOT themselves redirect (anti-
+    // recursion), and a worker-returned path is only trusted if it lies here.
+    wchar_t scratch[1024];
+    DWORD sn = GetEnvironmentVariableW(L"SEMBAZURU_VFS_SCRATCH", scratch, 1024);
+    if (sn > 0 && sn < 1024) {
+        int sl = LowerAndTrim(scratch, sn);
+        memcpy(g_vfsScratch, scratch,
+               (static_cast<size_t>(sl) + 1) * sizeof(wchar_t));
+        g_vfsScratchLen = sl;
+    }
+    g_vfsMode = true;
+}
+
+// Defined in the Helpers section below; forward-declared so the read-only check
+// can reuse the single source of truth for access-mask classification.
+BYTE ClassifyCreateFile(DWORD access, DWORD disposition);
+
+// A read-only open (read intent, no write/create/truncate): only these are
+// served from the agent. Writes are local and returned via WriteBack (M3.3).
+bool IsReadOnlyOpen(DWORD access, DWORD disposition) {
+    return ClassifyCreateFile(access, disposition) == trace::kOpenRead;
+}
+
+// True if the lowercased absolute `abs` (length `absLen`) lies under the
+// lowercased `prefix` (length `prefixLen`), with the match ending on a separator
+// boundary (or exact), so c:\work\a does not swallow the sibling c:\work\ab.
+bool PathUnderPrefix(const wchar_t* abs, int absLen, const wchar_t* prefix,
+                     int prefixLen) {
+    if (prefixLen == 0 || absLen < prefixLen) {
+        return false;
+    }
+    if (wcsncmp(abs, prefix, prefixLen) != 0) {
+        return false;
+    }
+    wchar_t after = abs[prefixLen];
+    return after == L'\0' || after == L'\\';
+}
+
+// True if `path` (resolved to absolute against the cwd) lies under g_vfsRoot and
+// NOT under the scratch root. Writes the lowercased absolute path into `absOut`.
+// Excluding scratch is the anti-recursion guard: a scratch open must never be
+// re-redirected even if scratch happens to sit under the VFS root.
+bool IsUnderVfsRoot(const wchar_t* path, wchar_t* absOut, int absCap) {
+    DWORD an = GetFullPathNameW(path, absCap, absOut, nullptr);
+    if (an == 0 || an >= static_cast<DWORD>(absCap)) {
+        return false;  // unresolved or too long: do not redirect (fall to local)
+    }
+    int absLen = LowerAndTrim(absOut, an);
+    if (PathUnderPrefix(absOut, absLen, g_vfsScratch, g_vfsScratchLen)) {
+        return false;  // a scratch path: never redirect (anti-recursion)
+    }
+    return PathUnderPrefix(absOut, absLen, g_vfsRoot, g_vfsRootLen);
+}
+
+bool WriteAllPipe(HANDLE h, const void* buf, DWORD len) {
+    const BYTE* p = static_cast<const BYTE*>(buf);
+    DWORD done = 0;
+    while (done < len) {
+        DWORD w = 0;
+        if (!WriteFile(h, p + done, len - done, &w, nullptr) || w == 0) {
+            return false;
+        }
+        done += w;
+    }
+    return true;
+}
+
+bool ReadExactPipe(HANDLE h, void* buf, DWORD len) {
+    BYTE* p = static_cast<BYTE*>(buf);
+    DWORD done = 0;
+    while (done < len) {
+        DWORD r = 0;
+        if (!ReadFile(h, p + done, len - done, &r, nullptr) || r == 0) {
+            return false;
+        }
+        done += r;
+    }
+    return true;
+}
+
+// Asks the worker to hydrate `absPath`; on success writes the local scratch path
+// (wide) into `localOut` and returns true. On not-found/error returns false and
+// the caller falls back to a local open. One short-lived pipe connection per
+// call (a per-thread persistent connection is an M3.5 latency optimization).
+bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
+    // Wide -> UTF-8 request. Paths are bounded (abs buffer is 1024 wide), so an
+    // 8 KiB UTF-8 buffer is ample and keeps stack use modest in this hot path.
+    const int kBuf = 8192;
+    int u8len =
+        WideCharToMultiByte(CP_UTF8, 0, absPath, -1, nullptr, 0, nullptr, nullptr);
+    if (u8len <= 1 || u8len > kBuf) {
+        return false;
+    }
+    char u8[kBuf];
+    if (WideCharToMultiByte(CP_UTF8, 0, absPath, -1, u8, u8len, nullptr,
+                            nullptr) == 0) {
+        return false;
+    }
+    DWORD payloadLen = static_cast<DWORD>(u8len - 1);  // drop NUL
+
+    HANDLE pipe = TrueCreateFileW(g_vfsPipe, GENERIC_READ | GENERIC_WRITE, 0,
+                                  nullptr, OPEN_EXISTING, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_PIPE_BUSY &&
+            WaitNamedPipeW(g_vfsPipe, 5000)) {
+            pipe = TrueCreateFileW(g_vfsPipe, GENERIC_READ | GENERIC_WRITE, 0,
+                                   nullptr, OPEN_EXISTING, 0, nullptr);
+        }
+        if (pipe == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+    }
+
+    bool ok = false;
+    if (WriteAllPipe(pipe, &payloadLen, 4) &&
+        WriteAllPipe(pipe, u8, payloadLen)) {
+        DWORD respLen = 0;
+        if (ReadExactPipe(pipe, &respLen, 4) && respLen >= 1 &&
+            respLen <= static_cast<DWORD>(kBuf)) {
+            char resp[kBuf];
+            if (ReadExactPipe(pipe, resp, respLen)) {
+                BYTE status = static_cast<BYTE>(resp[0]);
+                if (status == 0 && respLen > 1) {
+                    int wlen = MultiByteToWideChar(CP_UTF8, 0, resp + 1,
+                                                   static_cast<int>(respLen - 1),
+                                                   nullptr, 0);
+                    if (wlen > 0 && wlen < localCap) {
+                        int w = MultiByteToWideChar(
+                            CP_UTF8, 0, resp + 1,
+                            static_cast<int>(respLen - 1), localOut, wlen);
+                        if (w > 0) {
+                            localOut[w] = L'\0';
+                            ok = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    CloseHandle(pipe);
+    return ok;
+}
+
+// If VFS mode applies to this read-only open, returns a redirected handle to the
+// hydrated scratch copy. Returns INVALID_HANDLE_VALUE with *handled=false when
+// the open should proceed normally (not vfs mode, not a read, outside root, or
+// the worker could not supply it -> local fallback).
+HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
+                      LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags,
+                      HANDLE templ, bool* handled) {
+    *handled = false;
+    if (!g_vfsMode || path == nullptr || !IsReadOnlyOpen(access, disposition)) {
+        return INVALID_HANDLE_VALUE;
+    }
+    wchar_t abs[1024];
+    if (!IsUnderVfsRoot(path, abs, 1024)) {
+        return INVALID_HANDLE_VALUE;
+    }
+    wchar_t local[1024];
+    if (!VfsHydrate(abs, local, 1024)) {
+        return INVALID_HANDLE_VALUE;  // not supplied: fall back to local open
+    }
+    // Trust but verify: the worker must return a path under the scratch root.
+    // This bounds the damage a buggy/hostile worker can do (it cannot redirect a
+    // read to an arbitrary file the compiler would consume as source). When a
+    // scratch root is configured, a path outside it is rejected -> local open.
+    if (g_vfsScratchLen > 0) {
+        wchar_t lower[1024];
+        int i = 0;
+        for (; local[i] != L'\0' && i < 1023; i++) {
+            lower[i] = towlower(local[i]);
+        }
+        lower[i] = L'\0';
+        if (!PathUnderPrefix(lower, i, g_vfsScratch, g_vfsScratchLen)) {
+            return INVALID_HANDLE_VALUE;  // worker returned an out-of-scratch path
+        }
+    }
+    *handled = true;
+    return TrueCreateFileW(local, access, share, sa, disposition, flags, templ);
+}
 
 // --- Helpers -------------------------------------------------------------
 
@@ -314,6 +552,16 @@ void RegMapRemove(HKEY key) {
 HANDLE WINAPI HookedCreateFileW(LPCWSTR path, DWORD access, DWORD share,
                                 LPSECURITY_ATTRIBUTES sa, DWORD disposition,
                                 DWORD flags, HANDLE templ) {
+    // VFS mode: a read-only open under the session root is served from the
+    // agent (hydrated to a local scratch copy). On any miss we fall through to
+    // the normal local open below.
+    bool handled = false;
+    HANDLE redirected = VfsTryRedirect(path, access, share, sa, disposition,
+                                       flags, templ, &handled);
+    if (handled) {
+        return redirected;  // GetLastError is the redirected open's own
+    }
+
     HANDLE h =
         TrueCreateFileW(path, access, share, sa, disposition, flags, templ);
     DWORD saved = GetLastError();
@@ -326,6 +574,22 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR path, DWORD access, DWORD share,
 HANDLE WINAPI HookedCreateFileA(LPCSTR path, DWORD access, DWORD share,
                                 LPSECURITY_ATTRIBUTES sa, DWORD disposition,
                                 DWORD flags, HANDLE templ) {
+    // VFS mode: classify on the widened path and redirect read-only opens the
+    // same way as the W variant. The redirected handle is opened via the W path
+    // (a handle is a handle), avoiding an ANSI round-trip on the scratch name.
+    if (g_vfsMode && path != nullptr) {
+        WideArg wp(path);
+        if (wp.get() != nullptr) {
+            bool handled = false;
+            HANDLE redirected = VfsTryRedirect(wp.get(), access, share, sa,
+                                               disposition, flags, templ,
+                                               &handled);
+            if (handled) {
+                return redirected;
+            }
+        }
+    }
+
     HANDLE h =
         TrueCreateFileA(path, access, share, sa, disposition, flags, templ);
     DWORD saved = GetLastError();
@@ -930,6 +1194,8 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
 
     if (reason == DLL_PROCESS_ATTACH) {
         trace::Initialize(instance);
+        // Read VFS config with the real env API, before any hooks are armed.
+        InitVfsConfig();
         DetourRestoreAfterWith();
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
