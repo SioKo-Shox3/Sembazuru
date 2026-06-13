@@ -12,6 +12,7 @@ use sembazuru_proto::v0::{
     Command, ExecuteRequest, execute_event::Event, execution_client::ExecutionClient,
 };
 
+pub mod action_cache;
 pub mod fileserver;
 
 /// What a remote action reported back: the lifecycle states it passed through

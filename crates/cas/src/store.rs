@@ -261,7 +261,9 @@ fn read_dir_some(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// Writes `bytes` to `final_path` atomically: create the parent shard, write a
 /// uniquely-named temp sibling, fsync-free rename onto the final name (rename is
 /// atomic within a volume, and the temp is a sibling so it is same-volume).
-fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Shared with the action cache, which is keyed (not content-addressed) but
+/// needs the same crash- and reader-safe publish.
+pub(crate) fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = final_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "blob path has no parent"))?;

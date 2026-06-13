@@ -10,8 +10,12 @@
 //! This module is the blob store and its [`Digest`] type. The action cache
 //! (digest → `ActionResult`) builds on top of it (M4.3).
 
+mod action_cache;
 mod store;
 
+pub use action_cache::{
+    ActionCache, ActionResult, OutputFile, strong_fingerprint, weak_fingerprint,
+};
 pub use store::{BlobStore, CasError};
 
 use std::fmt;
