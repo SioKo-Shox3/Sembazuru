@@ -70,16 +70,21 @@ $cacheRoot = Join-Path $WorkRoot 'acache'
 $traceRoot = Join-Path $WorkRoot 'atrace'
 foreach ($d in @($scratchRoot, $casRoot, $cacheRoot, $traceRoot)) { New-Item -ItemType Directory -Force $d | Out-Null }
 
-# Reference (local, direct) build in the project dir, using the SAME output name
-# (a.obj) the distributed build uses — the compiler embeds the object's own name
-# (S_OBJNAME), so comparing against a differently-named ref.obj would spuriously
-# differ. Build a.obj, snapshot its bytes as ref.obj, then remove a.obj.
+# Reference (local) build in the project dir, matched to the distributed build in
+# two ways so the byte comparison is apples-to-apples:
+#   * same output name (a.obj): the compiler embeds the object's own name
+#     (S_OBJNAME), so a differently-named ref.obj would spuriously differ;
+#   * NON-TTY stdio (redirected to a file): clang-cl's object depends on whether
+#     stdout/stderr is a console, and a real build system (ninja/msbuild) and the
+#     worker both run the compiler with piped (non-tty) handles. A raw console
+#     reference would not match the piped distributed/fallback builds.
+# Build a.obj, snapshot its bytes as ref.obj, then remove a.obj.
 $refObj = Join-Path $proj 'ref.obj'
 $aObj = Join-Path $proj 'a.obj'
 Push-Location $proj
 try {
-    & $cc /nologo /c a.cpp /Foa.obj 2>&1 | Out-String | Write-Host
-    if ($LASTEXITCODE -ne 0) { throw 'reference build failed' }
+    cmd /c "$cc /nologo /c a.cpp /Foa.obj > refout.txt 2>&1"
+    if ($LASTEXITCODE -ne 0) { Get-Content refout.txt | Write-Host; throw 'reference build failed' }
     Copy-Item $aObj $refObj -Force
     Remove-Item $aObj -Force
 } finally { Pop-Location }
@@ -151,13 +156,11 @@ try {
 Start-Sleep -Milliseconds 300
 $rf = Invoke-Launcher
 Write-Host "FALLBACK exit=$($rf.exit) note=$($rf.note.Trim())"
-# Local fallback is a plain local compile via run_local; the M6 "Done when" asks
-# it to COMPLETE (produce a valid object), not to byte-match the distributed
-# build. (clang-cl's object can differ under run_local's layered environment; the
-# distribution-correctness claim is carried by the distributed + cached byte
-# checks below/above, which are strict.)
+# Local fallback is a plain local compile via run_local (non-tty stdio, like the
+# reference), so it should also be byte-identical for clang-cl.
 if ($rf.exit -ne 0) { $failures += "local fallback did not exit 0 (exit=$($rf.exit))" }
 if (-not (Test-Path $aObj) -or (Get-Item $aObj).Length -eq 0) { $failures += 'local fallback produced no/empty .obj' }
+if ($byteGate -and -not (Same-Bytes $aObj $refObj)) { $failures += 'local-fallback .obj is NOT byte-identical to the local build' }
 
 # 3. Action cache: restart the daemon (same cache root) but DO NOT start a worker.
 # A cache HIT serves the recorded output with no worker; a miss could only local-
