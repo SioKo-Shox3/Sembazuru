@@ -73,16 +73,54 @@ pub struct DependencyGraph {
     pub warnings: Vec<String>,
 }
 
-/// Normalizes a path for set comparison: strips a `\\?\` long-path prefix and
-/// case-folds (Windows file systems are case-insensitive). Relative paths are
-/// left as-is here; per-process working-directory resolution is a future
-/// refinement (the interceptor does not yet record the CWD per call).
+/// Normalizes a path for set comparison: strips a `\\?\` long-path prefix,
+/// folds `/`→`\`, collapses repeated separators, and case-folds (Windows file
+/// systems are case-insensitive). Relative paths are left as-is here;
+/// per-process working-directory resolution is a future refinement (the
+/// interceptor does not yet record the CWD per call).
 fn normalize_path(raw: &str) -> String {
     let stripped = raw
         .strip_prefix("\\\\?\\")
         .or_else(|| raw.strip_prefix("\\??\\"))
         .unwrap_or(raw);
-    stripped.replace('/', "\\").to_ascii_lowercase()
+    let unified = stripped.replace('/', "\\").to_ascii_lowercase();
+    collapse_separators(&unified)
+}
+
+/// Collapses runs of `\` into a single separator so that, e.g., `C:\\a\\\b`
+/// and `C:\a\b` fold to one entry. A leading `\\` is preserved: UNC
+/// (`\\server\share`) and device (`\\.\…`) paths legitimately begin with two,
+/// and `is_device` keys on that prefix.
+fn collapse_separators(p: &str) -> String {
+    let mut out = String::with_capacity(p.len());
+    let mut chars = p.chars();
+
+    // Preserve exactly one leading `\\`, consuming any further run.
+    let leading_unc = p.starts_with("\\\\");
+    if leading_unc {
+        out.push('\\');
+        out.push('\\');
+        for c in chars.by_ref() {
+            if c != '\\' {
+                out.push(c);
+                break;
+            }
+        }
+    }
+
+    let mut prev_sep = false;
+    for c in chars {
+        if c == '\\' {
+            if !prev_sep {
+                out.push('\\');
+            }
+            prev_sep = true;
+        } else {
+            out.push(c);
+            prev_sep = false;
+        }
+    }
+    out
 }
 
 /// Is this path under the session temp area, i.e. an intermediate artifact to
@@ -525,6 +563,36 @@ mod tests {
         assert_eq!(g.env[0].name, ENV_BLOCK_NAME);
         assert!(g.env[0].found);
         assert!(g.env[0].pids.contains(&10));
+    }
+
+    #[test]
+    fn repeated_separators_collapse_to_one_entry() {
+        // The same file reached via a doubled separator must fold to one input,
+        // not two: a duplicate entry would make the input set (and its hash)
+        // depend on incidental separator noise.
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events
+            .push(file_event(FileOp::OpenRead, "C:\\src\\\\a.c", 0));
+        t.events
+            .push(file_event(FileOp::OpenRead, "C:\\src\\a.c", 0));
+        let g = build_graph(&[t]);
+        assert_eq!(
+            g.inputs.len(),
+            1,
+            "doubled separator must not split entries"
+        );
+        assert_eq!(g.inputs[0].path, "c:\\src\\a.c");
+    }
+
+    #[test]
+    fn unc_leading_double_separator_is_preserved() {
+        assert_eq!(
+            collapse_separators("\\\\srv\\\\share\\x"),
+            "\\\\srv\\share\\x"
+        );
+        assert_eq!(collapse_separators("c:\\\\a\\\\\\b"), "c:\\a\\b");
+        // A device path keeps its `\\.\` prefix so `is_device` still matches.
+        assert!(is_device(&normalize_path("\\\\.\\pipe\\foo")));
     }
 
     #[test]
