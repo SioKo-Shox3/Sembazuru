@@ -53,8 +53,9 @@ enum EnvOp : BYTE {
     kEnvBlockRead = 2,
 };
 
-// Called from DllMain(DLL_PROCESS_ATTACH): snapshots pid/ppid/QPC and the
-// DLL's own path. Loader-lock safe (no LoadLibrary, no file I/O).
+// Called from DllMain(DLL_PROCESS_ATTACH): snapshots pid/ppid/QPC, the DLL's
+// own path, and the working directory. Loader-lock safe (no LoadLibrary, no
+// file I/O).
 void Initialize(HMODULE self);
 
 // Called from DllMain(DLL_PROCESS_DETACH) when reserved == nullptr.

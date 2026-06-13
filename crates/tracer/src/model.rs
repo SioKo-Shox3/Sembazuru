@@ -177,6 +177,10 @@ pub struct Trace {
     pub start_filetime: u64,
     pub exe_path: String,
     pub command_line: String,
+    /// Working directory sampled by the interceptor at DLL attach
+    /// (`docs/trace-format.md` §4). Empty if the writer could not record it;
+    /// the graph builder then leaves relative paths verbatim.
+    pub cwd: String,
     pub events: Vec<Event>,
     /// True if parsing stopped early on a truncated final record (the writing
     /// process was likely killed mid-write). Not an error; surfaced as a

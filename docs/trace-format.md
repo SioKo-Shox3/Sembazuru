@@ -66,6 +66,7 @@ disambiguates PID reuse within one trace session.
 | `start_filetime` | u64 | `GetSystemTimePreciseAsFileTime` at DLL attach (wall-clock anchor for the QPC timeline) |
 | `exe_path` | string | `GetModuleFileNameW(NULL)` |
 | `command_line` | string | `GetCommandLineW()` |
+| `cwd` | string | `GetCurrentDirectoryW()` sampled at DLL attach; empty if it did not fit the writer's buffer or could not be read. Like `exe_path`, this is a writer-resolved value, the one exception to §3's "paths as the application passed them" rule. Used by the reader to resolve relative paths to one canonical entry. |
 
 Records follow immediately after the header, back to back, until EOF.
 
@@ -194,13 +195,22 @@ Exclusions applied by the reader before any path enters a file set:
 - **Telemetry processes** (currently `vctip.exe`) are tagged and their
   accesses excluded by default, though the raw per-process trace is kept.
 
-Normalization (applied by the reader, never by the writer): strip a `\\?\`
-long-path prefix, fold separators and case. Resolving relative paths
-against the recording process's working directory is a known gap (the
-interceptor does not yet record a per-call CWD); until then a relative
-path is compared verbatim, which is stable run-to-run for a fixed working
-directory. These rules will be tightened by measurement during M1/M2; this
-section is the single place they are defined.
+Normalization (applied by the reader, never by the writer): fold `/`→`\`,
+strip a `\\?\` long-path prefix (rewriting `\\?\UNC\` back to `\\`), fold
+case, collapse repeated separators, and resolve `.`/`..` lexically. A
+relative path is resolved against the header's `cwd` (attach-time working
+directory) so that a relative open and its absolute form fold to one entry;
+when `cwd` is empty the relative path is compared verbatim (still
+separator-collapsed), which is stable run-to-run for a fixed working
+directory. Resolution is purely lexical — the filesystem is never touched,
+because a trace may be analyzed on a different machine.
+
+Remaining gaps (deliberate): a process that calls `SetCurrentDirectoryW`
+mid-run is resolved against its *attach-time* cwd, not the live one (cl /
+clang-cl do not chdir, so this does not affect the M2 corpus); and the rare
+drive-relative (`c:foo`) and current-drive-rooted (`\foo`) forms are left
+verbatim rather than guessing a base. These rules will be tightened by
+measurement during M2; this section is the single place they are defined.
 
 ## 7. JSON export
 

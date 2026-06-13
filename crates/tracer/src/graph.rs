@@ -73,18 +73,108 @@ pub struct DependencyGraph {
     pub warnings: Vec<String>,
 }
 
-/// Normalizes a path for set comparison: strips a `\\?\` long-path prefix,
-/// folds `/`→`\`, collapses repeated separators, and case-folds (Windows file
-/// systems are case-insensitive). Relative paths are left as-is here;
-/// per-process working-directory resolution is a future refinement (the
-/// interceptor does not yet record the CWD per call).
-fn normalize_path(raw: &str) -> String {
-    let stripped = raw
-        .strip_prefix("\\\\?\\")
-        .or_else(|| raw.strip_prefix("\\??\\"))
-        .unwrap_or(raw);
-    let unified = stripped.replace('/', "\\").to_ascii_lowercase();
-    collapse_separators(&unified)
+/// Normalizes a path for set comparison. Folds `/`→`\`, strips a `\\?\`
+/// long-path prefix (and rewrites `\\?\UNC\` back to `\\`), case-folds (Windows
+/// file systems are case-insensitive), and — for a drive-absolute path or a
+/// relative path resolved against `cwd` — collapses repeated separators and
+/// resolves `.`/`..` lexically so that, e.g., a relative open of `main.c` and
+/// its absolute form fold to one entry.
+///
+/// `cwd` is the recording process's working directory at attach
+/// (`Trace::cwd`); pass `""` when it is unknown, in which case a relative path
+/// is left verbatim (still separator-collapsed) — stable run-to-run for a fixed
+/// working directory, which is the pre-CWD behavior. Resolution is purely
+/// lexical: the filesystem is never touched (the trace may be analyzed on
+/// another machine). UNC/device paths and the rare drive-relative (`c:foo`) or
+/// current-drive-rooted (`\foo`) forms are not `.`/`..`-resolved — guessing
+/// their base would be worse than a verbatim entry.
+fn normalize_path(raw: &str, cwd: &str) -> String {
+    let u = unify(raw);
+    match classify(&u) {
+        PathKind::DriveAbsolute => canonicalize(&u),
+        PathKind::Relative if !cwd.is_empty() => {
+            let base = unify(cwd);
+            let joined = format!("{}\\{}", base.trim_end_matches('\\'), u);
+            match classify(&base) {
+                // Only a drive-absolute base is safe to `.`/`..`-resolve.
+                PathKind::DriveAbsolute => canonicalize(&joined),
+                _ => collapse_separators(&joined),
+            }
+        }
+        // UNC/device, drive-relative, current-drive-rooted, or relative with no
+        // known cwd: collapse separators but do not resolve dot segments.
+        _ => collapse_separators(&u),
+    }
+}
+
+/// Path shape, used to decide how (and whether) to resolve a path.
+enum PathKind {
+    /// `\\server\share\…` or `\\.\device` — leading double separator.
+    UncOrDevice,
+    /// `c:\…` — drive letter plus a rooted separator.
+    DriveAbsolute,
+    /// `c:foo` (drive-relative) or `\foo` (current-drive-rooted): rooted but
+    /// against a base we don't record.
+    Verbatim,
+    /// No root at all: resolve against the recording process's cwd.
+    Relative,
+}
+
+fn classify(p: &str) -> PathKind {
+    if p.starts_with("\\\\") {
+        return PathKind::UncOrDevice;
+    }
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return if b.get(2) == Some(&b'\\') {
+            PathKind::DriveAbsolute
+        } else {
+            PathKind::Verbatim // c:foo — drive-relative
+        };
+    }
+    if b.first() == Some(&b'\\') {
+        return PathKind::Verbatim; // \foo — current-drive-rooted
+    }
+    PathKind::Relative
+}
+
+/// Folds `/`→`\`, case-folds, and strips a long-path prefix (`\\?\`, `\??\`,
+/// and `\\?\UNC\` → `\\`). Does not collapse separators or resolve dots.
+fn unify(raw: &str) -> String {
+    let lower = raw.replace('/', "\\").to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("\\\\?\\unc\\") {
+        return format!("\\\\{rest}");
+    }
+    if let Some(rest) = lower.strip_prefix("\\\\?\\") {
+        return rest.to_string();
+    }
+    if let Some(rest) = lower.strip_prefix("\\??\\") {
+        return rest.to_string();
+    }
+    lower
+}
+
+/// Lexically canonicalizes a drive-absolute path: collapses separators and
+/// resolves `.`/`..` while keeping the `c:` root. `c:\a\..\b` → `c:\b`.
+fn canonicalize(p: &str) -> String {
+    let (root, rest) = p.split_at(2); // "c:" + the remainder
+    let mut comps: Vec<&str> = Vec::new();
+    for seg in rest.split('\\') {
+        match seg {
+            "" | "." => {} // collapsed separator or current-dir: drop
+            ".." => {
+                comps.pop(); // at the root, `..` has nowhere to go: ignore
+            }
+            other => comps.push(other),
+        }
+    }
+    let mut out = String::with_capacity(p.len());
+    out.push_str(root);
+    for c in comps {
+        out.push('\\');
+        out.push_str(c);
+    }
+    out
 }
 
 /// Collapses runs of `\` into a single separator so that, e.g., `C:\\a\\\b`
@@ -196,7 +286,7 @@ fn collect_temp_dirs(traces: &[Trace]) -> BTreeSet<String> {
             if let EventKind::Env { op: EnvOp::Read } = ev.kind {
                 let name = ev.path.to_ascii_uppercase();
                 if (name == "TMP" || name == "TEMP") && !ev.aux.is_empty() {
-                    let mut d = normalize_path(&ev.aux);
+                    let mut d = normalize_path(&ev.aux, &t.cwd);
                     if !d.ends_with('\\') {
                         d.push('\\');
                     }
@@ -313,7 +403,7 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
         for ev in &t.events {
             match &ev.kind {
                 EventKind::File { op, .. } => {
-                    fold_file(&mut acc, t.pid, *op, ev, &temp_dirs);
+                    fold_file(&mut acc, t.pid, *op, ev, &temp_dirs, &t.cwd);
                 }
                 EventKind::Registry {
                     op: RegistryOp::QueryValue,
@@ -373,8 +463,9 @@ fn fold_file(
     op: FileOp,
     ev: &crate::model::Event,
     temp_dirs: &BTreeSet<String>,
+    cwd: &str,
 ) {
-    let norm = normalize_path(&ev.path);
+    let norm = normalize_path(&ev.path, cwd);
     if is_device(&norm) {
         return; // named pipe / device, not a file
     }
@@ -421,7 +512,7 @@ fn fold_file(
             // Source is consumed (input-ish), destination is produced.
             acc.add_path(Bucket::Input, &norm, AccessKind::Move, pid);
             if !ev.aux.is_empty() {
-                let dst = normalize_path(&ev.aux);
+                let dst = normalize_path(&ev.aux, cwd);
                 if !is_device(&dst) && !is_intermediate(&dst, temp_dirs) {
                     acc.add_path(Bucket::Output, &dst, AccessKind::Write, pid);
                 }
@@ -451,6 +542,7 @@ mod tests {
             start_filetime: pid as u64, // deterministic ordering in tests
             exe_path: exe.to_string(),
             command_line: String::new(),
+            cwd: String::new(),
             events: Vec::new(),
             truncated: false,
         }
@@ -592,7 +684,49 @@ mod tests {
         );
         assert_eq!(collapse_separators("c:\\\\a\\\\\\b"), "c:\\a\\b");
         // A device path keeps its `\\.\` prefix so `is_device` still matches.
-        assert!(is_device(&normalize_path("\\\\.\\pipe\\foo")));
+        assert!(is_device(&normalize_path("\\\\.\\pipe\\foo", "")));
+    }
+
+    #[test]
+    fn relative_path_resolves_against_cwd() {
+        // A relative open (`main.c`) and the absolute form a sibling process
+        // sees must fold to one input — otherwise the same file is counted
+        // twice and the input hash depends on which form the app happened to
+        // pass.
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.cwd = "C:\\work\\proj".to_string();
+        t.events.push(file_event(FileOp::OpenRead, "main.c", 0));
+        t.events
+            .push(file_event(FileOp::OpenRead, "C:\\work\\proj\\main.c", 0));
+        // A `..` in a relative include is resolved lexically.
+        t.events
+            .push(file_event(FileOp::Probe, "..\\inc\\dep.h", 0));
+        let g = build_graph(&[t]);
+        let inputs: Vec<&str> = g.inputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            inputs.contains(&"c:\\work\\proj\\main.c"),
+            "relative and absolute forms must fold to one entry: {inputs:?}"
+        );
+        assert_eq!(
+            inputs.iter().filter(|p| p.ends_with("main.c")).count(),
+            1,
+            "main.c must appear exactly once: {inputs:?}"
+        );
+        assert!(
+            inputs.contains(&"c:\\work\\inc\\dep.h"),
+            "`..` must resolve lexically against cwd: {inputs:?}"
+        );
+    }
+
+    #[test]
+    fn relative_path_without_cwd_stays_verbatim() {
+        // Pre-CWD behavior preserved when the writer couldn't record a cwd:
+        // relative paths compare verbatim (stable for a fixed working dir).
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events.push(file_event(FileOp::OpenRead, "main.c", 0));
+        let g = build_graph(&[t]);
+        assert_eq!(g.inputs.len(), 1);
+        assert_eq!(g.inputs[0].path, "main.c");
     }
 
     #[test]

@@ -137,8 +137,10 @@ if ($pidCount -lt 2) {
     Write-Host "GATE 2 PASS  propagation: $pidCount processes traced incl. link.exe, no injection gaps"
 }
 
-# main.c must be an input; an output binary must be produced.
-if (-not ($graphMsvc.inputs.path -contains 'main.c')) {
+# main.c must be an input; an output binary must be produced. The reader now
+# resolves the relative source ('main.c') against the trace's recorded cwd, so
+# it appears as an absolute path -- match on the suffix, not the bare name.
+if (-not (@($graphMsvc.inputs.path | Where-Object { $_ -like '*main.c' }).Count -gt 0)) {
     $failures += 'graph: main.c not in inputs'
 }
 $hasExe = @($graphMsvc.outputs.path | Where-Object { $_ -like '*.exe' }).Count -gt 0
@@ -169,7 +171,7 @@ if ($null -eq $clang) {
 } else {
     $traceClang = Invoke-Traced 'clang' @('clang-cl', '/nologo', '/c', 'main.c')
     $graphClang = Export-Graph $traceClang
-    if (-not ($graphClang.inputs.path -contains 'main.c')) {
+    if (-not (@($graphClang.inputs.path | Where-Object { $_ -like '*main.c' }).Count -gt 0)) {
         $failures += 'clang-cl: main.c not captured in inputs'
     } else {
         $depSeen = @($graphClang.inputs.path | Where-Object { $_ -like '*dep.h' }).Count -gt 0

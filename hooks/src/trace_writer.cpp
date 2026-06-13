@@ -19,7 +19,7 @@ struct FileHeader {
     ULONGLONG qpcFrequency;
     ULONGLONG startQpc;
     ULONGLONG startFiletime;
-    // followed by: string exe_path, string command_line
+    // followed by: string exe_path, string command_line, string cwd
 };
 struct RecordHeader {
     BYTE type;
@@ -45,6 +45,13 @@ ULONGLONG g_startFiletime = 0;
 wchar_t g_dllPathW[1024];
 char g_dllPathA[1024];
 bool g_dllPathAValid = false;
+
+// Working directory sampled at DLL attach. The reader resolves relative paths
+// against this so a relative open (e.g. `main.c`) and its absolute form fold
+// to one dependency-graph entry. Empty (len 0) when the CWD did not fit the
+// buffer or could not be read; the reader then leaves relative paths verbatim.
+wchar_t g_cwdW[1024];
+int g_cwdLen = 0;
 
 HANDLE g_file = INVALID_HANDLE_VALUE;
 bool g_initDone = false;
@@ -168,6 +175,7 @@ void EnsureOpenLocked() {
     DWORD exeLen = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
     WriteStringField(exe, static_cast<int>(exeLen));
     WriteStringField(GetCommandLineW(), -1);
+    WriteStringField(g_cwdLen > 0 ? g_cwdW : nullptr, g_cwdLen);
 }
 
 }  // namespace
@@ -187,6 +195,13 @@ void Initialize(HMODULE self) {
     GetSystemTimePreciseAsFileTime(&ft);
     g_startFiletime =
         (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+
+    // CWD at attach. GetCurrentDirectoryW returns the length in WCHARs (no
+    // NUL) on success, or the required size (incl. NUL) if the buffer is too
+    // small; in the latter case the buffer is untouched, so we record empty.
+    // Not hooked and loader-lock safe (reads the PEB, no file I/O).
+    DWORD cwdLen = GetCurrentDirectoryW(ARRAYSIZE(g_cwdW), g_cwdW);
+    g_cwdLen = (cwdLen > 0 && cwdLen < ARRAYSIZE(g_cwdW)) ? static_cast<int>(cwdLen) : 0;
 
     DWORD len = GetModuleFileNameW(self, g_dllPathW, ARRAYSIZE(g_dllPathW));
     if (len > 0 && len < ARRAYSIZE(g_dllPathW)) {
