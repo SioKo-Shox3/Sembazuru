@@ -27,7 +27,7 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
 use crate::scheduler::Scheduler;
-use crate::{ExecuteError, Execution};
+use crate::{ExecOptions, ExecuteError, Execution};
 
 fn state_ev(state: ActionState, detail: &str) -> SubmitActionEvent {
     SubmitActionEvent {
@@ -95,7 +95,11 @@ impl LocalIntake for IntakeService {
         let scheduler = self.scheduler.clone();
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
-            let outcome = scheduler.dispatch(command, action_id, session_id).await;
+            // M6.0: plain dispatch. The action-cache resolve/record and the
+            // read-VFS config (ExecOptions) are wired in M6.1c.
+            let outcome = scheduler
+                .dispatch(command, action_id, session_id, ExecOptions::default())
+                .await;
             // dispatch already guarantees completion (remote or local fallback),
             // so we always have an exit code to mirror. The launcher only needs
             // the exit; the state event is for observability / a fallback note.

@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use sembazuru_proto::v0::{
-    Command, ExecuteRequest, execute_event::Event, execution_client::ExecutionClient,
+    Command, ExecuteRequest, VfsExecution, execute_event::Event, execution_client::ExecutionClient,
 };
 
 pub mod action_cache;
@@ -17,6 +17,18 @@ pub mod coordination;
 pub mod fileserver;
 pub mod intake;
 pub mod scheduler;
+
+/// Per-action execution extras carried alongside the command into `Execute`
+/// (M6.1). Empty by default — the M5 scale path and the single-shot CLI send
+/// neither, so the worker plain-spawns. The daemon fills these in: the prefetch
+/// hint from the action cache, and the read-VFS config for a real compile.
+#[derive(Debug, Default, Clone)]
+pub struct ExecOptions {
+    /// Prior build's input paths to warm ahead of process I/O (M5.4).
+    pub predicted_paths: Vec<String>,
+    /// Read-VFS execution config; `None` means plain spawn (back-compat).
+    pub vfs: Option<VfsExecution>,
+}
 
 /// What a remote action reported back: the lifecycle states it passed through
 /// (raw `ActionState` discriminants, in order) and, if it ran to completion,
@@ -142,24 +154,53 @@ pub async fn execute_remote_with(
     connect: ConnectPolicy,
 ) -> Result<ActionOutcome, ExecuteError> {
     let client = connect_with_policy(endpoint, connect).await?;
-    drive_execute(client, command, action_id, session_id).await
+    drive_execute(
+        client,
+        command,
+        action_id,
+        session_id,
+        ExecOptions::default(),
+    )
+    .await
 }
 
-/// Runs an action on an already-connected channel. The scheduler caches one
-/// channel per worker and calls this per action, so the control plane pays no
-/// per-action connection handshake — actions multiplex over the worker's one
-/// HTTP/2 connection (the control-plane analogue of the M5.3 data-plane pool).
+/// Runs an action on an already-connected channel with no execution extras
+/// (plain spawn). The scheduler caches one channel per worker and calls this per
+/// action, so the control plane pays no per-action connection handshake —
+/// actions multiplex over the worker's one HTTP/2 connection (the control-plane
+/// analogue of the M5.3 data-plane pool).
 pub async fn execute_on_channel(
     channel: tonic::transport::Channel,
     command: Command,
     action_id: String,
     session_id: String,
 ) -> Result<ActionOutcome, ExecuteError> {
+    execute_on_channel_with(
+        channel,
+        command,
+        action_id,
+        session_id,
+        ExecOptions::default(),
+    )
+    .await
+}
+
+/// Like [`execute_on_channel`], but carries [`ExecOptions`] (prefetch hint +
+/// read-VFS config) into the `ExecuteRequest`. The daemon's compile path uses
+/// this; the M5 scale path uses the plain [`execute_on_channel`].
+pub async fn execute_on_channel_with(
+    channel: tonic::transport::Channel,
+    command: Command,
+    action_id: String,
+    session_id: String,
+    opts: ExecOptions,
+) -> Result<ActionOutcome, ExecuteError> {
     drive_execute(
         ExecutionClient::new(channel),
         command,
         action_id,
         session_id,
+        opts,
     )
     .await
 }
@@ -170,16 +211,15 @@ async fn drive_execute(
     command: Command,
     action_id: String,
     session_id: String,
+    opts: ExecOptions,
 ) -> Result<ActionOutcome, ExecuteError> {
     let request = ExecuteRequest {
         action_id,
         command: Some(command),
         session_id,
         predicted_inputs: None,
-        // M5.4 plumbs the field and the worker-side warming; populating it from
-        // the cached manifest (AgentCache::predicted_paths) is wired when the
-        // daemon ties cache + scheduler + worker together (M5.5).
-        predicted_paths: Vec::new(),
+        predicted_paths: opts.predicted_paths,
+        vfs: opts.vfs,
     };
 
     let mut stream = client.execute(request).await?.into_inner();

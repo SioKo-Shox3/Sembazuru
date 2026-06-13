@@ -12,9 +12,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sembazuru_agent::Execution;
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::scheduler::{BuildAction, Scheduler};
+use sembazuru_agent::{ExecOptions, Execution};
 use sembazuru_proto::v0::{Capabilities, Command};
 use sembazuru_worker::WorkerService;
 
@@ -71,6 +71,7 @@ async fn dispatch_runs_remotely_with_live_workers() {
             cmd(&["cmd", "/c", "exit", "4"]),
             "act-1".into(),
             "sess".into(),
+            ExecOptions::default(),
         )
         .await;
     match exec {
@@ -92,6 +93,7 @@ async fn dispatch_reassigns_past_a_dead_worker() {
             cmd(&["cmd", "/c", "exit", "7"]),
             "act-2".into(),
             "sess".into(),
+            ExecOptions::default(),
         )
         .await;
     match exec {
@@ -113,6 +115,7 @@ async fn dispatch_falls_back_to_local_when_all_workers_dead() {
             cmd(&["cmd", "/c", "exit", "9"]),
             "act-3".into(),
             "sess".into(),
+            ExecOptions::default(),
         )
         .await;
     match exec {
@@ -136,6 +139,7 @@ async fn dispatch_falls_back_to_local_with_no_workers() {
             cmd(&["cmd", "/c", "exit", "2"]),
             "act-4".into(),
             "sess".into(),
+            ExecOptions::default(),
         )
         .await;
     match exec {
@@ -167,6 +171,7 @@ async fn dispatch_spreads_distinct_actions_across_workers() {
                 cmd(&["cmd", "/c", "set", &format!("SBZ_TU=tu{i}")]),
                 format!("act-burst-{i}"),
                 "sess".into(),
+                ExecOptions::default(),
             )
             .await
         }));

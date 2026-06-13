@@ -102,6 +102,30 @@ message ExecuteRequest {
   // the control plane here and the worker warms over the existing data-plane ops.
   // A worker that ignores it is still correct (it just does not pre-warm).
   repeated string predicted_paths = 5;
+  // Read-VFS execution (M6.1). When present, the worker runs the process under
+  // the injected hook DLL with on-demand file supply from the agent (the
+  // production compile path); when ABSENT the worker plain-spawns the process
+  // (the M5 scale path — back-compat). Unlike predicted_paths, this is NOT
+  // advisory: a worker that ignores it would run the compiler with no inputs.
+  VfsExecution vfs = 6;
+}
+
+// Configures the worker's read-VFS execution mode (M6.1). The worker starts a
+// per-action VFS pipe dialing `agent_fileserver`, injects the hook DLL, and
+// points its redirect at `vfs_root`. Reads under `vfs_root` are supplied on
+// demand by the agent; writes (the .obj) are NOT redirected — on a single
+// machine they land at the local output path the command line names.
+message VfsExecution {
+  // host:port of the agent's data-plane file server (the worker dials it).
+  string agent_fileserver = 1;
+  // Agent-side logical root under which read-only opens are redirected to the
+  // agent. Picks the project source tree, not the SDK (SDK stays worker-local).
+  string vfs_root = 2;
+  // Where the injected DLL writes the action's input trace, so the agent can
+  // build the input manifest for the action cache. SINGLE-MACHINE ONLY: agent
+  // and worker share the filesystem here; a 2-machine split moves trace
+  // ingestion onto the data plane (deferred with real-LAN, ADR 0004 §M5.5).
+  string trace_dir = 3;
 }
 
 // Worker-side state machine (§3.2):
