@@ -1,0 +1,19 @@
+[package]
+name = "sembazuru-proto"
+description = "Sembazuru control-plane gRPC/protobuf definitions (v0); protobuf lives only here"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+# A vendored protoc binary: no system protobuf install, no PATH dependency,
+# so the build (and CI) stays deterministic.
+protoc-bin-vendored = "3"

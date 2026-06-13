@@ -1,0 +1,138 @@
+syntax = "proto3";
+
+package sembazuru.v0;
+
+// Sembazuru control plane, v0. See docs/protocol/v0.md §3.
+//
+// Control traffic is low-rate (scheduling, lifecycle, keepalive); the
+// latency-critical file supply lives in the hand-rolled binary data plane
+// (docs/protocol/v0.md §4) and carries NO protobuf. protocol_version is
+// negotiated at Register time (§6); v0 = 0, and v0 makes no compatibility
+// promises until M3 ships.
+
+// A content digest. The hash algorithm is deliberately open (§4.1; candidate
+// BLAKE3, decided with CAS chunking in M4). For M3 this carries the M2
+// std-only SHA-256 used purely as content identity (no dedup yet).
+message Digest {
+  string algorithm = 1;  // e.g. "sha256"
+  string hex = 2;        // lowercase hex of the digest
+  uint64 size = 3;       // bytes of the addressed content
+}
+
+// ---- Coordination: registration & keepalive (§3.1) -----------------------
+
+service Coordination {
+  // Worker -> Agent: announce capabilities and negotiate the protocol version.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Bidirectional keepalive; either side noticing silence may trigger
+  // fallback (§3.2).
+  rpc Heartbeat(stream HeartbeatPing) returns (stream HeartbeatPong);
+}
+
+message Capabilities {
+  uint32 protocol_version = 1;                 // v0 = 0 (§6)
+  string os_build = 2;                         // Windows build number
+  string arch = 3;                             // e.g. "x86_64"
+  uint32 cpu_count = 4;
+  uint64 memory_bytes = 5;
+  // Data-plane transports the peer supports, so the data plane can evolve
+  // independently of the control plane (§3.1). Names, e.g. "tcp-framed".
+  repeated string data_plane_transports = 6;
+}
+
+message RegisterRequest {
+  string worker_id = 1;
+  Capabilities caps = 2;
+}
+
+message RegisterResponse {
+  uint32 protocol_version = 1;  // negotiated (min of the two peers); v0 = 0
+  bool accepted = 2;
+  string detail = 3;            // reason when accepted == false
+}
+
+message HeartbeatPing {
+  string worker_id = 1;
+  uint64 monotonic_qpc = 2;     // worker QueryPerformanceCounter sample
+}
+
+message HeartbeatPong {
+  uint64 agent_monotonic_us = 1;
+}
+
+// ---- Execution: action lifecycle (§3.2) ----------------------------------
+
+service Execution {
+  // Agent -> Worker: run this process under virtualization. Inputs are
+  // discovered on demand over the data plane, so the request names the input
+  // ROOT identity, not a file list — that on-demand discovery is the point.
+  rpc Execute(ExecuteRequest) returns (stream ExecuteEvent);
+  // Agent -> Worker: give up on a remote action (worker death, partition,
+  // latency budget exceeded). The agent may then re-execute locally (§3.2).
+  rpc Abort(AbortRequest) returns (AbortResponse);
+}
+
+message Command {
+  repeated string argv = 1;
+  map<string, string> env = 2;
+  string cwd = 3;               // working directory as seen locally (§3.2)
+}
+
+message ExecuteRequest {
+  string action_id = 1;
+  Command command = 2;
+  string session_id = 3;        // binds to a data-plane file session (§3.2)
+  Digest predicted_inputs = 4;  // optional prefetch hint manifest (M5)
+}
+
+// Worker-side state machine (§3.2):
+//   QUEUED -> PREPARING -> RUNNING -> COMPLETED
+//                |            |    \-> FAILED   (worker reports cause)
+//                \------------+------> ABORTED  (agent gave up / fallback)
+enum ActionState {
+  ACTION_STATE_UNSPECIFIED = 0;
+  QUEUED = 1;
+  PREPARING = 2;
+  RUNNING = 3;
+  COMPLETED = 4;
+  FAILED = 5;
+  ABORTED = 6;
+}
+
+message StateChange {
+  ActionState state = 1;
+  string detail = 2;            // human-readable cause for FAILED/ABORTED
+}
+
+// A produced output file. The bytes are returned over the data plane
+// (WriteBack, §4.1); this only announces identity + path. The path is the
+// agent-side logical path the action wrote, so the agent can publish it
+// atomically into the declared output set (§3.2).
+message OutputAvailable {
+  string path = 1;
+  Digest digest = 2;
+}
+
+message ExitStatus {
+  int32 exit_code = 1;
+  uint64 wall_time_us = 2;      // worker-measured wall clock
+  uint64 user_time_us = 3;
+  uint64 kernel_time_us = 4;
+}
+
+message ExecuteEvent {
+  oneof event {
+    StateChange state = 1;
+    OutputAvailable output = 2;
+    ExitStatus exit = 3;
+  }
+}
+
+message AbortRequest {
+  string action_id = 1;
+  string reason = 2;            // e.g. "fallback: latency budget exceeded"
+}
+
+message AbortResponse {
+  bool acknowledged = 1;
+}
