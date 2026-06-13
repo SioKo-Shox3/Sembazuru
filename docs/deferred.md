@@ -50,9 +50,17 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   「worker-local cache consulted first, M4」。
 - **CAS の重複排除・`Has(digests[])` バッチプローブ未実装。** 転送前に既存 digest を
   一括確認（v0 §4.3）。出所: v0 §4.3。
-- **ハッシュ方式とチャンク戦略が未決。** 現状は std-only SHA-256（tracer の `sha256_hex`）
-  を digest-as-identity に流用。候補 BLAKE3、固定 vs content-defined チャンクを実データで
-  決める。出所: v0 §4.1/§4.3/§9、DESIGN §9。
+- **ハッシュ方式とチャンク戦略 — 解消（ADR 0003、コミット M4.0）。** 実測で BLAKE3 採用、
+  チャンクは whole-file 基準＋大ファイル(2MiB超)のみ固定チャンク、CDC 見送り。`sembazuru-cas`
+  の `Digest`（algo タグ付き、既定 BLAKE3）に集約。`determinism.rs::sha256_hex` は M2 ゲート用に温存。
+- **CAS コアの DoS 上限がレイヤ外。** `put_verified`/`get` は untrusted バイト列を全量メモリに
+  載せる（巨大 blob で OOM）。BLAKE3 はストリーミング可能だが現コアは全量読み。blob サイズ上限・
+  ストリーミングハッシュはデータプレーン受信側で対処すべき（CAS コアの責務外）。出所: security(M4.1 LOW)。
+- **CAS の eviction/total_size がフルスキャン O(N)。** blob 数増で evict が重くなる（簡易版、ADR 0003
+  が明言）。将来サイズ累計のサイドカー化。出所: security(M4.1 LOW)。
+- **put と evict の並行でスプリアス失敗の余地。** content-addressed ゆえ内容汚染は無いが、稀に put が
+  一時的 io エラーを返し上位が永続失敗と誤認しうる。並行運用するなら `CasError` で一時/永続を区別。
+  出所: security(M4.1 MEDIUM)。
 - **アクションキャッシュ未実装。** 入力ハッシュ→出力。同一コンパイルをスキップ。
   土台は `verify-determinism --json` が出す入力ハッシュ→出力ハッシュ写像
   （determinism.md「Input-hash → output-hash mapping」）。鍵に command line＋env＋

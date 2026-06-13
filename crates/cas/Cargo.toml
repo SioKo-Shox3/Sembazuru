@@ -8,19 +8,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
-
-# Measurement-only dependencies (M4.0). The hash/chunk ADR (docs/decisions/
-# 0003-cas-hash-and-chunking.md) is decided with real data, so the `hash_bench`
-# example compares three implementations head to head:
-#   * the tracer's std-only hand-rolled SHA-256 (today's digest-as-identity),
-#   * `sha2` with the SHA-NI backend (RustCrypto),
-#   * `blake3` (the candidate).
-# These are dev-dependencies so the production dependency surface stays empty
-# until the ADR lands and M4.1 promotes the winner to a real dependency.
-[dev-dependencies]
+# Content hash for digest-as-identity (ADR 0003: BLAKE3, decided with real data
+# in docs/decisions/0003-cas-hash-and-chunking.md). CC0 OR Apache-2.0.
 blake3 = "1"
+
+# Measurement-only dependencies for the `hash_bench` example (M4.0), kept so the
+# ADR's numbers stay reproducible: it compares blake3 against `sha2` (SHA-NI)
+# and the tracer's std-only hand-rolled SHA-256. These do not enter the library.
+[dev-dependencies]
 # sha2 0.10 auto-selects the x86 SHA-NI backend at runtime (cpufeatures), no
-# external assembler needed — that is exactly the "best-case SHA-256" we want to
-# measure against blake3.
+# external assembler needed — the "best-case SHA-256" the ADR measures against.
 sha2 = "0.10"
 sembazuru-tracer = { path = "../tracer" }
