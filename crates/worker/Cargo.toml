@@ -17,6 +17,11 @@ path = "src/bin/sembazuru_worker.rs"
 [[example]]
 name = "vfs_host"
 
+# Dev driver that sends one VFS-mode Execute to a worker (M6.1b gate). Uses agent
+# (dev-dep) for the Execute client and proto for the request types.
+[[example]]
+name = "exec_vfs"
+
 [dev-dependencies]
 sembazuru-agent = { path = "../agent" }
 

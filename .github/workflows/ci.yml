@@ -66,3 +66,9 @@ jobs:
       # (the runner ships LLVM). The transfer half is the Rust worker-cache test.
       - name: M4 action-cache rebuild (2nd build skips compilation)
         run: pwsh -NoProfile -File hooks/test/m4_cache_rebuild.ps1 -RequireClangCl
+      # Gates M6.1b: a real sembazuru-worker process, driven over gRPC with
+      # ExecuteRequest.vfs, injects the hook DLL via launcher.exe and supplies the
+      # read on demand from the agent file server — proving the production VFS
+      # execution path (not just the vfs_host harness) redirects to agent bytes.
+      - name: M6.1b worker VFS execution (Execute redirects to agent bytes)
+        run: pwsh -NoProfile -File hooks/test/m6_worker_vfs_redirect.ps1

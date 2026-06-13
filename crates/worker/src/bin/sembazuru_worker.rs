@@ -10,12 +10,32 @@
 //! # dials a routable address rather than the unspecified bind address.
 //! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use sembazuru_worker::WorkerService;
 use sembazuru_worker::coordination::{default_worker_id, register_and_heartbeat};
+use sembazuru_worker::{WorkerService, WorkerVfsConfig};
+
+/// Read-VFS install config (M6.1), present only when all four paths are set:
+///   SEMBAZURU_LAUNCHER      launcher.exe (DetourCreateProcessWithDll injector)
+///   SEMBAZURU_DLL           sbz_interceptor64.dll (the hook)
+///   SEMBAZURU_SCRATCH_ROOT  per-action hydrated-input scratch trees go here
+///   SEMBAZURU_CAS_ROOT      worker-local content store (persisted across builds)
+/// Absent → a plain worker that only spawns processes directly (M5 scale).
+fn worker_vfs_config() -> Option<WorkerVfsConfig> {
+    let launcher = std::env::var_os("SEMBAZURU_LAUNCHER")?;
+    let dll = std::env::var_os("SEMBAZURU_DLL")?;
+    let scratch_root = std::env::var_os("SEMBAZURU_SCRATCH_ROOT")?;
+    let cas_root = std::env::var_os("SEMBAZURU_CAS_ROOT")?;
+    Some(WorkerVfsConfig {
+        launcher: PathBuf::from(launcher),
+        dll: PathBuf::from(dll),
+        scratch_root: PathBuf::from(scratch_root),
+        cas_root: PathBuf::from(cas_root),
+    })
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // SEMBAZURU_CAPACITY sets the admission limit; the scale harness sets it to
@@ -52,6 +72,18 @@ async fn run(capacity: Option<u32>) -> Result<(), Box<dyn std::error::Error + Se
     let service = match capacity {
         Some(c) => WorkerService::with_capacity(c),
         None => WorkerService::new(),
+    };
+    // Enable read-VFS execution (M6.1) when the install paths are configured.
+    let service = match worker_vfs_config() {
+        Some(cfg) => {
+            eprintln!(
+                "sembazuru-worker: VFS execution enabled (launcher {}, scratch {})",
+                cfg.launcher.display(),
+                cfg.scratch_root.display()
+            );
+            service.with_vfs(cfg)
+        }
+        None => service,
     };
 
     // If an agent is configured, register and heartbeat in the background. The

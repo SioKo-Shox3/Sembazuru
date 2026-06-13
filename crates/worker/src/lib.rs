@@ -13,19 +13,42 @@ pub mod coordination;
 pub mod fileclient;
 pub mod vfs_pipe;
 
+use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sembazuru_proto::v0::{
     AbortRequest, AbortResponse, ActionState, Command, ExecuteEvent, ExecuteRequest, ExitStatus,
-    StateChange, execute_event::Event, execution_server::Execution,
+    StateChange, VfsExecution, execute_event::Event, execution_server::Execution,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
+
+use crate::vfs_pipe::serve_vfs_with_prefetch_ready;
+
+/// Disambiguates per-action VFS pipe/scratch names within a worker process.
+static EXEC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Worker-local install config for read-VFS execution (M6.1). Set from the
+/// worker daemon's environment; absent on a plain (M5 scale) worker. The agent
+/// fileserver address is NOT here — it rides per-action in `VfsExecution` so one
+/// worker can serve many agents (forward-compatible with the LAN split).
+#[derive(Clone)]
+pub struct WorkerVfsConfig {
+    /// `launcher.exe` — injects the hook DLL via DetourCreateProcessWithDllExW.
+    pub launcher: PathBuf,
+    /// `sbz_interceptor64.dll` — the injected hook that redirects reads.
+    pub dll: PathBuf,
+    /// Root under which per-action scratch (hydrated input) trees are created.
+    pub scratch_root: PathBuf,
+    /// Worker-local content store, persisted across builds (M4 worker cache).
+    pub cas_root: PathBuf,
+}
 
 /// Default admission capacity when none is given: the machine's parallelism.
 fn default_capacity() -> u32 {
@@ -69,6 +92,9 @@ pub struct WorkerService {
     accept: Arc<Semaphore>,
     capacity: u32,
     ceiling: std::time::Duration,
+    /// Read-VFS install config; `None` → the worker only plain-spawns and
+    /// rejects VFS-mode requests (M5 scale worker). Set via [`with_vfs`].
+    vfs: Option<Arc<WorkerVfsConfig>>,
 }
 
 impl Default for WorkerService {
@@ -95,7 +121,16 @@ impl WorkerService {
             accept: Arc::new(Semaphore::new((capacity * QUEUE_FACTOR) as usize)),
             capacity,
             ceiling: default_action_ceiling(),
+            vfs: None,
         }
+    }
+
+    /// Enables read-VFS execution (M6.1): VFS-mode `Execute` requests inject the
+    /// hook DLL and supply inputs on demand. Without it, a VFS-mode request is
+    /// rejected (it would otherwise plain-spawn the compiler with no inputs).
+    pub fn with_vfs(mut self, cfg: WorkerVfsConfig) -> Self {
+        self.vfs = Some(Arc::new(cfg));
+        self
     }
 
     /// A handle to the in-flight-action counter, shared with every clone of the
@@ -160,6 +195,9 @@ fn exit_event(code: i32, wall_us: u64) -> Result<ExecuteEvent, Status> {
 #[allow(clippy::too_many_arguments)]
 async fn run_action(
     cmd: Command,
+    vfs_req: Option<VfsExecution>,
+    predicted_paths: Vec<String>,
+    vfs_cfg: Option<Arc<WorkerVfsConfig>>,
     tx: mpsc::Sender<Result<ExecuteEvent, Status>>,
     limit: Arc<Semaphore>,
     running: Arc<AtomicU32>,
@@ -201,33 +239,32 @@ async fn run_action(
         return;
     }
 
-    let mut command = tokio::process::Command::new(&cmd.argv[0]);
-    command.args(&cmd.argv[1..]);
-    if !cmd.cwd.is_empty() {
-        command.current_dir(&cmd.cwd);
-    }
-    // Provided env is layered on top of the worker's inherited environment.
-    // M3.2+ will make the env exact for remote correctness; loopback inherits.
-    for (k, v) in &cmd.env {
-        command.env(k, v);
-    }
-    command.stdin(Stdio::null());
-    // Kill the child if its task is dropped. Combined with the `tx.closed()` arm
-    // below, this guarantees that when the agent gives up on an action (drops the
-    // Execute stream — the fallback path) the worker does not leak an orphaned
-    // process holding an admission slot (DoS hardening).
-    command.kill_on_drop(true);
-
-    let start = Instant::now();
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
+    // Decide execution mode. VFS mode (M6.1) injects the hook DLL and supplies
+    // inputs on demand; plain mode (M5 scale) spawns the process directly. A
+    // VFS-mode request on a worker that lacks VFS config is a hard FAILED, not a
+    // plain spawn — plain-spawning would run the compiler with no inputs and
+    // produce a wrong result the agent would then trust.
+    let vfs_plan = match (vfs_req, vfs_cfg) {
+        (Some(v), Some(cfg)) => Some((v, cfg)),
+        (Some(_), None) => {
             let _ = tx
                 .send(state_event(
                     ActionState::Failed,
-                    &format!("spawn failed: {e}"),
+                    "worker is not configured for VFS execution",
                 ))
                 .await;
+            return;
+        }
+        (None, _) => None,
+    };
+
+    let start = Instant::now();
+    // For VFS mode, `pipe_task` keeps the per-action pipe server alive for the
+    // run; it is aborted after the child exits so it does not leak a task.
+    let (mut child, pipe_task) = match build_child(&cmd, vfs_plan, predicted_paths).await {
+        Ok(pair) => pair,
+        Err(detail) => {
+            let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
             return;
         }
     };
@@ -265,6 +302,128 @@ async fn run_action(
             }
         }
     }
+
+    // Stop the per-action VFS pipe server (if any). The serve loop runs forever
+    // by design, so it must be aborted once the action is done or it leaks one
+    // task (and one listening pipe instance) per action. The hydrated scratch
+    // tree is left for now; session/output cleanup is M3.3/M7.
+    if let Some(t) = pipe_task {
+        t.abort();
+    }
+}
+
+/// Builds the child process for an action. Plain mode spawns the command
+/// directly (M5 scale path) and returns `(child, None)`. VFS mode (M6.1) starts
+/// a per-action pipe server, waits for it to be dialable, then spawns the
+/// compiler through `launcher.exe` (DLL injection) with an explicit environment;
+/// it returns the pipe-server task so the caller can abort it after the run. On
+/// any setup failure it returns a human-readable detail for a FAILED event.
+async fn build_child(
+    cmd: &Command,
+    vfs_plan: Option<(VfsExecution, Arc<WorkerVfsConfig>)>,
+    predicted_paths: Vec<String>,
+) -> Result<
+    (
+        tokio::process::Child,
+        Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    ),
+    String,
+> {
+    let Some((v, cfg)) = vfs_plan else {
+        // Plain spawn (M5 scale path): provided env layered on the inherited one.
+        let mut command = tokio::process::Command::new(&cmd.argv[0]);
+        command.args(&cmd.argv[1..]);
+        if !cmd.cwd.is_empty() {
+            command.current_dir(&cmd.cwd);
+        }
+        for (k, val) in &cmd.env {
+            command.env(k, val);
+        }
+        command.stdin(Stdio::null());
+        // Kill the child if its task is dropped (agent gave up / fallback), so
+        // the worker never leaks an orphan holding an admission slot.
+        command.kill_on_drop(true);
+        let child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+        return Ok((child, None));
+    };
+
+    // VFS mode. Per-action unique pipe + scratch so concurrent actions never
+    // collide (their traces/scratch must not cross-contaminate).
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let pipe_name = format!("sbz-exec-{suffix}");
+    let scratch = cfg.scratch_root.join(&suffix);
+    let agent_addr: SocketAddr = v
+        .agent_fileserver
+        .parse()
+        .map_err(|e| format!("invalid agent_fileserver {:?}: {e}", v.agent_fileserver))?;
+    tokio::fs::create_dir_all(&scratch)
+        .await
+        .map_err(|e| format!("create scratch {}: {e}", scratch.display()))?;
+    if !v.trace_dir.is_empty() {
+        tokio::fs::create_dir_all(&v.trace_dir)
+            .await
+            .map_err(|e| format!("create trace_dir {}: {e}", v.trace_dir))?;
+    }
+    let scratch_str = scratch.to_string_lossy().into_owned();
+
+    // Start the pipe server and WAIT for readiness before launching, so the
+    // compiler cannot dial the pipe before it exists (Plan risk 1). A create
+    // failure drops `ready_tx`, so `ready_rx.await` errors and we fail closed.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let cas = cfg.cas_root.clone();
+    let pipe_for_task = pipe_name.clone();
+    let pipe_task = tokio::spawn(async move {
+        serve_vfs_with_prefetch_ready(
+            &pipe_for_task,
+            agent_addr,
+            scratch,
+            cas,
+            Duration::ZERO,
+            predicted_paths,
+            ready_tx,
+        )
+        .await
+    });
+    if ready_rx.await.is_err() {
+        pipe_task.abort();
+        return Err("VFS pipe server failed to start".to_string());
+    }
+
+    // Inject the DLL via launcher.exe. Env is set EXPLICITLY (env_clear first):
+    // launcher.cpp passes no env block, so the compiler inherits the launcher's
+    // environment — which is what we set here. Clearing first stops worker-
+    // internal vars (SEMBAZURU_AGENT/CAPACITY) and any stale SEMBAZURU_VFS_* from
+    // a prior action from leaking into the compiler and perturbing its output.
+    let mut command = tokio::process::Command::new(&cfg.launcher);
+    command.arg(&cfg.dll);
+    command.args(&cmd.argv);
+    if !cmd.cwd.is_empty() {
+        command.current_dir(&cmd.cwd);
+    }
+    command.env_clear();
+    for (k, val) in &cmd.env {
+        command.env(k, val);
+    }
+    command.env("SEMBAZURU_MODE", "vfs");
+    command.env("SEMBAZURU_VFS_ROOT", &v.vfs_root);
+    command.env("SEMBAZURU_VFS_PIPE", &pipe_name);
+    command.env("SEMBAZURU_VFS_SCRATCH", &scratch_str);
+    if !v.trace_dir.is_empty() {
+        command.env("SEMBAZURU_TRACE_DIR", &v.trace_dir);
+    }
+    command.stdin(Stdio::null());
+    command.kill_on_drop(true);
+    match command.spawn() {
+        Ok(child) => Ok((child, Some(pipe_task))),
+        Err(e) => {
+            pipe_task.abort();
+            Err(format!("launcher spawn failed: {e}"))
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -282,6 +441,11 @@ impl Execution for WorkerService {
         if cmd.argv.is_empty() {
             return Err(Status::invalid_argument("command.argv must be non-empty"));
         }
+        // M6.1: VFS config and prefetch hint ride the request; the worker's own
+        // install config decides whether VFS mode is even possible.
+        let vfs_req = req.vfs;
+        let predicted_paths = req.predicted_paths;
+        let vfs_cfg = self.vfs.clone();
 
         // Shed load before spawning anything: if the accepted-work backlog is
         // already at QUEUE_FACTOR × capacity, reject rather than pin more memory
@@ -304,6 +468,9 @@ impl Execution for WorkerService {
         // immediately and queued actions are visible as QUEUED events.
         tokio::spawn(run_action(
             cmd,
+            vfs_req,
+            predicted_paths,
+            vfs_cfg,
             tx,
             Arc::clone(&self.limit),
             Arc::clone(&self.running),
