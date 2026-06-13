@@ -79,3 +79,9 @@ jobs:
       # byte-identity gate (the runner ships LLVM).
       - name: M6.1 daemon compile (distributed byte-identical, fallback, cache hit)
         run: pwsh -NoProfile -File hooks/test/m6_daemon_compile.ps1 -RequireClangCl
+      # Gates M6.2: an MSBuild .vcxproj build routed through the daemon via the
+      # CLToolExe launcher shim — the compile runs remotely and falls back locally
+      # when the daemon is down. MSVC cl is byte-best-effort, so this checks the
+      # interception mechanism (the CMake/Ninja path carries the clang-cl bytes).
+      - name: M6.2 MSBuild integration (CLToolExe shim routes through the daemon)
+        run: pwsh -NoProfile -File hooks/test/m6_msbuild.ps1
