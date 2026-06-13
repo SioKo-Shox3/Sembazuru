@@ -144,6 +144,42 @@ pub async fn serve_vfs_with_prefetch(
     rtt: Duration,
     predicted_paths: Vec<String>,
 ) -> io::Result<()> {
+    // No readiness signal wanted (the dev harness/tests poll the pipe path or
+    // tolerate the race); discard it.
+    let (ready, _rx) = tokio::sync::oneshot::channel();
+    serve_vfs_with_prefetch_ready(
+        pipe_name,
+        agent_addr,
+        scratch_root,
+        cas_root,
+        rtt,
+        predicted_paths,
+        ready,
+    )
+    .await
+}
+
+/// Like [`serve_vfs_with_prefetch`], but fires `ready` the instant the first
+/// pipe instance exists in the namespace, BEFORE blocking on a client.
+///
+/// This closes a real race the worker's `Execute` path would otherwise hit
+/// (Plan review M6.1, risk 1): the first pipe instance is created inside this
+/// future, so a caller that spawns this as a task and immediately launches the
+/// hooked compiler can have the compiler dial `\\.\pipe\<name>` before
+/// `create()` has run — getting `ERROR_FILE_NOT_FOUND` and silently falling
+/// back to the real filesystem (no redirect). By awaiting `ready` before
+/// launching, the worker guarantees the pipe is listening first — deterministic,
+/// not a sleep-poll. If `create()` fails, `ready` is dropped without firing, so
+/// the caller's `rx.await` errors and the action fails closed.
+pub async fn serve_vfs_with_prefetch_ready(
+    pipe_name: &str,
+    agent_addr: SocketAddr,
+    scratch_root: PathBuf,
+    cas_root: PathBuf,
+    rtt: Duration,
+    predicted_paths: Vec<String>,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     let state = Arc::new(VfsState {
         scratch_root,
@@ -162,9 +198,14 @@ pub async fn serve_vfs_with_prefetch(
         });
     }
 
+    // Create the first instance synchronously, THEN signal readiness: once
+    // `create()` returns the pipe is in the namespace and a client dial will
+    // connect (or wait), never miss. Only after this do we let the caller launch.
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(&full)?;
+    let _ = ready.send(());
+
     loop {
         server.connect().await?;
         let connected = server;
@@ -301,6 +342,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// M6.1 (Plan risk 1): the readiness signal fires only after the first pipe
+    /// instance exists, so a client dialing the instant `ready` resolves connects
+    /// without a retry/poll. Without the synchronous create-before-signal, the
+    /// worker's launched compiler could miss the pipe and silently skip the VFS.
+    #[tokio::test]
+    async fn ready_signal_means_the_pipe_is_dialable() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let name = format!(
+            "sbz-ready-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let full = format!(r"\\.\pipe\{name}");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let serve_name = name.clone();
+        let scratch = temp("ready-scratch");
+        let cas = temp("ready-cas");
+        tokio::spawn(async move {
+            let _ = serve_vfs_with_prefetch_ready(
+                &serve_name,
+                "127.0.0.1:1".parse().unwrap(), // never dialed in this test
+                scratch,
+                cas,
+                Duration::ZERO,
+                Vec::new(),
+                tx,
+            )
+            .await;
+        });
+
+        // Block until the pipe is reported ready, then dial it ONCE — no retry.
+        rx.await
+            .expect("serve task created the pipe and signaled readiness");
+        let client = ClientOptions::new().open(&full);
+        assert!(
+            client.is_ok(),
+            "the pipe must be connectable the instant readiness fires, got {:?}",
+            client.err()
+        );
     }
 
     /// M5.4: prefetch_warm pulls the predicted files ahead of time, so the

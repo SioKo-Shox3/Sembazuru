@@ -26,7 +26,7 @@ use std::time::Duration;
 use sembazuru_proto::v0::Command;
 
 use crate::coordination::{WorkerEntry, WorkerTable};
-use crate::{ExecuteError, Execution, execute_on_channel, run_local};
+use crate::{ExecOptions, ExecuteError, Execution, execute_on_channel_with, run_local};
 
 /// Upper bound on a worker's self-reported `cpu_count` when used for load
 /// math. A worker is untrusted until M7 (ADR 0004 §6); clamping stops a single
@@ -276,7 +276,10 @@ impl Scheduler {
                 .expect("build gate semaphore is never closed");
             let s = self.clone();
             tasks.push(tokio::spawn(async move {
-                let outcome = s.dispatch(a.command, a.action_id, a.session_id).await;
+                // The scale path plain-spawns: no prefetch hint, no VFS config.
+                let outcome = s
+                    .dispatch(a.command, a.action_id, a.session_id, ExecOptions::default())
+                    .await;
                 drop(permit); // free a slot for the next queued action
                 outcome
             }));
@@ -309,6 +312,7 @@ impl Scheduler {
         command: Command,
         action_id: String,
         session_id: String,
+        opts: ExecOptions,
     ) -> Execution {
         let key = affinity_key(&command.argv);
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -329,11 +333,12 @@ impl Scheduler {
             };
             let attempt = tokio::time::timeout(
                 self.remote_budget,
-                execute_on_channel(
+                execute_on_channel_with(
                     channel,
                     command.clone(),
                     action_id.clone(),
                     session_id.clone(),
+                    opts.clone(),
                 ),
             )
             .await;
