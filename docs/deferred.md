@@ -144,6 +144,25 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   のみ参照（単一 agent 前提で正確）。複数 agent/別経路の負荷は見落とす。複数 agent 化時に再検討。
   出所: verifier(M5.2 懸念3)。
 
+### M5.5 実装後の既知の残リスク（quality gates 2026-06-14）
+- **完全な compile+VFS+RTT 多ワーカー効率は未実測（実 LAN 繰り延べ）。** 単機ハーネス（burn）は
+  分配 fan-out のみ測定し、データプレーン供給・RTT を含まない。ターボ／co-tenancy 交絡のため
+  忠実測定は実 2 台 LAN（決定者承認）。E(2)=0.88 は分配層の上限値。出所: verifier(M5.5 A1)、ADR 0004 §M5.5。
+- **悪意/誤設定 worker の容量過小・過大申告によるレイテンシ劣化。** agent は cpu_count を clamp(1,256)
+  し正しさは守る（reassign＋ローカルフォールバック）が、毎回 remote_budget(120s) を食わされる劣化攻撃は
+  成立。緩和は M7 認証。出所: security(M5.5 Low)、ADR 0004 §6。
+- **dead-but-TCP-accepting worker がアクションを最大 120s 拘束。** connect_timeout 250ms は connect_lazy で
+  初回 RPC まで遅延し、stall すると remote_budget まで reassign しない。レイテンシ予算チューニング（M5.5/M7）。
+  出所: verifier(M5.5 B3)。
+- **run_build の gate サイズ・channels prune は開始時スナップショット。** ビルド中の worker 増は未反映
+  （過小利用、ハングなし）。channels は run_build 開始で live のみ retain（無制限増大は解消）。
+  出所: security(M5.5 Low)、verifier(M5.5 B2)。
+- **同一 path への真の並行 WriteBack は path ロック未実装。** 現状の逐次 reassignment では発生せず、
+  発生しても content-addressed＋digest 検証＋atomic publish で誤バイト publish は構造的に不可（fail-closed）。
+  将来 worker 起因の投機的重複実行を入れるなら write_back の path 単位ロックを検討。出所: determinism(M5.5)。
+- **worker の Abort 未配線（acknowledge のみ）。** reassign 時に元 worker のプロセスを能動 kill しない
+  （タイムアウトのみ）。graceful drain は M7。出所: security(M5.5 Info)、M3.1 注。
+
 ## M7（堅牢化・セキュリティ）
 
 - **データプレーン/制御プレーンに認証・TLS 無し。** worker の Execute、agent の

@@ -1,12 +1,16 @@
-# M5.5 parallel-efficiency measurement (local evidence; ADR 0004 §M5.5).
+# M5.5 scheduler DISTRIBUTION fan-out efficiency (local evidence; ADR 0004 §M5.5).
 #
-# Measures how well the agent scheduler distributes a "compile phase" across
-# worker processes. Each worker process is pinned to a disjoint set of cores
-# (its child actions inherit the affinity), so W workers genuinely run in
-# parallel on W*k cores. A synthetic CPU-bound `burn` action stands in for a
-# compile (hybrid approach, decided 2026-06-14): this isolates the scheduler's
-# distribution efficiency and is deterministic; real clang-cl multi-worker
-# distribution + byte-identity is validated separately in CI.
+# Measures ONE component of compile-phase efficiency: how well the agent
+# scheduler distributes actions across worker processes and keeps them busy.
+# Each worker is pinned to a disjoint core set (its child actions inherit the
+# affinity), so W workers genuinely run in parallel. The action is a synthetic
+# CPU-bound `burn` with NO inputs/outputs — so this deliberately does NOT measure
+# the data-plane file supply or network RTT (the other half of compile-phase
+# efficiency). That full compile + VFS + RTT efficiency is confounded on one box
+# (turbo throttling, multi-process co-tenancy) and is the deferred real-LAN test
+# (ADR 0004 §M5.5, decider-gated). E(W) here is an upper-bound on the dispatch
+# layer, not the full picture. Correctness of multi-worker distribution is gated
+# in CI (`run_build_fans_out_a_whole_phase_across_workers`).
 #
 #   E(W) = T_compile(1) / (W * T_compile(W))
 #
