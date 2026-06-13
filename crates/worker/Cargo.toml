@@ -6,3 +6,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[[bin]]
+name = "sembazuru-worker"
+path = "src/bin/sembazuru_worker.rs"
+
+[dependencies]
+sembazuru-proto = { path = "../proto" }
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "net", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
