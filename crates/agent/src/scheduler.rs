@@ -166,6 +166,20 @@ impl Scheduler {
         Ok(channel)
     }
 
+    /// Drops cached channels whose worker is no longer live, bounding the cache
+    /// to the current cluster. A worker that restarts on the same endpoint just
+    /// re-inserts (and tonic reconnects) on the next dispatch.
+    fn prune_channels(&self) {
+        let live: std::collections::HashSet<String> = self
+            .table
+            .live_snapshot()
+            .into_iter()
+            .map(|w| w.execution_endpoint)
+            .collect();
+        let mut chans = self.channels.lock().expect("channels poisoned");
+        chans.retain(|ep, _| live.contains(ep));
+    }
+
     /// Effective free slots on a worker = its advertised capacity (clamped, as
     /// the worker is untrusted) minus the actions this agent currently has
     /// assigned to it.
@@ -236,12 +250,22 @@ impl Scheduler {
     /// scheduler entry point; `run_build`'s wall time over `actions.len()` actions
     /// against W workers is what the parallel-efficiency measurement divides.
     pub async fn run_build(&self, actions: Vec<BuildAction>) -> Vec<Execution> {
+        // Drop channels to workers that are no longer live so the cache cannot
+        // grow without bound across a long-lived agent's worker churn
+        // (security-reviewer / verifier B2).
+        self.prune_channels();
+
         // Throttle fan-out to roughly the cluster's capacity (×2 so a worker
         // finishing one action always has the next already queued, never idling
         // between dispatches). Excess actions wait HERE, on the agent, instead of
         // being flung at workers that reject past their backlog and bounce to
-        // slow local fallback — which would wreck parallel efficiency.
-        let cap = (self.cluster_capacity() * 2).max(1);
+        // slow local fallback — which would wreck parallel efficiency. The floor
+        // is the local core count, so an all-local fallback (no live workers)
+        // still runs in parallel rather than one TU at a time (verifier B1).
+        let local_floor = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let cap = (self.cluster_capacity() * 2).max(local_floor);
         let gate = Arc::new(tokio::sync::Semaphore::new(cap));
 
         let mut tasks = Vec::with_capacity(actions.len());
