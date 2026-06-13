@@ -17,18 +17,17 @@ use sembazuru_proto::v0::{
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 
-/// Best-effort local capabilities for `Register`. `cpu_count` is the admission
-/// budget the agent's least-loaded scheduling reasons about (ADR 0004); the
-/// rest is informational until the trust model hardens (M7).
-pub fn local_capabilities() -> Capabilities {
-    let cpu_count = std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(1);
+/// Best-effort local capabilities for `Register`. `cpu_count` MUST be the
+/// worker's real admission capacity (its concurrent-action limit), NOT the raw
+/// machine parallelism: the agent schedules against this number, so advertising
+/// more than the worker will actually admit makes the scheduler over-dispatch
+/// and the excess bounce off the backlog into slow local fallback (ADR 0004).
+pub fn local_capabilities(capacity: u32) -> Capabilities {
     Capabilities {
         protocol_version: PROTOCOL_VERSION,
         os_build: std::env::var("OS").unwrap_or_default(),
         arch: std::env::consts::ARCH.to_string(),
-        cpu_count,
+        cpu_count: capacity.max(1),
         memory_bytes: 0, // best-effort; not load-bearing for scheduling yet
         data_plane_transports: vec!["tcp-framed".to_string()],
     }
@@ -48,15 +47,17 @@ pub fn default_worker_id() -> String {
 /// drops or the agent closes the pong stream). Returns `Err` if the initial
 /// connect/register fails; a worker that cannot reach the agent simply runs
 /// un-registered (the agent never schedules to it) rather than crashing.
+#[allow(clippy::too_many_arguments)]
 pub async fn register_and_heartbeat(
     agent_endpoint: String,
     worker_id: String,
     execution_endpoint: String,
+    capacity: u32,
     running: Arc<AtomicU32>,
     heartbeat_interval: Duration,
     stop: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let caps = local_capabilities();
+    let caps = local_capabilities(capacity);
     let cpu_count = caps.cpu_count;
 
     // Match the agent's keepalive so a half-open TCP is noticed at the transport

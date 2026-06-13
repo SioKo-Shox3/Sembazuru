@@ -17,8 +17,29 @@ use std::time::Duration;
 use sembazuru_worker::WorkerService;
 use sembazuru_worker::coordination::{default_worker_id, register_and_heartbeat};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // SEMBAZURU_CAPACITY sets the admission limit; the scale harness sets it to
+    // the worker's pinned core count so each worker runs exactly its share in
+    // parallel. Unset → available_parallelism (the normal default).
+    let capacity = std::env::var("SEMBAZURU_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|&c| c > 0);
+
+    // Size the runtime to the worker's capacity (its concurrent actions), with a
+    // floor of 2 for the always-on accept/heartbeat work. Too few threads and a
+    // high-capacity worker drives its concurrent children near-serially; too many
+    // (tokio's default = one per machine core) and a core-pinned worker
+    // oversubscribes its cores and steals cycles from the very children it spawns.
+    let worker_threads = capacity.unwrap_or(2).clamp(2, 64) as usize;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(capacity))
+}
+
+async fn run(capacity: Option<u32>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:50061".to_string());
@@ -28,7 +49,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let local = listener.local_addr()?;
     eprintln!("sembazuru-worker: Execution service on {local}");
 
-    let service = WorkerService::new();
+    let service = match capacity {
+        Some(c) => WorkerService::with_capacity(c),
+        None => WorkerService::new(),
+    };
 
     // If an agent is configured, register and heartbeat in the background. The
     // worker announces the endpoint the agent should dial for Execution — its
@@ -54,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err(_) => format!("http://{local}"),
         };
         let worker_id = default_worker_id();
+        let capacity = service.capacity();
         let running = service.running_handle();
         // No graceful-drain trigger wired yet (process exit ends heartbeats);
         // the flag exists so a future Ctrl-C handler can deregister cleanly.
@@ -64,6 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 agent,
                 worker_id,
                 execution_endpoint,
+                capacity,
                 running,
                 Duration::from_secs(5),
                 stop,
