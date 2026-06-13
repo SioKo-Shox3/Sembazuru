@@ -75,6 +75,15 @@ function Time-Vfs {
                     Push-Location $workdir
                     try { & $launcher $dll cl /nologo /c /Brepro $srcAbs "/Foout.obj" 1>$null 2>$null } finally { Pop-Location }
                 }).TotalMilliseconds
+            # Self-validate: the measurement is only meaningful if the compile
+            # actually ran AND went through the VFS. Without this, a silently
+            # broken redirect would measure a plain local compile (and, with no
+            # VFS, the RTT shim never fires -> delta ~= 0 -> a false pass).
+            if ($LASTEXITCODE -ne 0) { throw "vfs compile (rtt=$RttUs us) exited $LASTEXITCODE" }
+            if (-not (Test-Path (Join-Path $workdir 'out.obj'))) { throw "vfs compile produced no out.obj (rtt=$RttUs us)" }
+            if (-not (Get-ChildItem -Recurse -File $scratch -ErrorAction SilentlyContinue)) {
+                throw "VFS not exercised: scratch empty (rtt=$RttUs us) -> measuring a local compile"
+            }
         } finally {
             Remove-Item Env:\SEMBAZURU_MODE, Env:\SEMBAZURU_VFS_ROOT, Env:\SEMBAZURU_VFS_PIPE, Env:\SEMBAZURU_VFS_SCRATCH -ErrorAction SilentlyContinue
         }
@@ -107,9 +116,10 @@ $delta = $vfs1 - $vfs0
 Write-Host ('RTT delta       : {0,7:N1} ms  (1ms-RTT minus 0ms-RTT; ~= round-trips x 1ms)' -f $delta)
 
 $failures = @()
-# Round-trips do not blow it up: a 1 ms RTT adds only a few ms (a handful of
-# project-file fetches), not hundreds. 150 ms of slack is generous.
-if ($delta -gt 150) {
+# Round-trips do not blow it up: a 1 ms RTT adds only a few ms (~one per project
+# file fetched; the corpus has ~8), not hundreds. 80 ms still leaves ~10x slack
+# over the expected delta while catching a round-trip-count blow-up.
+if ($delta -gt 80) {
     $failures += "round-trip latency dominates: 1ms RTT added $([int]$delta) ms (expected a few ms for a handful of project files)"
 }
 # Not catastrophically slower than local. The VFS path also pays fixed
