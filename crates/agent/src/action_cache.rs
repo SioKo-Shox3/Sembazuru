@@ -133,6 +133,22 @@ impl AgentCache {
         )
     }
 
+    /// The agent-side logical paths a prior build of this action read, for
+    /// dependency-prediction prefetch (M5.4, `ExecuteRequest.predicted_paths`).
+    /// Empty when the action has no cached manifest yet — a first build has
+    /// nothing to predict, so prefetch is simply skipped. NOTE: returns the
+    /// manifest's *logical* paths; reconciling those with the paths the worker
+    /// hydrates under the deployed `PathMap` is part of the M5.5 daemon wiring.
+    pub fn predicted_paths(&self, weak: &Digest) -> io::Result<Vec<String>> {
+        let Some(bytes) = self.cache.get_manifest(weak)? else {
+            return Ok(Vec::new());
+        };
+        let Some(manifest) = decode_manifest(&bytes) else {
+            return Ok(Vec::new()); // corrupt manifest → no prediction
+        };
+        Ok(manifest.inputs.into_iter().map(|e| e.logical).collect())
+    }
+
     /// Loads a trace directory and extracts the observed-input manifest. Thin
     /// wrapper over the tracer; returns an error string on an unreadable trace.
     pub fn manifest_from_trace_dir(&self, trace_dir: &str) -> Result<InputManifest, String> {
@@ -402,5 +418,37 @@ mod tests {
             cache.resolve(&weak, &tmp("u-b")).unwrap(),
             CacheLookup::Miss
         );
+    }
+
+    #[test]
+    fn predicted_paths_come_from_the_recorded_manifest() {
+        let root = tmp("predict");
+        let build = tmp("predict-build");
+        let cache = AgentCache::open(&root).unwrap();
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"src").unwrap();
+        std::fs::write(build.join("a.obj"), b"obj").unwrap();
+
+        let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
+        let weak = cache.weak_key(&argv, &[]);
+
+        // No manifest yet → nothing to predict (a first build skips prefetch).
+        assert!(cache.predicted_paths(&weak).unwrap().is_empty());
+
+        // After recording, the manifest's input logical paths are the prediction.
+        let header = build.join("h.h");
+        std::fs::write(&header, b"#pragma once").unwrap();
+        let manifest = manifest_for(&[("a.cpp", &input), ("h.h", &header)]);
+        cache
+            .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
+            .unwrap();
+
+        let mut predicted = cache.predicted_paths(&weak).unwrap();
+        predicted.sort();
+        assert_eq!(predicted, vec!["a.cpp".to_string(), "h.h".to_string()]);
+
+        // An unknown action still predicts nothing.
+        let other = cache.weak_key(&["other".to_string()], &[]);
+        assert!(cache.predicted_paths(&other).unwrap().is_empty());
     }
 }

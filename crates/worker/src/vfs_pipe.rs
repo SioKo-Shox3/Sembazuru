@@ -72,6 +72,25 @@ impl VfsState {
             .await
             .cloned()
     }
+
+    /// Dependency-prediction prefetch (M5.4): warm `paths` into the session
+    /// before the compiler asks for them. Each path is hydrated concurrently —
+    /// the multiplexed connection (M5.3) overlaps the probes/fetches, so N
+    /// predicted files warm in roughly one round-trip's wall time instead of N.
+    /// Best-effort: a path that fails to warm is simply hydrated for real later.
+    async fn prefetch_warm(self: &Arc<Self>, paths: &[String]) {
+        let mut tasks = Vec::with_capacity(paths.len());
+        for p in paths {
+            let state = Arc::clone(self);
+            let p = p.clone();
+            tasks.push(tokio::spawn(async move {
+                let _ = hydrate(&p, &state).await;
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+    }
 }
 
 /// Maps an agent-side logical path to its location in the scratch tree by
@@ -102,6 +121,29 @@ pub async fn serve_vfs(
     cas_root: PathBuf,
     rtt: Duration,
 ) -> io::Result<()> {
+    serve_vfs_with_prefetch(
+        pipe_name,
+        agent_addr,
+        scratch_root,
+        cas_root,
+        rtt,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Like [`serve_vfs`], but warms `predicted_paths` (a prior build's inputs, from
+/// `ExecuteRequest.predicted_paths`) into the session in the background as it
+/// starts serving — so the compiler's first opens hit an already-warm cache
+/// instead of paying the round-trip (M5.4 dependency-prediction prefetch).
+pub async fn serve_vfs_with_prefetch(
+    pipe_name: &str,
+    agent_addr: SocketAddr,
+    scratch_root: PathBuf,
+    cas_root: PathBuf,
+    rtt: Duration,
+    predicted_paths: Vec<String>,
+) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     let state = Arc::new(VfsState {
         scratch_root,
@@ -111,6 +153,14 @@ pub async fn serve_vfs(
         rtt,
         client: OnceCell::new(),
     });
+
+    // Warm predicted inputs ahead of process I/O, concurrently with serving.
+    if !predicted_paths.is_empty() {
+        let warm = Arc::clone(&state);
+        tokio::spawn(async move {
+            warm.prefetch_warm(&predicted_paths).await;
+        });
+    }
 
     let mut server = ServerOptions::new()
         .first_pipe_instance(true)
@@ -231,4 +281,80 @@ async fn write_response(pipe: &mut NamedPipeServer, status: u8, local: &str) -> 
         .await?;
     pipe.write_all(&payload).await?;
     pipe.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use sembazuru_agent::fileserver::ServerStats;
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    fn temp(tag: &str) -> PathBuf {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "sbz-vfsprefetch-{}-{tag}-{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// M5.4: prefetch_warm pulls the predicted files ahead of time, so the
+    /// compiler's later opens are served from the warm session cache with NO
+    /// further content crossing the data plane.
+    #[tokio::test]
+    async fn prefetch_warm_makes_later_opens_zero_transfer() {
+        // Agent file server with stats so we can measure content bytes served.
+        let src = temp("src");
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let body = format!("header-{i}-contents\n").repeat(50);
+            let p = src.join(format!("h{i}.h"));
+            std::fs::write(&p, &body).unwrap();
+            paths.push(p.to_string_lossy().into_owned());
+        }
+        let stats = Arc::new(ServerStats::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let stats = stats.clone();
+            tokio::spawn(async move {
+                let _ = sembazuru_agent::fileserver::serve_files_with_stats(listener, stats).await;
+            });
+        }
+
+        let state = Arc::new(VfsState {
+            scratch_root: temp("scratch"),
+            hydrated: Mutex::new(HashMap::new()),
+            cas: BlobStore::open(temp("cas")).unwrap(),
+            agent_addr: addr,
+            rtt: Duration::ZERO,
+            client: OnceCell::new(),
+        });
+
+        // Warm all predicted paths. Content is pulled once here.
+        state.prefetch_warm(&paths).await;
+        let after_warm = stats.content_bytes();
+        assert!(
+            after_warm > 0,
+            "prefetch should pull predicted content (got {after_warm} bytes)"
+        );
+
+        // The compiler's opens now hit the warm session cache: each hydrate
+        // returns OK and transfers NO further content.
+        for path in &paths {
+            let (status, local) = hydrate(path, &state).await;
+            assert_eq!(status, STATUS_OK, "warmed path hydrates as a hit");
+            assert!(!local.is_empty());
+        }
+        assert_eq!(
+            stats.content_bytes(),
+            after_warm,
+            "opens after prefetch transfer zero additional content"
+        );
+    }
 }

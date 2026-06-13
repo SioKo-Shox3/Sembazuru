@@ -94,7 +94,14 @@ message ExecuteRequest {
   string action_id = 1;
   Command command = 2;
   string session_id = 3;        // binds to a data-plane file session (§3.2)
-  Digest predicted_inputs = 4;  // optional prefetch hint manifest (M5)
+  Digest predicted_inputs = 4;  // optional prefetch hint manifest digest (unused)
+  // Dependency-prediction prefetch (M5.4, §4.1): the agent-side logical paths a
+  // prior build of this action read. The worker warms these into its cache
+  // ahead of process I/O, killing the first-build round-trips. v0 §4.1 frames
+  // PrefetchHint as "agent-pushed"; in the worker-pull data plane the hint rides
+  // the control plane here and the worker warms over the existing data-plane ops.
+  // A worker that ignores it is still correct (it just does not pre-warm).
+  repeated string predicted_paths = 5;
 }
 
 // Worker-side state machine (§3.2):
