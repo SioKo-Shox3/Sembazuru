@@ -362,12 +362,14 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
         (s.clone(), s)
     };
 
-    // Input-hash stability: the same logical inputs must hash the same in both
-    // runs, which is what makes the input->output mapping meaningful. Generated
-    // outputs (trace-derived, even if reopened read-write, and including temp
-    // artifacts) are excluded — only true sources count as inputs.
-    let in_a = compute_input_hash(&graph_a, &cwd_a, &trace_out_a);
-    let in_b = compute_input_hash(&graph_b, &cwd_b, &trace_out_b);
+    // Input-hash stability: the same logical inputs should hash the same in
+    // both runs. Generated outputs (trace-derived, including temp artifacts)
+    // are excluded — only true sources count. Kept as component lists so a
+    // mismatch can be diffed for the operator.
+    let comp_a = input_components(&graph_a, &cwd_a, &trace_out_a);
+    let comp_b = input_components(&graph_b, &cwd_b, &trace_out_b);
+    let in_a = hash_components(&comp_a);
+    let in_b = hash_components(&comp_b);
     let input_match = in_a == in_b;
 
     // Compare each logical output present in both runs; flag set mismatches.
@@ -431,14 +433,19 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
 
     let unexplained = results.iter().filter(|r| r.unexplained).count();
     let compared = compared_count(&results);
-    // A gate that compared *nothing* must not report success: if neither run
-    // left any output under the build root, the "same input -> same output"
-    // claim is vacuous. Require at least one byte-compared output.
-    let ok = unexplained == 0 && input_match && compared > 0;
+    // The gate keys on OUTPUT byte reproduction (the M2 "Done when") plus the
+    // guard that we actually compared something. An input-hash mismatch is a
+    // *warning*, not a failure: the tracer can capture run-varying build
+    // transients (e.g. clang's temp-file probes) that perturb the input key
+    // without the outputs differing — and the outputs are what must reproduce.
+    let ok = unexplained == 0 && compared > 0;
 
     if json {
-        print_json_report(&in_a, &in_b, input_match, &results);
+        print_json_report(&in_a, &in_b, input_match, ok, &results);
     } else {
+        if !input_match {
+            print_input_diff(&comp_a, &comp_b);
+        }
         print_text_report(&in_a, &in_b, input_match, &results);
     }
 
@@ -506,12 +513,26 @@ fn logical_outputs(graph: &DependencyGraph, cwd: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// Hashes the logical input set: sorted `(relative-path, content-hash)` pairs
-/// plus the build-root-relativized command lines. Inputs that don't exist
-/// (probe-misses) contribute their path and the marker `absent` — a build that
-/// depends on a file being missing is still part of the key. Generated outputs
-/// (in `outputs`) are excluded even if the build reopened them read-write.
-fn compute_input_hash(graph: &DependencyGraph, cwd: &str, outputs: &BTreeSet<String>) -> String {
+/// A logical path that `relativize` left relative (no drive, no UNC) lives
+/// under the build root; an absolute path lives outside it.
+fn is_under_build_root(logical: &str) -> bool {
+    let b = logical.as_bytes();
+    let drive = b.len() >= 2 && b[1] == b':';
+    !drive && !logical.starts_with("\\\\")
+}
+
+/// The sorted, hashable components of a run's input key: one
+/// `"logical\0content-hash"` line per source input, then a `--cmd--` marker,
+/// then the build-root-relativized command lines. Returned as a list so two
+/// runs can be diffed on mismatch rather than just compared by hash.
+///
+/// Exclusions keep the key stable: generated outputs (`outputs`, trace-derived,
+/// including run-varying temps) never count as inputs; and an *unreadable*
+/// input under the build root is a build transient (e.g. a temp file probed
+/// then renamed away by clang) whose run-varying name would wreck the key — it
+/// is dropped, whereas an absent input *outside* the root (a real
+/// include-search miss) keeps its `absent` marker.
+fn input_components(graph: &DependencyGraph, cwd: &str, outputs: &BTreeSet<String>) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
     for inp in &graph.inputs {
         let logical = determinism::relativize(&inp.path, cwd);
@@ -520,7 +541,12 @@ fn compute_input_hash(graph: &DependencyGraph, cwd: &str, outputs: &BTreeSet<Str
         }
         let content = match std::fs::read(&inp.path) {
             Ok(bytes) => determinism::sha256_hex(&bytes),
-            Err(_) => "absent".to_string(),
+            Err(_) => {
+                if is_under_build_root(&logical) {
+                    continue; // build transient with a run-varying name
+                }
+                "absent".to_string()
+            }
         };
         entries.push(format!("{logical}\u{0}{content}"));
     }
@@ -533,17 +559,32 @@ fn compute_input_hash(graph: &DependencyGraph, cwd: &str, outputs: &BTreeSet<Str
         .collect();
     cmds.sort();
 
+    entries.push("--cmd--".to_string());
+    entries.extend(cmds);
+    entries
+}
+
+fn hash_components(components: &[String]) -> String {
     let mut blob = String::new();
-    for e in &entries {
-        blob.push_str(e);
-        blob.push('\n');
-    }
-    blob.push_str("--cmd--\n");
-    for c in &cmds {
+    for c in components {
         blob.push_str(c);
         blob.push('\n');
     }
     determinism::sha256_hex(blob.as_bytes())
+}
+
+/// Prints which input components differ between the two runs, so an input-hash
+/// mismatch (a warning, not a failure) is diagnosable.
+fn print_input_diff(comp_a: &[String], comp_b: &[String]) {
+    let sa: BTreeSet<&String> = comp_a.iter().collect();
+    let sb: BTreeSet<&String> = comp_b.iter().collect();
+    println!("input-set differs (warning — the gate keys on output bytes):");
+    for e in sa.difference(&sb) {
+        println!("  only in A: {e}");
+    }
+    for e in sb.difference(&sa) {
+        println!("  only in B: {e}");
+    }
 }
 
 fn print_text_report(in_a: &str, in_b: &str, input_match: bool, results: &[OutResult]) {
@@ -551,7 +592,7 @@ fn print_text_report(in_a: &str, in_b: &str, input_match: bool, results: &[OutRe
     println!("input-hash B: {in_b}");
     println!(
         "input-hash match: {}",
-        if input_match { "yes" } else { "NO" }
+        if input_match { "yes" } else { "NO (warning)" }
     );
     println!("outputs:");
     for r in results {
@@ -571,14 +612,21 @@ fn print_text_report(in_a: &str, in_b: &str, input_match: bool, results: &[OutRe
         println!(
             "\nDETERMINISM FAIL: no outputs were compared (none produced under the build root)"
         );
-    } else if unexplained == 0 && input_match {
-        println!("\nDETERMINISM OK: {compared} output(s) reproduce (no unexplained differences)");
+    } else if unexplained == 0 {
+        let note = if input_match {
+            ""
+        } else {
+            " (input-set differed — see warning above)"
+        };
+        println!(
+            "\nDETERMINISM OK: {compared} output(s) reproduce (no unexplained differences){note}"
+        );
     } else {
         println!("\nDETERMINISM FAIL: {unexplained} unexplained output difference(s)");
     }
 }
 
-fn print_json_report(in_a: &str, in_b: &str, input_match: bool, results: &[OutResult]) {
+fn print_json_report(in_a: &str, in_b: &str, input_match: bool, ok: bool, results: &[OutResult]) {
     // Hand-rolled JSON (the export path uses serde; this keeps the gate output
     // dependency-light and stable). Values here are hashes, fixed labels, and
     // normalized relative paths — none contain characters needing escaping
@@ -586,9 +634,7 @@ fn print_json_report(in_a: &str, in_b: &str, input_match: bool, results: &[OutRe
     fn esc(s: &str) -> String {
         s.replace('\\', "\\\\").replace('"', "\\\"")
     }
-    let unexplained = results.iter().filter(|r| r.unexplained).count();
     let compared = compared_count(results);
-    let ok = unexplained == 0 && input_match && compared > 0;
     println!("{{");
     println!("  \"schema\": \"sembazuru-determinism/v0\",");
     println!("  \"ok\": {ok},");
