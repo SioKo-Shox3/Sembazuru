@@ -354,6 +354,20 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
     all_logical.extend(outs_b.iter().map(String::as_str));
 
     for logical in &all_logical {
+        // An output outside the build root keeps an absolute logical path; the
+        // two runs can't be matched by relative correspondence, and reading an
+        // absolute path would read the same physical file twice (a false
+        // Identical). Surface it as a failure rather than a silent pass.
+        if logical.len() >= 2 && logical.as_bytes()[1] == b':' {
+            results.push(OutResult {
+                path: (*logical).to_string(),
+                verdict: "outside-build-root".to_string(),
+                reasons: Vec::new(),
+                output_hash: String::new(),
+                unexplained: true,
+            });
+            continue;
+        }
         let in_a = outs_a.contains(*logical);
         let in_b = outs_b.contains(*logical);
         if in_a && in_b {
@@ -393,7 +407,11 @@ fn cmd_verify_determinism(args: &[String]) -> ExitCode {
     }
 
     let unexplained = results.iter().filter(|r| r.unexplained).count();
-    let ok = unexplained == 0 && input_match;
+    let compared = compared_count(&results);
+    // A gate that compared *nothing* must not report success: if neither run
+    // left any output under the build root, the "same input -> same output"
+    // claim is vacuous. Require at least one byte-compared output.
+    let ok = unexplained == 0 && input_match && compared > 0;
 
     if json {
         print_json_report(&in_a, &in_b, input_match, &results);
@@ -429,6 +447,21 @@ fn verdict_reasons(v: &Verdict) -> Vec<String> {
         Verdict::NormalizedEqual(rs) => rs.iter().map(|s| s.to_string()).collect(),
         _ => Vec::new(),
     }
+}
+
+/// Number of outputs that were actually byte-compared (not structurally
+/// missing, unreadable, or outside the build root). Zero means the gate
+/// verified nothing.
+fn compared_count(results: &[OutResult]) -> usize {
+    results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.verdict.as_str(),
+                "identical" | "normalized-equal" | "differs"
+            )
+        })
+        .count()
 }
 
 /// Joins a read root and a logical (relative) path into an on-disk path. If the
@@ -510,8 +543,13 @@ fn print_text_report(in_a: &str, in_b: &str, input_match: bool, results: &[OutRe
         }
     }
     let unexplained = results.iter().filter(|r| r.unexplained).count();
-    if unexplained == 0 && input_match {
-        println!("\nDETERMINISM OK: all outputs reproduce (no unexplained differences)");
+    let compared = compared_count(results);
+    if compared == 0 {
+        println!(
+            "\nDETERMINISM FAIL: no outputs were compared (none produced under the build root)"
+        );
+    } else if unexplained == 0 && input_match {
+        println!("\nDETERMINISM OK: {compared} output(s) reproduce (no unexplained differences)");
     } else {
         println!("\nDETERMINISM FAIL: {unexplained} unexplained output difference(s)");
     }
@@ -525,8 +563,13 @@ fn print_json_report(in_a: &str, in_b: &str, input_match: bool, results: &[OutRe
     fn esc(s: &str) -> String {
         s.replace('\\', "\\\\").replace('"', "\\\"")
     }
+    let unexplained = results.iter().filter(|r| r.unexplained).count();
+    let compared = compared_count(results);
+    let ok = unexplained == 0 && input_match && compared > 0;
     println!("{{");
     println!("  \"schema\": \"sembazuru-determinism/v0\",");
+    println!("  \"ok\": {ok},");
+    println!("  \"compared\": {compared},");
     println!("  \"input_hash\": {{");
     println!("    \"a\": \"{in_a}\",");
     println!("    \"b\": \"{in_b}\",");
