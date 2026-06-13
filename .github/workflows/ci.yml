@@ -60,3 +60,9 @@ jobs:
       # is not catastrophically slower than local. See docs/decisions/0002.
       - name: M3.5 VFS speed (round-trips do not break the compile)
         run: pwsh -NoProfile -File hooks/test/vfs_bench.ps1
+      # M4 "Done when" (compile-execution half): the second build of an
+      # unchanged project HITs the action cache (compile skipped) and reproduces
+      # build 1's output byte-for-byte; a changed input MISSes. clang-cl runs too
+      # (the runner ships LLVM). The transfer half is the Rust worker-cache test.
+      - name: M4 action-cache rebuild (2nd build skips compilation)
+        run: pwsh -NoProfile -File hooks/test/m4_cache_rebuild.ps1 -RequireClangCl
