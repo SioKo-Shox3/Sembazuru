@@ -136,10 +136,12 @@ function Invoke-SameRootGate {
     # b.obj; run A's bytes are read from the snapshot, run B's from $root.
     # Out-Host (not the pipeline) so the report prints but does not become this
     # function's return value, leaving $LASTEXITCODE the only thing returned.
+    # No --output: trace-derived output discovery now finds the surviving .obj
+    # on its own. cl writes the object directly (no rename); the M3.1.5
+    # NtSetInformationFile hook makes clang/lld's temp->rename visible too.
     & $TracerExe verify-determinism `
         --trace-a $traceA --root-a $snap `
-        --trace-b $traceB --root-b $root `
-        --output a.obj --output b.obj | Out-Host
+        --trace-b $traceB --root-b $root | Out-Host
     return $LASTEXITCODE
 }
 
@@ -159,10 +161,12 @@ function Invoke-DiffRootGate {
     Build-Run -Root $rootA -TraceDir $traceA -Cc $Cc -Flags $Flags
     Build-Run -Root $rootB -TraceDir $traceB -Cc $Cc -Flags $Flags
 
+    # No --output: clang-cl/lld write via an NT temp->rename that the M3.1.5
+    # NtSetInformationFile hook now records, so the final .obj is discovered
+    # from the trace (the §8 gap that made --output necessary is closed).
     & $TracerExe verify-determinism `
         --trace-a $traceA --root-a $rootA `
-        --trace-b $traceB --root-b $rootB `
-        --output a.obj --output b.obj | Out-Host
+        --trace-b $traceB --root-b $rootB | Out-Host
     return $LASTEXITCODE
 }
 

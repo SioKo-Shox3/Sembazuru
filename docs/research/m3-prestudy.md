@@ -58,6 +58,12 @@
 > M3.1.5 は**観測のみ**（True* 先行→記録→結果不変）で上記を追加し、`determinism.ps1` から
 > `--output` 回避策を外して pass することを Done-when とする（NT rename が見えれば不要、
 > determinism.md 112-136）。これで trace-format §8 ギャップを解消する。
+>
+> **EDR/M7 メモ:** ntdll エクスポート（NtSetInformationFile）のインラインフックは Win32 フック
+> より強いマルウェアシグナルになる（ntdll は syscall 境界で、EDR/マルウェア双方が使う手口）。
+> ただし RWX/直接 syscall/スレッド乗っ取り等の TTP は無く、文書化された Detours 経路のまま。
+> M7 の署名・許可リスト申請で「DLL は ntdll!NtSetInformationFile をインラインフックする」旨を
+> 明示する（ベンダ説明で不意打ちにしない）。
 
 主要ソース: BuildXL DetouredFunctions.h/.cpp、BuildXL #680、LLVM D38570、tup-users ML、
 UCRT fopen.cpp、s-schoener.com (FindFirstFile internals)、eternalnop (Win32 callstack)。

@@ -109,30 +109,28 @@ local path) is therefore a distribution-time concern for M3/M4 — solved either
 by normalizing the remote path to match the local one, or by an `S_OBJNAME`
 post-processing step. It is deliberately out of M2 scope.
 
-## Known limitation: clang/lld write outputs via an untracked temp + rename
+## Resolved in M3.1.5: clang/lld write outputs via a temp + NT rename
 
 clang-cl and lld write each output to a **run-varying temporary** (e.g.
 `a-915f50da.obj.tmp`) and then atomically rename it onto the final name. On a
-recent LLVM that rename is an NT-level operation (`SetFileInformationByHandle`
-with `FileRenameInfo`), which the M2 Win32-layer hooks do not observe — the
-documented user-mode gap that the M3 NT-layer/VFS work closes
-(`docs/trace-format.md` §8). The trace therefore records only the transient
-temp write, never the surviving artifact.
+recent LLVM that rename is an NT-level operation
+(`NtSetInformationFile(FileRenameInformation)`, reached either directly or via
+`SetFileInformationByHandle`), which the M2 Win32-layer hooks did not observe —
+the documented user-mode gap (`docs/trace-format.md` §8). The trace then
+recorded only the transient temp write, never the surviving artifact, so
+trace-derived output discovery could not match the two runs' outputs and the
+harness had to name them explicitly with `verify-determinism … --output a.obj
+--output b.obj`.
 
-Because the temp name changes every run, trace-derived output discovery can't
-match the two runs' outputs (and the temp no longer exists on disk). The
-harness works around this by telling `verify-determinism` which surviving
-artifacts to compare explicitly:
-
-```
-sembazuru-trace verify-determinism … --output a.obj --output b.obj
-```
-
-`--output` replaces trace-derived output discovery for the comparison, while
-the trace is still used to compute the input hash (the run-varying temps are
-trace-derived outputs and are excluded from it, so they don't perturb the key).
-Once NT-layer hooks land in M3, the rename becomes visible and explicit
-`--output` is no longer required.
+**M3.1.5 closes this.** The interceptor now hooks `NtSetInformationFile` and
+records the rename as a move (source resolved from the handle with
+`GetFinalPathNameByHandleW`, destination from the information buffer). The reader
+drops the renamed-away temp from the output set and treats it as a deletion, so
+the surviving final artifact is discovered from the trace alone. The harness no
+longer passes `--output`; trace-derived discovery finds `a.obj`/`b.obj`
+directly. The mechanism is gated independently by `hooks/test/nt_rename.ps1`.
+MSVC `cl` was never affected (it writes the object directly, importing no
+`ntdll`).
 
 ## Input-hash → output-hash mapping
 

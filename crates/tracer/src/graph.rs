@@ -518,8 +518,22 @@ fn fold_file(
             acc.add_path(Bucket::Deletion, &norm, AccessKind::Delete, pid);
         }
         FileOp::Move => {
-            // Source is consumed (input-ish), destination is produced.
-            acc.add_path(Bucket::Input, &norm, AccessKind::Move, pid);
+            // The source is renamed away: it does not survive the build. If a
+            // prior write in this run produced it — the compiler's
+            // write-temp-then-rename-onto-the-final-name pattern, e.g. lld via
+            // NtSetInformationFile(FileRenameInformation) — drop it from the
+            // outputs so a run-varying temp name cannot break output-set
+            // comparison, and record it in the separate deletions set. It is
+            // deliberately NOT added to inputs: a self-produced transient with a
+            // run-varying name must not perturb the input hash (which excludes
+            // generated outputs, not arbitrary inputs). lld opens its temp
+            // read+write (it memory-maps the output buffer), so the temp was
+            // also added to INPUTS by the read side of that open — drop it from
+            // both sets, not just outputs, or the run-varying name pollutes the
+            // input hash whenever the temp lives outside the build root.
+            acc.outputs.remove(&norm);
+            acc.inputs.remove(&norm);
+            acc.add_path(Bucket::Deletion, &norm, AccessKind::Move, pid);
             if !ev.aux.is_empty() {
                 let dst = normalize_path(&ev.aux, cwd);
                 if !is_device(&dst) && !is_intermediate(&dst, temp_dirs) {
@@ -631,6 +645,47 @@ mod tests {
         assert!(g.outputs.is_empty(), "transient must not be an output");
         assert_eq!(g.deletions.len(), 1);
         assert_eq!(g.deletions[0].path, "c:\\build\\_cl_12345.tmp");
+    }
+
+    #[test]
+    fn write_temp_then_rename_yields_only_the_final_output() {
+        // The lld / clang-cl pattern, now observable via the NtSetInformationFile
+        // hook (M3.1.5): write a run-varying temp, then rename it onto the final
+        // name. The surviving output must be ONLY the final artifact; the temp
+        // must be neither an output (it is gone) nor an input (it is a
+        // self-produced transient that would poison the run-to-run input hash).
+        let mut t = trace(10, 1, "C:\\clang-cl.exe");
+        t.cwd = "C:\\work".to_string();
+        // lld opens its temp READ+WRITE (it memory-maps the output buffer), so
+        // the temp lands in BOTH inputs and outputs at the open; the rename must
+        // then clear it from both. (OpenWrite alone would make `inputs.is_empty`
+        // pass vacuously and hide the input-hash-pollution regression.)
+        t.events.push(file_event(
+            FileOp::OpenReadWrite,
+            "C:\\work\\a-915f50da.obj.tmp",
+            0,
+        ));
+        // Move records source in `path`, destination in `aux`. The hook emits
+        // the destination as the NT-form path the buffer carries (\??\C:\...);
+        // the reader must normalize it to the same key as the Win32 records.
+        let mut rename = file_event(FileOp::Move, "C:\\work\\a-915f50da.obj.tmp", 0);
+        rename.aux = "\\??\\C:\\work\\a.obj".to_string();
+        t.events.push(rename);
+
+        let g = build_graph(&[t]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(outs, vec!["c:\\work\\a.obj"], "only the final survives");
+        assert!(
+            g.inputs.is_empty(),
+            "the run-varying temp must not become an input: {:?}",
+            g.inputs.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+        assert!(
+            g.deletions
+                .iter()
+                .any(|d| d.path == "c:\\work\\a-915f50da.obj.tmp"),
+            "the renamed-away temp is recorded as a (non-surviving) deletion"
+        );
     }
 
     #[test]
