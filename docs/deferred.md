@@ -195,19 +195,19 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   実ビルドシステム（ninja/msbuild）はコンパイラ出力を pipe する＝非 tty なので、**参照を非 tty（ファイルリダイレクト）で
   ビルド**するのが現実に即した正しい比較。修正後、**分散ビルドと action cache republish は clang-cl バイト一致**
   （CI ゲートで実証）。出所: verifier(M6.1)、CI 実測。
-- **ローカルフォールバックの .obj は clang-cl で参照とバイト一致しない（残差・要調査）。** distributed（worker・
-  launcher 注入・env_clear）と参照（非 tty）は一致するが、`run_local` フォールバック（launcher 直 spawn・継承 env）は
-  同一 source/cwd/非 tty にも関わらず参照と clang-cl バイトが一致しない残差がある。機能的には正当な .obj で、M6
-  Done-when（フォールバックは「完了」）は満たす。ゲートはフォールバックを「exit 0＋非空 .obj」で検証し、バイト一致は
-  distributed＋cached に限定。run_local の起動条件（env レイヤリング/PATH 解決の clang-cl 差）を要調査。出所: CI(M6.1)。
-- **m6_daemon_compile の distributed/cached バイト一致が CI 実行間でフレークする（要調査・正確性寄り）。**
-  同一コミット e26eeb2 が m6/daemon-launcher 実行では success、main 実行では同一ステップ「M6.1 daemon compile
-  (byte-identical)」で failure（distributed/cached とも参照不一致）。コード非依存＝daemon 経路のバイト一致が
-  run 間で非決定的。下位の vfs_compile.ps1（clang-cl バイト一致）と m4_cache_rebuild は同 run で PASS のため、
-  差は launcher→daemon→worker 経路（env レイヤリング/トレース/タイミング）に局在。M7.0 の auth 変更は無関係
-  （Rust ジョブ・下位ゲートは PASS、auth=off は M6 と wire 一致）。determinism 非交渉事項に関わるため M7 で
-  原因特定（run_local 残差 [上記] と同根の可能性）。それまで本ゲートのバイト一致はフレーク扱い。出所: CI 実測
-  (run 27488952841/27487941501 比較、2026-06-14)。
+- ~~**ローカルフォールバックの .obj は clang-cl で参照とバイト一致しない（残差・要調査）。**~~ **解消（M7.0、
+  原因特定）。** 残差の正体は env/PATH ではなく **COFF ヘッダの TimeDateStamp（offset 4–7）の壁時計タイムスタンプ**
+  だった。M7.0 の CI 診断（ref/distributed/cached/fallback の 554 バイト中 offset 4 の 1 バイトのみ相違、値はビルド
+  時刻の秒差）で確定。`/Brepro` 無しの clang-cl は COFF タイムスタンプを壁時計で埋めるため、ビルドが別秒に走ると
+  1 バイトだけ差が出る（distribution は無関係＝バイト完全保存）。ゲートの clang-cl 呼び出しに `/Brepro` を付与して
+  タイムスタンプを sentinel 化し解消。出所: CI 診断(M7.0, run 27489791478)。
+- ~~**m6_daemon_compile の distributed/cached バイト一致が CI 実行間でフレークする。**~~ **解消（M7.0、原因特定＋
+  修正）。** 原因は上記と同根の **COFF TimeDateStamp（壁時計）**。同一コミット e26eeb2 が branch 間で success/failure に
+  割れたのは、参照ビルドと distributed ビルドが同一壁時計秒に収まるか否か（worker 登録リトライの遅延次第）でタイム
+  スタンプの 1 バイトが一致/不一致になっていたため。CI 診断で ref/distributed/cached/fallback が offset 4 の 1 バイト
+  （タイムスタンプ）のみ相違と確定し、distribution 自体はバイト完全保存（cached==distributed も確認）。M7.0 auth とは
+  無関係。ゲートの clang-cl 呼び出しに `/Brepro` を付与して解消。出所: CI 診断(run 27489791478、ref==ref2 で compiler
+  決定性も確認、2026-06-14)。
 - **action cache の trace は単機共有 FS 前提（VfsExecution.trace_dir）。** worker が書いた trace を daemon が
   直接読む。2 台分割では trace を data plane で返す必要。実 LAN（決定者承認）で対応。出所: ADR 0005、M6.1c。
 - **launcher の出力推論は /Fo ベースの最小ヒューリスティック。** `/Fo` 無し・複数出力・非標準フラグは
