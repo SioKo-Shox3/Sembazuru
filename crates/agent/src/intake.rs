@@ -136,6 +136,7 @@ impl LocalIntake for IntakeService {
             command,
             req.declared_outputs,
             req.non_deterministic,
+            req.strict_vfs,
             action_id,
             session_id,
             n,
@@ -156,6 +157,7 @@ async fn run_submission(
     command: Command,
     declared_outputs: Vec<String>,
     non_deterministic: bool,
+    strict_vfs: bool,
     action_id: String,
     session_id: String,
     n: u64,
@@ -242,6 +244,7 @@ async fn run_submission(
             // way). A 2-machine split would scope this to the project source root.
             vfs_root: command.cwd.clone(),
             trace_dir: trace_dir.clone(),
+            strict: strict_vfs,
         }),
     };
 
@@ -381,6 +384,7 @@ pub async fn submit_to_daemon(
     command: Command,
     declared_outputs: Vec<String>,
     non_deterministic: bool,
+    strict_vfs: bool,
 ) -> Result<(i32, String), ExecuteError> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(ExecuteError::Transport)?
@@ -392,6 +396,7 @@ pub async fn submit_to_daemon(
         command: Some(command),
         declared_outputs,
         non_deterministic,
+        strict_vfs,
     };
     let mut stream = client.submit_action(request).await?.into_inner();
     let mut exit_code: Option<i32> = None;

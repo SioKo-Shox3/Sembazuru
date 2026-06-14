@@ -51,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             agent_fileserver,
             vfs_root,
             trace_dir,
+            strict: false,
         }),
     };
 

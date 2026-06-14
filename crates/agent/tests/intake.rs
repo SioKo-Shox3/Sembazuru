@@ -84,6 +84,7 @@ async fn intake_runs_action_remotely_and_mirrors_exit() {
         cmd(&["cmd", "/c", "exit", "5"]),
         Vec::new(),
         false,
+        false,
     )
     .await
     .expect("daemon mirrored an exit code");
@@ -111,6 +112,7 @@ async fn intake_completes_via_local_fallback_with_no_workers() {
         cmd(&["cmd", "/c", "exit", "3"]),
         Vec::new(),
         false,
+        false,
     )
     .await
     .expect("daemon completed via local fallback");
@@ -129,6 +131,7 @@ async fn submit_errors_when_daemon_is_down() {
         "http://127.0.0.1:1".into(),
         cmd(&["cmd", "/c", "exit", "0"]),
         Vec::new(),
+        false,
         false,
     )
     .await;

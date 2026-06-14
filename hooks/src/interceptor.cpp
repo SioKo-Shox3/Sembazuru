@@ -131,6 +131,14 @@ int g_vfsRootLen = 0;
 wchar_t g_vfsPipe[260];     // full \\.\pipe\<name>
 wchar_t g_vfsScratch[1024]; // lowercased scratch root, no trailing backslash
 int g_vfsScratchLen = 0;    // 0 = not configured (no scratch guard)
+// Strict virtualization (M8.2 (2), ADR 0007 §a(2)). When true, a read-only open
+// committed to the VFS (under vfs_root) that cannot be supplied FAILS instead of
+// falling through to a local open, and drops kUnvirtMarker so the worker re-runs
+// the action locally. Default false keeps the compiler-compatible fail-open.
+bool g_vfsStrict = false;
+// Marker dropped in the scratch root on a strict unvirtualized access. Must match
+// `UNVIRT_MARKER` in `crates/worker/src/lib.rs`.
+const wchar_t* kUnvirtMarker = L".sbz-unvirtualized";
 
 // Lowercases [0,len) in place and strips trailing backslashes, returning the
 // new length. Shared by the root/scratch config readers.
@@ -179,6 +187,10 @@ void InitVfsConfig() {
                (static_cast<size_t>(sl) + 1) * sizeof(wchar_t));
         g_vfsScratchLen = sl;
     }
+    // Strict mode (M8.2 (2)): any set, non-"0" value enables it.
+    wchar_t strict[16];
+    DWORD stn = GetEnvironmentVariableW(L"SEMBAZURU_VFS_STRICT", strict, 16);
+    g_vfsStrict = (stn > 0 && stn < 16 && wcscmp(strict, L"0") != 0);
     g_vfsMode = true;
 }
 
@@ -312,10 +324,40 @@ bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
     return ok;
 }
 
+// Drops the unvirtualized-access marker (kUnvirtMarker) in the scratch root,
+// once per process, so the worker turns this action into a local re-run
+// (M8.2 (2)). Best-effort: uses the real CreateFileW; if it cannot be written the
+// worker simply won't fall back (same as the non-strict path) — never worse.
+void VfsMarkUnvirtualized() {
+    static LONG written = 0;
+    if (InterlockedExchange(&written, 1) != 0) {
+        return;  // already marked this action
+    }
+    if (g_vfsScratchLen == 0) {
+        return;  // no scratch root to drop the marker in
+    }
+    wchar_t marker[1100];
+    if (_snwprintf_s(marker, 1100, _TRUNCATE, L"%s\\%s", g_vfsScratch,
+                     kUnvirtMarker) < 0) {
+        return;
+    }
+    HANDLE h = TrueCreateFileW(marker, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        CloseHandle(h);
+    }
+}
+
 // If VFS mode applies to this read-only open, returns a redirected handle to the
 // hydrated scratch copy. Returns INVALID_HANDLE_VALUE with *handled=false when
-// the open should proceed normally (not vfs mode, not a read, outside root, or
-// the worker could not supply it -> local fallback).
+// the open should proceed normally (not vfs mode, not a read, outside root, or —
+// in non-strict mode — the worker could not supply it, so local fallback).
+//
+// Once IsUnderVfsRoot passes we are COMMITTED to virtualizing this path. Any
+// later failure to produce a valid hydrated handle is an unvirtualized access:
+// in strict mode (M8.2 (2)) it FAILS the open (sets *handled, drops the marker) so
+// the worker re-runs locally — never a silent local read of a wrong/absent file;
+// in non-strict mode it keeps the compiler-compatible fail-open (handled=false).
 HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
                       LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags,
                       HANDLE templ, bool* handled) {
@@ -325,33 +367,42 @@ HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
     }
     wchar_t abs[1024];
     if (!IsUnderVfsRoot(path, abs, 1024)) {
-        return INVALID_HANDLE_VALUE;
+        return INVALID_HANDLE_VALUE;  // outside root: a worker-local file, open it
     }
+    // Committed-failure exit for a path under vfs_root we could not virtualize.
+    auto committedFailure = [&]() -> HANDLE {
+        if (g_vfsStrict) {
+            VfsMarkUnvirtualized();
+            *handled = true;  // do NOT fall through to a local open
+            SetLastError(ERROR_FILE_NOT_FOUND);
+        }
+        return INVALID_HANDLE_VALUE;
+    };
     wchar_t local[1024];
     if (!VfsHydrate(abs, local, 1024)) {
-        return INVALID_HANDLE_VALUE;  // not supplied: fall back to local open
+        return committedFailure();  // agent could not supply it
     }
     // Trust but verify: the worker must return a path under the scratch root.
     // This bounds the damage a buggy/hostile worker can do — it cannot redirect a
     // read to an arbitrary file the compiler would consume as source (M7.1).
     //
     //  * A scratch root MUST be configured in VFS mode; if it is not, fail closed
-    //    (local open) rather than open an unvalidated worker-supplied path.
+    //    rather than open an unvalidated worker-supplied path.
     //  * Canonicalize the returned path (GetFullPathName) BEFORE the prefix check,
     //    so a worker cannot escape scratch with `<scratch>\..\..\secret`: `..`,
     //    mixed separators, and relative components are collapsed first, then the
     //    boundary-aware prefix check runs on the resolved, lowercased path.
     if (g_vfsScratchLen == 0) {
-        return INVALID_HANDLE_VALUE;  // no scratch guard configured: do not redirect
+        return committedFailure();  // no scratch guard configured
     }
     wchar_t canon[1024];
     DWORD cn = GetFullPathNameW(local, 1024, canon, nullptr);
     if (cn == 0 || cn >= 1024) {
-        return INVALID_HANDLE_VALUE;  // unresolvable/too long: fall back to local
+        return committedFailure();  // unresolvable / too long
     }
     int cl = LowerAndTrim(canon, cn);
     if (!PathUnderPrefix(canon, cl, g_vfsScratch, g_vfsScratchLen)) {
-        return INVALID_HANDLE_VALUE;  // worker returned an out-of-scratch path
+        return committedFailure();  // worker returned an out-of-scratch path
     }
     *handled = true;
     return TrueCreateFileW(canon, access, share, sa, disposition, flags, templ);

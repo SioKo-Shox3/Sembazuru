@@ -138,6 +138,15 @@ message VfsExecution {
   // and worker share the filesystem here; a 2-machine split moves trace
   // ingestion onto the data plane (deferred with real-LAN, ADR 0004 §M5.5).
   string trace_dir = 3;
+  // Strict virtualization (M8.2, ADR 0007 §a②). When true, a read-only open
+  // under `vfs_root` that the agent could NOT supply must FAIL rather than
+  // fall through to a local open: on a worker without the source co-located,
+  // that local open would silently read the wrong (or no) file. The DLL marks
+  // the unvirtualized access and the worker turns it into a "did not complete"
+  // so the agent re-runs the whole action locally. Default false keeps the
+  // single-machine compiler behavior (fail-open is harmless when the bytes are
+  // co-located) — so all M3-M7 gates are unchanged.
+  bool strict = 4;
 }
 
 // Worker-side state machine (§3.2):
@@ -237,6 +246,13 @@ message SubmitActionRequest {
   // result would be wrong (ADR 0007 §c: separate distribution from caching).
   // Default false = deterministic = cacheable (M4-M7 back-compat).
   bool non_deterministic = 3;
+  // Run under strict virtualization: an unsuppliable read under the input root
+  // fails the action (→ local fallback) instead of silently reading a local
+  // file (ADR 0007 §a②). For arbitrary processes whose inputs are not
+  // co-located on the worker. Default false preserves the compiler behavior.
+  // The launcher sets it from SEMBAZURU_VFS_STRICT; the daemon copies it into
+  // VfsExecution.strict.
+  bool strict_vfs = 4;
 }
 
 message SubmitActionEvent {
