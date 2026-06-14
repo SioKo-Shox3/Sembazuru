@@ -45,6 +45,48 @@ else { throw 'no compiler (clang-cl/cl) on PATH' }
 # assert the mechanism (exit/notes/output produced), not byte-identity.
 $byteGate = ($cc -eq 'clang-cl')
 
+# --- diagnostic helpers (M7.0: capture WHY a byte mismatch happens) ----------
+function Same-Bytes($a, $b) {
+    if (-not (Test-Path $a) -or -not (Test-Path $b)) { return $false }
+    $ha = (Get-FileHash $a -Algorithm SHA256).Hash
+    $hb = (Get-FileHash $b -Algorithm SHA256).Hash
+    return $ha -eq $hb
+}
+function Hexdump($bytes, $start, $len) {
+    $end = [Math]::Min($bytes.Length, $start + $len)
+    if ($end -le $start) { Write-Host '      (past end)'; return }
+    $win = $bytes[$start..($end - 1)]
+    $hex = ($win | ForEach-Object { $_.ToString('x2') }) -join ' '
+    $asc = -join ($win | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { '.' } })
+    Write-Host ("      @0x{0:X}: {1}" -f $start, $hex)
+    Write-Host ("      ascii : {0}" -f $asc)
+}
+# On a mismatch, report sizes, the first differing offset, a hex+ascii window
+# around it (an embedded path/string shows up in ascii), and the total number of
+# differing bytes — enough to tell "one embedded path" from "codegen divergence".
+function Dump-Diff($label, $a, $b) {
+    Write-Host "--- DIFF DIAG ($label) ---"
+    if (-not (Test-Path $a)) { Write-Host "  MISSING: $a"; return }
+    if (-not (Test-Path $b)) { Write-Host "  MISSING: $b"; return }
+    $ba = [System.IO.File]::ReadAllBytes($a)
+    $bb = [System.IO.File]::ReadAllBytes($b)
+    Write-Host ("  sizes: A={0} B={1}" -f $ba.Length, $bb.Length)
+    $min = [Math]::Min($ba.Length, $bb.Length)
+    $off = -1
+    $ndiff = 0
+    for ($i = 0; $i -lt $min; $i++) { if ($ba[$i] -ne $bb[$i]) { if ($off -lt 0) { $off = $i }; $ndiff++ } }
+    $ndiff += [Math]::Abs($ba.Length - $bb.Length)
+    if ($off -lt 0) {
+        Write-Host ("  common {0} bytes identical; lengths differ by {1}" -f $min, [Math]::Abs($ba.Length - $bb.Length))
+        $off = $min
+    } else {
+        Write-Host ("  first diff at offset {0} (0x{0:X}); {1} differing bytes total" -f $off, $ndiff)
+    }
+    $start = [Math]::Max(0, $off - 16)
+    Write-Host "  A:"; Hexdump $ba $start 64
+    Write-Host "  B:"; Hexdump $bb $start 64
+}
+
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Push-Location $repo
 try {
@@ -86,6 +128,9 @@ foreach ($d in @($scratchRoot, $casRoot, $cacheRoot, $traceRoot)) { New-Item -It
 #     reference would not match the piped distributed/fallback builds.
 # Build a.obj, snapshot its bytes as ref.obj, then remove a.obj.
 $refObj = Join-Path $proj 'ref.obj'
+$ref2Obj = Join-Path $proj 'ref2.obj'
+$distObj = Join-Path $proj 'dist.obj'   # snapshot of the distributed build (DIAG)
+$fbObj = Join-Path $proj 'fb.obj'       # snapshot of the run_local fallback (DIAG)
 $aObj = Join-Path $proj 'a.obj'
 Push-Location $proj
 try {
@@ -93,7 +138,23 @@ try {
     if ($LASTEXITCODE -ne 0) { Get-Content refout.txt | Write-Host; throw 'reference build failed' }
     Copy-Item $aObj $refObj -Force
     Remove-Item $aObj -Force
+    # M7.0 DIAG: build the reference a SECOND time to prove clang-cl is itself
+    # deterministic in this environment. If ref != ref2, the byte flake is the
+    # compiler/runner, not the daemon path; if ref == ref2 but distributed differs,
+    # the difference is introduced by the launcher->daemon->worker path.
+    cmd /c "$cc /nologo /c a.cpp /Foa.obj > refout2.txt 2>&1"
+    if ($LASTEXITCODE -ne 0) { Get-Content refout2.txt | Write-Host; throw 'reference build #2 failed' }
+    Copy-Item $aObj $ref2Obj -Force
+    Remove-Item $aObj -Force
 } finally { Pop-Location }
+if ($byteGate) {
+    if (Same-Bytes $refObj $ref2Obj) {
+        Write-Host "DIAG: reference clang-cl is deterministic in this env (ref == ref2)"
+    } else {
+        Write-Host "DIAG: reference clang-cl is NON-deterministic in this env (ref != ref2) — the byte flake is the compiler/runner, not the daemon path"
+        Dump-Diff 'ref-vs-ref2' $refObj $ref2Obj
+    }
+}
 
 $coord = '127.0.0.1:50090'; $intake = '127.0.0.1:50091'; $fs = '127.0.0.1:50092'; $worker = '127.0.0.1:50061'
 $daemonUrl = "http://$intake"
@@ -131,13 +192,6 @@ function Invoke-Launcher {
         return @{ exit = $code; note = $err }
     } finally { Pop-Location }
 }
-function Same-Bytes($a, $b) {
-    if (-not (Test-Path $a) -or -not (Test-Path $b)) { return $false }
-    $ha = (Get-FileHash $a -Algorithm SHA256).Hash
-    $hb = (Get-FileHash $b -Algorithm SHA256).Hash
-    return $ha -eq $hb
-}
-
 $failures = @()
 $daemon = Start-Daemon
 $workerProc = Start-Worker
@@ -157,7 +211,12 @@ try {
     # Remote stdout/stderr mirroring: the compiler's #pragma message must reach
     # the launcher's console (it ran on the worker, not here).
     if ($r.note -notmatch [regex]::Escape($diag)) { $failures += 'remote compiler diagnostics were NOT mirrored to the launcher (stdout/stderr streaming)' }
-    if ($byteGate -and -not (Same-Bytes $aObj $refObj)) { $failures += 'distributed .obj is NOT byte-identical to the local build' }
+    if ($byteGate -and -not (Same-Bytes $aObj $refObj)) {
+        $failures += 'distributed .obj is NOT byte-identical to the local build'
+        Dump-Diff 'distributed-vs-ref' $aObj $refObj
+    }
+    # Snapshot the distributed object for the post-fallback comparison below.
+    if (Test-Path $aObj) { Copy-Item $aObj $distObj -Force }
 } finally {
     foreach ($p in @($workerProc, $daemon)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
 }
@@ -173,6 +232,18 @@ Write-Host "FALLBACK exit=$($rf.exit) note=$($rf.note.Trim())"
 # docs/deferred.md and does not affect a functionally-valid local build.)
 if ($rf.exit -ne 0) { $failures += "local fallback did not exit 0 (exit=$($rf.exit))" }
 if (-not (Test-Path $aObj) -or (Get-Item $aObj).Length -eq 0) { $failures += 'local fallback produced no/empty .obj' }
+# M7.0 DIAG (not a gate failure): how does run_local relate to ref and to the
+# distributed object? If distributed == fallback but both != ref, the launcher
+# full-env forwarding (the M7.1 allowlist target) is the shared cause; if
+# distributed == ref but fallback != ref, only run_local diverges (the known
+# residual). This is the decisive split for the byte flake.
+if ($byteGate -and (Test-Path $aObj)) {
+    Copy-Item $aObj $fbObj -Force
+    Write-Host ("DIAG: fallback==ref? {0}; distributed==ref? {1}; distributed==fallback? {2}" -f `
+        (Same-Bytes $fbObj $refObj), (Same-Bytes $distObj $refObj), (Same-Bytes $distObj $fbObj))
+    if (-not (Same-Bytes $fbObj $refObj)) { Dump-Diff 'fallback-vs-ref' $fbObj $refObj }
+    if ((Test-Path $distObj) -and -not (Same-Bytes $distObj $fbObj)) { Dump-Diff 'distributed-vs-fallback' $distObj $fbObj }
+}
 
 # 3. Action cache: restart the daemon (same cache root) but DO NOT start a worker.
 # A cache HIT serves the recorded output with no worker; a miss could only local-
@@ -185,7 +256,10 @@ try {
     if ($rc.exit -ne 0) { $failures += "cached build did not exit 0 (exit=$($rc.exit))" }
     if ($rc.note -notmatch 'cache hit') { $failures += 'second build did not HIT the action cache' }
     if (-not (Test-Path $aObj)) { $failures += 'cached build produced no .obj' }
-    if ($byteGate -and -not (Same-Bytes $aObj $refObj)) { $failures += 'cached .obj is NOT byte-identical to the local build' }
+    if ($byteGate -and -not (Same-Bytes $aObj $refObj)) {
+        $failures += 'cached .obj is NOT byte-identical to the local build'
+        Dump-Diff 'cached-vs-ref' $aObj $refObj
+    }
 } finally {
     if ($daemon2 -and -not $daemon2.HasExited) { Stop-Process -Id $daemon2.Id -Force -ErrorAction SilentlyContinue }
 }
