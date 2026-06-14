@@ -146,12 +146,17 @@ async fn main() {
     // The build integration marks non-byte-reproducible actions (e.g. tests) so
     // the daemon distributes but never caches them (ADR 0007 §c).
     let non_deterministic = env_flag("SEMBAZURU_NONDETERMINISTIC");
+    // Strict virtualization for arbitrary processes whose inputs are not
+    // co-located on the worker: an unsuppliable input fails the action → local
+    // fallback rather than a silent wrong local read (ADR 0007 §a②).
+    let strict_vfs = env_flag("SEMBAZURU_VFS_STRICT");
 
     let code = match submit_to_daemon(
         endpoint,
         command.clone(),
         declared_outputs,
         non_deterministic,
+        strict_vfs,
     )
     .await
     {

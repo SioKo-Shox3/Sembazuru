@@ -387,6 +387,34 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **non_deterministic record-skip の結合テストは M8.5 で実証。** 単体は `cacheable_outputs`／`infer_outputs` を
   カバー。record-skip 経路（VFS＋cache＋worker 必要）は M8.5 の非決定 WL ゲートで実証。出所: verifier(M8.1 Finding 3)。
 
+### M8.2 実装後の状態と繰延（2026-06-14）
+- **① route-away スクリーン・② worker fail-closed は実装（M8.2）。** ①=agent `scheduler::route_away_reason`
+  （msys2/cygwin ランタイムリンクのバイナリ走査＋`SEMBAZURU_LOCAL_ONLY` denylist）でリモート投入前にローカルへ。
+  ②=`VfsExecution.strict`／`SEMBAZURU_VFS_STRICT` で hook（`interceptor.cpp` `committedFailure`）が vfs_root 配下の
+  供給不能 open を**ローカルに落とさず**失敗させ `.sbz-unvirtualized` を drop、worker が exit を抑止→agent が
+  「no exit＝fallback」経路でローカル再実行。既定 off で M3-M7 ゲート不変。出所: ADR 0007 §a。
+- **③ breakaway 子の注入検証・④ mmap strict 強制は繰延（防御深化・低優先）。** 正しさの核（①②）は満たす。
+  ③: 既存 Detours は子へ注入する（M7.3）。env を消して vfs モードを失う breakaway 子の検知は parent の
+  CreateProcess フックでの追加検査が要る。コンパイラ/dxc は breakaway 子を生成しないため M8.4 証明には不要。
+  ④: read 経路は ② が CreateFile 境界で閉じる（redirected handle 上の mmap は hydrated copy、fail-closed なら
+  handle 自体が無い）。非フック open→mmap の残余は route-away（①）の領域。完全強制（handle→path 追跡）は
+  EDR シグナル増を伴うため繰延。実装時は security-reviewer 必須。出所: ADR 0007 §a③④。
+- **strict fail-closed の e2e は M8.4 dxc ゲートで実証予定。** worker marker→exit 抑止→fallback の結合は
+  VFS＋worker＋DLL ハーネス（CI）。単体は route-away（`route_away_reason`/`bypass_runtime_of`/`contains_ascii_ci`）。
+  出所: M8.2。
+
+#### M8.2 security-reviewer 所見（opus, 2026-06-14, PASS-with-findings・BLOCK/HIGH 無し）
+- **MEDIUM-1 解消（M8.2）。** 非 strict アクションの `cmd.env` に `SEMBAZURU_VFS_STRICT=1` を仕込むと DLL は
+  strict 化するが worker は marker を見ず desync しうる問題。worker が `SEMBAZURU_VFS_STRICT` を**権威的に
+  "1"/"0" で常時設定**（`SEMBAZURU_MODE` 等と同様）し、action 由来 env の上書きを封じた。出所: security(M8.2 MEDIUM-1)。
+- **MEDIUM-2 解消（M8.2）。** `bypass_runtime_of` が dispatch 毎に argv0 全体を読む問題。(path,len,mtime)
+  キーで verdict をメモ化（`RUNTIME_VERDICTS`）し、同一ツールチェーンの走査を 1 回に。スキャンは前置打ち切り
+  しない（msys2 は route-away が唯一の安全網＝strict で捕捉不能のため完全走査を維持）。出所: security(M8.2 MEDIUM-2)。
+- **LOW-1 繰延（観測性）。** strict fail した open は trace に記録されず、どのパスで fallback したかが追いにくい。
+  `committedFailure` 前に RecordCreateFile を足せば改善（True*/再入契約は満たす）。安全性ではなく診断性。出所: security(M8.2 LOW-1)。
+- **INFO-1 受容。** marker チェックは正常 exit 経路のみ（ceiling/cancel は元々 no-exit→fallback で同結果）。
+  将来 timeout が合成 exit を出すようにする場合は marker チェックを回避しないこと。出所: security(M8.2 INFO-1)。
+
 ### M8.x（実 2 台 LAN・決定者承認の別スコープ・繰延）
 M8 の汎化作業（単機+RTT で実証）から分離。承認後に着手:
 - **cwd=入力ルート崩れの cross-machine 実証**（M8.3 は単機で宣言ルートを実装、2 台での実証は M8.x）。

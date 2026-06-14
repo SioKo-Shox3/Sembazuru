@@ -314,6 +314,21 @@ impl Scheduler {
         session_id: String,
         opts: ExecOptions,
     ) -> Execution {
+        // Route-away screen (M8.2, ADR 0007 §a①). A process that bypasses the
+        // user-mode hooks — the msys2/Cygwin runtime issues direct NT syscalls
+        // (BuildXL #680), or an operator put it on the denylist — cannot be
+        // virtualized: on a worker it would silently read unvirtualized files and
+        // produce a wrong result. user-mode hooks cannot observe what they never
+        // intercepted, so the only safe move is to run it locally from the start
+        // (non-negotiable #2). Correctness over the lost distribution.
+        if let Some(why) = route_away_reason(&command) {
+            let exit_code = run_local(&command).await.unwrap_or(-1);
+            return Execution::LocalFallback {
+                exit_code,
+                reason: format!("route-away ({why})"),
+            };
+        }
+
         let key = affinity_key(&command.argv);
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut reason = "no live workers".to_string();
@@ -365,6 +380,102 @@ impl Scheduler {
     }
 }
 
+/// User-mode-hook-bypassing runtimes: a binary linked against one of these issues
+/// direct NT syscalls that our Detours hooks never see, so its file I/O cannot be
+/// virtualized (ADR 0001 §110-113, BuildXL #680). Matched as a substring of the
+/// binary's bytes — the import directory stores the DLL name as a plain ASCII
+/// C-string, so a scan needs no PE parser and a normal exe does not contain these
+/// names unless it actually imports them.
+const BYPASS_RUNTIMES: &[&str] = &["msys-2.0.dll", "cygwin1.dll"];
+
+/// Why this action must run locally rather than be virtualized on a worker, or
+/// `None` if it is safe to distribute (ADR 0007 §a①). Two screens:
+///
+///   1. the `SEMBAZURU_LOCAL_ONLY` denylist (operator escape hatch; `;`-separated
+///      exe basenames, case-insensitive);
+///   2. a binary linked against a hook-bypassing runtime ([`BYPASS_RUNTIMES`]).
+///
+/// Fail-open by design: an unreadable / bare-name `argv[0]` is *not* forced local
+/// (the worker-side fail-closed redirect is the backstop, M8.2 ②) — this screen
+/// only catches what it can positively identify, conservatively.
+fn route_away_reason(command: &Command) -> Option<String> {
+    let argv0 = command.argv.first()?;
+    let base = std::path::Path::new(argv0)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(argv0)
+        .to_ascii_lowercase();
+
+    if let Ok(list) = std::env::var("SEMBAZURU_LOCAL_ONLY")
+        && list
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .any(|e| e.eq_ignore_ascii_case(&base))
+    {
+        return Some(format!("{base} on SEMBAZURU_LOCAL_ONLY"));
+    }
+
+    if let Some(rt) = bypass_runtime_of(argv0) {
+        return Some(format!("{base} links {rt} (bypasses user-mode hooks)"));
+    }
+    None
+}
+
+/// Memoized verdicts, keyed by (path, len, mtime-secs), so the full-binary scan
+/// runs once per distinct toolchain binary rather than once per dispatch (a build
+/// has thousands of TUs through the same compiler — security M8.2 MEDIUM-2). A
+/// toolchain upgrade (changed len/mtime) re-scans. The scan is NOT bounded to a
+/// prefix: route-away is the *only* safety net for an msys2/Cygwin binary (its
+/// direct syscalls bypass the hook, so strict-VFS can't catch it), so a missed
+/// import name would let it run remotely and read unvirtualized files.
+type RuntimeVerdictCache = Mutex<HashMap<(String, u64, u64), Option<&'static str>>>;
+static RUNTIME_VERDICTS: std::sync::LazyLock<RuntimeVerdictCache> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The hook-bypassing runtime DLL `path` is linked against, if any (memoized).
+/// Returns `None` if the file cannot be read (bare PATH-resolved name,
+/// permissions) — the caller treats that as "let it try remote; the worker
+/// fail-closes if needed".
+fn bypass_runtime_of(path: &str) -> Option<&'static str> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let key = (path.to_string(), meta.len(), mtime);
+    if let Some(v) = RUNTIME_VERDICTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return *v;
+    }
+    let verdict = std::fs::read(path).ok().and_then(|bytes| {
+        BYPASS_RUNTIMES
+            .iter()
+            .copied()
+            .find(|rt| contains_ascii_ci(&bytes, rt.as_bytes()))
+    });
+    RUNTIME_VERDICTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, verdict);
+    verdict
+}
+
+/// Case-insensitive ASCII substring search of `haystack` for `needle` (no
+/// allocation of a lowercased copy of the whole binary).
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +497,73 @@ mod tests {
             .into_iter()
             .find(|w| w.worker_id == id)
             .unwrap()
+    }
+
+    fn tmp_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "sbz-routeaway-{}-{tag}-{seq}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    fn cmd1(argv0: &str) -> Command {
+        Command {
+            argv: vec![argv0.to_string()],
+            env: Default::default(),
+            cwd: String::new(),
+        }
+    }
+
+    #[test]
+    fn contains_ascii_ci_matches_case_insensitively() {
+        assert!(contains_ascii_ci(b"....MSYS-2.0.DLL\0..", b"msys-2.0.dll"));
+        assert!(contains_ascii_ci(b"x\0cygwin1.dll\0", b"cygwin1.dll"));
+        assert!(!contains_ascii_ci(b"kernel32.dll\0", b"msys-2.0.dll"));
+        assert!(!contains_ascii_ci(b"ab", b"abc")); // needle longer than haystack
+    }
+
+    #[test]
+    fn bypass_runtime_is_detected_from_the_binary_bytes() {
+        // A binary whose import directory names the msys2 runtime is detected.
+        let msys = tmp_file("msys", b"MZ\x90...imports...\0msys-2.0.dll\0...");
+        assert_eq!(
+            bypass_runtime_of(msys.to_str().unwrap()),
+            Some("msys-2.0.dll")
+        );
+        // A clean binary is not.
+        let clean = tmp_file("clean", b"MZ\x90...kernel32.dll\0ntdll.dll\0");
+        assert_eq!(bypass_runtime_of(clean.to_str().unwrap()), None);
+        // An unreadable path fails open (None) — the worker fail-close is the backstop.
+        assert_eq!(bypass_runtime_of("c:\\nope\\missing-xyz.exe"), None);
+        let _ = std::fs::remove_file(&msys);
+        let _ = std::fs::remove_file(&clean);
+    }
+
+    #[test]
+    fn route_away_screens_msys_binaries_but_not_clean_ones() {
+        let msys = tmp_file("ra-msys", b"MZ\0cygwin1.dll\0");
+        let why = route_away_reason(&cmd1(msys.to_str().unwrap()));
+        assert!(
+            why.is_some_and(|w| w.contains("cygwin1.dll")),
+            "a cygwin-linked binary must route away to local"
+        );
+        let clean = tmp_file("ra-clean", b"MZ\0kernel32.dll\0");
+        assert!(
+            route_away_reason(&cmd1(clean.to_str().unwrap())).is_none(),
+            "a clean binary is safe to distribute"
+        );
+        // Empty argv → nothing to screen.
+        assert!(
+            route_away_reason(&cmd1("")).is_none()
+                || route_away_reason(&Command::default()).is_none()
+        );
+        let _ = std::fs::remove_file(&msys);
+        let _ = std::fs::remove_file(&clean);
     }
 
     #[test]

@@ -68,6 +68,14 @@ fn default_capacity() -> u32 {
 /// waiting backlog so the worker cannot be memory-flooded).
 const QUEUE_FACTOR: u32 = 8;
 
+/// Marker the injected DLL drops in the per-action scratch dir when, under strict
+/// VFS (ADR 0007 §a②), a read-only open under `vfs_root` could not be supplied by
+/// the agent and was therefore failed instead of opened locally. Its presence
+/// after the child exits means the process saw a wrong/missing input, so the
+/// worker reports the action as not-completed and the agent re-runs it locally.
+/// Must match `kUnvirtMarker` in `hooks/src/interceptor.cpp`.
+const UNVIRT_MARKER: &str = ".sbz-unvirtualized";
+
 /// Hard ceiling on a single action's wall time when none is configured. This is
 /// a runaway/hung-child backstop (a process the agent never reaps still frees
 /// its slot), NOT the latency budget — it is generous so it never kills a real
@@ -319,13 +327,14 @@ async fn run_action(
     // For VFS mode, `pipe_task` keeps the per-action pipe server alive for the
     // run; `job` is the process-tree kill handle. Both are cleaned up after the
     // child exits.
-    let (mut child, pipe_task, job) = match build_child(&cmd, vfs_plan, predicted_paths).await {
-        Ok(triple) => triple,
-        Err(detail) => {
-            let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
-            return;
-        }
-    };
+    let (mut child, pipe_task, job, unvirt_marker) =
+        match build_child(&cmd, vfs_plan, predicted_paths).await {
+            Ok(quad) => quad,
+            Err(detail) => {
+                let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
+                return;
+            }
+        };
 
     // Register the job so `Abort` (or a reassign that drops the stream) kills the
     // whole tree. Both the map and this scope hold an Arc; the action's processes
@@ -369,15 +378,32 @@ async fn run_action(
                 // has the full diagnostics in hand when it sees the exit code.
                 if let Some(h) = stdout_reader.take() { let _ = h.await; }
                 if let Some(h) = stderr_reader.take() { let _ = h.await; }
-                // On Windows a process always has an exit code; unwrap_or guards
-                // the signal-terminated case that does not occur here.
-                let code = status.code().unwrap_or(-1);
-                // Saturate explicitly rather than let `as u64` wrap; this is the
-                // pattern that will be copied for user/kernel time accounting
-                // later, where the values are not bounded by a wall clock.
-                let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let _ = tx.send(exit_event(code, wall)).await;
-                let _ = tx.send(state_event(ActionState::Completed, "")).await;
+                // Fail-closed (M8.2 ②): under strict VFS, if the DLL marked an
+                // unvirtualized access (a read under vfs_root the agent could not
+                // supply), the process ran against a wrong/missing input — its
+                // exit code is untrustworthy. Report NOT-completed (Failed, no
+                // exit) so the agent re-runs the whole action locally. This is the
+                // sanctioned fallback channel: the agent treats "no exit status"
+                // as a fallback trigger (a nonzero exit would NOT fall back).
+                if unvirt_marker.as_ref().is_some_and(|m| m.exists()) {
+                    let _ = tx
+                        .send(state_event(
+                            ActionState::Failed,
+                            "unvirtualized access under vfs_root (strict): re-run locally",
+                        ))
+                        .await;
+                } else {
+                    // On Windows a process always has an exit code; unwrap_or
+                    // guards the signal-terminated case that does not occur here.
+                    let code = status.code().unwrap_or(-1);
+                    // Saturate explicitly rather than let `as u64` wrap; this is
+                    // the pattern that will be copied for user/kernel time
+                    // accounting later, where the values are not bounded by a wall
+                    // clock.
+                    let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    let _ = tx.send(exit_event(code, wall)).await;
+                    let _ = tx.send(state_event(ActionState::Completed, "")).await;
+                }
             }
             Err(e) => {
                 let _ = tx
@@ -426,6 +452,9 @@ async fn build_child(
         tokio::process::Child,
         Option<tokio::task::JoinHandle<std::io::Result<()>>>,
         Option<JobObject>,
+        // Strict-VFS unvirtualized-access marker path to check after exit (M8.2
+        // ②); `None` in plain mode or when strict VFS is off.
+        Option<std::path::PathBuf>,
     ),
     String,
 > {
@@ -459,7 +488,7 @@ async fn build_child(
                 None => Ok(j), // already exited; nothing to assign
             })
             .map_err(|e| setup_err("job object setup failed", e))?;
-        return Ok((child, None, Some(job)));
+        return Ok((child, None, Some(job), None));
     };
 
     // VFS mode. Per-action unique pipe + scratch so concurrent actions never
@@ -535,6 +564,18 @@ async fn build_child(
     if !v.trace_dir.is_empty() {
         command.env("SEMBAZURU_TRACE_DIR", &v.trace_dir);
     }
+    // Strict virtualization (M8.2 ②): tell the DLL to FAIL an unsuppliable
+    // read under vfs_root (and drop UNVIRT_MARKER) instead of opening the local
+    // file. Default off keeps the compiler fail-open behavior (all M3-M7 gates).
+    // Set it AUTHORITATIVELY ("1"/"0") like SEMBAZURU_MODE/_ROOT/_PIPE, so the
+    // action's cmd.env cannot smuggle strict on and desync the DLL from this
+    // worker's marker check (security M8.2 MEDIUM-1).
+    command.env("SEMBAZURU_VFS_STRICT", if v.strict { "1" } else { "0" });
+    let unvirt_marker = if v.strict {
+        Some(std::path::PathBuf::from(&scratch_str).join(UNVIRT_MARKER))
+    } else {
+        None
+    };
     command.stdin(Stdio::null());
     // Capture the launcher's stdout/stderr — which are the injected compiler's,
     // since launcher.exe forwards its std handles — to stream to the agent (M6.1).
@@ -567,7 +608,7 @@ async fn build_child(
             return Err(setup_err("job object setup failed", e));
         }
     };
-    Ok((child, Some(pipe_task), Some(job)))
+    Ok((child, Some(pipe_task), Some(job), unvirt_marker))
 }
 
 #[tonic::async_trait]
