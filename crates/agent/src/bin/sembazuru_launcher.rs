@@ -22,18 +22,45 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// The action's declared output files, in ADR 0007 §b priority order:
+///   1. external declaration via `SEMBAZURU_OUTPUTS` (`;`-separated paths
+///      relative to cwd) — the build-system / arbitrary-process escape hatch;
+///   2. else the clang-cl/cl `/Fo` fast-path inference below.
+///
+/// Empty result = "let the daemon discover outputs from the action trace" (the
+/// compiler-independent path, e.g. dxc). A wrong or empty guess only disables
+/// caching for that action — never a wrong build.
+fn declared_outputs(compiler_argv: &[String]) -> Vec<String> {
+    if let Ok(spec) = std::env::var("SEMBAZURU_OUTPUTS") {
+        let outs: Vec<String> = spec
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if !outs.is_empty() {
+            return outs;
+        }
+    }
+    infer_outputs(compiler_argv)
+}
+
 /// Best-effort inference of the action's output files from a clang-cl/cl command
-/// line, so the daemon can record them in the action cache (a 2nd identical build
-/// then republishes them and skips the compile). Recognizes `/Fo<path>` (the
-/// object output); a `/Fo<dir>\` form names the object after the `/c` source.
-/// Returns paths as written (relative to cwd = the cache's build root). A wrong
-/// or empty guess only disables caching for that action — never a wrong build.
+/// line — a fast-path for the common compiler case; the general case is
+/// trace-based discovery on the daemon (ADR 0007 §b). Recognizes `/Fo<path>`
+/// (the object output); a `/Fo<dir>\` form names the object after the `/c`
+/// source. Only emits a *glued* `/Fo<path>`: a bare `-Fo` (the space-separated
+/// form some tools like dxc use) is left for trace discovery rather than guessed
+/// wrong. Returns paths as written (relative to cwd = the cache's build root).
 fn infer_outputs(compiler_argv: &[String]) -> Vec<String> {
     let mut source: Option<String> = None;
     let mut fo: Option<String> = None;
     for a in &compiler_argv[1..] {
         if let Some(rest) = a.strip_prefix("/Fo").or_else(|| a.strip_prefix("-Fo")) {
-            fo = Some(rest.trim_start_matches(':').to_string());
+            let p = rest.trim_start_matches(':');
+            if !p.is_empty() {
+                fo = Some(p.to_string());
+            }
         } else if !a.starts_with('/') && !a.starts_with('-') {
             let lower = a.to_ascii_lowercase();
             if lower.ends_with(".cpp")
@@ -61,6 +88,17 @@ fn infer_outputs(compiler_argv: &[String]) -> Vec<String> {
         },
         Some(p) => vec![p],
         None => obj_from_source().into_iter().collect(),
+    }
+}
+
+/// A boolean env flag: set and not one of the falsey spellings ("", "0", "false").
+fn env_flag(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
     }
 }
 
@@ -104,9 +142,19 @@ async fn main() {
     let command = Command { argv, env, cwd };
 
     let endpoint = env_or("SEMBAZURU_DAEMON", "http://127.0.0.1:50071");
-    let declared_outputs = infer_outputs(&command.argv);
+    let declared_outputs = declared_outputs(&command.argv);
+    // The build integration marks non-byte-reproducible actions (e.g. tests) so
+    // the daemon distributes but never caches them (ADR 0007 §c).
+    let non_deterministic = env_flag("SEMBAZURU_NONDETERMINISTIC");
 
-    let code = match submit_to_daemon(endpoint, command.clone(), declared_outputs).await {
+    let code = match submit_to_daemon(
+        endpoint,
+        command.clone(),
+        declared_outputs,
+        non_deterministic,
+    )
+    .await
+    {
         Ok((code, note)) => {
             if !note.is_empty() {
                 eprintln!("sembazuru: {note}");
@@ -119,4 +167,52 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::infer_outputs;
+
+    fn argv(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn cl_glued_fo_is_inferred() {
+        // The clang-cl/cl fast-path: a glued /Fo<path> is the object output.
+        assert_eq!(
+            infer_outputs(&argv(&["clang-cl", "/c", "a.cpp", "/Foout\\a.obj"])),
+            vec!["out\\a.obj".to_string()]
+        );
+        // Inferred from the /c source when no /Fo is given.
+        assert_eq!(
+            infer_outputs(&argv(&["clang-cl", "/c", "a.cpp"])),
+            vec!["a.obj".to_string()]
+        );
+    }
+
+    #[test]
+    fn dxc_separated_fo_is_left_for_trace_discovery() {
+        // dxc writes `-Fo out.dxil` (space-separated). The old code set fo=Some("")
+        // — a bogus empty output that broke recording. Now a bare -Fo emits
+        // nothing, so the daemon discovers the real output from the trace.
+        assert!(
+            infer_outputs(&argv(&[
+                "dxc", "-T", "ps_6_0", "-E", "main", "-Fo", "out.dxil", "tri.hlsl"
+            ]))
+            .is_empty(),
+            "a bare -Fo must not be guessed; trace discovery handles it"
+        );
+        // A glued -Fo<path> form is still honored.
+        assert_eq!(
+            infer_outputs(&argv(&["dxc", "-Foout.dxil", "tri.hlsl"])),
+            vec!["out.dxil".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_tool_with_no_recognizable_output_infers_nothing() {
+        // An arbitrary process: nothing inferable → empty → trace discovery.
+        assert!(infer_outputs(&argv(&["my-tool", "--in", "x", "--out", "y"])).is_empty());
+    }
 }

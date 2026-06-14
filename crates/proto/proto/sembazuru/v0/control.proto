@@ -225,10 +225,18 @@ message SubmitActionRequest {
   // own argv[0]). cwd is the launcher's working directory — the basis the agent
   // uses to identify the input root (§3.2).
   Command command = 1;
-  // Output paths the build system expects this action to produce, when the
-  // launcher can infer them from the command line (e.g. clang-cl /Fo). Empty
-  // means "discover the outputs from the action trace" (M6.1). Advisory only.
+  // Output paths the build system expects this action to produce, when they can
+  // be declared (external SEMBAZURU_OUTPUTS, or inferred from a clang-cl /Fo).
+  // Empty means "discover the outputs from the action trace" (M6.1/M8.1). The
+  // ordering is external-declared > trace-discovered > uncached (ADR 0007 §b).
+  // Advisory only.
   repeated string declared_outputs = 2;
+  // The action is non-deterministic (its outputs are not byte-reproducible for
+  // identical inputs, e.g. a test that embeds a timestamp). Distribute it but do
+  // NOT record it in the action cache — serving a stale byte-identical-input
+  // result would be wrong (ADR 0007 §c: separate distribution from caching).
+  // Default false = deterministic = cacheable (M4-M7 back-compat).
+  bool non_deterministic = 3;
 }
 
 message SubmitActionEvent {
