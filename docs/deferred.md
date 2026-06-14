@@ -125,21 +125,25 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   `idle_slots` はテストでハードコード値を流すのみ。`WorkerService` の fetch_add／RunningGuard
   decrement は単体では健全だが、Execute 駆動での増減反映は M5.2（スケジューラが idle_slots を
   消費）で結合テストする。出所: verifier(M5.1 B1)。
-- **WorkerTable は単調増大（reaper 無し）。** worker 再起動は pid 違いで別エントリ化し、旧エントリは
-  dead_timeout で live フィルタから外れるが map からは消えない。セッション境界の eviction は
-  deferred #8（M5.3）と併せて対応。出所: verifier(M5.1 B2)、deferred #8。
-- **可用性の単一障害点（LAN 前提で許容）。** WorkerTable の `std::sync::Mutex` poisoning 時に
-  `.expect` で Coordination 全体が落ちる。heartbeat ハンドラの pong 送信は half-open 時に
-  HTTP/2 keepalive timeout(10s) まで滞留しうる（リークではない）。M7 の堅牢化で sanitize。
-  出所: verifier(M5.1 B3/B4)。
+- ~~**WorkerTable は単調増大（reaper 無し）。**~~ **解消（M7.4）。** register 時に opportunistic reaper
+  （`dead_timeout * REAP_FACTOR=20` 経過の dead エントリを retain で除去）を追加。worker 再起動で pid 違いの
+  別エントリが累積しても map は有界。背景タスク不要（derive-liveness-on-read と整合）。テスト
+  `reaper_drops_long_dead_entries_on_register`。出所: verifier(M5.1 B2)、coordination.rs。
+- ~~**可用性の単一障害点（Mutex poisoning の .expect）。**~~ **解消（M7.4、B3）。** WorkerTable の全 lock を
+  poison 耐性（`lock().unwrap_or_else(into_inner)`、`WorkerTable::lock`）へ。1 スレッドの panic が Coordination
+  全体を落とさない。テスト `poison_tolerant_lock_recovers_after_a_panic`。heartbeat pong の half-open 滞留（B4）は
+  HTTP/2 keepalive(10s) で解消する既知挙動（リークでなく受容）。出所: verifier(M5.1 B3/B4)、coordination.rs。
 
 ### M5.2 実装後の既知の残リスク（security-reviewer 2026-06-14、詳細は ADR 0004 追補）
 - ~~**無認証 Register による誤結果注入／アクション吸引。**~~ **M7.0 で緩和（ADR 0006）。** 共有
   トークンを持たない worker は Register/データプレーンとも拒否されるため、無認証の rogue worker が
   登録して誤結果を返す／アクションを吸引する経路は閉鎖。トークンを持つ trusted worker のバグ/誤設定は
   残（capacity 申告は依然 clamp(1,256) で正しさを担保）。出所: security(M5.2 M3)、ADR 0006。
-- **孫プロセスの孤児。** `kill_on_drop` は直接の子のみ。Job Object でツリー一括 kill は M7 サンドボックス。
-  出所: security(M5.2 L3)。
+- ~~**孫プロセスの孤児。**~~ **解消（M6.1e ツリー kill＋M7.4 サンドボックス強化）。** Job Object でツリー一括
+  kill（M6.1e）に加え、M7.4 で untrusted compiler 子へ UI 制限（desktop/clipboard/exitwindows/globalatoms/
+  displaysettings/systemparameters）＋`DIE_ON_UNHANDLED_EXCEPTION`（WER ダイアログで headless worker を
+  ハングさせない）を付与。breakaway は既定 off 維持（job から脱出不可）。`crates/worker/src/job.rs`。
+  出所: security(M5.2 L3)、M7.4。
 - **再割り当て境界の重複 WriteBack。** WriteBack 実装（M3.3/将来）時に content-addressed 冪等を
   テスト固定。現状 WriteBack 未実装で顕在化せず。出所: security(M5.2 M4)。
 - **heartbeat の running_actions を least-loaded に未使用。** スケジューラは agent 自身の in_flight
@@ -328,8 +332,26 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   カテゴリのみ返す（`setup_err`）。agent の WriteBack I/O エラー（create/temp/seek/write/open/rename）も同様に
   agent stderr へ、worker へは粗いカテゴリ（`wb_io_err`）。digest mismatch 等のハッシュ系は有用かつ非パスなので温存。
   開発者は FAILED→ローカルフォールバックで実コンパイラ出力を直接得る。出所: lib.rs/fileserver.rs。
-- **32/64bit 双方の DLL。** 子プロセスのビット跨ぎ注入に両 bit の interceptor が要る
-  （現状 64bit のみ、命名規約は 32bit を予期済）。出所: trace-format §8、BuildXL。
+- ~~**32/64bit 双方の DLL。**~~ **解消（M7.3）。** CMakeLists を arch 連動 DLL 名（x64→sbz_interceptor64、
+  x86→sbz_interceptor32）にし両 bit ビルド、同ディレクトリ配置。Detours が 64/32 サフィックスから兄弟 DLL を
+  導出して子のビット幅に応じ自動注入。クロスビット注入ゲート（m7_inject32.ps1、正＋負の対照）で実証。
+  出所: trace-format §8、M7.3。
+
+### M7.4 残項目（運用堅牢化の繰延、daily 信頼性 Done-when は満たす）
+- **障害時フォールバックは網羅テスト済み（M7.4c）。** no-worker（intake/scheduler_dispatch）、remote-unreachable
+  （loopback）、daemon-down（m6_daemon_compile）を既存テストでカバー。M7 新規の障害モード（auth 拒否 worker・
+  容量過小/過大申告）は「live worker 無し→フォールバック」「remote 失敗→フォールバック」に帰着し既存経路で
+  カバー（非交渉事項 #2）。冗長テストは追加せず帰着を記録。出所: M7.4。
+- **レイテンシ予算タイマの値調整は実 2 台 LAN まで繰延。** 機構は M5.2 導入済み。M5.5 が「忠実な値調整は
+  実 2 台 LAN（決定者承認）」とした方針を踏襲。単機＋RTT エミュでは本番 RTT 分布が得られず実値化不能。
+  保守的既定値は維持。出所: ADR 0004 §5、M5.5、M7.4。
+- **worker Abort/再割り当ての graceful drain は繰延（refinement）。** 現状の Job Object ツリー kill は正しく
+  即時（孤児なし）。graceful drain（in-flight を待って畳む）は綺麗さの改善であり正しさ要件ではないため、
+  実 2 台 LAN での reassign 実測と併せて将来対応。出所: M5.x、M7.4。
+- **per-action scratch/trace／agent セッション CAS の disk eviction は繰延（deferred #8 と同根）。** 長寿命
+  daemon/worker での disk 累積。境界破棄はセッションライフサイクル（M5.5 部分対応）に依存し、ビルド単位
+  eviction は daemon のセッション寿命管理が要る。WorkerTable reaper（M7.4）でテーブルは有界化したが、
+  scratch/trace/CAS の eviction は別途。出所: deferred #8、security(M6.1 Low)、M7.4。
 
 ## 横断・既知の制約
 
