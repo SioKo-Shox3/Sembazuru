@@ -90,6 +90,16 @@ Win32 API layer is hooked, so toolchains that issue `Nt*` syscalls directly
 cross-checks completeness against `cl /showIncludes` to prove the Win32
 surface is sufficient for MSVC and clang-cl.
 
+## Distributed builds (M6) — try it
+
+The remote-execution path is wired end to end and exercised in CI: point an
+existing **CMake/Ninja** or **MSBuild** project at the launcher and its compiles
+run on a worker, with the action cache and local fallback working. A distributed
+`clang-cl` object is byte-identical to a local build, an incremental header edit
+recompiles only its dependents, and stopping the daemon falls back to a normal
+local compile. This is the **single-machine** path today (real two-machine LAN is
+a separate, deferred milestone). Step-by-step: [`docs/quickstart.md`](docs/quickstart.md).
+
 ## Roadmap
 
 Milestones advance by a **"Done when"** condition, not by date. This is a spare-time, long-horizon project; each milestone is designed to be independently useful if published on its own.
