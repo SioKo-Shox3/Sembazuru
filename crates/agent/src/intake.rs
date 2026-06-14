@@ -135,6 +135,7 @@ impl LocalIntake for IntakeService {
             self.vfs.clone(),
             command,
             req.declared_outputs,
+            req.non_deterministic,
             action_id,
             session_id,
             n,
@@ -154,6 +155,7 @@ async fn run_submission(
     vfs: Option<Arc<IntakeVfsContext>>,
     command: Command,
     declared_outputs: Vec<String>,
+    non_deterministic: bool,
     action_id: String,
     session_id: String,
     n: u64,
@@ -248,20 +250,32 @@ async fn run_submission(
         .await;
 
     // Record a successful remote run so the next identical build hits. Needs the
-    // trace (from the DLL) and the declared outputs (from the launcher); without
-    // either, recording is skipped (the build is still correct, just uncached).
+    // trace (from the DLL); the outputs come from the launcher's declaration when
+    // it had one, else they are discovered from the trace itself (ADR 0007 §b —
+    // the compiler-independent path, so dxc and other non-clang-cl tools cache
+    // too). A non-deterministic action is distributed but never recorded (ADR
+    // 0007 §c): a later byte-identical-input hit would serve a stale result.
+    // Without a trace or any discoverable output, recording is skipped (the build
+    // is still correct, just uncached).
     if let (Some(cache), Some(weak)) = (&ctx.cache, &weak)
         && matches!(&outcome, Execution::Remote(o) if o.exit_code == Some(0))
         && !trace_dir.is_empty()
-        && !declared_outputs.is_empty()
+        && !non_deterministic
     {
         let cache = cache.clone();
         let weak = weak.clone();
         let br = build_root.clone();
-        let outs = declared_outputs.clone();
+        let declared = declared_outputs.clone();
         let td = trace_dir.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            if let Ok(manifest) = cache.manifest_from_trace_dir(&td) {
+            let outs: Vec<String> = if !declared.is_empty() {
+                declared
+            } else {
+                cache.outputs_from_trace_dir(&td).unwrap_or_default()
+            };
+            if !outs.is_empty()
+                && let Ok(manifest) = cache.manifest_from_trace_dir(&td)
+            {
                 let _ = cache.record(&weak, &manifest, &br, &outs, 0);
             }
         })
@@ -366,6 +380,7 @@ pub async fn submit_to_daemon(
     endpoint: String,
     command: Command,
     declared_outputs: Vec<String>,
+    non_deterministic: bool,
 ) -> Result<(i32, String), ExecuteError> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(ExecuteError::Transport)?
@@ -376,6 +391,7 @@ pub async fn submit_to_daemon(
     let request = SubmitActionRequest {
         command: Some(command),
         declared_outputs,
+        non_deterministic,
     };
     let mut stream = client.submit_action(request).await?.into_inner();
     let mut exit_code: Option<i32> = None;

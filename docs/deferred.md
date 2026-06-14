@@ -371,9 +371,21 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **M3.x「未仮想化検知器未実装」「per-file 暗黙ローカルフォールバックの危険」を M8.2 で対応予定。**
   ADR 0007 §(a) の二段機構（route-away スクリーン＋worker fail-closed）で扱う。着手・解消時に M3.x 該当行へ
   「解消（M8.2）」を付す。出所: ADR 0007、deferred M3.x。
-- **M6.1「launcher の出力推論は /Fo ヒューリスティック」を M8.1 で汎化予定。** trace ベース出力発見
+- **M6.1「launcher の出力推論は /Fo ヒューリスティック」を M8.1 で汎化（解消）。** trace ベース出力発見
   （`logical_outputs`）を既定経路化し、外部宣言（`SEMBAZURU_OUTPUTS`／declared_outputs）を優先。dxc 等
-  非 cl/clang-cl でもキャッシュ可能化。出所: ADR 0007 §(b)、M6.1。
+  非 cl/clang-cl でもキャッシュ可能化。outside-root 出力があるアクションは fail-closed で無キャッシュ
+  （`cacheable_outputs`、verifier M8.1 Finding 1）。出所: ADR 0007 §(b)、M6.1。
+
+### M8.1 実装後の既知の残リスク（verifier 2026-06-14）
+- **既定 cacheable の非決定性露出（MEDIUM・設計受容・ADR 0007 §c）。** trace 発見でキャッシュ対象が広がった結果、
+  宣言出力を持たなかった非決定的ツールも既定（`non_deterministic=false`）でキャッシュされうる。strong key は入力
+  再ハッシュのみで**出力の非決定性は検知できない**ため、真に非決定的なツールは run1 のバイトを run2 で誤提供しうる。
+  防御は ① 人手の `SEMBAZURU_NONDETERMINISTIC` フラグ（既定 false）と ② determinism ゲート（M8.4、決定的 WL のみ
+  キャッシュ実証）。本 changeset は「auto-discover したアクションが determinism ゲートを通過済みか」を強制しない＝
+  ADR 0007 §c の「既定決定的・不一致 or 既知フラグで降格」前提に依存。dxc は M8.4 で byte 一致を実証してから
+  キャッシュ対象とする。出所: verifier(M8.1 Finding 2)、ADR 0007 §c。
+- **non_deterministic record-skip の結合テストは M8.5 で実証。** 単体は `cacheable_outputs`／`infer_outputs` を
+  カバー。record-skip 経路（VFS＋cache＋worker 必要）は M8.5 の非決定 WL ゲートで実証。出所: verifier(M8.1 Finding 3)。
 
 ### M8.x（実 2 台 LAN・決定者承認の別スコープ・繰延）
 M8 の汎化作業（単機+RTT で実証）から分離。承認後に着手:

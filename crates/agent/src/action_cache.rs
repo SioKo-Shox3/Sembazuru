@@ -155,6 +155,40 @@ impl AgentCache {
         let (graph, cwd) = action_key::load_run_from_dir(trace_dir)?;
         Ok(action_key::input_manifest(&graph, &cwd))
     }
+
+    /// The build-root-relative output paths a traced run produced (observed
+    /// writes/renames), for trace-based output discovery when the launcher could
+    /// not declare them (ADR 0007 §b; the M8.1 compiler-independence path). This
+    /// reuses the exact output set the determinism harness compares, so a cached
+    /// output is byte-identical to what `verify-determinism` checks.
+    ///
+    /// **Fail-closed:** if the run produced *any* output outside the build root,
+    /// the whole action is declined for caching (returns empty). Such an output
+    /// is not build-root-relative, so [`record`] cannot store it and [`resolve`]
+    /// cannot republish it — caching only the under-root subset would silently
+    /// serve an incomplete result on the next hit (ADR 0007 §b.3: 推論不能なら
+    /// 無キャッシュ). See [`cacheable_outputs`].
+    ///
+    /// [`record`]: AgentCache::record
+    /// [`resolve`]: AgentCache::resolve
+    pub fn outputs_from_trace_dir(&self, trace_dir: &str) -> Result<Vec<String>, String> {
+        let (graph, cwd) = action_key::load_run_from_dir(trace_dir)?;
+        Ok(cacheable_outputs(action_key::logical_outputs(&graph, &cwd)))
+    }
+}
+
+/// Applies the cacheability rule to a traced run's logical outputs: if any output
+/// is outside the build root (an absolute/UNC path that cannot be stored or
+/// republished as a build-root-relative cache output), the whole action is
+/// uncacheable — return empty so the caller skips recording rather than caching a
+/// partial set (ADR 0007 §b.3). Otherwise return all outputs.
+fn cacheable_outputs(outputs: impl IntoIterator<Item = String>) -> Vec<String> {
+    let all: Vec<String> = outputs.into_iter().collect();
+    if all.iter().any(|p| !action_key::is_under_build_root(p)) {
+        Vec::new()
+    } else {
+        all
+    }
 }
 
 /// Content digest of the toolchain binary, or a name-based digest if it cannot
@@ -272,6 +306,28 @@ mod tests {
                 .collect(),
             cmds: vec!["clang-cl /c a.cpp".into()],
         }
+    }
+
+    #[test]
+    fn cacheable_outputs_declines_when_any_output_is_outside_root() {
+        // All under root → all cacheable.
+        assert_eq!(
+            cacheable_outputs(["a.dxil".to_string(), "sub\\b.obj".to_string()]),
+            vec!["a.dxil".to_string(), "sub\\b.obj".to_string()]
+        );
+        // One output outside the root (absolute drive path) → the WHOLE action is
+        // uncacheable; we must not cache only the under-root subset and silently
+        // omit the outside one on a later hit (verifier M8.1 Finding 1).
+        assert!(
+            cacheable_outputs(["a.dxil".to_string(), "c:\\symbols\\a.pdb".to_string()]).is_empty(),
+            "an outside-root output must make the action uncacheable, not partially cached"
+        );
+        // A UNC output is also outside the root.
+        assert!(
+            cacheable_outputs(["a.dxil".to_string(), "\\\\srv\\share\\x".to_string()]).is_empty()
+        );
+        // No outputs at all → nothing to cache (also empty).
+        assert!(cacheable_outputs(std::iter::empty()).is_empty());
     }
 
     #[test]

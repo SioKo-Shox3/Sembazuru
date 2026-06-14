@@ -79,9 +79,14 @@ async fn intake_runs_action_remotely_and_mirrors_exit() {
 
     // A launcher submitting `cmd /c exit 5` must get exit 5 back, and the action
     // must have actually run on the worker (not local fallback).
-    let (code, _note) = submit_to_daemon(endpoint, cmd(&["cmd", "/c", "exit", "5"]), Vec::new())
-        .await
-        .expect("daemon mirrored an exit code");
+    let (code, _note) = submit_to_daemon(
+        endpoint,
+        cmd(&["cmd", "/c", "exit", "5"]),
+        Vec::new(),
+        false,
+    )
+    .await
+    .expect("daemon mirrored an exit code");
     assert_eq!(
         code, 5,
         "the compiler's exit code is mirrored through intake"
@@ -101,9 +106,14 @@ async fn intake_completes_via_local_fallback_with_no_workers() {
     let scheduler = Scheduler::new(WorkerTable::new(Duration::from_secs(60)));
     let endpoint = start_intake(scheduler).await;
 
-    let (code, _note) = submit_to_daemon(endpoint, cmd(&["cmd", "/c", "exit", "3"]), Vec::new())
-        .await
-        .expect("daemon completed via local fallback");
+    let (code, _note) = submit_to_daemon(
+        endpoint,
+        cmd(&["cmd", "/c", "exit", "3"]),
+        Vec::new(),
+        false,
+    )
+    .await
+    .expect("daemon completed via local fallback");
     assert_eq!(
         code, 3,
         "local fallback ran the command and mirrored its exit"
@@ -119,6 +129,7 @@ async fn submit_errors_when_daemon_is_down() {
         "http://127.0.0.1:1".into(),
         cmd(&["cmd", "/c", "exit", "0"]),
         Vec::new(),
+        false,
     )
     .await;
     assert!(
