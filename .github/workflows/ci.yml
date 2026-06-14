@@ -125,6 +125,14 @@ jobs:
       - name: M8.4 dxc distribution (arbitrary process, byte-identical, fallback, cache hit)
         timeout-minutes: 10
         run: pwsh -NoProfile -File hooks/test/m8_dxc.ps1 -RequireDxc
+      # Gates M8.5 (ADR 0007 §c): the SAME dxc action marked non-deterministic
+      # (SEMBAZURU_NONDETERMINISTIC=1) still DISTRIBUTES (build 1 remote) but is
+      # NEVER cached — build 2 with the worker stopped does NOT hit the cache and
+      # falls back locally. Proves the flag separates distribution from caching
+      # (the mechanism a non-byte-reproducible test runner would use).
+      - name: M8.5 non-deterministic policy (distributed but not cached)
+        timeout-minutes: 10
+        run: pwsh -NoProfile -File hooks/test/m8_dxc.ps1 -RequireDxc -NonDeterministic
       # Gates M7.2: the Authenticode sign->verify pipeline. Runs LAST so it signs
       # the final artifacts (launcher.exe + hook DLL) without perturbing the
       # compile gates above. Uses an ephemeral self-signed cert to prove the
