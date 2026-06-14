@@ -31,6 +31,23 @@ use crate::action_cache::{AgentCache, CacheLookup};
 use crate::scheduler::Scheduler;
 use crate::{ExecOptions, ExecuteError, Execution};
 
+/// Per-action options the launcher hands to the daemon alongside the command
+/// (the non-command fields of [`SubmitActionRequest`]). Bundled so adding a knob
+/// does not churn every call site. All default to the compiler-compatible
+/// behavior: declare nothing, deterministic, non-strict, input root = cwd.
+#[derive(Default, Clone)]
+pub struct SubmitOptions {
+    /// Output paths to record (empty = discover from the trace, ADR 0007 §b).
+    pub declared_outputs: Vec<String>,
+    /// Distribute but never cache (non-byte-reproducible, ADR 0007 §c).
+    pub non_deterministic: bool,
+    /// Fail an unsuppliable read under the input root instead of a local open
+    /// (ADR 0007 §a②).
+    pub strict_vfs: bool,
+    /// Declared input root; empty = use cwd (ADR 0007 / M8.3).
+    pub input_root: String,
+}
+
 fn state_ev(state: ActionState, detail: &str) -> SubmitActionEvent {
     SubmitActionEvent {
         event: Some(Event::State(StateChange {
@@ -137,6 +154,7 @@ impl LocalIntake for IntakeService {
             req.declared_outputs,
             req.non_deterministic,
             req.strict_vfs,
+            req.input_root,
             action_id,
             session_id,
             n,
@@ -158,6 +176,7 @@ async fn run_submission(
     declared_outputs: Vec<String>,
     non_deterministic: bool,
     strict_vfs: bool,
+    input_root: String,
     action_id: String,
     session_id: String,
     n: u64,
@@ -239,10 +258,18 @@ async fn run_submission(
         predicted_paths,
         vfs: Some(VfsExecution {
             agent_fileserver: ctx.agent_fileserver.clone(),
-            // Single-machine: reads under the build dir redirect through the VFS;
-            // anything outside resolves to the same local bytes (correct either
-            // way). A 2-machine split would scope this to the project source root.
-            vfs_root: command.cwd.clone(),
+            // The declared input root scopes the worker's reads (M8.3); empty =
+            // cwd, the compiler default (the project tree is the cwd). An
+            // arbitrary process may read above its cwd, so the integration can
+            // declare a broader root. Single-machine: anything outside resolves
+            // to the same local bytes (fail-open); strict mode + a too-narrow
+            // root would fail-close those reads, which is why the root is
+            // declarable.
+            vfs_root: if input_root.is_empty() {
+                command.cwd.clone()
+            } else {
+                input_root.clone()
+            },
             trace_dir: trace_dir.clone(),
             strict: strict_vfs,
         }),
@@ -382,9 +409,7 @@ pub async fn serve_intake_service(
 pub async fn submit_to_daemon(
     endpoint: String,
     command: Command,
-    declared_outputs: Vec<String>,
-    non_deterministic: bool,
-    strict_vfs: bool,
+    opts: SubmitOptions,
 ) -> Result<(i32, String), ExecuteError> {
     let channel = tonic::transport::Endpoint::from_shared(endpoint)
         .map_err(ExecuteError::Transport)?
@@ -394,9 +419,10 @@ pub async fn submit_to_daemon(
     let mut client = LocalIntakeClient::new(channel);
     let request = SubmitActionRequest {
         command: Some(command),
-        declared_outputs,
-        non_deterministic,
-        strict_vfs,
+        declared_outputs: opts.declared_outputs,
+        non_deterministic: opts.non_deterministic,
+        strict_vfs: opts.strict_vfs,
+        input_root: opts.input_root,
     };
     let mut stream = client.submit_action(request).await?.into_inner();
     let mut exit_code: Option<i32> = None;

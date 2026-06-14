@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use sembazuru_agent::intake::submit_to_daemon;
+use sembazuru_agent::intake::{SubmitOptions, submit_to_daemon};
 use sembazuru_agent::run_local;
 use sembazuru_proto::v0::Command;
 
@@ -142,24 +142,21 @@ async fn main() {
     let command = Command { argv, env, cwd };
 
     let endpoint = env_or("SEMBAZURU_DAEMON", "http://127.0.0.1:50071");
-    let declared_outputs = declared_outputs(&command.argv);
-    // The build integration marks non-byte-reproducible actions (e.g. tests) so
-    // the daemon distributes but never caches them (ADR 0007 §c).
-    let non_deterministic = env_flag("SEMBAZURU_NONDETERMINISTIC");
-    // Strict virtualization for arbitrary processes whose inputs are not
-    // co-located on the worker: an unsuppliable input fails the action → local
-    // fallback rather than a silent wrong local read (ADR 0007 §a②).
-    let strict_vfs = env_flag("SEMBAZURU_VFS_STRICT");
+    let opts = SubmitOptions {
+        declared_outputs: declared_outputs(&command.argv),
+        // Mark non-byte-reproducible actions (e.g. tests) so the daemon
+        // distributes but never caches them (ADR 0007 §c).
+        non_deterministic: env_flag("SEMBAZURU_NONDETERMINISTIC"),
+        // Strict virtualization for arbitrary processes whose inputs are not
+        // co-located on the worker: an unsuppliable input fails the action →
+        // local fallback rather than a silent wrong local read (ADR 0007 §a②).
+        strict_vfs: env_flag("SEMBAZURU_VFS_STRICT"),
+        // Declared input root for processes that read above their cwd (ADR
+        // 0007 / M8.3); empty = use cwd (the compiler default).
+        input_root: std::env::var("SEMBAZURU_INPUT_ROOT").unwrap_or_default(),
+    };
 
-    let code = match submit_to_daemon(
-        endpoint,
-        command.clone(),
-        declared_outputs,
-        non_deterministic,
-        strict_vfs,
-    )
-    .await
-    {
+    let code = match submit_to_daemon(endpoint, command.clone(), opts).await {
         Ok((code, note)) => {
             if !note.is_empty() {
                 eprintln!("sembazuru: {note}");

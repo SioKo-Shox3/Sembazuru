@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sembazuru_agent::coordination::WorkerTable;
-use sembazuru_agent::intake::{serve_intake, submit_to_daemon};
+use sembazuru_agent::intake::{SubmitOptions, serve_intake, submit_to_daemon};
 use sembazuru_agent::scheduler::Scheduler;
 use sembazuru_proto::v0::{Capabilities, Command};
 use sembazuru_worker::WorkerService;
@@ -82,9 +82,7 @@ async fn intake_runs_action_remotely_and_mirrors_exit() {
     let (code, _note) = submit_to_daemon(
         endpoint,
         cmd(&["cmd", "/c", "exit", "5"]),
-        Vec::new(),
-        false,
-        false,
+        SubmitOptions::default(),
     )
     .await
     .expect("daemon mirrored an exit code");
@@ -110,9 +108,7 @@ async fn intake_completes_via_local_fallback_with_no_workers() {
     let (code, _note) = submit_to_daemon(
         endpoint,
         cmd(&["cmd", "/c", "exit", "3"]),
-        Vec::new(),
-        false,
-        false,
+        SubmitOptions::default(),
     )
     .await
     .expect("daemon completed via local fallback");
@@ -130,9 +126,7 @@ async fn submit_errors_when_daemon_is_down() {
     let err = submit_to_daemon(
         "http://127.0.0.1:1".into(),
         cmd(&["cmd", "/c", "exit", "0"]),
-        Vec::new(),
-        false,
-        false,
+        SubmitOptions::default(),
     )
     .await;
     assert!(
