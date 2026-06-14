@@ -132,17 +132,23 @@ $ref2Obj = Join-Path $proj 'ref2.obj'
 $distObj = Join-Path $proj 'dist.obj'   # snapshot of the distributed build (DIAG)
 $fbObj = Join-Path $proj 'fb.obj'       # snapshot of the run_local fallback (DIAG)
 $aObj = Join-Path $proj 'a.obj'
+# /Brepro makes clang-cl emit a REPRODUCIBLE object: without it the COFF header's
+# TimeDateStamp (offset 4) is the wall clock, so two builds a second apart differ
+# in exactly that one field — which made this gate flaky (the distributed build
+# lands a second or two after the local reference, only matching when they happen
+# to share a wall-clock second). The byte difference was never distribution
+# changing the output; it was the timestamp. /Brepro pins it to a sentinel so the
+# comparison tests real content. (M7.0 CI diag: the only differing byte across
+# ref/distributed/cached/fallback was offset 4, the timestamp.)
 Push-Location $proj
 try {
-    cmd /c "$cc /nologo /c a.cpp /Foa.obj > refout.txt 2>&1"
+    cmd /c "$cc /nologo /Brepro /c a.cpp /Foa.obj > refout.txt 2>&1"
     if ($LASTEXITCODE -ne 0) { Get-Content refout.txt | Write-Host; throw 'reference build failed' }
     Copy-Item $aObj $refObj -Force
     Remove-Item $aObj -Force
-    # M7.0 DIAG: build the reference a SECOND time to prove clang-cl is itself
-    # deterministic in this environment. If ref != ref2, the byte flake is the
-    # compiler/runner, not the daemon path; if ref == ref2 but distributed differs,
-    # the difference is introduced by the launcher->daemon->worker path.
-    cmd /c "$cc /nologo /c a.cpp /Foa.obj > refout2.txt 2>&1"
+    # Build the reference a SECOND time to prove clang-cl is itself reproducible
+    # in this environment (ref == ref2 with /Brepro).
+    cmd /c "$cc /nologo /Brepro /c a.cpp /Foa.obj > refout2.txt 2>&1"
     if ($LASTEXITCODE -ne 0) { Get-Content refout2.txt | Write-Host; throw 'reference build #2 failed' }
     Copy-Item $aObj $ref2Obj -Force
     Remove-Item $aObj -Force
@@ -186,7 +192,7 @@ function Invoke-Launcher {
     try {
         $env:SEMBAZURU_DAEMON = $daemonUrl
         if (Test-Path $aObj) { Remove-Item -Force $aObj }
-        $err = & $launcher $cc /nologo /c a.cpp /Foa.obj 2>&1 | Out-String
+        $err = & $launcher $cc /nologo /Brepro /c a.cpp /Foa.obj 2>&1 | Out-String
         $code = $LASTEXITCODE
         Remove-Item Env:\SEMBAZURU_DAEMON -ErrorAction SilentlyContinue
         return @{ exit = $code; note = $err }
