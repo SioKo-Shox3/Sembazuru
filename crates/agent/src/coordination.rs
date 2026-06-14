@@ -8,7 +8,9 @@
 //! Liveness is *derived on read* from the last ping's age rather than tracked by
 //! a reaper task: a worker is live iff its last ping is younger than
 //! `dead_timeout`. That gives the M5.1 "dead within the timeout" guarantee with
-//! no background thread and no missed-tick bookkeeping.
+//! no background thread and no missed-tick bookkeeping. Long-dead entries are
+//! reaped *opportunistically on register* (M7.4) so the table stays bounded
+//! across worker restarts without a background task.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -49,12 +51,26 @@ pub struct WorkerTable {
     dead_timeout: Duration,
 }
 
+/// A long-dead entry is reaped after this many `dead_timeout`s, so a daemon that
+/// sees many worker restarts (each a new pid → new entry) does not grow the table
+/// without bound (M7.4; M5.1 B2). Generous so a briefly-flapping worker is not
+/// reaped before it would simply re-register.
+const REAP_FACTOR: u32 = 20;
+
 impl WorkerTable {
     pub fn new(dead_timeout: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             dead_timeout,
         }
+    }
+
+    /// Poison-tolerant lock (M7.4; M5.1 B3). A panic while another thread held the
+    /// lock must NOT cascade into taking down the whole Coordination service via
+    /// `.expect`. The map's operations are idempotent enough that recovering the
+    /// guard and continuing is safe — at worst one entry is mid-update.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, WorkerEntry>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Insert or refresh a worker on `Register`. Registration resets capacity to
@@ -66,7 +82,15 @@ impl WorkerTable {
         caps: Capabilities,
     ) {
         let idle = caps.cpu_count;
-        let mut map = self.inner.lock().expect("worker table poisoned");
+        let mut map = self.lock();
+        // Opportunistic reaping (M7.4; M5.1 B2): drop long-dead entries so a daemon
+        // that sees many worker restarts (each a new pid → a new entry) does not
+        // grow the table without bound. Tied to register (rare) rather than a
+        // background task, matching the derive-liveness-on-read design. A worker
+        // re-registering keeps its own entry fresh (its last_ping is now), so this
+        // only removes entries that have been silent far past the dead window.
+        let reap_after = self.dead_timeout * REAP_FACTOR;
+        map.retain(|_, e| e.last_ping.elapsed() < reap_after);
         map.insert(
             worker_id.clone(),
             WorkerEntry {
@@ -83,7 +107,7 @@ impl WorkerTable {
     /// Record a heartbeat: refresh capacity and the liveness clock. A ping for an
     /// unknown worker is ignored — registration must come first.
     pub fn on_ping(&self, worker_id: &str, running_actions: u32, idle_slots: u32) {
-        let mut map = self.inner.lock().expect("worker table poisoned");
+        let mut map = self.lock();
         if let Some(e) = map.get_mut(worker_id) {
             e.running_actions = running_actions;
             e.idle_slots = idle_slots;
@@ -93,7 +117,7 @@ impl WorkerTable {
 
     /// Whether a worker is currently live (heard from within `dead_timeout`).
     pub fn is_live(&self, worker_id: &str) -> bool {
-        let map = self.inner.lock().expect("worker table poisoned");
+        let map = self.lock();
         map.get(worker_id)
             .is_some_and(|e| e.last_ping.elapsed() < self.dead_timeout)
     }
@@ -101,7 +125,7 @@ impl WorkerTable {
     /// Snapshot of the workers eligible for scheduling right now (live only).
     /// The M5.2 scheduler picks from this set.
     pub fn live_snapshot(&self) -> Vec<WorkerEntry> {
-        let map = self.inner.lock().expect("worker table poisoned");
+        let map = self.lock();
         map.values()
             .filter(|e| e.last_ping.elapsed() < self.dead_timeout)
             .cloned()
@@ -110,7 +134,7 @@ impl WorkerTable {
 
     /// Count of currently-live workers.
     pub fn live_count(&self) -> usize {
-        let map = self.inner.lock().expect("worker table poisoned");
+        let map = self.lock();
         map.values()
             .filter(|e| e.last_ping.elapsed() < self.dead_timeout)
             .count()
@@ -245,4 +269,52 @@ pub async fn serve_coordination_with_token(
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caps(cpu: u32) -> Capabilities {
+        Capabilities {
+            cpu_count: cpu,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_drops_long_dead_entries_on_register() {
+        // Tiny dead window so the reap threshold (dead_timeout * REAP_FACTOR) is
+        // short enough to test without a long sleep.
+        let table = WorkerTable::new(Duration::from_millis(5));
+        table.upsert_register("old".into(), "http://old".into(), caps(4));
+        // Wait past the reap threshold.
+        tokio::time::sleep(Duration::from_millis(5 * u64::from(REAP_FACTOR) + 60)).await;
+        // A new registration triggers the opportunistic reap of the dead "old".
+        table.upsert_register("new".into(), "http://new".into(), caps(4));
+
+        let map = table.lock();
+        assert!(!map.contains_key("old"), "long-dead entry must be reaped");
+        assert!(map.contains_key("new"), "the fresh entry remains");
+        assert_eq!(
+            map.len(),
+            1,
+            "table is bounded, not growing across restarts"
+        );
+    }
+
+    #[test]
+    fn poison_tolerant_lock_recovers_after_a_panic() {
+        // A panic while holding the lock poisons the mutex; the next access must
+        // recover the guard, not cascade the panic (M5.1 B3).
+        let table = WorkerTable::new(Duration::from_secs(15));
+        let t2 = table.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = t2.lock();
+            panic!("poison the mutex while holding it");
+        }));
+        // The table is still usable: this would panic on a poisoned `.expect`.
+        table.upsert_register("w".into(), "http://w".into(), caps(2));
+        assert!(table.is_live("w"));
+    }
 }

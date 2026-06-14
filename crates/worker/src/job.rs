@@ -19,9 +19,14 @@ use std::os::windows::io::RawHandle;
 
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, TerminateJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
+    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_READCLIPBOARD,
+    JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+    JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    TerminateJobObject,
 };
 
 /// An owned Job Object that kills every process in it when the handle closes
@@ -35,28 +40,62 @@ unsafe impl Send for JobObject {}
 unsafe impl Sync for JobObject {}
 
 impl JobObject {
-    /// Creates a job whose processes are all killed when the last handle closes.
+    /// Creates a job whose processes are all killed when the last handle closes,
+    /// AND that sandboxes the (untrusted, remotely-supplied) compiler tree it
+    /// holds (M7.4):
+    ///
+    /// * `KILL_ON_JOB_CLOSE` — the orphan-prevention guarantee (M6.1e).
+    /// * `DIE_ON_UNHANDLED_EXCEPTION` — a crashing child dies instead of popping a
+    ///   Windows Error Reporting dialog that would hang a headless worker.
+    /// * UI restrictions — the action is a console compiler that needs no UI, so
+    ///   deny it the desktop, clipboard, global atoms, ExitWindows, and
+    ///   display/system-parameter changes. This stops untrusted code from
+    ///   reaching into the worker operator's session. (`docs/deferred.md` M7
+    ///   sandbox; security M5.2/M5.5 flagged Job Object hardening.)
+    ///
+    /// Process breakaway is deliberately NOT enabled (neither `BREAKAWAY_OK` nor
+    /// `SILENT_BREAKAWAY_OK`), so a child cannot escape the job — that is what
+    /// makes the tree-kill and these limits inescapable.
     pub fn new_kill_on_close() -> io::Result<JobObject> {
-        // SAFETY: standard Win32 calls; the out-param struct is zero-initialized
+        // SAFETY: standard Win32 calls; the out-param structs are zero-initialized
         // and fully written before use, and the handle is checked for null.
         unsafe {
             let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             if handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
+            let set = |class, ptr: *const core::ffi::c_void, len| -> io::Result<()> {
+                if SetInformationJobObject(handle, class, ptr, len) == 0 {
+                    let e = io::Error::last_os_error();
+                    CloseHandle(handle);
+                    return Err(e);
+                }
+                Ok(())
+            };
+
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let ok = SetInformationJobObject(
-                handle,
+            info.BasicLimitInformation.LimitFlags =
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+            set(
                 JobObjectExtendedLimitInformation,
                 (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                 std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            );
-            if ok == 0 {
-                let e = io::Error::last_os_error();
-                CloseHandle(handle);
-                return Err(e);
-            }
+            )?;
+
+            let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
+            ui.UIRestrictionsClass = JOB_OBJECT_UILIMIT_DESKTOP
+                | JOB_OBJECT_UILIMIT_EXITWINDOWS
+                | JOB_OBJECT_UILIMIT_READCLIPBOARD
+                | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+                | JOB_OBJECT_UILIMIT_GLOBALATOMS
+                | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+                | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;
+            set(
+                JobObjectBasicUIRestrictions,
+                (&ui as *const JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+            )?;
+
             Ok(JobObject(handle as isize))
         }
     }
