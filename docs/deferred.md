@@ -208,6 +208,11 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   （タイムスタンプ）のみ相違と確定し、distribution 自体はバイト完全保存（cached==distributed も確認）。M7.0 auth とは
   無関係。ゲートの clang-cl 呼び出しに `/Brepro` を付与して解消。出所: CI 診断(run 27489791478、ref==ref2 で compiler
   決定性も確認、2026-06-14)。
+- **他の clang-cl バイトゲートも /Brepro 一貫適用が望ましい（堅牢化・低優先）。** vfs_compile.ps1 /
+  m4_cache_rebuild.ps1 / determinism.ps1 等の clang-cl バイト一致比較も、原理的には同じ COFF 壁時計
+  タイムスタンプ・フレークの対象。現状は参照と被測定ビルドが近接（同一秒）して安定 PASS するが、ランナー負荷で
+  まれにフレークしうる。M6.1 daemon ゲートと同様に各 clang-cl 呼び出しへ `/Brepro` を付与すれば構造的に堅牢化
+  できる（タイムスタンプ正規化と等価）。ローカル clang-cl 非搭載のため CI で検証要。出所: M7.0 原因特定の派生。
 - **action cache の trace は単機共有 FS 前提（VfsExecution.trace_dir）。** worker が書いた trace を daemon が
   直接読む。2 台分割では trace を data plane で返す必要。実 LAN（決定者承認）で対応。出所: ADR 0005、M6.1c。
 - **launcher の出力推論は /Fo ベースの最小ヒューリスティック。** `/Fo` 無し・複数出力・非標準フラグは
