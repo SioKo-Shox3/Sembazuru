@@ -253,6 +253,14 @@ message SubmitActionRequest {
   // The launcher sets it from SEMBAZURU_VFS_STRICT; the daemon copies it into
   // VfsExecution.strict.
   bool strict_vfs = 4;
+  // Declared input root: the agent-side directory under which the worker's reads
+  // are virtualized (becomes VfsExecution.vfs_root). EMPTY = use cwd (the M6/M7
+  // compiler default, where the project tree is the cwd). An arbitrary process
+  // may read above its cwd (e.g. ../shared), so the build integration can declare
+  // a broader root here (M8.3, ADR 0007). The launcher sets it from
+  // SEMBAZURU_INPUT_ROOT. Must contain cwd so outputs/inputs under cwd stay in
+  // scope.
+  string input_root = 5;
 }
 
 message SubmitActionEvent {
