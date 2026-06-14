@@ -415,6 +415,16 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **INFO-1 受容。** marker チェックは正常 exit 経路のみ（ceiling/cancel は元々 no-exit→fallback で同結果）。
   将来 timeout が合成 exit を出すようにする場合は marker チェックを回避しないこと。出所: security(M8.2 INFO-1)。
 
+### M8.4 実装後のメモ（2026-06-14）
+- **dxc -Qstrip_debug の決定性は determinism-checker で独立確認（解消）。** 連続・2 秒間隔（秒境界跨ぎ）・
+  cross-dir の 6 ビルドが単一 sha256 に収束。clang-cl の COFF 壁時計タイムスタンプ相当の依存も埋め込み絶対パスも
+  無く、非決定性は debug 情報（PDB）にのみ存在し `-Qstrip_debug` が除去。正規化フラグ不要。M8.4 ゲートは strip 済み
+  成果物を比較。出所: determinism-checker(M8.4)、ADR 0007 付録。
+- **署名付き DXIL は dxil.dll 同梱が前提（本番メモ・低優先）。** 検証環境（Vulkan SDK dxc）には dxil.dll が
+  無く、コンテナ先頭ハッシュは dxc 内部のコンテンツハッシュ（決定的）。本番で署名付き DXIL を配布するなら
+  dxc.exe の隣に dxil.dll を置く。M8.4 ゲートは ref vs distributed を同一 dxc で比較するため署名有無に非依存。
+  Windows SDK の dxc は 3 点同梱（CI はこれを使用）。出所: determinism-checker(M8.4)。
+
 ### M8.x（実 2 台 LAN・決定者承認の別スコープ・繰延）
 M8 の汎化作業（単機+RTT で実証）から分離。承認後に着手:
 - **cwd=入力ルート崩れの cross-machine 実証**（M8.3 は単機で宣言ルートを実装、2 台での実証は M8.x）。

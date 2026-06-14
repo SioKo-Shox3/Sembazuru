@@ -113,6 +113,18 @@ jobs:
       # (remove the 32-bit sibling -> no trace).
       - name: M7.3 cross-bitness injection (64-bit injector -> 32-bit child)
         run: pwsh -NoProfile -File hooks/test/m7_inject32.ps1
+      # Gates the M8 "Done when" (DESIGN §7): an ARBITRARY non-compiler process
+      # distributes with NO dedicated support. dxc (the HLSL shader compiler) runs
+      # through the SAME launcher->daemon->worker path as clang-cl — no dxc code in
+      # the binaries — and the distributed .dxil is byte-identical to local, falls
+      # back locally with the daemon down, and a 2nd build HITS the cache via
+      # trace-based output discovery (M8.1). Runs with strict VFS on (M8.2), which
+      # must not spuriously fire when supply works. dxc comes from the Windows SDK
+      # on the runner; -RequireDxc fails the gate if it is absent. timeout-minutes
+      # bounds it (M7.3 lesson: a stuck child process must not hang CI).
+      - name: M8.4 dxc distribution (arbitrary process, byte-identical, fallback, cache hit)
+        timeout-minutes: 10
+        run: pwsh -NoProfile -File hooks/test/m8_dxc.ps1 -RequireDxc
       # Gates M7.2: the Authenticode sign->verify pipeline. Runs LAST so it signs
       # the final artifacts (launcher.exe + hook DLL) without perturbing the
       # compile gates above. Uses an ephemeral self-signed cert to prove the
