@@ -13,6 +13,9 @@
 *.ilk
 *.idb
 
+# Scratch / local verification temp (untracked working dir)
+/_vtmp/
+
 # Editor / OS noise
 *.swp
 *.tmp
