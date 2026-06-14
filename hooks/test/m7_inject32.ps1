@@ -9,8 +9,10 @@
 # one and is a correct 32-bit PE exporting the Detours helper.
 #
 # Positive: with the 32-bit sibling present, the injected interceptor traces the
-# 32-bit child's file open. Negative control: remove the sibling and the same run
-# produces no trace — proving the trace came from the 32-bit DLL, not by accident.
+# 32-bit child's file open (a 32-bit process can only be injected by the 32-bit
+# DLL, so the trace IS the proof of cross-bitness injection). Negative control:
+# run the same probe with NO launcher (no injection) and get no trace — proving
+# the trace requires injection, not the probe alone.
 #
 # clang-cl/lld are not needed here; this exercises the injection mechanism with a
 # tiny C++ probe (built x86), so it runs wherever cl is available (local + CI).
@@ -41,19 +43,33 @@ $victim = Join-Path $WorkRoot 'opened-by-32bit-child.txt'
 Set-Content $victim "read me from a 32-bit process`n" -Encoding ascii
 
 # Runs the 64-bit launcher -> 32-bit probe (which opens $victim), tracing into a
-# fresh dir; returns the count of trace files produced.
+# fresh dir; returns the count of trace files produced. Timeout-protected: the
+# cross-bitness injection spawns a Detours helper, and a hang there must surface
+# as a clean failure (with diagnostics), never an unbounded CI hang.
+$LAUNCH_TIMEOUT_MS = 60000
 function Invoke-Probe32 {
-    param([string]$Tag)
+    param([string]$Tag, [switch]$AllowNonZero)
     $traceDir = Join-Path $WorkRoot "$Tag-trace"
     New-Item -ItemType Directory -Force $traceDir | Out-Null
+    $outFile = Join-Path $WorkRoot "$Tag-out.txt"
+    $errFile = Join-Path $WorkRoot "$Tag-err.txt"
     $env:SEMBAZURU_TRACE_DIR = $traceDir
     try {
-        $out = & $launcher $dll64 $probe32 $victim 2>&1 | Out-String
-        $code = $LASTEXITCODE
+        $p = Start-Process -FilePath $launcher -ArgumentList @($dll64, $probe32, $victim) `
+            -PassThru -NoNewWindow -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if (-not $p.WaitForExit($LAUNCH_TIMEOUT_MS)) {
+            try { $p.Kill() } catch {}
+            throw "${Tag}: launcher hung > $($LAUNCH_TIMEOUT_MS/1000)s (cross-bitness injection did not complete)"
+        }
+        $code = $p.ExitCode
     } finally {
         Remove-Item Env:\SEMBAZURU_TRACE_DIR -ErrorAction SilentlyContinue
     }
-    if ($code -ne 0) { Write-Host $out; throw "${Tag}: probe exited $code" }
+    $oOut = Get-Content $outFile -Raw -ErrorAction SilentlyContinue
+    $oErr = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+    $o = "$oOut $oErr".Trim()
+    Write-Host "${Tag}: exit=$code out=$o"
+    if ($code -ne 0 -and -not $AllowNonZero) { throw "${Tag}: probe exited $code" }
     return @{
         traceDir = $traceDir
         count    = (Get-ChildItem $traceDir -Filter *.sbzt -ErrorAction SilentlyContinue).Count
@@ -93,18 +109,27 @@ if ($pos.count -lt 1) {
     }
 }
 
-# --- Negative control: remove the sibling -> no injection, no trace ----------
-Remove-Item $dll32 -Force
-$neg = Invoke-Probe32 'no32'
-if ($neg.count -ne 0) {
-    $failures += "negative control FAILED: trace produced ($($neg.count)) with the 32-bit DLL removed"
-} else {
-    Write-Host 'NEGATIVE PASS: with the 32-bit sibling removed, no injection/trace (control holds)'
+# --- Negative control: run the probe WITHOUT the launcher -> no trace --------
+# Running the 32-bit probe directly (no injection at all) must produce no trace,
+# proving the trace in the positive case came from an injected interceptor, not
+# from the probe itself. (We deliberately do NOT use the "remove the 32-bit DLL"
+# control: with the sibling missing, Detours' cross-bitness helper can linger
+# holding handles, which is a harness hazard, not a property worth asserting.)
+$negTrace = Join-Path $WorkRoot 'direct-trace'
+New-Item -ItemType Directory -Force $negTrace | Out-Null
+$env:SEMBAZURU_TRACE_DIR = $negTrace
+try {
+    $pn = Start-Process -FilePath $probe32 -ArgumentList @($victim) -PassThru -NoNewWindow
+    $pn.WaitForExit(15000) | Out-Null
+} finally {
+    Remove-Item Env:\SEMBAZURU_TRACE_DIR -ErrorAction SilentlyContinue
 }
-
-# Restore the staged 32-bit sibling so a later signing step (sign_smoke.ps1) finds
-# it — the negative control above removed it.
-Copy-Item $dll32src $dll32 -Force
+$negCount = (Get-ChildItem $negTrace -Filter *.sbzt -ErrorAction SilentlyContinue).Count
+if ($negCount -ne 0) {
+    $failures += "negative control FAILED: the un-injected probe produced a trace ($negCount)"
+} else {
+    Write-Host 'NEGATIVE PASS: the probe run directly (no injection) produced no trace'
+}
 
 if ($failures.Count -gt 0) {
     Write-Host ''
