@@ -89,13 +89,16 @@ const ALLOW_EXACT: &[&str] = &[
 ];
 
 /// Variable-name prefixes (compared case-insensitively) for toolchain families
-/// whose exact names vary by version, so enumerating them is brittle.
+/// whose exact names vary by version, so enumerating them is brittle. Kept
+/// deliberately narrow and MS-namespaced (security M7.1 LOW-6): broad prefixes
+/// like a bare `FRAMEWORK` would forward unrelated `FRAMEWORK_*` secrets, which
+/// contradicts the allowlist philosophy. The `Framework*` exacts above cover the
+/// real toolchain vars, so no `FRAMEWORK` prefix is needed here.
 const ALLOW_PREFIX: &[&str] = &[
-    "VSCMD_",     // VSCMD_ARG_*, VSCMD_VER, …
+    "VSCMD_",     // VSCMD_ARG_*, VSCMD_VER, … (vcvars argument echo)
     "__VSCMD",    // internal vcvars bookkeeping
-    "WINDOWSSDK", // WindowsSdk* not covered exactly
-    "VCTOOLS",    // VCTools* not covered exactly
-    "FRAMEWORK",  // Framework* not covered exactly
+    "WINDOWSSDK", // WindowsSdkDir/Version/VerBinPath… (MS-namespaced)
+    "VCTOOLS",    // VCToolsInstallDir/Version/RedistDir (MS-namespaced)
 ];
 
 /// Whether `name` is a compiler-relevant variable to forward. Matching is
