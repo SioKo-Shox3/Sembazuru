@@ -58,8 +58,12 @@ struct VfsState {
     agent_addr: SocketAddr,
     rtt: Duration,
     /// Shared cluster token (M7, ADR 0006) presented on the data-plane handshake.
-    /// Empty when the cluster runs without auth (no handshake, M6-identical wire).
+    /// Empty when the cluster runs without auth.
     auth_token: String,
+    /// The action's agent-side input root (`VfsExecution.vfs_root`), declared on
+    /// the handshake so the agent scopes file supply to it (M7.1). Empty = the
+    /// agent does not scope (legacy/tests).
+    session_root: String,
     /// The session's pooled, multiplexed agent connection, dialed on first
     /// hydrate. `OnceCell::get_or_try_init` retries if the first dial fails, so a
     /// worker that starts before the agent is listening recovers on a later open.
@@ -72,10 +76,11 @@ impl VfsState {
     async fn client(&self) -> io::Result<FileClient> {
         self.client
             .get_or_try_init(|| {
-                FileClient::connect_with_rtt_token(
+                FileClient::connect_with_rtt_session(
                     self.agent_addr,
                     self.rtt,
                     self.auth_token.clone(),
+                    self.session_root.clone(),
                 )
             })
             .await
@@ -129,6 +134,7 @@ pub async fn serve_vfs(
     scratch_root: PathBuf,
     cas_root: PathBuf,
     rtt: Duration,
+    vfs_root: String,
 ) -> io::Result<()> {
     serve_vfs_with_prefetch(
         pipe_name,
@@ -137,6 +143,7 @@ pub async fn serve_vfs(
         cas_root,
         rtt,
         Vec::new(),
+        vfs_root,
     )
     .await
 }
@@ -152,6 +159,7 @@ pub async fn serve_vfs_with_prefetch(
     cas_root: PathBuf,
     rtt: Duration,
     predicted_paths: Vec<String>,
+    vfs_root: String,
 ) -> io::Result<()> {
     // No readiness signal wanted (the dev harness/tests poll the pipe path or
     // tolerate the race); discard it.
@@ -164,6 +172,7 @@ pub async fn serve_vfs_with_prefetch(
         rtt,
         predicted_paths,
         ready,
+        vfs_root,
     )
     .await
 }
@@ -180,6 +189,7 @@ pub async fn serve_vfs_with_prefetch(
 /// launching, the worker guarantees the pipe is listening first — deterministic,
 /// not a sleep-poll. If `create()` fails, `ready` is dropped without firing, so
 /// the caller's `rx.await` errors and the action fails closed.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_vfs_with_prefetch_ready(
     pipe_name: &str,
     agent_addr: SocketAddr,
@@ -188,6 +198,7 @@ pub async fn serve_vfs_with_prefetch_ready(
     rtt: Duration,
     predicted_paths: Vec<String>,
     ready: tokio::sync::oneshot::Sender<()>,
+    vfs_root: String,
 ) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     let state = Arc::new(VfsState {
@@ -197,8 +208,10 @@ pub async fn serve_vfs_with_prefetch_ready(
         agent_addr,
         rtt,
         // Production token comes from the environment (ADR 0006); empty disables
-        // the handshake (M6-identical wire on an unauthenticated cluster).
+        // auth (the agent then accepts unconditionally).
         auth_token: sembazuru_proto::auth::cluster_token_from_env().unwrap_or_default(),
+        // Declared input root the agent scopes file supply to (M7.1).
+        session_root: vfs_root,
         client: OnceCell::new(),
     });
 
@@ -384,6 +397,7 @@ mod tests {
                 Duration::ZERO,
                 Vec::new(),
                 tx,
+                String::new(), // unscoped (this test never dials the agent)
             )
             .await;
         });
@@ -429,7 +443,8 @@ mod tests {
             cas: BlobStore::open(temp("cas")).unwrap(),
             agent_addr: addr,
             rtt: Duration::ZERO,
-            auth_token: String::new(), // auth-disabled harness
+            auth_token: String::new(),   // auth-disabled harness
+            session_root: String::new(), // unscoped harness
             client: OnceCell::new(),
         });
 

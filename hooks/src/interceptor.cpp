@@ -332,22 +332,29 @@ HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
         return INVALID_HANDLE_VALUE;  // not supplied: fall back to local open
     }
     // Trust but verify: the worker must return a path under the scratch root.
-    // This bounds the damage a buggy/hostile worker can do (it cannot redirect a
-    // read to an arbitrary file the compiler would consume as source). When a
-    // scratch root is configured, a path outside it is rejected -> local open.
-    if (g_vfsScratchLen > 0) {
-        wchar_t lower[1024];
-        int i = 0;
-        for (; local[i] != L'\0' && i < 1023; i++) {
-            lower[i] = towlower(local[i]);
-        }
-        lower[i] = L'\0';
-        if (!PathUnderPrefix(lower, i, g_vfsScratch, g_vfsScratchLen)) {
-            return INVALID_HANDLE_VALUE;  // worker returned an out-of-scratch path
-        }
+    // This bounds the damage a buggy/hostile worker can do — it cannot redirect a
+    // read to an arbitrary file the compiler would consume as source (M7.1).
+    //
+    //  * A scratch root MUST be configured in VFS mode; if it is not, fail closed
+    //    (local open) rather than open an unvalidated worker-supplied path.
+    //  * Canonicalize the returned path (GetFullPathName) BEFORE the prefix check,
+    //    so a worker cannot escape scratch with `<scratch>\..\..\secret`: `..`,
+    //    mixed separators, and relative components are collapsed first, then the
+    //    boundary-aware prefix check runs on the resolved, lowercased path.
+    if (g_vfsScratchLen == 0) {
+        return INVALID_HANDLE_VALUE;  // no scratch guard configured: do not redirect
+    }
+    wchar_t canon[1024];
+    DWORD cn = GetFullPathNameW(local, 1024, canon, nullptr);
+    if (cn == 0 || cn >= 1024) {
+        return INVALID_HANDLE_VALUE;  // unresolvable/too long: fall back to local
+    }
+    int cl = LowerAndTrim(canon, cn);
+    if (!PathUnderPrefix(canon, cl, g_vfsScratch, g_vfsScratchLen)) {
+        return INVALID_HANDLE_VALUE;  // worker returned an out-of-scratch path
     }
     *handled = true;
-    return TrueCreateFileW(local, access, share, sa, disposition, flags, templ);
+    return TrueCreateFileW(canon, access, share, sa, disposition, flags, templ);
 }
 
 // --- Helpers -------------------------------------------------------------

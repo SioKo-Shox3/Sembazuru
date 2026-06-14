@@ -57,6 +57,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _ = r;
     });
     eprintln!("vfs_host: file server on {addr}, pipe {pipe_name}, rtt {rtt:?}");
-    sembazuru_worker::vfs_pipe::serve_vfs(&pipe_name, addr, scratch, cas_root, rtt).await?;
+    // Dev harness: unscoped (production scoping is exercised by the daemon gate,
+    // where the worker declares the action's vfs_root). Empty root = no scoping.
+    sembazuru_worker::vfs_pipe::serve_vfs(&pipe_name, addr, scratch, cas_root, rtt, String::new())
+        .await?;
     Ok(())
 }

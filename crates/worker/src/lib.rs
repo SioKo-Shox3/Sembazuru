@@ -181,6 +181,18 @@ fn state_event(state: ActionState, detail: &str) -> Result<ExecuteEvent, Status>
     })
 }
 
+/// Sanitizes a worker-side error (setup or run) for the wire (M7.1,
+/// `docs/deferred.md` M7 "エラー詳細の情報漏洩"). The detailed cause — which can contain worker-side
+/// filesystem paths and raw OS error text — is logged to the worker's OWN stderr
+/// (safe; the worker operator sees it), while only the coarse, path-free
+/// `category` crosses the trust boundary to the agent (and onward to the
+/// developer's console). The developer still gets the real compiler error: a
+/// FAILED action falls back to a local build, whose output they see directly.
+fn setup_err(category: &'static str, detail: impl std::fmt::Display) -> String {
+    eprintln!("sembazuru-worker: {category}: {detail}");
+    category.to_string()
+}
+
 fn exit_event(code: i32, wall_us: u64) -> Result<ExecuteEvent, Status> {
     Ok(ExecuteEvent {
         event: Some(Event::Exit(ExitStatus {
@@ -369,7 +381,7 @@ async fn run_action(
             }
             Err(e) => {
                 let _ = tx
-                    .send(state_event(ActionState::Failed, &format!("wait failed: {e}")))
+                    .send(state_event(ActionState::Failed, &setup_err("wait failed", e)))
                     .await;
             }
         }
@@ -435,7 +447,7 @@ async fn build_child(
         // the worker never leaks an orphan holding an admission slot. The plain
         // path has no grandchild to orphan, so no Job Object is needed here.
         command.kill_on_drop(true);
-        let child = command.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+        let child = command.spawn().map_err(|e| setup_err("spawn failed", e))?;
         return Ok((child, None, None));
     };
 
@@ -451,14 +463,14 @@ async fn build_child(
     let agent_addr: SocketAddr = v
         .agent_fileserver
         .parse()
-        .map_err(|e| format!("invalid agent_fileserver {:?}: {e}", v.agent_fileserver))?;
+        .map_err(|e| setup_err("invalid agent fileserver address", e))?;
     tokio::fs::create_dir_all(&scratch)
         .await
-        .map_err(|e| format!("create scratch {}: {e}", scratch.display()))?;
+        .map_err(|e| setup_err("create scratch dir failed", e))?;
     if !v.trace_dir.is_empty() {
         tokio::fs::create_dir_all(&v.trace_dir)
             .await
-            .map_err(|e| format!("create trace_dir {}: {e}", v.trace_dir))?;
+            .map_err(|e| setup_err("create trace dir failed", e))?;
     }
     let scratch_str = scratch.to_string_lossy().into_owned();
 
@@ -468,6 +480,10 @@ async fn build_child(
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let cas = cfg.cas_root.clone();
     let pipe_for_task = pipe_name.clone();
+    // Declare the action's input root so the agent scopes file supply to it
+    // (M7.1): the worker only legitimately reads under vfs_root (the hook
+    // redirects exactly that subtree), so a request outside it is illegitimate.
+    let vfs_root = v.vfs_root.clone();
     let pipe_task = tokio::spawn(async move {
         serve_vfs_with_prefetch_ready(
             &pipe_for_task,
@@ -477,6 +493,7 @@ async fn build_child(
             Duration::ZERO,
             predicted_paths,
             ready_tx,
+            vfs_root,
         )
         .await
     });
@@ -517,7 +534,7 @@ async fn build_child(
         Ok(child) => child,
         Err(e) => {
             pipe_task.abort();
-            return Err(format!("launcher spawn failed: {e}"));
+            return Err(setup_err("launcher spawn failed", e));
         }
     };
 
@@ -536,7 +553,7 @@ async fn build_child(
         Err(e) => {
             pipe_task.abort();
             // `child` drops here; kill_on_drop terminates at least the launcher.
-            return Err(format!("job object setup failed: {e}"));
+            return Err(setup_err("job object setup failed", e));
         }
     };
     Ok((child, Some(pipe_task), Some(job)))
