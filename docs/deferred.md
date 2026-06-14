@@ -284,6 +284,16 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   実証済み（ゲートは clang-cl で hard 強制、cl では DIAG）。非英語 cl の堅牢化が要るなら worker の出力コードページを CMake
   サンプルに合わせる（コンソール CP 固定）か、depfile ベース（`/sourceDependencies` JSON）への移行が将来余地。クリーンビルドと
   cached/distributed のバイト経路は元々無影響。出所: M6.3 直接プローブ＋CI 実測(2026-06-15)、launcher.cpp/worker lib.rs/agent intake.rs。
+- **【要対応・価値】MSBuild シム経路ではアクションキャッシュが命中しない（分散・フォールバックは動く）。** MSBuild の
+  CL タスクは複数ソースを 1 つの cl 呼び出しにバッチ化（多くはレスポンスファイル経由）するため、シムは単一の多ソース
+  アクションを受け取る。launcher の出力推論は単一 `/Fo` 前提で 1 obj しか名付けず、かつ argv ベースのキーが
+  バッチ/レスポンスファイル形で安定しないため、per-file の CMake/Ninja 経路（B1=m6_ninja で完全命中を実証）のようには
+  キャッシュされない（M6.2=m6_msbuild で build2 が cache-hit=False を実測、ローカルフォールバックで完走）。VS/MSBuild は
+  Windows の主要ビルドシステムなので 2 回目スキップが効かないのは価値ギャップ。修正候補: ① launcher でレスポンスファイル
+  （`@file`）を展開して実 argv・実出力集合を得る、② 多ソース時は出力推論を空にして trace ベース発見に委ねる
+  （`infer_outputs` を多ソースで empty 化、M8.1 の `logical_outputs` が全 obj を拾う）、③ argv 正規化でキー安定化。
+  load-bearing 度は中（launcher＋daemon の出力/キー経路）。m6_msbuild は cache を非致命 DIAG として可視化（命中すれば自動で
+  HIT 表示）。出所: M6.2 多 TU 実測(2026-06-15)、sembazuru_launcher.rs infer_outputs。
 
 ## M7（堅牢化・セキュリティ）
 
