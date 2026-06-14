@@ -89,10 +89,18 @@ async fn main() {
 
     // The launcher's working directory and environment are what the compiler
     // would have seen — carry them so local fallback and remote execution match.
+    // The environment is reduced to compiler-relevant variables (M7.1): the full
+    // environment can reach a remote worker over the LAN, so forwarding the
+    // developer's secrets would leak them off-box (ADR 0006 is LAN-trusted, not
+    // "leak everything"). A local fallback re-applies these same variables, so
+    // the dropped ones (secrets, worker-internal SEMBAZURU_*) were never needed
+    // to compile. Builds with unusual env deps can re-add names via
+    // SEMBAZURU_ENV_PASSTHROUGH.
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let env: HashMap<String, String> = std::env::vars().collect();
+    let full_env: HashMap<String, String> = std::env::vars().collect();
+    let env = sembazuru_agent::env_filter::filter_compiler_env(&full_env);
     let command = Command { argv, env, cwd };
 
     let endpoint = env_or("SEMBAZURU_DAEMON", "http://127.0.0.1:50071");

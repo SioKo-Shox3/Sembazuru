@@ -96,6 +96,7 @@ async fn pipe_hydrates_file_into_scratch() {
                 sc,
                 cas,
                 std::time::Duration::ZERO,
+                String::new(), // unscoped harness
             )
             .await;
         });
@@ -161,7 +162,15 @@ async fn worker_cache_eliminates_retransfer_on_second_build() {
     {
         let (pn, sc, cas) = (pipe1.clone(), dir.join("scratch1"), cas_root.clone());
         tokio::spawn(async move {
-            let _ = sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc, cas, Duration::ZERO).await;
+            let _ = sembazuru_worker::vfs_pipe::serve_vfs(
+                &pn,
+                addr,
+                sc,
+                cas,
+                Duration::ZERO,
+                String::new(),
+            )
+            .await;
         });
     }
     let (status, local1) = pipe_hydrate(&full1, &logical_str).await;
@@ -183,7 +192,15 @@ async fn worker_cache_eliminates_retransfer_on_second_build() {
     {
         let (pn, sc, cas) = (pipe2.clone(), dir.join("scratch2"), cas_root.clone());
         tokio::spawn(async move {
-            let _ = sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc, cas, Duration::ZERO).await;
+            let _ = sembazuru_worker::vfs_pipe::serve_vfs(
+                &pn,
+                addr,
+                sc,
+                cas,
+                Duration::ZERO,
+                String::new(),
+            )
+            .await;
         });
     }
     let (status, local2) = pipe_hydrate(&full2, &logical_str).await;

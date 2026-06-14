@@ -227,10 +227,13 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   resolve 時に**現在内容で再ハッシュ**するため内容改竄は防げる（誤バイト提供は構造的に不可）。だが悪意/バグ
   worker が trace から入力を**落とす**と、その入力変更が strong key を動かさず stale な cache 命中を招く。
   単機では worker はローカル信頼プロセス。緩和は M7 の Register 認証（mTLS/attestation）と同根。出所: security(M6.1 Low)。
-- **launcher の full-env 転送：LAN 分割の直前が今。** M6.0 LOW（開発者シークレットの off-box）の「リモート到達前に
-  allowlist 検討」のチェックポイントは M6.1 で到来。単機 loopback では未流出（intake loopback ロック）だが、
-  実 2 台 LAN を入れる前に env allowlist を必須化する。worker 側 env_clear は worker 内部 var の漏洩を防ぐ正の効果。
-  出所: security(M6.1 Low、M6.0 LOW の再タグ)。
+- ~~**launcher の full-env 転送：LAN 分割の直前が今。**~~ **解消（M7.1、LAN 分割前に先行実装）。** launcher は
+  `std::env::vars()` 全転送をやめ、コンパイラ関連 env のみの allowlist（`env_filter::filter_compiler_env`：
+  PATH/INCLUDE/LIB/LIBPATH/TMP/TEMP・VS/Windows SDK ロケータ・OS 基本＋families の prefix、case-insensitive、
+  `SEMBAZURU_ENV_PASSTHROUGH` で追加可）に縮約。開発者のシークレット（AWS/GitHub/SSH 等）と worker 内部
+  `SEMBAZURU_*` はワイヤに乗らない。ローカルフォールバック（run_local）は継承 env で従来どおり動作（off-box
+  流出は元々なし）。determinism は CI バイトゲートで確認（allowlist が出力影響 env を取りこぼさない）。
+  出所: env_filter.rs、tests(env_filter)、security(M6.1 Low/M6.0 LOW)。
 - **per-action scratch/trace ディレクトリの無制限増加（disk DoS）。** in-flight 資源（pipe/job/task）は admission で
   有界かつ終了時清掃。だが worker の hydrated scratch（`lib.rs` 注: M3.3/M7）と daemon の per-action `trace-{n}`
   （`SEMBAZURU_TRACE_ROOT` 下）はビルド毎に残置・累積。長寿命 daemon/worker で disk 枯渇。セッション境界 eviction
@@ -274,11 +277,20 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   ClientTlsConfig＋データプレーン tokio-rustls）は実 2 台 LAN 実測・ゼロトラスト判断と同じ繰延に置く
   （本番条件で on 経路を検証できないため）。wire 非破壊の移行口（予約 11・capability flag）は確保済み。
   digest 検証は TLS 有無に関わらず常時。出所: ADR 0006、AskUser(2026-06-14)。
-- **agent fileserver のパススコープ無し。** 要求された任意絶対パスを読む。M7 で
-  セッション宣言ルートに限定。出所: security(M3.2 F2)。
-- **DLL が worker 返却パスを scratch 配下かのみ検証。** 完全なパススコープ／
-  `SEMBAZURU_VFS_SCRATCH` 検証の拡張は M7。出所: security(M3.2)。実装済み: scratch
-  配下チェック＋scratch 配下 open の非リダイレクト（anti-recursion）。
+- **agent fileserver のパススコープ — 解消（M7.1）。** データプレーンの session-open ハンドシェイク
+  （`HelloRequest`）を常時化し、worker が宣言した入力ルート（`VfsExecution.vfs_root`）を agent が記録、
+  read 系（StatBatch/OpenRead/DirList）をそのルート配下に限定。範囲外は not-found（存在も秘匿）。任意絶対パス
+  供給を廃止し、rogue/buggy worker が agent の任意ファイル（例 ~/.ssh）を読む経路を閉鎖。境界一致＋case/
+  separator 正規化、path 形エッジ（8.3/`\\?\`/UNC/symlink）は fail-closed。出所: fileserver.rs（path_in_scope）、
+  tests(dataplane_fs declared_root_scopes_file_supply)。WriteBack（出力書き戻し）パスのスコープは別項（下記）。
+- **DLL 返却パス検証 — 強化（M7.1）。** hook は worker 返却（hydrated scratch）パスを **GetFullPathName で
+  正規化してから** scratch 配下を境界チェック（`<scratch>\..\..\secret` の `..` トラバーサルを閉鎖）、かつ
+  VFS モードで scratch 未設定なら fail-closed（未検証パスを開かない）。実装済みの anti-recursion（scratch 配下
+  open 非リダイレクト）は維持。出所: interceptor.cpp(VfsTryRedirect)。
+- **WriteBack の出力パスはスコープ未検証（M7.1 で繰延）。** 悪意/バグ worker が WriteBack で agent の任意パスへ
+  書き込みうる。出力は宣言出力集合（v0 §3.2 declared_outputs）に限定すべきだが、単機モデルでは出力はコマンドが
+  名指すローカルパスに落ちる（writeback 非経由）。content-addressed＋digest 検証＋atomic publish で誤バイトは
+  構造的に不可。実 2 台 writeback 導入時に declared_outputs ベースの宛先スコープを設計。出所: M7.1 設計判断。
 - **EDR/許可リスト申請事項:** DLL は ntdll!NtSetInformationFile をインラインフック
   ＋ファイル open のリダイレクト（観測より強いシグナル）＋名前付きパイプ。RWX/直接
   syscall/スレッド乗っ取り等の TTP は無く署名可能。M7 のベンダ説明で明示。出所:
@@ -290,8 +302,11 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   ベア名。** M3.2 で `env_clear`＋絶対 argv0 へ。BatBadBut(.bat/.cmd 引数注入)は
   std 1.77.2 で緩和済だが、worker argv[0] は絶対パスのみ・batch 起動は拒否/明示の
   不変条件を M3.2 サンドボックス仕様に明記。出所: security(M3.1 F6/F7)。
-- **エラー詳細の情報漏洩:** spawn/rename 失敗の Display や FAILED detail が worker 側
-  パスを露出。信頼境界が変わる M7 で粗いコードに sanitize。出所: security(M3.1)。
+- **エラー詳細の情報漏洩 — 解消（M7.1）。** worker のセットアップ/実行エラー（spawn/scratch/trace/job/wait）の
+  詳細（worker 側パス・生 OS エラー）を worker の stderr にローカル出力し、ワイヤ（FAILED detail）には粗い
+  カテゴリのみ返す（`setup_err`）。agent の WriteBack I/O エラー（create/temp/seek/write/open/rename）も同様に
+  agent stderr へ、worker へは粗いカテゴリ（`wb_io_err`）。digest mismatch 等のハッシュ系は有用かつ非パスなので温存。
+  開発者は FAILED→ローカルフォールバックで実コンパイラ出力を直接得る。出所: lib.rs/fileserver.rs。
 - **32/64bit 双方の DLL。** 子プロセスのビット跨ぎ注入に両 bit の interceptor が要る
   （現状 64bit のみ、命名規約は 32bit を予期済）。出所: trace-format §8、BuildXL。
 

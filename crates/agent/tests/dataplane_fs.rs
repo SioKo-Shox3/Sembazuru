@@ -304,8 +304,31 @@ async fn calls_fail_fast_when_the_connection_dies() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        // Accept one connection, then drop it — the worker's reader sees EOF.
-        if let Ok((sock, _)) = listener.accept().await {
+        use sembazuru_dataplane::async_io::{read_frame, write_frame};
+        use sembazuru_dataplane::ops::HelloResponse;
+        use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+        use tokio::io::AsyncWriteExt;
+        // Accept one connection, COMPLETE the session handshake so connect()
+        // succeeds, then drop it — the worker's reader then sees EOF mid-session.
+        if let Ok((mut sock, _)) = listener.accept().await {
+            if let Ok((h, _)) = read_frame(&mut sock).await {
+                let resp = HelloResponse {
+                    ok: true,
+                    detail: String::new(),
+                }
+                .encode();
+                let _ = write_frame(
+                    &mut sock,
+                    FrameHeader {
+                        request_id: h.request_id,
+                        op: OpCode::Hello,
+                        is_response: true,
+                    },
+                    &resp,
+                )
+                .await;
+                let _ = sock.flush().await;
+            }
             drop(sock);
         }
     });
@@ -373,21 +396,73 @@ async fn handshake_wrong_token_is_refused() {
 }
 
 #[tokio::test]
+async fn declared_root_scopes_file_supply() {
+    // M7.1 path scoping: a worker declares its input root on the session handshake
+    // and the agent refuses to supply anything outside it — even though the agent
+    // process can read those files. Defends against a rogue/buggy worker reading
+    // arbitrary agent-side files (e.g. ~/.ssh/id_rsa) over the data plane.
+    let root = TempDir::new("scope-root");
+    let in_root = root.write("src/in.h", b"inside the declared root");
+    // A file the agent CAN read but that lives OUTSIDE the declared root.
+    let outside = TempDir::new("scope-outside");
+    let secret = outside.write("secret.txt", b"must never be supplied");
+
+    let addr = start_server().await; // agent is unscoped; scope comes from the client
+    let client = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),                      // auth off
+        root.path.to_string_lossy().into(), // declared root
+    )
+    .await
+    .unwrap();
+
+    // In-root file is served normally.
+    let got = client
+        .fetch(&in_root)
+        .await
+        .unwrap()
+        .expect("in-root file served");
+    assert_eq!(got.0, b"inside the declared root");
+
+    // Out-of-root file: fetch resolves to None (existence-hidden), not its bytes.
+    assert!(
+        client.fetch(&secret).await.unwrap().is_none(),
+        "a path outside the declared root must not be supplied"
+    );
+    // And a stat probe of it reports "does not exist".
+    let stat = client
+        .stat_batch(std::slice::from_ref(&secret))
+        .await
+        .unwrap();
+    assert!(
+        !stat.entries[0].exists,
+        "out-of-root stat must report non-existence (no existence leak)"
+    );
+    // Sanity: the same agent, unscoped, WOULD have served it (proves the file is
+    // real and readable, so the scoping is what blocked it).
+    let addr2 = start_server().await;
+    let unscoped = FileClient::connect(addr2).await.unwrap();
+    assert!(
+        unscoped.fetch(&secret).await.unwrap().is_some(),
+        "unscoped agent serves the same file — scoping, not absence, blocked it"
+    );
+}
+
+#[tokio::test]
 async fn handshake_missing_token_against_authed_server_is_refused() {
-    let dir = TempDir::new("auth-missing");
-    let path = dir.write("a.h", b"unreachable");
     let addr = start_server_with_token("s3cret").await;
 
-    // A tokenless client (M6-style `connect`) sends no Hello; its first frame is
-    // an op, which the authed server refuses — the op must not return data.
-    let client = FileClient::connect(addr).await.unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(5), client.fetch(&path)).await;
-    assert!(
-        got.is_ok(),
-        "the call must not hang against an authed server"
-    );
-    assert!(
-        got.unwrap().is_err(),
-        "a tokenless client gets no files from an authed agent"
-    );
+    // A tokenless client opens the session with an empty token; the authed server
+    // rejects the handshake, so connect itself fails — no op is ever served.
+    match FileClient::connect(addr).await {
+        Ok(_) => panic!("a tokenless client must be rejected by an authed agent"),
+        Err(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                e.to_string().contains("missing cluster auth token"),
+                "reason should be the safe missing-token string, got: {e}"
+            );
+        }
+    }
 }

@@ -425,11 +425,17 @@ impl HasResponse {
 
 // --- Hello (session auth handshake, M7 / ADR 0006) -----------------------
 
-/// The worker's session-opening handshake: presents the shared cluster token.
-/// Only sent when auth is configured (see [`crate::wire::OpCode::Hello`]).
+/// The worker's session-opening handshake. Always the first frame on a data-
+/// plane connection (M7.1): it presents the shared cluster token (M7.0, may be
+/// empty when auth is off) and DECLARES the session's input root (M7.1) so the
+/// agent can scope file supply to that subtree — an empty root means "no
+/// scoping" (legacy/tests). See [`crate::wire::OpCode::Hello`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloRequest {
     pub token: String,
+    /// Agent-side logical root the worker will read under (its `vfs_root`).
+    /// The agent refuses to supply paths outside it. Empty = unscoped.
+    pub root: String,
 }
 
 /// The agent's verdict on the handshake. `ok == false` means the agent will
@@ -444,13 +450,15 @@ impl HelloRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.str(&self.token);
+        w.str(&self.root);
         w.into_bytes()
     }
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(buf);
         let token = r.str()?;
+        let root = r.str()?;
         r.finish()?;
-        Ok(HelloRequest { token })
+        Ok(HelloRequest { token, root })
     }
 }
 

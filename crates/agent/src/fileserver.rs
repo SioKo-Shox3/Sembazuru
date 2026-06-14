@@ -249,16 +249,16 @@ async fn handle_conn(
     // mutex-shared because a frame must be written whole.
     let (mut rd, mut wr) = sock.into_split();
 
-    // Shared-token handshake (M7, ADR 0006). Only when a token is configured: the
-    // peer's FIRST frame must be a Hello carrying the right token, or the agent
-    // refuses to serve a single op. This closes the unauthenticated file-supply
-    // path (an arbitrary peer reading the agent's filesystem). With no token the
-    // handshake is skipped entirely, so the wire matches M6 byte-for-byte.
-    if let Some(expected) = expected_token.as_ref()
-        && !handshake(&mut rd, &mut wr, expected).await?
-    {
-        return Ok(()); // rejected; connection closed
-    }
+    // Session-open handshake (M7.0 auth + M7.1 path scoping). ALWAYS the first
+    // frame: the peer must open the session with a Hello before any op. The agent
+    // validates the shared token (closing the unauthenticated file-supply path)
+    // and records the declared input root, then refuses to supply any path
+    // outside it (closing the arbitrary-absolute-path read). An empty root means
+    // unscoped (legacy/tests); an empty configured token means auth off.
+    let scope_root = match handshake(&mut rd, &mut wr, expected_token.as_deref()).await? {
+        HandshakeResult::Reject => return Ok(()), // rejected; connection closed
+        HandshakeResult::Accept(root) => Arc::new(root),
+    };
 
     let wr = Arc::new(Mutex::new(wr));
     loop {
@@ -270,8 +270,9 @@ async fn handle_conn(
         let session = session.clone();
         let map = map.clone();
         let wr = wr.clone();
+        let root = scope_root.clone();
         tokio::spawn(async move {
-            let resp_payload = dispatch(header.op, &payload, &session, &map).await;
+            let resp_payload = dispatch(header.op, &payload, &session, &map, &root).await;
             let resp_header = FrameHeader {
                 request_id: header.request_id,
                 op: header.op,
@@ -283,18 +284,54 @@ async fn handle_conn(
     }
 }
 
-/// Server side of the M7 data-plane handshake (ADR 0006). The peer's first frame
-/// must be a `Hello` carrying the cluster token; this validates it and replies
-/// with the verdict. Returns `Ok(true)` to proceed into the op loop, `Ok(false)`
-/// to close — after sending the rejection so the client surfaces a clean
-/// `PermissionDenied` rather than a bare connection reset. EOF before the
-/// handshake is just a peer that connected and left (`Ok(false)`). The reason is
-/// a fixed safe string (no secret, no internal path; M7 §5).
+/// Outcome of the session-open handshake.
+enum HandshakeResult {
+    /// Bad token (or malformed/absent Hello): a rejection was sent; close.
+    Reject,
+    /// Accepted; the declared input root to scope file supply to (`None` =
+    /// unscoped, the legacy/test case).
+    Accept(Option<String>),
+}
+
+/// Normalizes a declared root for prefix comparison: lowercased, `/`→`\`, no
+/// trailing separator. Empty in → `None` (unscoped).
+fn normalize_root(root: &str) -> Option<String> {
+    let r = root.replace('/', "\\").to_lowercase();
+    let r = r.trim_end_matches('\\');
+    if r.is_empty() {
+        None
+    } else {
+        Some(r.to_string())
+    }
+}
+
+/// Whether the requested (agent-side logical) path is within the session's
+/// declared root. `None` root = unscoped (always in). The comparison normalizes
+/// separators and case and requires a path-component boundary, so `…\proj` does
+/// not match a sibling `…\project`. Path-form edge cases (8.3 short names,
+/// `\\?\`, UNC, symlinks) are the known residuals tracked in `docs/deferred.md`;
+/// they fail CLOSED here (treated as out of scope) rather than leak.
+fn path_in_scope(requested: &str, root: &Option<String>) -> bool {
+    let Some(root) = root else {
+        return true;
+    };
+    let req = requested.replace('/', "\\").to_lowercase();
+    let req = req.trim_end_matches('\\');
+    req == root.as_str() || req.starts_with(&format!("{root}\\"))
+}
+
+/// Server side of the session-open handshake (M7.0 auth + M7.1 scoping). The
+/// peer's first frame must be a `Hello` carrying the cluster token and the
+/// declared root; this validates the token and replies with the verdict, then
+/// returns the normalized root to scope supply to. A rejection is sent before
+/// closing so the client surfaces a clean `PermissionDenied`, not a bare reset.
+/// EOF before the handshake is just a peer that connected and left. The reason
+/// is a fixed safe string (no secret, no internal path; M7 §5).
 async fn handshake(
     rd: &mut tokio::net::tcp::OwnedReadHalf,
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
-    expected: &str,
-) -> io::Result<bool> {
+    expected: Option<&str>,
+) -> io::Result<HandshakeResult> {
     use tokio::io::AsyncWriteExt;
 
     // Slow-loris defense (security F4): a peer that connects and then never sends
@@ -303,20 +340,28 @@ async fn handshake(
     const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let (header, payload) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(rd)).await {
         Ok(Ok(v)) => v,
-        Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Ok(HandshakeResult::Reject);
+        }
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(HandshakeResult::Reject),
     };
-    let decision: Result<(), &'static str> = if header.op == OpCode::Hello {
+    // Validate the token; on success carry the declared root out.
+    let decision: Result<Option<String>, &'static str> = if header.op == OpCode::Hello {
         match HelloRequest::decode(&payload) {
-            Ok(h) => sembazuru_proto::auth::check(Some(expected), &h.token),
+            Ok(h) => match sembazuru_proto::auth::check(expected, &h.token) {
+                Ok(()) => Ok(normalize_root(&h.root)),
+                Err(reason) => Err(reason),
+            },
             Err(_) => Err("malformed handshake"),
         }
     } else {
-        Err("auth handshake required")
+        Err("session handshake required")
     };
-    let ok = decision.is_ok();
-    let detail = decision.err().unwrap_or("").to_string();
+    let (ok, detail) = match &decision {
+        Ok(_) => (true, String::new()),
+        Err(reason) => (false, reason.to_string()),
+    };
     let resp = HelloResponse { ok, detail }.encode();
     write_frame(
         wr,
@@ -329,17 +374,26 @@ async fn handshake(
     )
     .await?;
     wr.flush().await?;
-    Ok(ok)
+    Ok(match decision {
+        Ok(root) => HandshakeResult::Accept(root),
+        Err(_) => HandshakeResult::Reject,
+    })
 }
 
-async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Session>, map: &PathMap) -> Vec<u8> {
+async fn dispatch(
+    op: OpCode,
+    payload: &[u8],
+    session: &Arc<Session>,
+    map: &PathMap,
+    root: &Option<String>,
+) -> Vec<u8> {
     match op {
         OpCode::StatBatch => match StatRequest::decode(payload) {
-            Ok(req) => stat_batch(req, map).await.encode(),
+            Ok(req) => stat_batch(req, map, root).await.encode(),
             Err(_) => StatResponse { entries: vec![] }.encode(),
         },
         OpCode::OpenRead => match OpenReadRequest::decode(payload) {
-            Ok(req) => open_read(req, session, map).await.encode(),
+            Ok(req) => open_read(req, session, map, root).await.encode(),
             Err(_) => not_found_open().encode(),
         },
         OpCode::Read => match ReadRequest::decode(payload) {
@@ -347,7 +401,7 @@ async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Session>, map: &Path
             Err(_) => ReadResponse { bytes: vec![] }.encode(),
         },
         OpCode::DirList => match DirListRequest::decode(payload) {
-            Ok(req) => dir_list(req, map).await.encode(),
+            Ok(req) => dir_list(req, map, root).await.encode(),
             Err(_) => DirListResponse {
                 exists: false,
                 entries: vec![],
@@ -382,6 +436,17 @@ fn wb_err(detail: String) -> WriteBackResponse {
     WriteBackResponse { ok: false, detail }
 }
 
+/// Sanitizes an agent-side WriteBack I/O error for the wire (M7.1, error-leak
+/// hardening). The raw `io::Error` carries the agent's output/temp filesystem
+/// paths; that detail is logged on the AGENT's own stderr and only the coarse,
+/// path-free `category` is returned to the (untrusted) worker. Digest-mismatch
+/// and protocol-misuse responses stay verbatim — they carry hashes/offsets, not
+/// paths, and are the useful signal.
+fn wb_io_err(category: &'static str, detail: impl std::fmt::Display) -> WriteBackResponse {
+    eprintln!("sembazuru-agent: writeback {category}: {detail}");
+    wb_err(category.to_string())
+}
+
 /// A same-directory temp sibling, so the eventual rename is same-volume (atomic).
 fn tmp_sibling(final_path: &std::path::Path) -> PathBuf {
     let mut tmp = final_path.to_path_buf();
@@ -411,11 +476,11 @@ async fn write_back(req: WriteBackRequest, session: &Session) -> WriteBackRespon
         if let Some(parent) = final_path.parent()
             && let Err(e) = tokio::fs::create_dir_all(parent).await
         {
-            return wb_err(format!("create output dir: {e}"));
+            return wb_io_err("create output dir failed", e);
         }
         let tmp = tmp_sibling(&final_path);
         if let Err(e) = tokio::fs::File::create(&tmp).await {
-            return wb_err(format!("create temp: {e}"));
+            return wb_io_err("create temp failed", e);
         }
         wbs.insert(
             req.path.clone(),
@@ -445,13 +510,13 @@ async fn write_back(req: WriteBackRequest, session: &Session) -> WriteBackRespon
         {
             Ok(mut f) => {
                 if let Err(e) = f.seek(std::io::SeekFrom::Start(req.offset)).await {
-                    return wb_err(format!("seek temp: {e}"));
+                    return wb_io_err("seek temp failed", e);
                 }
                 if let Err(e) = f.write_all(&req.bytes).await {
-                    return wb_err(format!("write temp: {e}"));
+                    return wb_io_err("write temp failed", e);
                 }
             }
-            Err(e) => return wb_err(format!("open temp: {e}")),
+            Err(e) => return wb_io_err("open temp failed", e),
         }
         state.hasher.update(&req.bytes);
         state.written += req.bytes.len() as u64;
@@ -478,7 +543,7 @@ async fn write_back(req: WriteBackRequest, session: &Session) -> WriteBackRespon
     }
     if let Err(e) = tokio::fs::rename(&state.tmp, &final_path).await {
         let _ = tokio::fs::remove_file(&state.tmp).await;
-        return wb_err(format!("atomic publish: {e}"));
+        return wb_io_err("atomic publish failed", e);
     }
     WriteBackResponse {
         ok: true,
@@ -498,9 +563,21 @@ fn not_found_open() -> OpenReadResponse {
 /// Existence + attributes only (no digest): header resolution probes many
 /// non-existent paths, so this stays cheap and ingests nothing. Digest/content
 /// come from OpenRead (which is also where snapshot pinning happens).
-async fn stat_batch(req: StatRequest, map: &PathMap) -> StatResponse {
+async fn stat_batch(req: StatRequest, map: &PathMap, root: &Option<String>) -> StatResponse {
     let mut entries = Vec::with_capacity(req.paths.len());
     for p in &req.paths {
+        // Out-of-scope paths report "does not exist" — same as a real negative
+        // probe, so a rogue worker cannot even learn whether a path outside the
+        // declared root is present (M7.1 path scoping).
+        if !path_in_scope(p, root) {
+            entries.push(StatEntry {
+                exists: false,
+                is_dir: false,
+                size: 0,
+                digest_hex: String::new(),
+            });
+            continue;
+        }
         let actual = map.resolve(p);
         let entry = match tokio::fs::metadata(&actual).await {
             Ok(md) => StatEntry {
@@ -521,7 +598,17 @@ async fn stat_batch(req: StatRequest, map: &PathMap) -> StatResponse {
     StatResponse { entries }
 }
 
-async fn open_read(req: OpenReadRequest, session: &Session, map: &PathMap) -> OpenReadResponse {
+async fn open_read(
+    req: OpenReadRequest,
+    session: &Session,
+    map: &PathMap,
+    root: &Option<String>,
+) -> OpenReadResponse {
+    // Out-of-scope open reports "not found" (existence-hiding) and ingests
+    // nothing, so no out-of-root content ever enters the session CAS (M7.1).
+    if !path_in_scope(&req.path, root) {
+        return not_found_open();
+    }
     let actual = map.resolve(&req.path);
     let Some((digest, size)) = session.ingest(&req.path, actual).await else {
         return not_found_open();
@@ -584,7 +671,14 @@ async fn has(req: HasRequest, session: &Session) -> HasResponse {
 
 /// Lists a directory's immediate children (depth is reserved for deeper
 /// prefetch; M3.2 serves one level, which covers the include-dir snapshot case).
-async fn dir_list(req: DirListRequest, map: &PathMap) -> DirListResponse {
+async fn dir_list(req: DirListRequest, map: &PathMap, root: &Option<String>) -> DirListResponse {
+    // Out-of-scope directory reports "does not exist" (existence-hiding, M7.1).
+    if !path_in_scope(&req.path, root) {
+        return DirListResponse {
+            exists: false,
+            entries: vec![],
+        };
+    }
     let actual = map.resolve(&req.path);
     let mut rd = match tokio::fs::read_dir(&actual).await {
         Ok(rd) => rd,
@@ -648,6 +742,39 @@ mod tests {
             PathMap::Identity.resolve("c:\\x\\y.h"),
             PathBuf::from("c:\\x\\y.h")
         );
+    }
+
+    #[test]
+    fn normalize_root_lowercases_and_strips_trailing_sep() {
+        assert_eq!(normalize_root(""), None);
+        assert_eq!(normalize_root("\\"), None);
+        assert_eq!(
+            normalize_root("C:\\Work\\Proj\\"),
+            Some("c:\\work\\proj".to_string())
+        );
+        assert_eq!(
+            normalize_root("C:/Work/Proj"),
+            Some("c:\\work\\proj".to_string())
+        );
+    }
+
+    #[test]
+    fn path_in_scope_enforces_root_with_a_boundary() {
+        let root = normalize_root("C:\\work\\proj");
+        // In root: the root itself and anything under it (any case/separator).
+        assert!(path_in_scope("C:\\work\\proj", &root));
+        assert!(path_in_scope("C:\\work\\proj\\src\\a.cpp", &root));
+        assert!(path_in_scope("c:/WORK/proj/inc/h.h", &root));
+        // A sibling that merely shares the prefix string is NOT in scope.
+        assert!(!path_in_scope("C:\\work\\project\\x", &root));
+        // Outside the root entirely.
+        assert!(!path_in_scope(
+            "C:\\windows\\system32\\drivers\\etc\\hosts",
+            &root
+        ));
+        assert!(!path_in_scope("C:\\users\\dev\\.ssh\\id_rsa", &root));
+        // No root = unscoped: everything is allowed (legacy/tests).
+        assert!(path_in_scope("C:\\anything\\at\\all", &None));
     }
 
     #[test]
