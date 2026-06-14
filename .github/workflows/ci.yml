@@ -92,3 +92,9 @@ jobs:
       # interception mechanism (the CMake/Ninja path carries the clang-cl bytes).
       - name: M6.2 MSBuild integration (CLToolExe shim routes through the daemon)
         run: pwsh -NoProfile -File hooks/test/m6_msbuild.ps1
+      # Gates M7.2: the Authenticode sign->verify pipeline. Runs LAST so it signs
+      # the final artifacts (launcher.exe + hook DLL) without perturbing the
+      # compile gates above. Uses an ephemeral self-signed cert to prove the
+      # mechanism; a real release swaps in an OV cert (docs/security/edr-allowlist.md).
+      - name: M7.2 Authenticode signing pipeline (sign+verify, placeholder cert)
+        run: pwsh -NoProfile -File hooks/test/sign_smoke.ps1
