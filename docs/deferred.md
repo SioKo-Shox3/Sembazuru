@@ -260,6 +260,20 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   注入）は無く署名可能。M7 のベンダ許可リスト申請は steady-state の挙動（injector が cl.exe を子に注入）を明記。
   出所: security(M6.1 Info)、deferred EDR メモ。
 
+### M6.3（CMake/Ninja 統合ゲート）実装後の繰延（2026-06-15）
+- **distributed `.obj` がフル env のローカル参照とバイト一致しない（DIAG 降格・best-effort）。** `m6_ninja.ps1` は
+  CMake の compile 行で distributed と「launcher 無しローカル参照」を比較すると、clang-cl で ~900B 差が出る（CI 実測、
+  TAIL ASCII で確認）。差は `.debug$S` のビルド情報（cwd/パス/コマンドライン文字列）で、ローカル参照は開発者のフル env、
+  worker は `env_clear`＋コンパイラ env allowlist（M6.0/M7.1）で走る**非対称**に起因。リンク・実行に無影響（exe exit 0）、
+  `distributed==cached` は完全一致（CAS round-trip ロスレス）。よってゲートの hard 不変条件は `cached==distributed` とし、
+  dist-vs-ref は DIAG。canonical な distributed==local バイト一致は最小 compile について `m6_daemon_compile.ps1` が所有。
+  強い「CMake 経路でも distributed==local」を求めるなら、参照ビルドを worker と同じフィルタ env で取る対応が将来余地。
+  出所: CI 診断(M6.3, run 27505885286)、verifier(M6.3 反証)、横断「MSVC ネイティブのバイト一致は best-effort」と同類。
+- **単一 worker＋並列 fanout ではスケジューラが一部アクションをローカルフォールバックする（設計通り・ゲートは -j1 で回避）。**
+  ninja の並列投入で idle slot 不足時に route-away ではなくローカル実行に落ちる（windows-2025 で remote=3/4 を観測）。
+  M6.3 は `ninja -j 1`（直列）で単一 worker に常時スロットを持たせ全 TU の remote を決定化。並列 fanout の取りこぼし削減
+  （キューイング/待機の閾値）は M5 のスケーリング領域。出所: CI(M6.3, run 27506175019)。
+
 ## M7（堅牢化・セキュリティ）
 
 - **制御/データプレーンの認証 — 解消（M7.0、ADR 0006）。** 信頼モデルを LAN-trusted に
