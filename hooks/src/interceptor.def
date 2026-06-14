@@ -1,5 +1,7 @@
 ; DetourCreateProcessWithDllEx requires the injected DLL to export
 ; DetourFinishHelperProcess (provided by detours.lib) as ordinal 1.
-LIBRARY sbz_interceptor64
+; No LIBRARY line: the same .def serves both the 64- and 32-bit interceptor
+; DLLs (sbz_interceptor64 / sbz_interceptor32), whose output name CMake sets per
+; target architecture.
 EXPORTS
     DetourFinishHelperProcess @1 NONAME

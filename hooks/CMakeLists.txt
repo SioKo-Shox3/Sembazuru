@@ -25,14 +25,27 @@ target_include_directories(detours PUBLIC ${DETOURS_DIR})
 target_compile_definitions(detours PRIVATE WIN32_LEAN_AND_MEAN)
 
 # --- M1 tracer: observe-only interceptor + injection launcher ---------------
-# The DLL name must end in "64" (or "32"): Detours' cross-bitness child
-# injection derives the sibling DLL name from that suffix.
-add_library(sbz_interceptor64 SHARED
+# The DLL name must end in "64" (or "32"): when a process carrying the hook DLL
+# spawns a child of the OTHER bitness, Detours derives the sibling DLL name from
+# that suffix and injects it (M7.3 cross-bitness child injection). So we name the
+# DLL by the build's target architecture: an x64 build yields sbz_interceptor64,
+# an x86 build (cmake -A Win32) yields sbz_interceptor32. CI builds both and
+# places them side by side so the sibling lookup finds the other bitness.
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+  set(SBZ_INTERCEPTOR sbz_interceptor64)
+else()
+  set(SBZ_INTERCEPTOR sbz_interceptor32)
+endif()
+add_library(${SBZ_INTERCEPTOR} SHARED
   src/interceptor.cpp
   src/trace_writer.cpp
   src/interceptor.def
 )
-target_link_libraries(sbz_interceptor64 PRIVATE detours)
+target_link_libraries(${SBZ_INTERCEPTOR} PRIVATE detours)
 
 add_executable(launcher src/launcher.cpp)
 target_link_libraries(launcher PRIVATE detours)
+
+# Cross-bitness injection probe (M7.3). A tiny target the 32-bit build turns into
+# a 32-bit child for m7_inject32.ps1; no Detours dependency (it is the injectee).
+add_executable(probe test/probe.cpp)

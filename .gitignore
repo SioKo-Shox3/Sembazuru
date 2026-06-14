@@ -3,6 +3,7 @@
 
 # C++ / CMake build output (out-of-source builds only)
 /hooks/build/
+/hooks/build32/
 
 # Visual Studio / MSVC artifacts outside build dirs
 .vs/

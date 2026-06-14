@@ -20,12 +20,27 @@ jobs:
 
   hooks:
     name: C++ hooks + tracer (MSVC)
-    runs-on: windows-latest
+    # M7.3 Windows-version matrix: run the hook/Detours + determinism + injection
+    # gates on more than one Windows image so an OS update (or a Detours-fork
+    # regression against it) is caught automatically. fail-fast off so one OS
+    # leg's failure does not hide the other's result.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cmake -S hooks -B hooks/build -A x64
       - run: cmake --build hooks/build --config Release
+      # M7.3: also build the 32-bit interceptor (and the probe) and place the
+      # 32-bit DLL next to the 64-bit one, so Detours' cross-bitness sibling
+      # lookup finds it when a 64-bit injector spawns a 32-bit child.
+      - run: cmake -S hooks -B hooks/build32 -A Win32
+      - run: cmake --build hooks/build32 --config Release
+      - name: Stage 32-bit interceptor next to the 64-bit one
+        run: Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
       - run: cargo build -p sembazuru-tracer --release
       - uses: ilammy/msvc-dev-cmd@v1
       # Gates the M1 "Done when": completeness (every /showIncludes header is
@@ -92,6 +107,12 @@ jobs:
       # interception mechanism (the CMake/Ninja path carries the clang-cl bytes).
       - name: M6.2 MSBuild integration (CLToolExe shim routes through the daemon)
         run: pwsh -NoProfile -File hooks/test/m6_msbuild.ps1
+      # Gates M7.3: a 64-bit injector spawning a 32-bit child gets the 32-bit
+      # interceptor (sbz_interceptor32.dll) via Detours' cross-bitness sibling
+      # lookup. Positive (trace written, child's open captured) + negative control
+      # (remove the 32-bit sibling -> no trace).
+      - name: M7.3 cross-bitness injection (64-bit injector -> 32-bit child)
+        run: pwsh -NoProfile -File hooks/test/m7_inject32.ps1
       # Gates M7.2: the Authenticode sign->verify pipeline. Runs LAST so it signs
       # the final artifacts (launcher.exe + hook DLL) without perturbing the
       # compile gates above. Uses an ephemeral self-signed cert to prove the
