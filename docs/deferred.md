@@ -366,6 +366,22 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   eviction は daemon のセッション寿命管理が要る。WorkerTable reaper（M7.4）でテーブルは有界化したが、
   scratch/trace/CAS の eviction は別途。出所: deferred #8、security(M6.1 Low)、M7.4。
 
+## M8（汎用化 / Beyond Compilation）— ADR 0007
+
+- **M3.x「未仮想化検知器未実装」「per-file 暗黙ローカルフォールバックの危険」を M8.2 で対応予定。**
+  ADR 0007 §(a) の二段機構（route-away スクリーン＋worker fail-closed）で扱う。着手・解消時に M3.x 該当行へ
+  「解消（M8.2）」を付す。出所: ADR 0007、deferred M3.x。
+- **M6.1「launcher の出力推論は /Fo ヒューリスティック」を M8.1 で汎化予定。** trace ベース出力発見
+  （`logical_outputs`）を既定経路化し、外部宣言（`SEMBAZURU_OUTPUTS`／declared_outputs）を優先。dxc 等
+  非 cl/clang-cl でもキャッシュ可能化。出所: ADR 0007 §(b)、M6.1。
+
+### M8.x（実 2 台 LAN・決定者承認の別スコープ・繰延）
+M8 の汎化作業（単機+RTT で実証）から分離。承認後に着手:
+- **cwd=入力ルート崩れの cross-machine 実証**（M8.3 は単機で宣言ルートを実装、2 台での実証は M8.x）。
+- **trace のデータプレーン返送**（単機共有 FS 前提＝`VfsExecution.trace_dir` の解消、ADR 0005/M6.1c 繰越）。
+- **WriteBack の declared-output スコープ**（M7.1 繰越）。**authoritative root binding**（M7.1 HIGH-2）。
+- 環境準備（実 2 台）と決定者承認が前提（M3 以来の方針踏襲）。出所: ADR 0007、AskUser(2026-06-14)。
+
 ## 横断・既知の制約
 
 - **MSVC ネイティブのバイト一致はベストエフォート（M4.5 で S_OBJNAME のみ正規化）。**

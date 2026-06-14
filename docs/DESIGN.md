@@ -218,6 +218,15 @@ Incredibuild の本当の堀である「プロセス仮想化」を OSS で再�
 - コンパイラ非依存・ビルドシステム非依存の「汎用プロセス分散レイヤー」として確立
 - **Done when:** コンパイル以外のワークロードが、専用対応なしにそのまま分散される
 
+> **設計詳細は ADR `0007-arbitrary-process-distribution.md`（ACCEPTED）。** 要点:
+> (a) 未仮想化アクセスは **route-away スクリーン（msys2/denylist/breakaway をリモート前にローカルへ）＋
+> worker 側 fail-closed（vfs_root 配下の供給不能を silent-local にせず abort→ローカル再実行）** の二段で扱う
+> （user-mode では未観測 read を事後に救えない＝ADR 0001 §110-113 の帰結。syscall パターン検知は採らない）。
+> (b) 出力宣言は **任意**（外部宣言 > trace 発見 > 無キャッシュ）。宣言なしでも分散は成立＝ゼロコンフィグ堅持。
+> (c) **分散とキャッシュを分離**（決定的のみ action cache、非決定は分散可・キャッシュ不可）。
+> 最初の証明 WL = **dxc（HLSL）**。**実 2 台 LAN** は M8 で要件化せず、cross-machine 固有
+> （cwd=入力ルート崩れ・trace データプレーン返送・writeback スコープ）は決定者承認の **M8.x** に分離。
+
 ---
 
 ## 8. 横断的な懸念（全フェーズで意識する）
