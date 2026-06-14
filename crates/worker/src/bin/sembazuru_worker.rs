@@ -115,6 +115,9 @@ async fn run(capacity: Option<u32>) -> Result<(), Box<dyn std::error::Error + Se
         // No graceful-drain trigger wired yet (process exit ends heartbeats);
         // the flag exists so a future Ctrl-C handler can deregister cleanly.
         let stop = Arc::new(AtomicBool::new(false));
+        // Shared cluster token (ADR 0006), presented on Register. Empty when the
+        // cluster runs without auth; the agent then accepts unconditionally.
+        let auth_token = sembazuru_proto::auth::cluster_token_from_env().unwrap_or_default();
         eprintln!("sembazuru-worker: registering with agent {agent} as {worker_id}");
         tokio::spawn(async move {
             if let Err(e) = register_and_heartbeat(
@@ -125,6 +128,7 @@ async fn run(capacity: Option<u32>) -> Result<(), Box<dyn std::error::Error + Se
                 running,
                 Duration::from_secs(5),
                 stop,
+                auth_token,
             )
             .await
             {

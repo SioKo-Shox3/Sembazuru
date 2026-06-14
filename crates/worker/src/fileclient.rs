@@ -156,9 +156,55 @@ impl FileClient {
     }
 
     /// Connects with a synthetic per-op RTT injected at the framing layer (for
-    /// the M3.5 latency benchmark; pass `Duration::ZERO` in production).
+    /// the M3.5 latency benchmark; pass `Duration::ZERO` in production). No auth
+    /// token — used by tests/examples on an auth-disabled agent.
     pub async fn connect_with_rtt<A: ToSocketAddrs>(addr: A, rtt: Duration) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        Self::connect_with_rtt_token(addr, rtt, String::new()).await
+    }
+
+    /// Connects and, when `token` is non-empty, performs the shared-token
+    /// handshake (M7, ADR 0006) before any op: it writes a single `Hello` frame
+    /// and waits for the agent's verdict, failing the connect if the agent
+    /// rejects it. An empty token skips the handshake entirely, so the wire is
+    /// byte-identical to M6 on an auth-disabled cluster. The handshake runs on
+    /// the raw stream *before* the multiplexing reader task starts, so it cannot
+    /// race ordinary ops.
+    pub async fn connect_with_rtt_token<A: ToSocketAddrs>(
+        addr: A,
+        rtt: Duration,
+        token: String,
+    ) -> io::Result<Self> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = TcpStream::connect(addr).await?;
+        if !token.is_empty() {
+            let payload = sembazuru_dataplane::ops::HelloRequest { token }.encode();
+            write_frame(
+                &mut stream,
+                FrameHeader {
+                    request_id: 0,
+                    op: OpCode::Hello,
+                    is_response: false,
+                },
+                &payload,
+            )
+            .await?;
+            stream.flush().await?;
+            let (header, resp) = read_frame(&mut stream).await?;
+            if header.op != OpCode::Hello || !header.is_response {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "data-plane handshake response did not correlate",
+                ));
+            }
+            let hello = sembazuru_dataplane::ops::HelloResponse::decode(&resp).map_err(to_io)?;
+            if !hello.ok {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("data-plane auth rejected: {}", hello.detail),
+                ));
+            }
+        }
         let (rd, wr) = stream.into_split();
         let mux = Arc::new(Mux {
             write: Mutex::new(wr),

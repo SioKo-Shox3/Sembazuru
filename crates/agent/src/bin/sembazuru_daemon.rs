@@ -20,8 +20,10 @@
 use std::sync::Arc;
 
 use sembazuru_agent::action_cache::AgentCache;
-use sembazuru_agent::coordination::{DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination};
-use sembazuru_agent::fileserver::{ServerStats, serve_files_with_stats};
+use sembazuru_agent::coordination::{
+    DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination_with_token,
+};
+use sembazuru_agent::fileserver::{ServerStats, serve_files_with_stats_token};
 use sembazuru_agent::intake::{
     IntakeService, IntakeVfsContext, resolve_loopback_intake, serve_intake_service,
 };
@@ -31,11 +33,39 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+/// Warns loudly when an unauthenticated daemon exposes a LAN-reachable listener:
+/// auth disabled **and** a non-loopback bind means any host on the network can
+/// register a worker or read the agent's filesystem (ADR 0006; security F1).
+/// Loopback, or auth enabled, is fine and says nothing.
+fn warn_if_exposed(role: &str, addr: std::net::SocketAddr, auth_enabled: bool) {
+    if !auth_enabled && !addr.ip().is_loopback() {
+        eprintln!(
+            "sembazuru-daemon: WARNING: {role} listens on {addr} (non-loopback) with worker auth \
+             DISABLED — any host on this network can reach it. Set SEMBAZURU_CLUSTER_TOKEN on the \
+             daemon and every worker to require authentication (ADR 0006)."
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let coord_addr = env_or("SEMBAZURU_COORD", "127.0.0.1:50070");
     let intake_addr = env_or("SEMBAZURU_INTAKE", "127.0.0.1:50071");
     let file_addr = env_or("SEMBAZURU_FILESERVER", "127.0.0.1:50072");
+
+    // Shared cluster token (ADR 0006). When set, workers must present it on both
+    // the control plane (Register) and the data-plane handshake; when unset the
+    // daemon runs unauthenticated (M5/M6 LAN behaviour). Distributed out-of-band
+    // via SEMBAZURU_CLUSTER_TOKEN to the daemon and every worker.
+    let cluster_token = sembazuru_proto::auth::cluster_token_from_env();
+    eprintln!(
+        "sembazuru-daemon: worker auth {}",
+        if cluster_token.is_some() {
+            "ENABLED (shared token)"
+        } else {
+            "disabled (LAN-trusted)"
+        }
+    );
 
     let table = WorkerTable::new(DEFAULT_DEAD_TIMEOUT);
     let scheduler = Scheduler::new(table.clone());
@@ -47,10 +77,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "sembazuru-daemon: Coordination on {}",
         coord_listener.local_addr()?
     );
+    warn_if_exposed(
+        "Coordination",
+        coord_listener.local_addr()?,
+        cluster_token.is_some(),
+    );
     {
         let t = table.clone();
+        let tok = cluster_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_coordination(coord_listener, t).await {
+            if let Err(e) = serve_coordination_with_token(coord_listener, t, tok).await {
                 eprintln!("sembazuru-daemon: Coordination server exited: {e}");
             }
         });
@@ -61,10 +97,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file_listener = tokio::net::TcpListener::bind(&file_addr).await?;
     let fileserver_addr = file_listener.local_addr()?;
     eprintln!("sembazuru-daemon: file server on {fileserver_addr}");
+    warn_if_exposed("file server", fileserver_addr, cluster_token.is_some());
     {
         let stats = Arc::new(ServerStats::default());
+        let tok = cluster_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_files_with_stats(file_listener, stats).await {
+            if let Err(e) = serve_files_with_stats_token(file_listener, stats, tok).await {
                 eprintln!("sembazuru-daemon: file server exited: {e}");
             }
         });

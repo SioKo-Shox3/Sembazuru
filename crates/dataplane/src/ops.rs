@@ -423,6 +423,53 @@ impl HasResponse {
     }
 }
 
+// --- Hello (session auth handshake, M7 / ADR 0006) -----------------------
+
+/// The worker's session-opening handshake: presents the shared cluster token.
+/// Only sent when auth is configured (see [`crate::wire::OpCode::Hello`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelloRequest {
+    pub token: String,
+}
+
+/// The agent's verdict on the handshake. `ok == false` means the agent will
+/// close the connection; `detail` is a fixed safe string (no secret, no path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelloResponse {
+    pub ok: bool,
+    pub detail: String,
+}
+
+impl HelloRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.str(&self.token);
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let token = r.str()?;
+        r.finish()?;
+        Ok(HelloRequest { token })
+    }
+}
+
+impl HelloResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bool(self.ok);
+        w.str(&self.detail);
+        w.into_bytes()
+    }
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let ok = r.bool()?;
+        let detail = r.str()?;
+        r.finish()?;
+        Ok(HelloResponse { ok, detail })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

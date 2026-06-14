@@ -121,13 +121,28 @@ impl WorkerTable {
 pub struct CoordinationService {
     table: WorkerTable,
     start: Instant,
+    /// Configured cluster auth token (ADR 0006). `None` = auth disabled, in
+    /// which case `Register` accepts unconditionally (M5/M6 back-compat).
+    expected_token: Option<String>,
 }
 
 impl CoordinationService {
+    /// Builds the service with auth **disabled** (M5/M6 LAN back-compat). The
+    /// daemon enables auth explicitly via [`serve_coordination_with_token`] with
+    /// the env-configured token; this default keeps tests/harnesses unauthenticated
+    /// without depending on the process environment.
     pub fn new(table: WorkerTable) -> Self {
+        Self::with_token(table, None)
+    }
+
+    /// Builds the service with an explicit expected token (`None` = auth
+    /// disabled). Tests use this to exercise accept/reject without touching the
+    /// process environment.
+    pub fn with_token(table: WorkerTable, expected_token: Option<String>) -> Self {
         Self {
             table,
             start: Instant::now(),
+            expected_token,
         }
     }
 }
@@ -147,11 +162,24 @@ impl Coordination for CoordinationService {
         if req.execution_endpoint.is_empty() {
             return Err(Status::invalid_argument("execution_endpoint is required"));
         }
+        // Shared-token auth (ADR 0006). With a cluster token configured, a worker
+        // presenting the wrong/no token is rejected here — this closes the
+        // unauthenticated-Register path that let a rogue worker inject wrong
+        // results or black-hole actions (deferred M5.2/M5.5, M6.1). With no token
+        // configured this is a no-op accept (M5/M6 LAN back-compat). The reason
+        // is a fixed safe string (no secret, no internal path; M7 §5).
+        if let Err(reason) =
+            sembazuru_proto::auth::check(self.expected_token.as_deref(), &req.auth_token)
+        {
+            return Ok(Response::new(RegisterResponse {
+                protocol_version: PROTOCOL_VERSION,
+                accepted: false,
+                detail: reason.to_string(),
+            }));
+        }
         let caps = req.caps.unwrap_or_default();
         self.table
             .upsert_register(req.worker_id, req.execution_endpoint, caps);
-        // M5 is LAN-trusted: accept unconditionally (ADR 0004 §6). Attestation
-        // is reserved for M7 (RegisterRequest fields 10–11).
         Ok(Response::new(RegisterResponse {
             protocol_version: PROTOCOL_VERSION,
             accepted: true,
@@ -188,18 +216,32 @@ impl Coordination for CoordinationService {
 
 /// Serves the `Coordination` service on an already-bound listener, populating
 /// `table` as workers register and heartbeat. Mirrors the worker's
-/// `serve_on_listener` (ephemeral-port-friendly for tests and the daemon).
+/// `serve_on_listener` (ephemeral-port-friendly for tests and the daemon). Auth
+/// **disabled** — the daemon uses [`serve_coordination_with_token`] with the
+/// env-configured token (ADR 0006); this plain form is for tests/harnesses.
 pub async fn serve_coordination(
     listener: TcpListener,
     table: WorkerTable,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_coordination_with_token(listener, table, None).await
+}
+
+/// Like [`serve_coordination`] but with an explicit expected token (`None` =
+/// auth disabled). Lets tests stand up an authenticated server deterministically
+/// without mutating the process-global environment.
+pub async fn serve_coordination_with_token(
+    listener: TcpListener,
+    table: WorkerTable,
+    expected_token: Option<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use sembazuru_proto::v0::coordination_server::CoordinationServer;
 
+    let svc = CoordinationService::with_token(table, expected_token);
     let incoming = TcpListenerStream::new(listener);
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .add_service(CoordinationServer::new(CoordinationService::new(table)))
+        .add_service(CoordinationServer::new(svc))
         .serve_with_incoming(incoming)
         .await?;
     Ok(())

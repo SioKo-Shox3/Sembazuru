@@ -57,6 +57,9 @@ struct VfsState {
     cas: BlobStore,
     agent_addr: SocketAddr,
     rtt: Duration,
+    /// Shared cluster token (M7, ADR 0006) presented on the data-plane handshake.
+    /// Empty when the cluster runs without auth (no handshake, M6-identical wire).
+    auth_token: String,
     /// The session's pooled, multiplexed agent connection, dialed on first
     /// hydrate. `OnceCell::get_or_try_init` retries if the first dial fails, so a
     /// worker that starts before the agent is listening recovers on a later open.
@@ -68,7 +71,13 @@ impl VfsState {
     /// bump; all hydrates issue ops concurrently over the one socket.
     async fn client(&self) -> io::Result<FileClient> {
         self.client
-            .get_or_try_init(|| FileClient::connect_with_rtt(self.agent_addr, self.rtt))
+            .get_or_try_init(|| {
+                FileClient::connect_with_rtt_token(
+                    self.agent_addr,
+                    self.rtt,
+                    self.auth_token.clone(),
+                )
+            })
             .await
             .cloned()
     }
@@ -187,6 +196,9 @@ pub async fn serve_vfs_with_prefetch_ready(
         cas: BlobStore::open(cas_root)?,
         agent_addr,
         rtt,
+        // Production token comes from the environment (ADR 0006); empty disables
+        // the handshake (M6-identical wire on an unauthenticated cluster).
+        auth_token: sembazuru_proto::auth::cluster_token_from_env().unwrap_or_default(),
         client: OnceCell::new(),
     });
 
@@ -417,6 +429,7 @@ mod tests {
             cas: BlobStore::open(temp("cas")).unwrap(),
             agent_addr: addr,
             rtt: Duration::ZERO,
+            auth_token: String::new(), // auth-disabled harness
             client: OnceCell::new(),
         });
 

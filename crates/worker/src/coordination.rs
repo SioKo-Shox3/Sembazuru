@@ -30,6 +30,10 @@ pub fn local_capabilities(capacity: u32) -> Capabilities {
         cpu_count: capacity.max(1),
         memory_bytes: 0, // best-effort; not load-bearing for scheduling yet
         data_plane_transports: vec!["tcp-framed".to_string()],
+        // This build speaks the M7 shared-token handshake (ADR 0006). An agent
+        // with a cluster token configured uses this to tell M7 workers from
+        // pre-M7 ones; an agent without a token ignores it.
+        supports_auth: true,
     }
 }
 
@@ -56,6 +60,9 @@ pub async fn register_and_heartbeat(
     running: Arc<AtomicU32>,
     heartbeat_interval: Duration,
     stop: Arc<AtomicBool>,
+    // Shared cluster token to present on Register (ADR 0006). Empty when the
+    // cluster runs without auth; the agent then accepts unconditionally.
+    auth_token: String,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let caps = local_capabilities(capacity);
     let cpu_count = caps.cpu_count;
@@ -73,6 +80,7 @@ pub async fn register_and_heartbeat(
             worker_id: worker_id.clone(),
             caps: Some(caps),
             execution_endpoint,
+            auth_token,
         })
         .await?
         .into_inner();

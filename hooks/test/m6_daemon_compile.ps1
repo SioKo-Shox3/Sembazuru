@@ -16,7 +16,13 @@
 param(
     [string]$BuildDir = (Join-Path $PSScriptRoot '..\build\Release'),
     [string]$WorkRoot = (Join-Path $PSScriptRoot '..\build\m6-daemon-work'),
-    [switch]$RequireClangCl
+    [switch]$RequireClangCl,
+    # M7.0 (ADR 0006): when set, the daemon and worker both run with this shared
+    # cluster token, so the full distributed path (Register + data-plane Hello)
+    # runs AUTHENTICATED end to end. The .obj must still be byte-identical — auth
+    # is connection-level and does not touch compiler output. Empty = M5/M6
+    # unauthenticated path (back-compat), which is the default gate.
+    [string]$AuthToken = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -95,18 +101,22 @@ $daemonUrl = "http://$intake"
 function Start-Daemon {
     $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $intake; $env:SEMBAZURU_FILESERVER = $fs
     $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
+    if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
     $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
     Remove-Item Env:\SEMBAZURU_COORD, Env:\SEMBAZURU_INTAKE, Env:\SEMBAZURU_FILESERVER, `
-        Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT -ErrorAction SilentlyContinue
+        Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+        -ErrorAction SilentlyContinue
     $p
 }
 function Start-Worker {
     $env:SEMBAZURU_AGENT = "http://$coord"
     $env:SEMBAZURU_LAUNCHER = $launcherExe; $env:SEMBAZURU_DLL = $dll
     $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot; $env:SEMBAZURU_CAS_ROOT = $casRoot
+    if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
     $p = Start-Process -FilePath $workerExe -ArgumentList @($worker) -PassThru -WindowStyle Hidden
     Remove-Item Env:\SEMBAZURU_AGENT, Env:\SEMBAZURU_LAUNCHER, Env:\SEMBAZURU_DLL, `
-        Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT -ErrorAction SilentlyContinue
+        Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+        -ErrorAction SilentlyContinue
     $p
 }
 # Run the launcher as the compiler wrapper; returns @{ exit; note } (note=stderr).
@@ -186,4 +196,5 @@ if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Host "  - $_" }
     exit 1
 }
-Write-Host "M6.1 DAEMON COMPILE GATE PASS (distributed byte-identical, local fallback, 2nd-build cache hit) compiler=$cc"
+$authLabel = if ($AuthToken) { 'AUTH=on (shared token)' } else { 'auth=off' }
+Write-Host "M6.1 DAEMON COMPILE GATE PASS (distributed byte-identical, local fallback, 2nd-build cache hit) compiler=$cc $authLabel"
