@@ -140,10 +140,23 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   登録して誤結果を返す／アクションを吸引する経路は閉鎖。トークンを持つ trusted worker のバグ/誤設定は
   残（capacity 申告は依然 clamp(1,256) で正しさを担保）。出所: security(M5.2 M3)、ADR 0006。
 - ~~**孫プロセスの孤児。**~~ **解消（M6.1e ツリー kill＋M7.4 サンドボックス強化）。** Job Object でツリー一括
-  kill（M6.1e）に加え、M7.4 で untrusted compiler 子へ UI 制限（desktop/clipboard/exitwindows/globalatoms/
-  displaysettings/systemparameters）＋`DIE_ON_UNHANDLED_EXCEPTION`（WER ダイアログで headless worker を
-  ハングさせない）を付与。breakaway は既定 off 維持（job から脱出不可）。`crates/worker/src/job.rs`。
-  出所: security(M5.2 L3)、M7.4。
+  kill（M6.1e、孫 kill を `dropping_the_job_kills_the_grandchild` テストで実証）に加え、M7.4 で UI 制限
+  （desktop/clipboard/exitwindows/globalatoms/displaysettings/systemparameters）＋`DIE_ON_UNHANDLED_EXCEPTION`
+  （WER ダイアログで headless worker をハングさせない）を付与。**VFS 経路だけでなく plain-spawn 経路の子にも
+  同 Job Object を適用**（security HIGH-1、サンドボックスを両経路で一貫）。breakaway は既定 off 維持
+  （job 脱出不可）。`crates/worker/src/job.rs`、`lib.rs build_child`。出所: security(M5.2 L3/M7.4)、M7.4。
+- **現サンドボックスの守備範囲＝UI＋孤児＋WER のみ（脅威モデル明記・受容）。** Job Object UI 制限は
+  USER/GDI（デスクトップ・クリップボード・atom・display/system params）のみで、**ネットワーク発信・
+  ファイル/レジストリ書込み・子プロセス生成・トークン操作は制限しない**。脅威モデルは LAN-trusted＋
+  共有トークン認証（rogue worker は閉鎖済み）前提のため、実行コードは「trusted worker が受け取った
+  コンパイラ入力」＝脅威は外部攻撃者でなくバグ/誤設定。その前提下で UI 制限＋ツリー kill＋die-on-exception
+  は妥当な第一歩。network/FS/registry 隔離（WFP/AppContainer）は受容リスクとして M7 未実装、ゼロトラスト
+  方向で将来対応。出所: security(M7.4 MEDIUM-2)、researcher(Job Object 限界)。
+- **spawn→assign の TOCTOU 窓（既存残差・MEDIUM-1）。** launcher/子を非サスペンドで spawn してから
+  assign するため、極端な競合で grandchild が job 外に出る理論的余地（M6.1 risk5 で既出）。完全排除は
+  CREATE_SUSPENDED→assign→ResumeThread だが tokio Command は CREATE_SUSPENDED を直接出せず
+  `creation_flags`＋手動 ResumeThread が要る。kill_on_drop が直接子をカバーし通常は assign が勝つ。
+  出所: security(M7.4 MEDIUM-1)、M6.1e。
 - **再割り当て境界の重複 WriteBack。** WriteBack 実装（M3.3/将来）時に content-addressed 冪等を
   テスト固定。現状 WriteBack 未実装で顕在化せず。出所: security(M5.2 M4)。
 - **heartbeat の running_actions を least-loaded に未使用。** スケジューラは agent 自身の in_flight
