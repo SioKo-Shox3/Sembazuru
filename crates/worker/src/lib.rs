@@ -444,11 +444,22 @@ async fn build_child(
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         // Kill the child if its task is dropped (agent gave up / fallback), so
-        // the worker never leaks an orphan holding an admission slot. The plain
-        // path has no grandchild to orphan, so no Job Object is needed here.
+        // the worker never leaks an orphan holding an admission slot.
         command.kill_on_drop(true);
         let child = command.spawn().map_err(|e| setup_err("spawn failed", e))?;
-        return Ok((child, None, None));
+        // Sandbox this child too (M7.4, security HIGH-1): the plain path has no
+        // grandchild to orphan, but the Job Object's UI restrictions and
+        // die-on-unhandled-exception still apply, so whatever the agent asked us
+        // to run is sandboxed UNIFORMLY with the VFS path — not left bare. (The
+        // small spawn->assign window is the same documented residual as the VFS
+        // path; kill_on_drop covers the direct child meanwhile.)
+        let job = JobObject::new_kill_on_close()
+            .and_then(|j| match child.raw_handle() {
+                Some(h) => j.assign(h).map(|()| j),
+                None => Ok(j), // already exited; nothing to assign
+            })
+            .map_err(|e| setup_err("job object setup failed", e))?;
+        return Ok((child, None, Some(job)));
     };
 
     // VFS mode. Per-action unique pipe + scratch so concurrent actions never

@@ -139,6 +139,88 @@ mod tests {
     use super::*;
     use std::process::Stdio;
 
+    /// Whether `pid` is currently a running process. Uses `tasklist` (no unsafe in
+    /// the test): it prints the row only when the PID exists, and "No tasks…"
+    /// otherwise.
+    fn pid_alive(pid: u32) -> bool {
+        match std::process::Command::new("tasklist")
+            .args(["/NH", "/FI", &format!("PID eq {pid}")])
+            .output()
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+            Err(_) => false,
+        }
+    }
+
+    /// The whole reason the Job Object exists (M6.1e): killing the direct child
+    /// must also kill the GRANDCHILD (the real compiler the launcher injects).
+    /// `powershell -> ping` models `launcher -> compiler`: we capture the
+    /// grandchild (ping) PID, drop the job, and assert that exact PID is gone —
+    /// proving the *tree* kill, not just the direct child (which `kill_on_drop`
+    /// already covered).
+    #[tokio::test]
+    async fn dropping_the_job_kills_the_grandchild() {
+        let dir = std::env::temp_dir().join(format!("sbz-job-gc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let pidfile = dir.join("gc.pid");
+        let _ = std::fs::remove_file(&pidfile);
+
+        let job = JobObject::new_kill_on_close().unwrap();
+        // The direct child (powershell) launches ping as a grandchild, records its
+        // PID, then waits on it (so the grandchild is long-lived until killed).
+        let script = format!(
+            "$p = Start-Process ping -ArgumentList '-n','30','127.0.0.1' -PassThru \
+             -WindowStyle Hidden; Set-Content -Path '{}' -Value $p.Id; Wait-Process -Id $p.Id",
+            pidfile.display()
+        );
+        let mut child = tokio::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        job.assign(child.raw_handle().expect("child handle while running"))
+            .unwrap();
+
+        // Read the grandchild PID once powershell records it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let gc_pid = loop {
+            if let Ok(s) = std::fs::read_to_string(&pidfile)
+                && let Ok(pid) = s.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild PID was never recorded"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert!(
+            pid_alive(gc_pid),
+            "grandchild {gc_pid} should be running before the kill"
+        );
+
+        // Drop the job: the OS kills the whole tree (powershell AND ping).
+        drop(job);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+
+        // The grandchild's exact PID must be gone — poll briefly for async teardown.
+        let mut gone = false;
+        for _ in 0..50 {
+            if !pid_alive(gc_pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            gone,
+            "grandchild PID {gc_pid} survived the job kill — tree kill failed"
+        );
+    }
+
     /// A child assigned to a KILL_ON_JOB_CLOSE job is terminated when the job
     /// handle drops — the core orphan-prevention guarantee.
     #[tokio::test]
