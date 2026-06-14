@@ -284,16 +284,28 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   実証済み（ゲートは clang-cl で hard 強制、cl では DIAG）。非英語 cl の堅牢化が要るなら worker の出力コードページを CMake
   サンプルに合わせる（コンソール CP 固定）か、depfile ベース（`/sourceDependencies` JSON）への移行が将来余地。クリーンビルドと
   cached/distributed のバイト経路は元々無影響。出所: M6.3 直接プローブ＋CI 実測(2026-06-15)、launcher.cpp/worker lib.rs/agent intake.rs。
-- **【要対応・価値】MSBuild シム経路ではアクションキャッシュが命中しない（分散・フォールバックは動く）。** MSBuild の
-  CL タスクは複数ソースを 1 つの cl 呼び出しにバッチ化（多くはレスポンスファイル経由）するため、シムは単一の多ソース
-  アクションを受け取る。launcher の出力推論は単一 `/Fo` 前提で 1 obj しか名付けず、かつ argv ベースのキーが
-  バッチ/レスポンスファイル形で安定しないため、per-file の CMake/Ninja 経路（B1=m6_ninja で完全命中を実証）のようには
-  キャッシュされない（M6.2=m6_msbuild で build2 が cache-hit=False を実測、ローカルフォールバックで完走）。VS/MSBuild は
-  Windows の主要ビルドシステムなので 2 回目スキップが効かないのは価値ギャップ。修正候補: ① launcher でレスポンスファイル
-  （`@file`）を展開して実 argv・実出力集合を得る、② 多ソース時は出力推論を空にして trace ベース発見に委ねる
-  （`infer_outputs` を多ソースで empty 化、M8.1 の `logical_outputs` が全 obj を拾う）、③ argv 正規化でキー安定化。
-  load-bearing 度は中（launcher＋daemon の出力/キー経路）。m6_msbuild は cache を非致命 DIAG として可視化（命中すれば自動で
-  HIT 表示）。出所: M6.2 多 TU 実測(2026-06-15)、sembazuru_launcher.rs infer_outputs。
+- **【要対応・繰延】MSBuild シム経路の action cache 命中（分散・フォールバックは動く／キャッシュは未命中）。** 真因は
+  トレースの実コマンドラインで確定: MSBuild の CL タスクは全ソースを **1 つの `cl @<temp>\tmp<RANDOM>.rsp`（レスポンス
+  ファイル）で起動した単一バッチアクション**で、(a) ランダム rsp パスで weak key が毎ビルド変わる、(b) `/Zi` の共有 PDB
+  （`bin\test.pdb`）が obj（`obj\`）と別サブツリーの絶対パス出力として cwd 外に落ち `cacheable_outputs` の root 外
+  fail-close に当たる、の二重で常時 miss（m6_msbuild は cache を非致命 DIAG で可視化）。
+  **修正プロトタイプ（rsp 内容アドレス安定化＋`SEMBAZURU_INPUT_ROOT` スコープ＋root 正規化）は実装したが、品質ゲートで
+  二つの BLOCK を検出し差し戻した（2026-06-15）:**
+  - **キャッシュ汚染（determinism FAIL・最重要）:** rsp 経由のソースが**裸の相対名でトレース**され、`manifest_hash` が
+    daemon cwd から読めず「build-root-relative な読めない入力＝一時物」ヒューリスティック（`action_key.rs` input_components
+    L113-120／manifest_hash L224-231）で**落とす**ため、ソースが strong key に入らない（記録 manifest はツールチェーン DLL のみ）。
+    結果、命中を有効化すると **`a.cpp` 編集後も hit し stale な obj を serve**（ハッシュ実測で確認）。ADR 0007 §c の「同一入力
+    なら一貫セット」前提が、強キーの入力カバレッジ欠落で崩れる。
+  - **書き込みスコープ脱出（security BLOCK）:** `is_under_build_root`（`action_key.rs:85-89`）が `..` を弾かず、resolve の
+    `build_root.join(logical)`（`action_cache.rs:94`）で root 外へ任意書き込みの理論的余地（M7.1 BLOCK-1 同種）。加えて
+    resolve は**未正規化のクライアント供給 `input_root`** を使い record（正規化）と非対称、広い root 宣言で書き込み拡大。
+  - **正しい修正に必要な作業（別タスク）:** ① manifest がコンパイル対象ソースを**解決可能な絶対パス**で捕捉し、入力を
+    確実に拾えないアクションは fail-closed で無キャッシュ（ADR 0007 §b.3 を入力側にも）。② `is_under_build_root` を `..`／
+    rooted／UNC に対し自己完結で拒否、`input_root` を一度だけ正規化して gate と publish で同一値、書き込み root を cwd に
+    clamp（or 明示許容）。③ rsp の content-addressed temp は atomic-rename＋digest 再検証で TOCTOU 硬化。
+  - 据え置きの低リスク: 共有 PDB を**複数アクション横断**でキャッシュ（MSBuild バッチでは非発生）／cross-machine の出力
+    パス整合（M8.x）／`/Zi` PDB の非決定（命中時は build1 一貫セット・MSVC byte best-effort）。
+  出所: M6.2 訂正＋トレース command_line＋品質ゲート（verifier/determinism/security, 2026-06-15）。
 
 ## M7（堅牢化・セキュリティ）
 
