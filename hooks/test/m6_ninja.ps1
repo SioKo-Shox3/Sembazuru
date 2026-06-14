@@ -49,18 +49,6 @@ else { throw 'no compiler (clang-cl/cl) on PATH' }
 # we assert the mechanism (notes/exit/outputs), not byte-identity.
 $byteGate = ($cc -eq 'clang-cl')
 
-# Pin the compiler diagnostic language so ninja's `deps = msvc` parsing works across
-# the launcher. CMake records the LOCALIZED /showIncludes prefix at configure time;
-# the worker runs the compiler under env_clear + a compiler-env allowlist, so on a
-# non-English-locale dev box the remote cl would emit a DIFFERENT language than the
-# prefix CMake captured -> ninja parses 0 deps -> incremental header tracking breaks
-# (the independent TU edit would go undetected). VSLANG=1033 forces English on both
-# sides; SEMBAZURU_ENV_PASSTHROUGH lets the launcher forward it to the worker (it is
-# dropped by the default allowlist). clang-cl does not localize, so this is a no-op
-# for the CI byte gate. (Real non-English users need the same passthrough; see
-# docs/deferred.md.)
-$env:VSLANG = '1033'
-$env:SEMBAZURU_ENV_PASSTHROUGH = 'VSLANG'
 
 $ninjaCmd = Get-Command ninja -ErrorAction SilentlyContinue
 if (-not $ninjaCmd) {
@@ -368,18 +356,18 @@ if ($fb.exit -ne 0) { $failures += "local fallback ninja build failed (exit=$($f
 if (-not $fbLocal) { $failures += 'fallback did not run locally (no fallback note)' }
 if (-not (Test-Path $exe)) { $failures += 'fallback produced no app.exe' }
 
-# 5. Incremental header tracking (B3) — DIAGNOSTIC, non-fatal. Ideal behavior: on a
-# fresh-cache build the compiler runs for every TU; editing the shared header then
-# recompiles EXACTLY its dependents (a/b/c) and leaves the independent TU (main)
-# untouched, and the relinked exe reflects the edit. That requires the remote
-# compiler's /showIncludes to reach ninja so it records shared.h as a dependency.
-# As of this writing the distributed path does NOT propagate /showIncludes to ninja
-# (the worker/launcher stdio chain drops the injected child's dependency output), so
-# ninja records 0 header deps and a header edit is missed -> incremental DISTRIBUTED
-# builds can serve STALE objects (docs/deferred.md). This is a KNOWN LIMITATION, not a
-# gate failure: clean builds and the cached/distributed byte path above are unaffected,
-# and the diagnostic flips to WORKS automatically once propagation is fixed. A fresh
-# cache root + fresh ports isolate this probe (and dodge worker-port TIME_WAIT).
+# 5. Incremental header tracking (B3). On a fresh-cache build the compiler runs for
+# every TU; editing the shared header must then recompile EXACTLY its dependents
+# (a/b/c) through the launcher, leave the independent TU (main) untouched, and the
+# relinked exe must reflect the edit. This proves the remote compiler's /showIncludes
+# reaches ninja (so ninja records shared.h as a dep) across the launcher->worker round
+# trip. ENFORCED for clang-cl (the first-class CI target, verified working). For native
+# cl this is a DIAGNOSTIC only: ninja's `deps = msvc` matches the LOCALIZED prefix byte
+# string, and the worker (env_clear) can emit /showIncludes in a different codepage than
+# the prefix CMake sampled on a non-English dev box -> prefix mismatch -> 0 deps. That
+# is a cl-on-non-English-locale encoding edge (docs/deferred.md), not a distribution
+# defect; clang-cl emits ASCII and is unaffected. Fresh cache root + fresh ports isolate
+# this probe (and dodge worker-port TIME_WAIT).
 $coord = '127.0.0.1:50105'; $intake = '127.0.0.1:50106'; $fs = '127.0.0.1:50107'; $worker = '127.0.0.1:50064'
 $daemonUrl = "http://$intake"
 $cacheRoot = Join-Path $WorkRoot 'acache-inc'; $traceRoot = Join-Path $WorkRoot 'atrace-inc'
@@ -419,18 +407,19 @@ try {
         # Ideal: a/b/c recompiled (3 remote), main untouched, exe reflects BASE=20
         # (f+g+h = 21+22+23 = 66; main = 66-36 = 30).
         $tracked = $aChanged -and ($incRemote -eq 3) -and $mainUnchanged -and ($incExit -eq 30)
-        Write-Host "INCREMENTAL DIAG: populate-remote=$popRemote/$($tus.Count) edit-recompiles=$incRemote a.obj-changed=$aChanged main-unchanged=$mainUnchanged exe-exit=$incExit(want 30, baseline $exitBefore)"
+        Write-Host "INCREMENTAL: populate-remote=$popRemote/$($tus.Count) edit-recompiles=$incRemote a.obj-changed=$aChanged main-unchanged=$mainUnchanged exe-exit=$incExit(want 30, baseline $exitBefore)"
         if ($tracked) {
-            Write-Host 'INCREMENTAL DIAG: header-dependency tracking WORKS through the launcher (only dependents recompiled remotely; exe reflects the edit)'
+            Write-Host 'INCREMENTAL: header-dependency tracking WORKS through the launcher (only dependents recompiled remotely; exe reflects the edit)'
+        } elseif ($byteGate) {
+            # clang-cl is locale-immune, so a failure here is a real regression.
+            $failures += "incremental: header-dependency tracking failed (clang-cl): edit-recompiles=$incRemote (want 3), a.obj-changed=$aChanged, main-unchanged=$mainUnchanged, exe-exit=$incExit (want 30)"
         } else {
-            Write-Host 'INCREMENTAL DIAG: header-dependency tracking NOT active through the launcher (KNOWN LIMITATION, docs/deferred.md): the remote compiler /showIncludes is not propagated to ninja, so a header edit may not trigger a distributed recompile (stale-object risk on incremental distributed builds; clean builds + the cached/distributed byte path are unaffected)'
+            Write-Host 'INCREMENTAL DIAG (cl, non-fatal): header deps not tracked through the launcher — on a non-English locale ninja''s deps=msvc prefix byte-string can mismatch the worker''s codepage (docs/deferred.md). clang-cl (CI) is ASCII and enforces this; clean builds + the cached/distributed byte path are unaffected.'
         }
     }
 } finally {
     foreach ($p in @($worker3, $daemon3)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
 }
-
-Remove-Item Env:\VSLANG, Env:\SEMBAZURU_ENV_PASSTHROUGH -ErrorAction SilentlyContinue
 
 if ($failures.Count -gt 0) {
     Write-Host ''
@@ -440,4 +429,5 @@ if ($failures.Count -gt 0) {
 }
 $authLabel = if ($AuthToken) { 'AUTH=on (shared token)' } else { 'auth=off' }
 $byteLabel = if ($byteGate) { 'cached==distributed byte-identical' } else { 'mechanism-only (cl)' }
-Write-Host "M6.3 NINJA GATE PASS (multi-TU CMake/Ninja distributed via COMPILER_LAUNCHER; all TUs remote, $byteLabel, link local, 2nd-build cache hit, local fallback; incremental header-dep tracking reported as DIAG) compiler=$cc $authLabel"
+$incLabel = if ($byteGate) { 'incremental header edit recompiles only dependents' } else { 'incremental tracking reported as DIAG (cl locale edge)' }
+Write-Host "M6.3 NINJA GATE PASS (multi-TU CMake/Ninja distributed via COMPILER_LAUNCHER; all TUs remote, $byteLabel, link local, 2nd-build cache hit, local fallback; $incLabel) compiler=$cc $authLabel"
