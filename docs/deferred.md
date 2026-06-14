@@ -287,6 +287,27 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   正規化してから** scratch 配下を境界チェック（`<scratch>\..\..\secret` の `..` トラバーサルを閉鎖）、かつ
   VFS モードで scratch 未設定なら fail-closed（未検証パスを開かない）。実装済みの anti-recursion（scratch 配下
   open 非リダイレクト）は維持。出所: interceptor.cpp(VfsTryRedirect)。
+### M7.1 security-reviewer 所見（2026-06-14、BLOCK-1 は修正済み）
+- **BLOCK-1 解消（M7.1）。** Rust の `path_in_scope` が `..` を正規化せず文字列前置一致のみで、
+  `c:\root\..\..\secret` がスコープ内判定→OS が `..` を畳んでスコープ外供給（fail-open）だった。
+  `normalize_requested`（FS 非依存の字句正規化：ドライブ絶対要求・`.`/`..` 畳み込み・ドライブ脱出は None＝
+  fail-closed）を追加し、正規化後に境界一致。C++ 側（GetFullPathName）と規律を揃えた。テスト追加
+  （path_in_scope_blocks_dotdot_traversal、normalize_requested_rejects_*、dataplane_fs に `..` 結合）。
+  出所: security(M7.1 BLOCK-1)。
+- **スコープルートは worker 自己申告（HIGH-2・LAN-trusted で受容、authoritative 化は繰延）。** agent の
+  file server はステートレスで Hello の宣言 root をそのまま信用するため、悪意 token 保持 worker は root を
+  `c:\`/空に広げ自スコープを無効化できる。LAN-trusted（worker は共有トークン保持）では防御層として受容だが、
+  agent が dispatch した `vfs_root` を session_id でキーに authoritative 照合する方式はゼロトラスト方向の
+  繰延。v0 §5 に「worker-declared・widen 可」を明記済み。出所: security(M7.1 HIGH-2)、verifier(M7.1 concern)。
+- **range Read は scope/pin 認可ゲートを持たない（MEDIUM-3・低実害・繰延）。** `read_range` は digest で
+  CAS を引くのみで scope も pin も見ない。BLOCK-1 修正で out-of-scope open は pin しない＝正規経路で digest を
+  学習できず、256bit digest は総当たり非現実的。ただし CAS はセッション横断共有のため、別経路で digest を
+  得れば scope 無関係に読める構造的弱さは残る。per-session pinned-digest 許可セットに限定するのが将来対応。
+  出所: security(M7.1 MEDIUM-3)。
+- **エラー sanitize 残存経路（LOW-7・確認済み・許容）。** scheduler の fallback `reason`（worker_id＋transport
+  error）は agent→ローカル開発者コンソール（loopback）向けで FS パス非含有・非信頼境界越えでない。M7.1b の
+  sanitize 対象（worker→agent・agent WriteBack→worker）は閉鎖済み。intake/coordination に FS パス漏洩は無し。
+  出所: security(M7.1 LOW-7)。
 - **WriteBack の出力パスはスコープ未検証（M7.1 で繰延）。** 悪意/バグ worker が WriteBack で agent の任意パスへ
   書き込みうる。出力は宣言出力集合（v0 §3.2 declared_outputs）に限定すべきだが、単機モデルでは出力はコマンドが
   名指すローカルパスに落ちる（writeback 非経由）。content-addressed＋digest 検証＋atomic publish で誤バイトは

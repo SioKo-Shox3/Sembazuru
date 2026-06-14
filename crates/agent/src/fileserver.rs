@@ -305,19 +305,58 @@ fn normalize_root(root: &str) -> Option<String> {
     }
 }
 
+/// Lexically normalizes an agent-side requested path for scope comparison:
+/// lowercases, unifies separators, and collapses `.`/`..` components WITHOUT
+/// touching the filesystem (so it works for the many non-existent probe paths
+/// and never resolves symlinks). Returns `None` — which the caller treats as out
+/// of scope (fail closed) — for anything that is not a drive-absolute `x:\…`
+/// path or that escapes its drive root via `..`.
+///
+/// Collapsing `..` here is the load-bearing security step (security M7.1 BLOCK-1):
+/// without it a request like `c:\root\..\..\users\dev\.ssh\id_rsa` string-prefix-
+/// matches the root yet the OS resolves it OUTSIDE the root. This mirrors the
+/// C++ hook's `GetFullPathName`-then-prefix discipline (`interceptor.cpp`). UNC,
+/// `\\?\`, drive-relative `x:foo`, and 8.3 forms are rejected (fail closed),
+/// matching the known residuals in `docs/deferred.md`.
+fn normalize_requested(path: &str) -> Option<String> {
+    let p = path.replace('/', "\\").to_lowercase();
+    let b = p.as_bytes();
+    // Require a drive-absolute path: "x:\...". Drive-relative "x:foo", UNC
+    // "\\host\share", and "\\?\..." are not the form a hooked compiler emits for
+    // a vfs_root read.
+    let drive_abs = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    if !drive_abs {
+        return None;
+    }
+    let drive = &p[..2]; // "x:"
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in p[3..].split('\\') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                stack.pop()?; // `..` above the drive root: escape → fail closed
+            }
+            other => stack.push(other),
+        }
+    }
+    Some(format!("{drive}\\{}", stack.join("\\")))
+}
+
 /// Whether the requested (agent-side logical) path is within the session's
-/// declared root. `None` root = unscoped (always in). The comparison normalizes
-/// separators and case and requires a path-component boundary, so `…\proj` does
-/// not match a sibling `…\project`. Path-form edge cases (8.3 short names,
-/// `\\?\`, UNC, symlinks) are the known residuals tracked in `docs/deferred.md`;
-/// they fail CLOSED here (treated as out of scope) rather than leak.
+/// declared root. `None` root = unscoped (always in). The requested path is
+/// lexically normalized first ([`normalize_requested`] collapses `.`/`..`), then
+/// matched against the root with a path-component boundary, so `…\proj` does not
+/// match a sibling `…\project` and `…\proj\..\secret` does not escape. A path
+/// that will not normalize (non-absolute, UNC, `\\?\`, drive-escaping) is OUT of
+/// scope (fail closed).
 fn path_in_scope(requested: &str, root: &Option<String>) -> bool {
     let Some(root) = root else {
         return true;
     };
-    let req = requested.replace('/', "\\").to_lowercase();
-    let req = req.trim_end_matches('\\');
-    req == root.as_str() || req.starts_with(&format!("{root}\\"))
+    let Some(norm) = normalize_requested(requested) else {
+        return false;
+    };
+    norm == root.as_str() || norm.starts_with(&format!("{root}\\"))
 }
 
 /// Server side of the session-open handshake (M7.0 auth + M7.1 scoping). The
@@ -775,6 +814,43 @@ mod tests {
         assert!(!path_in_scope("C:\\users\\dev\\.ssh\\id_rsa", &root));
         // No root = unscoped: everything is allowed (legacy/tests).
         assert!(path_in_scope("C:\\anything\\at\\all", &None));
+    }
+
+    #[test]
+    fn path_in_scope_blocks_dotdot_traversal() {
+        // security M7.1 BLOCK-1: a `..` request that string-prefix-matches the
+        // root but resolves OUTSIDE it must be rejected.
+        let root = normalize_root("C:\\work\\proj");
+        assert!(!path_in_scope(
+            "C:\\work\\proj\\..\\..\\users\\dev\\.ssh\\id_rsa",
+            &root
+        ));
+        assert!(!path_in_scope("C:\\work\\proj\\..\\secret.txt", &root));
+        assert!(!path_in_scope("c:/work/proj/../../etc/hosts", &root));
+        // Interior `..` that stays inside the root is fine (collapses in-root).
+        assert!(path_in_scope("C:\\work\\proj\\src\\..\\inc\\h.h", &root));
+        // `.` components are harmless.
+        assert!(path_in_scope("C:\\work\\proj\\.\\a.cpp", &root));
+    }
+
+    #[test]
+    fn normalize_requested_rejects_non_absolute_and_escaping_forms() {
+        // Drive-relative, UNC, \\?\, bare relative, and drive-escaping all fail.
+        assert_eq!(normalize_requested("c:foo\\bar"), None);
+        assert_eq!(normalize_requested("\\\\host\\share\\x"), None);
+        assert_eq!(normalize_requested("\\\\?\\c:\\work\\x"), None);
+        assert_eq!(normalize_requested("relative\\path"), None);
+        assert_eq!(normalize_requested("c:\\..\\x"), None); // escapes drive root
+        // A normal drive-absolute path collapses `.`/`..` correctly.
+        assert_eq!(
+            normalize_requested("C:\\work\\.\\proj\\sub\\..\\a.cpp"),
+            Some("c:\\work\\proj\\a.cpp".to_string())
+        );
+        // None of these forms are in scope (fail closed).
+        let root = normalize_root("C:\\work\\proj");
+        assert!(!path_in_scope("c:foo", &root));
+        assert!(!path_in_scope("\\\\host\\share\\work\\proj\\x", &root));
+        assert!(!path_in_scope("\\\\?\\c:\\work\\proj\\x", &root));
     }
 
     #[test]

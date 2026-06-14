@@ -430,6 +430,25 @@ async fn declared_root_scopes_file_supply() {
         client.fetch(&secret).await.unwrap().is_none(),
         "a path outside the declared root must not be supplied"
     );
+
+    // `..` traversal (security M7.1 BLOCK-1): a path that string-prefix-matches
+    // the root but climbs out with `..` must ALSO be refused. The OS would resolve
+    // this to the real `secret` outside the root.
+    let outside_name = outside
+        .path
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let traversal = format!(
+        "{}\\..\\{}\\secret.txt",
+        root.path.to_string_lossy(),
+        outside_name
+    );
+    assert!(
+        client.fetch(&traversal).await.unwrap().is_none(),
+        "a `..` traversal escaping the declared root must not be supplied"
+    );
     // And a stat probe of it reports "does not exist".
     let stat = client
         .stat_batch(std::slice::from_ref(&secret))
