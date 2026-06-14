@@ -190,8 +190,14 @@ function Clean-Outputs {
     if (Test-Path $exe) { Remove-Item -Force $exe }
 }
 # Run ninja (-v surfaces each launcher's "sembazuru: <note>" line). Returns combined output + exit.
-function Invoke-Ninja {
-    $out = & $ninja -C $build -v 2>&1 | Out-String
+# $jobs>0 caps parallelism: the distributed/cached builds run serially (-j 1) so the
+# single worker always has a free admission slot and EVERY TU is dispatched remotely.
+# With parallel fanout the scheduler may (by design) local-fallback an action when no
+# slot is free — that is M5's multi-worker scaling concern, not this integration gate.
+function Invoke-Ninja([int]$jobs = 0) {
+    $a = @('-C', $build, '-v')
+    if ($jobs -gt 0) { $a += @('-j', "$jobs") }
+    $out = & $ninja @a 2>&1 | Out-String
     return @{ exit = $LASTEXITCODE; out = $out }
 }
 
@@ -264,10 +270,10 @@ try {
     }
     if (-not $live) { $failures += 'worker never came up (probe never ran remotely)' }
 
-    # 1. Distributed multi-TU build via Ninja + the launcher.
+    # 1. Distributed multi-TU build via Ninja + the launcher (serial: every TU remote).
     $env:SEMBAZURU_DAEMON = $daemonUrl
     Clean-Outputs
-    $d = Invoke-Ninja
+    $d = Invoke-Ninja 1
     Remove-Item Env:\SEMBAZURU_DAEMON -ErrorAction SilentlyContinue
     $remoteCount = ([regex]::Matches($d.out, 'sembazuru: remote')).Count
     Write-Host "DIST build exit=$($d.exit) remote-compiles=$remoteCount"
@@ -314,7 +320,7 @@ try {
     Start-Sleep -Milliseconds 600
     $env:SEMBAZURU_DAEMON = $daemonUrl
     Clean-Outputs
-    $c = Invoke-Ninja
+    $c = Invoke-Ninja 1
     Remove-Item Env:\SEMBAZURU_DAEMON -ErrorAction SilentlyContinue
     $hitCount = ([regex]::Matches($c.out, 'sembazuru: cache hit')).Count
     Write-Host "CACHE build exit=$($c.exit) cache-hits=$hitCount"
