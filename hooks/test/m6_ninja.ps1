@@ -49,6 +49,19 @@ else { throw 'no compiler (clang-cl/cl) on PATH' }
 # we assert the mechanism (notes/exit/outputs), not byte-identity.
 $byteGate = ($cc -eq 'clang-cl')
 
+# Pin the compiler diagnostic language so ninja's `deps = msvc` parsing works across
+# the launcher. CMake records the LOCALIZED /showIncludes prefix at configure time;
+# the worker runs the compiler under env_clear + a compiler-env allowlist, so on a
+# non-English-locale dev box the remote cl would emit a DIFFERENT language than the
+# prefix CMake captured -> ninja parses 0 deps -> incremental header tracking breaks
+# (the independent TU edit would go undetected). VSLANG=1033 forces English on both
+# sides; SEMBAZURU_ENV_PASSTHROUGH lets the launcher forward it to the worker (it is
+# dropped by the default allowlist). clang-cl does not localize, so this is a no-op
+# for the CI byte gate. (Real non-English users need the same passthrough; see
+# docs/deferred.md.)
+$env:VSLANG = '1033'
+$env:SEMBAZURU_ENV_PASSTHROUGH = 'VSLANG'
+
 $ninjaCmd = Get-Command ninja -ErrorAction SilentlyContinue
 if (-not $ninjaCmd) {
     if ($RequireNinja) { throw 'ninja required but not on PATH' }
@@ -355,6 +368,70 @@ if ($fb.exit -ne 0) { $failures += "local fallback ninja build failed (exit=$($f
 if (-not $fbLocal) { $failures += 'fallback did not run locally (no fallback note)' }
 if (-not (Test-Path $exe)) { $failures += 'fallback produced no app.exe' }
 
+# 5. Incremental header tracking (B3) — DIAGNOSTIC, non-fatal. Ideal behavior: on a
+# fresh-cache build the compiler runs for every TU; editing the shared header then
+# recompiles EXACTLY its dependents (a/b/c) and leaves the independent TU (main)
+# untouched, and the relinked exe reflects the edit. That requires the remote
+# compiler's /showIncludes to reach ninja so it records shared.h as a dependency.
+# As of this writing the distributed path does NOT propagate /showIncludes to ninja
+# (the worker/launcher stdio chain drops the injected child's dependency output), so
+# ninja records 0 header deps and a header edit is missed -> incremental DISTRIBUTED
+# builds can serve STALE objects (docs/deferred.md). This is a KNOWN LIMITATION, not a
+# gate failure: clean builds and the cached/distributed byte path above are unaffected,
+# and the diagnostic flips to WORKS automatically once propagation is fixed. A fresh
+# cache root + fresh ports isolate this probe (and dodge worker-port TIME_WAIT).
+$coord = '127.0.0.1:50105'; $intake = '127.0.0.1:50106'; $fs = '127.0.0.1:50107'; $worker = '127.0.0.1:50064'
+$daemonUrl = "http://$intake"
+$cacheRoot = Join-Path $WorkRoot 'acache-inc'; $traceRoot = Join-Path $WorkRoot 'atrace-inc'
+$scratchRoot = Join-Path $WorkRoot 'wscratch-inc'; $casRoot = Join-Path $WorkRoot 'wcas-inc'
+foreach ($d in @($cacheRoot, $traceRoot, $scratchRoot, $casRoot)) { New-Item -ItemType Directory -Force $d | Out-Null }
+$daemon3 = Start-Daemon
+$worker3 = Start-Worker
+try {
+    $live3 = $false
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 400
+        if ((Probe-Launcher) -match 'sembazuru: remote') { $live3 = $true; break }
+    }
+    if (-not $live3) {
+        Write-Host 'INCREMENTAL DIAG: worker did not come up; skipping (non-fatal)'
+    } else {
+        # Empty cache so every TU is a MISS and the compiler actually runs.
+        $env:SEMBAZURU_DAEMON = $daemonUrl
+        Clean-Outputs
+        $pop = Invoke-Ninja 1
+        $popRemote = ([regex]::Matches($pop.out, 'sembazuru: remote')).Count
+        $mainObj = Tu-Obj $build 'main.cpp'; $aObjP = Tu-Obj $build 'a.cpp'
+        $mainBefore = if (Test-Path $mainObj) { (Get-FileHash $mainObj -Algorithm SHA256).Hash } else { '' }
+        $aBefore = if (Test-Path $aObjP) { (Get-FileHash $aObjP -Algorithm SHA256).Hash } else { '' }
+        & $exe | Out-Null; $exitBefore = $LASTEXITCODE
+        # Sleep so the edited header's mtime is strictly newer than the just-built objects.
+        Start-Sleep -Milliseconds 1500
+        Set-Content (Join-Path $proj 'shared.h') "#define BASE 20`n" -Encoding ascii
+        $env:SEMBAZURU_DAEMON = $daemonUrl
+        $inc = Invoke-Ninja 1
+        Remove-Item Env:\SEMBAZURU_DAEMON -ErrorAction SilentlyContinue
+        $incRemote = ([regex]::Matches($inc.out, 'sembazuru: remote')).Count
+        $aAfter = if (Test-Path $aObjP) { (Get-FileHash $aObjP -Algorithm SHA256).Hash } else { '' }
+        $mainAfter = if (Test-Path $mainObj) { (Get-FileHash $mainObj -Algorithm SHA256).Hash } else { '' }
+        & $exe | Out-Null; $incExit = $LASTEXITCODE
+        $aChanged = ($aAfter -ne $aBefore); $mainUnchanged = ($mainAfter -eq $mainBefore)
+        # Ideal: a/b/c recompiled (3 remote), main untouched, exe reflects BASE=20
+        # (f+g+h = 21+22+23 = 66; main = 66-36 = 30).
+        $tracked = $aChanged -and ($incRemote -eq 3) -and $mainUnchanged -and ($incExit -eq 30)
+        Write-Host "INCREMENTAL DIAG: populate-remote=$popRemote/$($tus.Count) edit-recompiles=$incRemote a.obj-changed=$aChanged main-unchanged=$mainUnchanged exe-exit=$incExit(want 30, baseline $exitBefore)"
+        if ($tracked) {
+            Write-Host 'INCREMENTAL DIAG: header-dependency tracking WORKS through the launcher (only dependents recompiled remotely; exe reflects the edit)'
+        } else {
+            Write-Host 'INCREMENTAL DIAG: header-dependency tracking NOT active through the launcher (KNOWN LIMITATION, docs/deferred.md): the remote compiler /showIncludes is not propagated to ninja, so a header edit may not trigger a distributed recompile (stale-object risk on incremental distributed builds; clean builds + the cached/distributed byte path are unaffected)'
+        }
+    }
+} finally {
+    foreach ($p in @($worker3, $daemon3)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
+}
+
+Remove-Item Env:\VSLANG, Env:\SEMBAZURU_ENV_PASSTHROUGH -ErrorAction SilentlyContinue
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     Write-Host 'M6.3 NINJA GATE FAIL:'
@@ -363,4 +440,4 @@ if ($failures.Count -gt 0) {
 }
 $authLabel = if ($AuthToken) { 'AUTH=on (shared token)' } else { 'auth=off' }
 $byteLabel = if ($byteGate) { 'cached==distributed byte-identical' } else { 'mechanism-only (cl)' }
-Write-Host "M6.3 NINJA GATE PASS (multi-TU CMake/Ninja distributed via COMPILER_LAUNCHER; all TUs remote, $byteLabel, link local, 2nd-build cache hit, local fallback) compiler=$cc $authLabel"
+Write-Host "M6.3 NINJA GATE PASS (multi-TU CMake/Ninja distributed via COMPILER_LAUNCHER; all TUs remote, $byteLabel, link local, 2nd-build cache hit, local fallback; incremental header-dep tracking reported as DIAG) compiler=$cc $authLabel"
