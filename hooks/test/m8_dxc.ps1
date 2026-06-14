@@ -28,6 +28,14 @@ param(
     # When set, fail hard if dxc cannot be found (CI). Locally, a missing dxc
     # SKIPs (exit 0) so the gate is opt-in off-CI.
     [switch]$RequireDxc,
+    # M8.5: mark the action non-deterministic (SEMBAZURU_NONDETERMINISTIC=1). It
+    # must still DISTRIBUTE (build 1 runs remotely), but must NOT be cached — so
+    # build 2 (worker stopped) does NOT hit the cache and instead falls back
+    # locally (ADR 0007 §c: separate distribution from caching). Proves the flag
+    # controls caching, using the same real dxc workload. (dxc is actually
+    # deterministic, so the locally-fallen-back .dxil still byte-matches — we are
+    # testing the policy switch, the mechanism a genuine test runner would use.)
+    [switch]$NonDeterministic,
     # Shared cluster token (ADR 0006): when set the whole distributed path runs
     # authenticated. The .dxil must still be byte-identical (auth is connection
     # level). Empty = unauthenticated LAN start (default).
@@ -156,10 +164,11 @@ function Invoke-Launcher {
     Push-Location $proj
     try {
         $env:SEMBAZURU_DAEMON = $daemonUrl; $env:SEMBAZURU_VFS_STRICT = '1'
+        if ($NonDeterministic) { $env:SEMBAZURU_NONDETERMINISTIC = '1' }
         if (Test-Path $aDxil) { Remove-Item -Force $aDxil }
         $err = & $launcher $dxc @dxcArgs 2>&1 | Out-String
         $code = $LASTEXITCODE
-        Remove-Item Env:\SEMBAZURU_DAEMON, Env:\SEMBAZURU_VFS_STRICT -ErrorAction SilentlyContinue
+        Remove-Item Env:\SEMBAZURU_DAEMON, Env:\SEMBAZURU_VFS_STRICT, Env:\SEMBAZURU_NONDETERMINISTIC -ErrorAction SilentlyContinue
         return @{ exit = $code; note = $err }
     } finally { Pop-Location }
 }
@@ -205,12 +214,18 @@ try {
     Start-Sleep -Milliseconds 500
     $rc = Invoke-Launcher
     Write-Host "BUILD2 exit=$($rc.exit) note=$($rc.note.Trim())"
-    if ($rc.exit -ne 0) { $failures += "cached build did not exit 0 (exit=$($rc.exit))" }
-    if ($rc.note -notmatch 'cache hit') { $failures += 'second build did not HIT the action cache (trace-based output discovery, M8.1)' }
-    if (-not (Test-Path $aDxil)) { $failures += 'cached build produced no .dxil' }
+    if ($rc.exit -ne 0) { $failures += "second build did not exit 0 (exit=$($rc.exit))" }
+    if ($NonDeterministic) {
+        # M8.5: a non-deterministic action is distributed but NEVER recorded, so
+        # build 2 (no worker) must NOT hit the cache — it falls back locally.
+        if ($rc.note -match 'cache hit') { $failures += 'non-deterministic action was cached (must distribute-but-not-cache, ADR 0007 §c)' }
+    } else {
+        if ($rc.note -notmatch 'cache hit') { $failures += 'second build did not HIT the action cache (trace-based output discovery, M8.1)' }
+    }
+    if (-not (Test-Path $aDxil)) { $failures += 'second build produced no .dxil' }
     if (-not (Same-Bytes $aDxil $refDxil)) {
-        $failures += 'cached .dxil is NOT byte-identical to the local build'
-        Dump-Diff 'cached-vs-ref' $aDxil $refDxil
+        $failures += 'second-build .dxil is NOT byte-identical to the local build'
+        Dump-Diff 'build2-vs-ref' $aDxil $refDxil
     }
 } finally {
     if ($daemon2 -and -not $daemon2.HasExited) { Stop-Process -Id $daemon2.Id -Force -ErrorAction SilentlyContinue }
@@ -223,4 +238,8 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 $authLabel = if ($AuthToken) { 'AUTH=on' } else { 'auth=off' }
-Write-Host "M8.4 DXC GATE PASS (arbitrary process distributed: byte-identical, local fallback, trace-discovered cache hit) tool=dxc strict=on $authLabel"
+if ($NonDeterministic) {
+    Write-Host "M8.5 DXC NON-DETERMINISTIC GATE PASS (distributed but NOT cached: build2 did not hit, fell back locally) tool=dxc strict=on $authLabel"
+} else {
+    Write-Host "M8.4 DXC GATE PASS (arbitrary process distributed: byte-identical, local fallback, trace-discovered cache hit) tool=dxc strict=on $authLabel"
+}
