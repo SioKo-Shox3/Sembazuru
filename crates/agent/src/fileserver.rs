@@ -49,9 +49,9 @@ impl ServerStats {
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
-    DirEntry, DirListRequest, DirListResponse, HasRequest, HasResponse, OpenReadRequest,
-    OpenReadResponse, ReadRequest, ReadResponse, StatEntry, StatRequest, StatResponse,
-    WriteBackRequest, WriteBackResponse,
+    DirEntry, DirListRequest, DirListResponse, HasRequest, HasResponse, HelloRequest,
+    HelloResponse, OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse, StatEntry,
+    StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use tokio::net::{TcpListener, TcpStream};
@@ -168,27 +168,42 @@ impl Drop for Session {
     }
 }
 
-/// Serves the file session identity-mapped on an already-bound listener.
+/// Serves the file session identity-mapped on an already-bound listener. Auth
+/// **disabled** (for tests/harnesses); the daemon uses
+/// [`serve_files_with_stats_token`] with the env-configured token (ADR 0006).
 pub async fn serve_files(listener: TcpListener) -> io::Result<()> {
     serve_with_map(
         listener,
         PathMap::Identity,
         Arc::new(ServerStats::default()),
+        None,
     )
     .await
 }
 
 /// Like [`serve_files`] but with a caller-held [`ServerStats`], so a test or the
 /// M4 rebuild gate can read how many content bytes the agent actually served.
+/// Auth disabled.
 pub async fn serve_files_with_stats(
     listener: TcpListener,
     stats: Arc<ServerStats>,
 ) -> io::Result<()> {
-    serve_with_map(listener, PathMap::Identity, stats).await
+    serve_with_map(listener, PathMap::Identity, stats, None).await
+}
+
+/// Like [`serve_files_with_stats`] but requires the shared cluster token on the
+/// data-plane handshake (M7, ADR 0006). `expected_token == None` disables auth.
+/// The daemon calls this with [`sembazuru_proto::auth::cluster_token_from_env`].
+pub async fn serve_files_with_stats_token(
+    listener: TcpListener,
+    stats: Arc<ServerStats>,
+    expected_token: Option<String>,
+) -> io::Result<()> {
+    serve_with_map(listener, PathMap::Identity, stats, expected_token).await
 }
 
 /// Serves with paths under `logical_root` remapped to `backing_root`. For tests
-/// that need agent-served bytes to differ from the local original.
+/// that need agent-served bytes to differ from the local original. Auth disabled.
 pub async fn serve_files_remap(
     listener: TcpListener,
     logical_root: &str,
@@ -198,33 +213,53 @@ pub async fn serve_files_remap(
         logical_root: logical_root.replace('/', "\\").to_lowercase(),
         backing_root,
     };
-    serve_with_map(listener, map, Arc::new(ServerStats::default())).await
+    serve_with_map(listener, map, Arc::new(ServerStats::default()), None).await
 }
 
 async fn serve_with_map(
     listener: TcpListener,
     map: PathMap,
     stats: Arc<ServerStats>,
+    expected_token: Option<String>,
 ) -> io::Result<()> {
     let session = Arc::new(Session::new(stats)?);
     let map = Arc::new(map);
+    let expected_token = Arc::new(expected_token);
     loop {
         let (sock, _peer) = listener.accept().await?;
         let s = session.clone();
         let m = map.clone();
+        let tok = expected_token.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(sock, s, m).await;
+            let _ = handle_conn(sock, s, m, tok).await;
         });
     }
 }
 
-async fn handle_conn(sock: TcpStream, session: Arc<Session>, map: Arc<PathMap>) -> io::Result<()> {
+async fn handle_conn(
+    sock: TcpStream,
+    session: Arc<Session>,
+    map: Arc<PathMap>,
+    expected_token: Arc<Option<String>>,
+) -> io::Result<()> {
     // Pipelining (M5.3): read requests off the connection and dispatch each on
     // its own task, writing responses (tagged with the request id) as they
     // finish — possibly out of order. The client correlates by request id, so a
     // slow op no longer head-of-line-blocks the ones behind it. The write half is
     // mutex-shared because a frame must be written whole.
-    let (mut rd, wr) = sock.into_split();
+    let (mut rd, mut wr) = sock.into_split();
+
+    // Shared-token handshake (M7, ADR 0006). Only when a token is configured: the
+    // peer's FIRST frame must be a Hello carrying the right token, or the agent
+    // refuses to serve a single op. This closes the unauthenticated file-supply
+    // path (an arbitrary peer reading the agent's filesystem). With no token the
+    // handshake is skipped entirely, so the wire matches M6 byte-for-byte.
+    if let Some(expected) = expected_token.as_ref()
+        && !handshake(&mut rd, &mut wr, expected).await?
+    {
+        return Ok(()); // rejected; connection closed
+    }
+
     let wr = Arc::new(Mutex::new(wr));
     loop {
         let (header, payload) = match read_frame(&mut rd).await {
@@ -246,6 +281,55 @@ async fn handle_conn(sock: TcpStream, session: Arc<Session>, map: Arc<PathMap>) 
             let _ = write_frame(&mut *w, resp_header, &resp_payload).await;
         });
     }
+}
+
+/// Server side of the M7 data-plane handshake (ADR 0006). The peer's first frame
+/// must be a `Hello` carrying the cluster token; this validates it and replies
+/// with the verdict. Returns `Ok(true)` to proceed into the op loop, `Ok(false)`
+/// to close — after sending the rejection so the client surfaces a clean
+/// `PermissionDenied` rather than a bare connection reset. EOF before the
+/// handshake is just a peer that connected and left (`Ok(false)`). The reason is
+/// a fixed safe string (no secret, no internal path; M7 §5).
+async fn handshake(
+    rd: &mut tokio::net::tcp::OwnedReadHalf,
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    expected: &str,
+) -> io::Result<bool> {
+    use tokio::io::AsyncWriteExt;
+
+    // Slow-loris defense (security F4): a peer that connects and then never sends
+    // a Hello must not pin a connection task forever. Bound the wait; a timeout is
+    // treated as a (silent) rejection and the connection is closed.
+    const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let (header, payload) = match tokio::time::timeout(HANDSHAKE_TIMEOUT, read_frame(rd)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Ok(false),
+    };
+    let decision: Result<(), &'static str> = if header.op == OpCode::Hello {
+        match HelloRequest::decode(&payload) {
+            Ok(h) => sembazuru_proto::auth::check(Some(expected), &h.token),
+            Err(_) => Err("malformed handshake"),
+        }
+    } else {
+        Err("auth handshake required")
+    };
+    let ok = decision.is_ok();
+    let detail = decision.err().unwrap_or("").to_string();
+    let resp = HelloResponse { ok, detail }.encode();
+    write_frame(
+        wr,
+        FrameHeader {
+            request_id: header.request_id,
+            op: OpCode::Hello,
+            is_response: true,
+        },
+        &resp,
+    )
+    .await?;
+    wr.flush().await?;
+    Ok(ok)
 }
 
 async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Session>, map: &PathMap) -> Vec<u8> {
@@ -284,6 +368,13 @@ async fn dispatch(op: OpCode, payload: &[u8], session: &Arc<Session>, map: &Path
             }
             .encode(),
         },
+        // A Hello only belongs as the first frame (handled in `handshake`); one
+        // arriving mid-stream is a protocol error, answered with a rejection.
+        OpCode::Hello => HelloResponse {
+            ok: false,
+            detail: "unexpected handshake after session open".to_string(),
+        }
+        .encode(),
     }
 }
 

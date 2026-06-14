@@ -38,6 +38,12 @@ message Capabilities {
   // Data-plane transports the peer supports, so the data plane can evolve
   // independently of the control plane (§3.1). Names, e.g. "tcp-framed".
   repeated string data_plane_transports = 6;
+  // Capability flag (§6): the worker speaks the M7 shared-token auth handshake
+  // (ADR 0006) and carries auth_token in RegisterRequest / the data-plane
+  // session handshake. An agent with a cluster token configured rejects a
+  // worker that does not advertise this; an agent without a token ignores it.
+  // Gating is by capability flag, not version sniffing (§6).
+  bool supports_auth = 7;
 }
 
 message RegisterRequest {
@@ -47,9 +53,15 @@ message RegisterRequest {
   // is worker->agent push (§3.1), so the worker announces its own Execution
   // endpoint here; the agent learns it from registration, not a static list.
   string execution_endpoint = 3;  // e.g. "http://127.0.0.1:50061"
-  // Reserved for the zero-trust trust model (M7, DESIGN.md §9): attestation
-  // token / client-cert. Kept out of v0 so adding them is wire-compatible.
-  reserved 10, 11;
+  // Shared cluster auth token (M7, ADR 0006). The trust model is LAN-trusted:
+  // the worker presents a shared secret (distributed out-of-band via the
+  // SEMBAZURU_CLUSTER_TOKEN env var) and the agent matches it. Empty when the
+  // cluster runs without a token, in which case the agent accepts
+  // unconditionally (back-compat with M5/M6). Field 11 stays reserved for a
+  // future client-cert / attestation field, so a wire-compatible move to mTLS /
+  // zero-trust remains open (ADR 0006 "future").
+  string auth_token = 10;
+  reserved 11;
 }
 
 message RegisterResponse {

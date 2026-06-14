@@ -134,8 +134,10 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   出所: verifier(M5.1 B3/B4)。
 
 ### M5.2 実装後の既知の残リスク（security-reviewer 2026-06-14、詳細は ADR 0004 追補）
-- **無認証 Register による誤結果注入／アクション吸引。** 緩和は M7 mTLS/attestation。暫定で
-  `cpu_count` を clamp(1,256) 済み。出所: security(M5.2 M3)。
+- ~~**無認証 Register による誤結果注入／アクション吸引。**~~ **M7.0 で緩和（ADR 0006）。** 共有
+  トークンを持たない worker は Register/データプレーンとも拒否されるため、無認証の rogue worker が
+  登録して誤結果を返す／アクションを吸引する経路は閉鎖。トークンを持つ trusted worker のバグ/誤設定は
+  残（capacity 申告は依然 clamp(1,256) で正しさを担保）。出所: security(M5.2 M3)、ADR 0006。
 - **孫プロセスの孤児。** `kill_on_drop` は直接の子のみ。Job Object でツリー一括 kill は M7 サンドボックス。
   出所: security(M5.2 L3)。
 - **再割り当て境界の重複 WriteBack。** WriteBack 実装（M3.3/将来）時に content-addressed 冪等を
@@ -227,9 +229,38 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 
 ## M7（堅牢化・セキュリティ）
 
-- **データプレーン/制御プレーンに認証・TLS 無し。** worker の Execute、agent の
-  ファイルサーバ（任意絶対パスを供給）、VFS パイプ いずれも無認証。v0 §5 が M7 と明記。
-  出所: security(M3.1/M3.2)、v0 §5。
+- **制御/データプレーンの認証 — 解消（M7.0、ADR 0006）。** 信頼モデルを LAN-trusted に
+  確定し、共有トークン（`SEMBAZURU_CLUSTER_TOKEN`）を制御プレーン（Register）とデータプレーン
+  （session 確立 Hello）両方で照合。誤/無トークンは拒否（無認証 Register／無認証ファイル供給の
+  誤結果注入経路を閉鎖）。token 未設定なら従来どおり無条件 accept（M5/M6 後方互換）。VFS パイプ
+  （hook↔worker のローカル名前付きパイプ）は機内ローカル経路で非対象（信頼境界は worker→agent TCP）。
+  proto は `auth_token`(10)＋`supports_auth` capability flag で wire 非破壊。予約 11 は client-cert/
+  attestation 用に継続。出所: ADR 0006、crates/{proto,worker,agent}、tests(coordination/dataplane_fs)。
+### M7.0 security-reviewer 残所見（2026-06-14、PASS-with-findings・BLOCK 無し）
+- **F1 解消（M7.0g）。** auth 無効かつ非 loopback bind 時に daemon が起動時 WARNING を出す
+  （`warn_if_exposed`、coord/fileserver の local_addr が非 loopback で発火）。fail-closed の
+  `SEMBAZURU_REQUIRE_AUTH` フラグ化は将来余地。出所: security(M7.0 F1)。
+- **F4 解消（M7.0g）。** データプレーン handshake に 10s read タイムアウト（slow-loris で接続タスクを
+  無限占有させない）。未認証 in-flight 接続数の上限化は LAN 前提で deferred。出所: security(M7.0 F4)。
+- **heartbeat ストリームは token 非検証（LOW・受容）。** `on_ping` は既存エントリのみ更新（新規注入不可、
+  Register が gate 済み）。既知 worker_id を推測した peer が liveness clock を refresh し black-hole を
+  延命しうるが、新規誤結果注入はできず LAN 前提で許容。HeartbeatPing への token 追加は hot keepalive を
+  膨らませるため見送り。出所: security/verifier(M7.0)。
+- **VFS パイプのローカル ACL 無し（F2・LOW・既存前提）。** `\\.\pipe\<name>` は同一マシンの任意ユーザ
+  プロセスが接続し任意 logical path の hydrate を誘発しうる（M3/M6 からの既存前提、M7 新規欠陥ではない）。
+  agent 側パススコープ（M7.1）が別途効く。将来 SDDL で現ユーザ限定 ACL を付す余地。出所: security(M7.0 F2)。
+- **token_eq の長さ早期 return（F3・LOW・修正不要）。** 内容比較は定数時間。長さと「presented が空か否か」
+  のみタイミングに出るが、共有クラスタトークンで実害なし。出所: security(M7.0 F3)。
+- **Register→VFS 供給の一気通貫 e2e は未整備（verifier 指摘）。** 制御プレーン（Register/heartbeat）と
+  データプレーン（Hello→fetch）の auth は個別テストで実証、結合は daemon/worker の本番配線で担保。
+  authed 全経路の e2e は m7 CI で `SEMBAZURU_CLUSTER_TOKEN` を設定した daemon コンパイルゲートで補完予定。
+  出所: verifier(M7.0)。
+
+- **TLS（暗号化）は LAN 既定 off・実 LAN まで繰延。** LAN-trusted ではトークンが認証を担い、TLS は
+  「localhost/LAN-trusted スコープを出る時のみ必須」（v0 §5）。実 TLS 配線（tonic ServerTlsConfig/
+  ClientTlsConfig＋データプレーン tokio-rustls）は実 2 台 LAN 実測・ゼロトラスト判断と同じ繰延に置く
+  （本番条件で on 経路を検証できないため）。wire 非破壊の移行口（予約 11・capability flag）は確保済み。
+  digest 検証は TLS 有無に関わらず常時。出所: ADR 0006、AskUser(2026-06-14)。
 - **agent fileserver のパススコープ無し。** 要求された任意絶対パスを読む。M7 で
   セッション宣言ルートに限定。出所: security(M3.2 F2)。
 - **DLL が worker 返却パスを scratch 配下かのみ検証。** 完全なパススコープ／

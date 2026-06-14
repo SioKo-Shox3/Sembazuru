@@ -52,6 +52,12 @@ pub enum OpCode {
     DirList = 4,
     WriteBack = 5,
     Has = 6,
+    /// Session-opening handshake carrying the shared cluster token (M7, ADR
+    /// 0006). Only exchanged when auth is configured: with no token the
+    /// connection goes straight to ops, byte-identical to M6 (back-compat). When
+    /// auth is on, the worker's first frame MUST be a Hello the agent accepts,
+    /// or the agent closes the connection.
+    Hello = 7,
 }
 
 impl OpCode {
@@ -63,6 +69,7 @@ impl OpCode {
             4 => Ok(OpCode::DirList),
             5 => Ok(OpCode::WriteBack),
             6 => Ok(OpCode::Has),
+            7 => Ok(OpCode::Hello),
             other => Err(Error::UnknownOp(other)),
         }
     }

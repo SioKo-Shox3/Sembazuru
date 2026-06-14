@@ -330,3 +330,64 @@ async fn calls_fail_fast_when_the_connection_dies() {
         "calls after the connection died fail fast, not hang"
     );
 }
+
+// ---- M7.0 data-plane shared-token handshake (ADR 0006) -------------------
+
+/// Starts an agent file server that requires `token` on the handshake.
+async fn start_server_with_token(token: &str) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
+    let token = token.to_string();
+    tokio::spawn(async move {
+        let _ =
+            sembazuru_agent::fileserver::serve_files_with_stats_token(listener, stats, Some(token))
+                .await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn handshake_right_token_serves_files() {
+    let dir = TempDir::new("auth-ok");
+    let path = dir.write("a.h", b"authed-bytes");
+    let addr = start_server_with_token("s3cret").await;
+
+    // The worker presents the right token and then reads normally.
+    let client = FileClient::connect_with_rtt_token(addr, Duration::ZERO, "s3cret".to_string())
+        .await
+        .expect("handshake with the right token succeeds");
+    let (bytes, _digest) = client.fetch(&path).await.unwrap().expect("file exists");
+    assert_eq!(bytes, b"authed-bytes");
+}
+
+#[tokio::test]
+async fn handshake_wrong_token_is_refused() {
+    let addr = start_server_with_token("s3cret").await;
+    // Wrong token: the agent rejects the handshake, so connect itself fails with
+    // PermissionDenied — no op is ever served.
+    match FileClient::connect_with_rtt_token(addr, Duration::ZERO, "nope".to_string()).await {
+        Ok(_) => panic!("handshake with the wrong token must fail"),
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+    }
+}
+
+#[tokio::test]
+async fn handshake_missing_token_against_authed_server_is_refused() {
+    let dir = TempDir::new("auth-missing");
+    let path = dir.write("a.h", b"unreachable");
+    let addr = start_server_with_token("s3cret").await;
+
+    // A tokenless client (M6-style `connect`) sends no Hello; its first frame is
+    // an op, which the authed server refuses — the op must not return data.
+    let client = FileClient::connect(addr).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), client.fetch(&path)).await;
+    assert!(
+        got.is_ok(),
+        "the call must not hang against an authed server"
+    );
+    assert!(
+        got.unwrap().is_err(),
+        "a tokenless client gets no files from an authed agent"
+    );
+}
