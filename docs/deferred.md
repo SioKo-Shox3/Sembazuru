@@ -273,6 +273,17 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   ninja の並列投入で idle slot 不足時に route-away ではなくローカル実行に落ちる（windows-2025 で remote=3/4 を観測）。
   M6.3 は `ninja -j 1`（直列）で単一 worker に常時スロットを持たせ全 TU の remote を決定化。並列 fanout の取りこぼし削減
   （キューイング/待機の閾値）は M5 のスケーリング領域。出所: CI(M6.3, run 27506175019)。
+- **【要対応・正確性】分散コンパイルで `/showIncludes` が ninja に伝播せず、ヘッダ依存追跡が壊れる（増分ビルドが stale .obj を使いうる）。**
+  CMake/Ninja の `deps = msvc` はコンパイラの `/showIncludes` 出力（"Note: including file:" 行）を ninja が解釈して
+  ヘッダ依存を記録する。だが launcher→worker→agent→launcher の経路で**注入された子コンパイラの依存出力が ninja に届かず**、
+  ninja は `#deps 0` を記録（M6.3 増分プローブで実測：素の ninja+cl は依存追跡するが、launcher 経由だと 0 件）。結果、
+  分散ビルド後に**ヘッダを編集しても依存 TU が再コンパイルされず stale な .obj が使われうる**（クリーンビルドと
+  cached/distributed のバイト経路は無影響）。worker は子の stdout/stderr を OutputChunk でストリームし launcher は
+  replay するが（`#pragma message` は届く＝m6_daemon で実証済み）、`/showIncludes` 行は出力に現れない（C++ launcher.exe の
+  注入子 stdio 転送、または stderr 経路の取りこぼしが疑い）。compiler 非依存（cl/clang-cl 共通）。M6.3 では非致命の
+  INCREMENTAL DIAG として CI ログに可視化（修正で自動的に WORKS へ）。修正は C++ launcher / worker / agent の stdio 経路に
+  関わる load-bearing 変更で security-reviewer 必須。代替: depfile ベース（`/sourceDependencies` JSON ＋ `deps = gcc`）で
+  ロケール・伝播非依存にする手もある。出所: M6.3 増分プローブ実測(2026-06-15)、worker lib.rs spawn_stdio_reader、intake.rs emit_outcome。
 
 ## M7（堅牢化・セキュリティ）
 
