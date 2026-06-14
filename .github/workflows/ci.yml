@@ -115,12 +115,12 @@ jobs:
         run: pwsh -NoProfile -File hooks/test/m6_msbuild.ps1
       # Gates M6.3: a real multi-TU CMake project built with the Ninja generator
       # and CMAKE_<LANG>_COMPILER_LAUNCHER (the cleanest production hook, docs/
-      # integrations). Every TU distributes through the daemon; each clang-cl .obj
-      # is byte-identical to a non-distributed reference; the link stays local
+      # integrations). Every TU distributes through the daemon; the link stays local
       # (exe runs, exits 0); a 2nd build with the worker stopped HITS the cache for
-      # every TU; and with the daemon down ninja still completes (local fallback).
-      # timeout-minutes bounds a stuck child (M7.3 lesson).
-      - name: M6.3 ninja distributed build (clang-cl byte-identical, cache hit, fallback)
+      # every TU and the cached object is byte-identical to the distributed one
+      # (clang-cl, lossless CAS round-trip); and with the daemon down ninja still
+      # completes (local fallback). timeout-minutes bounds a stuck child (M7.3 lesson).
+      - name: M6.3 ninja distributed build (all TUs remote, cached==distributed, cache hit, fallback)
         timeout-minutes: 10
         run: pwsh -NoProfile -File hooks/test/m6_ninja.ps1 -RequireClangCl -RequireNinja
       # Gates M7.3: a 64-bit injector spawning a 32-bit child gets the 32-bit
