@@ -227,6 +227,34 @@ Incredibuild の本当の堀である「プロセス仮想化」を OSS で再�
 > 最初の証明 WL = **dxc（HLSL）**。**実 2 台 LAN** は M8 で要件化せず、cross-machine 固有
 > （cwd=入力ルート崩れ・trace データプレーン返送・writeback スコープ）は決定者承認の **M8.x** に分離。
 
+> **現状（2026-06）:** M0–M8 はいずれも **単機経路（daemon＋worker＋ビルドが同一ホスト）** で Done-when を満たし、
+> `.github/workflows/ci.yml` の各ゲートで常時検証している。ここから先（M9・M10）は「単機で実証した機構を、
+> 物理的に分かれた複数台で本番化し（M9）、ビルドして使うソフトから入れて使うソフトにする（M10）」工程。
+
+### M9 — 実 2 台 LAN（cross-machine の本番化）
+
+M3 以来「実 2 台は決定者承認の別スコープ」として繰り延べてきた cross-machine 固有の課題を、正式マイルストーンとして片付ける。単機（＋RTT エミュ）では構造的に得られない本番条件をここで満たす。
+
+- **cwd＝入力ルート崩れ**の cross-machine 対応（M8.3 で単機の宣言ルートは実装済み。2 台での実証が残）
+- **trace のデータプレーン返送**（`VfsExecution.trace_dir` の単機共有 FS 前提を解消。ADR 0005／M6.1c 繰越）
+- **WriteBack の declared-output スコープ**（M7.1 繰越）と **worker-root の authoritative binding**（M7.1 HIGH-2）
+- **多ワーカー並列効率の実測**（M5.5 の E(2)=0.88 は分配層の上限値。忠実な値は実 LAN・ターボ／co-tenancy 交絡を排した実機で）
+- **レイテンシ予算タイマ・フォールバック閾値の実値化**（機構は M5.2 導入済み、本番 RTT 分布が要る）
+- **Done when:** 物理的に分かれた 2 台以上で、ローカルと **バイト一致**（clang-cl）の成果物が、ローカル実行から大きく劣化しない速度で得られ、ワーカー切断時にローカルフォールバックで確実に完走する
+
+> 実 2 台環境の準備と決定者承認が着手の前提（M3 以来の方針を踏襲）。ADR 0007 §M8.x の繰延項目を本マイルストーンへ集約する。
+
+### M10 — 配布物と常駐 UX（Productization）
+
+「ビルドして使えるソフト」から「入れて使えるソフト」へ。OSS が日常採用される最後の壁であり、設計原則「**無設定で動く**」（§2）を導入・運用の UX として実現するフェーズ。
+
+- **Windows インストールウィザード** — 署名済み MSI／winget。バイナリ群（`sembazuru-daemon`／`sembazuru-worker`／`sembazuru`(launcher)／`launcher.exe`＋`sbz_interceptor{64,32}.dll`／`Directory.Build.targets`）の配置・PATH 登録・**daemon の Windows サービス登録（常駐化）**・ファイアウォール規則（Coordination/fileserver/worker ポート）・`SEMBAZURU_CLUSTER_TOKEN` 初期設定・アンインストールまで。**M7.2 の Authenticode 署名パイプライン**と EDR 許可リスト申請（`docs/security/edr-allowlist.md`）に必ず接続する（フック DLL 注入は EDR 誤検知の的＝署名・申請なしでは採用が止まる）。
+- **常駐 GUI アプリ** — daemon をトレイ常駐／サービスとして動かし、接続 worker 一覧と health・キャッシュヒット率・in-flight アクション・remote/local/fallback の内訳を可視化。daemon/worker の start/stop と `SEMBAZURU_*`（cache root・cluster token 等）の設定を GUI に隠蔽する。実装は Rust GUI（Tauri／egui／windows-rs トレイ）で既存 gRPC Coordination を叩く＝スタックと整合。
+- **長寿命 daemon の disk eviction**（deferred #8：per-action scratch/trace・agent セッション CAS の累積）を併せて対応。常駐サービス化で必ず顕在化するため M10 で同時に片付ける。
+- **Done when:** 非開発者が署名済みインストーラから導入し、GUI から daemon／worker を起動して既存プロジェクトを分散ビルドでき、クラスタ／キャッシュの状態を目視確認できる
+
+> 注: Unreal Engine／UnrealBuildTool 統合（design-only・EULA／clean-room・ADR 0005）と MSVC cross-dir バイト一致（best-effort・`determinism.md`）は M9/M10 とは独立した継続課題として `docs/deferred.md` で追跡する。
+
 ---
 
 ## 8. 横断的な懸念（全フェーズで意識する）
