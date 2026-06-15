@@ -12,11 +12,25 @@
               SEMBAZURU_LAUNCHER_DIR = directory containing sembazuru.exe
               SEMBAZURU_SHIM_CC      = the real compiler ("cl.exe" or "clang-cl.exe")
               SEMBAZURU_DAEMON       = daemon endpoint (default http://127.0.0.1:50071)
+              SEMBAZURU_INPUT_ROOT   = your solution/repo root (see below)
             and start a daemon + at least one worker (see docs/integrations).
 
        The launcher hands each compile to the daemon, which distributes it; if the
        daemon is unreachable it falls back to a normal local compile, so the build
        always completes. Set SEMBAZURU_DISABLE=true to bypass the shim entirely.
+
+       Action caching across the MSBuild CL task (SEMBAZURU_INPUT_ROOT):
+         MSBuild batches all sources into ONE `cl @<response-file>` invocation, and
+         a /Zi build writes objects (obj\) and a shared PDB (bin\) in *separate*
+         subtrees. For the action cache to key on the right sources and republish
+         every output on a hit, point SEMBAZURU_INPUT_ROOT at the one directory that
+         contains them all — your solution/repo root. The launcher anchors the
+         response file and the cache relativizes/publishes obj\ and bin\ under this
+         single root. Leave it unset to fall back to each compile's own working
+         directory (correct, but a /Zi build whose outputs land outside that dir is
+         simply not cached — never miscached). A `.sembazuru\` folder of
+         content-addressed response files is created under the root; add it to
+         .gitignore.
 
        This file is imported after the C++ toolset (Directory.Build.targets is the
        last import), so it overrides the toolset's default CL.exe. -->

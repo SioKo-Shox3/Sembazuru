@@ -102,6 +102,68 @@ fn env_flag(key: &str) -> bool {
     }
 }
 
+/// Rewrites each `@<path>` response-file argument in `argv` to a
+/// content-addressed stable path under `root`. See the call site for why: it
+/// makes the action's weak key reproducible across builds. Each rewrite is best
+/// effort — a failure leaves the original argument untouched.
+fn stabilize_response_files(argv: &mut [String], root: &str) {
+    for arg in argv.iter_mut() {
+        let Some(path) = arg.strip_prefix('@') else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(stable) = stabilize_one(path, root) {
+            *arg = format!("@{stable}");
+        }
+    }
+}
+
+/// Materializes the response file at `path` as `<root>\.sembazuru\sbz-rsp-<digest>.rsp`
+/// and returns that stable path, or `None` if it cannot be done safely.
+///
+/// Hardening: the bytes are written to a unique temp sibling and **atomically
+/// renamed** into place, then the on-disk file is re-read and its digest
+/// re-verified before the path is returned (TOCTOU: only rewrite the argument if
+/// the stable file truly holds these exact bytes). Content addressing makes it
+/// idempotent — a correct existing copy is reused, and concurrent launchers
+/// writing the same digest converge on identical content.
+fn stabilize_one(path: &str, root: &str) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let digest: String = sembazuru_cas::Digest::of(&bytes).hex().to_owned();
+    let dir = std::path::Path::new(root).join(".sembazuru");
+    std::fs::create_dir_all(&dir).ok()?;
+    let stable = dir.join(format!("sbz-rsp-{digest}.rsp"));
+
+    // Reuse a correct existing copy (idempotent across builds and launchers).
+    // Refuse to trust a pre-placed *symlink* even if its target's bytes hash
+    // correctly: on a shared build root an attacker could point it elsewhere and
+    // swap the target after the digest check (TOCTOU). Treating a symlink as
+    // "not correct" forces the atomic rename below, replacing it with our own
+    // regular file before the compiler ever opens it.
+    let is_regular = std::fs::symlink_metadata(&stable)
+        .map(|m| !m.file_type().is_symlink())
+        .unwrap_or(false);
+    let already_correct = is_regular
+        && std::fs::read(&stable)
+            .map(|b| digest == sembazuru_cas::Digest::of(&b).hex())
+            .unwrap_or(false);
+    if !already_correct {
+        let tmp = dir.join(format!("sbz-rsp-{digest}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, &bytes).ok()?;
+        if std::fs::rename(&tmp, &stable).is_err() {
+            // A racing launcher may have published it first; clean up our temp.
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    // Re-verify the on-disk content before trusting the path (TOCTOU).
+    let on_disk = std::fs::read(&stable).ok()?;
+    (digest == sembazuru_cas::Digest::of(&on_disk).hex())
+        .then(|| stable.to_string_lossy().into_owned())
+}
+
 #[tokio::main]
 async fn main() {
     // argv[0] is `sembazuru` itself; argv[1..] is the real compiler command.
@@ -137,6 +199,25 @@ async fn main() {
     let cwd = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
+
+    // Declared input root for processes that read above their cwd (ADR 0007 /
+    // M8.3); empty = use cwd (the compiler default).
+    let input_root = std::env::var("SEMBAZURU_INPUT_ROOT").unwrap_or_default();
+
+    // Stabilize any `@<response-file>` argument before submitting. MSBuild's CL
+    // task names the response file with a per-invocation random temp path, so the
+    // weak key (an argv hash) would change every build and never cache. Rewriting
+    // it to a content-addressed stable path under the build root makes the key
+    // reproducible and puts the file where the read-VFS can supply it. On any
+    // failure the original argument is kept — the build stays correct, just
+    // uncached.
+    let rsp_root = if input_root.is_empty() {
+        cwd.as_str()
+    } else {
+        input_root.as_str()
+    };
+    stabilize_response_files(&mut argv, rsp_root);
+
     let full_env: HashMap<String, String> = std::env::vars().collect();
     let env = sembazuru_agent::env_filter::filter_compiler_env(&full_env);
     let command = Command { argv, env, cwd };
@@ -153,7 +234,7 @@ async fn main() {
         strict_vfs: env_flag("SEMBAZURU_VFS_STRICT"),
         // Declared input root for processes that read above their cwd (ADR
         // 0007 / M8.3); empty = use cwd (the compiler default).
-        input_root: std::env::var("SEMBAZURU_INPUT_ROOT").unwrap_or_default(),
+        input_root,
     };
 
     let code = match submit_to_daemon(endpoint, command.clone(), opts).await {
@@ -173,7 +254,7 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::infer_outputs;
+    use super::{infer_outputs, stabilize_response_files};
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
@@ -216,5 +297,59 @@ mod tests {
     fn unknown_tool_with_no_recognizable_output_infers_nothing() {
         // An arbitrary process: nothing inferable → empty → trace discovery.
         assert!(infer_outputs(&argv(&["my-tool", "--in", "x", "--out", "y"])).is_empty());
+    }
+
+    #[test]
+    fn response_file_arg_is_rewritten_to_a_stable_content_addressed_path() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("sbz-rsp-test-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Two response files with identical content but different (random) names —
+        // the MSBuild case. Both must rewrite to the SAME stable path so the weak
+        // key is reproducible across builds.
+        let rsp_a = root.join("tmpAAAA.rsp");
+        let rsp_b = root.join("tmpBBBB.rsp");
+        std::fs::write(&rsp_a, b"/c\na.cpp\nb.cpp\n").unwrap();
+        std::fs::write(&rsp_b, b"/c\na.cpp\nb.cpp\n").unwrap();
+
+        let root_s = root.to_string_lossy().into_owned();
+        let mut argv_a = vec!["cl".to_string(), format!("@{}", rsp_a.display())];
+        let mut argv_b = vec!["cl".to_string(), format!("@{}", rsp_b.display())];
+        stabilize_response_files(&mut argv_a, &root_s);
+        stabilize_response_files(&mut argv_b, &root_s);
+
+        assert_eq!(
+            argv_a[1], argv_b[1],
+            "identical content → identical key arg"
+        );
+        let stable = argv_a[1].strip_prefix('@').unwrap();
+        assert!(
+            std::path::Path::new(stable).exists(),
+            "stable rsp must exist on disk"
+        );
+        assert_eq!(
+            std::fs::read(stable).unwrap(),
+            b"/c\na.cpp\nb.cpp\n",
+            "stable rsp content matches the original"
+        );
+
+        // Different content → different stable path (a changed action must not
+        // collide onto the prior key).
+        let rsp_c = root.join("tmpCCCC.rsp");
+        std::fs::write(&rsp_c, b"/c\na.cpp\nb.cpp\nc.cpp\n").unwrap();
+        let mut argv_c = vec!["cl".to_string(), format!("@{}", rsp_c.display())];
+        stabilize_response_files(&mut argv_c, &root_s);
+        assert_ne!(argv_a[1], argv_c[1], "changed content → changed key arg");
+
+        // A non-response argument is left untouched.
+        let mut plain = vec!["cl".to_string(), "/c".to_string(), "a.cpp".to_string()];
+        stabilize_response_files(&mut plain, &root_s);
+        assert_eq!(plain, vec!["cl", "/c", "a.cpp"]);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

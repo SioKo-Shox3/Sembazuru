@@ -26,7 +26,8 @@ use std::io;
 use std::path::Path;
 
 use sembazuru_cas::{ActionCache, ActionResult, BlobStore, Digest, OutputFile};
-use sembazuru_tracer::action_key::{self, InputEntry, InputManifest};
+use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest};
+use sembazuru_tracer::normalize_for_compare;
 
 /// Owns the on-disk CAS + action cache rooted at one directory.
 pub struct AgentCache {
@@ -72,6 +73,12 @@ impl AgentCache {
         let Some(manifest) = decode_manifest(&manifest_bytes) else {
             return Ok(CacheLookup::Miss); // corrupt manifest → re-run
         };
+        // Defense-in-depth: a manifest marked uncacheable (a real read whose
+        // content the strong key could not cover) must never resolve to a hit,
+        // even if one was somehow stored. `record` already refuses to store these.
+        if !manifest.cacheable {
+            return Ok(CacheLookup::Miss);
+        }
         let strong = sembazuru_cas::strong_fingerprint(weak, &action_key::manifest_hash(&manifest));
         let Some(result) = self.cache.get_result(&strong)? else {
             return Ok(CacheLookup::Miss);
@@ -82,6 +89,18 @@ impl AgentCache {
         // miss would leave a partial result for the re-run to clean up.
         let mut fetched = Vec::with_capacity(result.outputs.len());
         for out in &result.outputs {
+            // Scope guard (BLOCK-B): never publish a stored output outside the
+            // build root. A stored logical that fails the guard means a corrupt
+            // or tampered entry — fail closed (hard error), do not publish any.
+            if !action_key::is_under_build_root(&out.logical_path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to publish cached output outside the build root: {:?}",
+                        out.logical_path
+                    ),
+                ));
+            }
             let Some(bytes) = self.store.get(&out.digest)? else {
                 return Ok(CacheLookup::Miss);
             };
@@ -110,6 +129,26 @@ impl AgentCache {
         output_logical_paths: &[String],
         exit_code: i32,
     ) -> io::Result<()> {
+        // Input-side fail-closed (ADR 0007 §b.3): if the strong key cannot be
+        // guaranteed to cover a real content read, decline the action rather
+        // than risk a stale hit. Store nothing so a later resolve simply misses.
+        if !manifest.cacheable {
+            return Ok(());
+        }
+        // Output-side scope guard (BLOCK-B): every output must publish *under*
+        // the build root. `output_logical_paths` may come from the launcher's
+        // own declaration (`SEMBAZURU_OUTPUTS` / `/Fo`), which is not run through
+        // `cacheable_outputs`, so re-validate here. A `..`/rooted/absolute path
+        // is a hard error — never read-from or store an out-of-scope output.
+        for logical in output_logical_paths {
+            if !action_key::is_under_build_root(logical) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("refusing to cache output outside the build root: {logical:?}"),
+                ));
+            }
+        }
+
         self.cache.put_manifest(weak, &encode_manifest(manifest))?;
 
         let mut outputs = Vec::with_capacity(output_logical_paths.len());
@@ -151,9 +190,19 @@ impl AgentCache {
 
     /// Loads a trace directory and extracts the observed-input manifest. Thin
     /// wrapper over the tracer; returns an error string on an unreadable trace.
-    pub fn manifest_from_trace_dir(&self, trace_dir: &str) -> Result<InputManifest, String> {
+    ///
+    /// `root_override` is the action's declared input root (e.g. a solution root
+    /// spanning `obj\` and `bin\`); when empty/`None`, the run's working
+    /// directory is used. Inputs are anchored and relativized against this same
+    /// root so the manifest's logical paths match the outputs published under it.
+    pub fn manifest_from_trace_dir(
+        &self,
+        trace_dir: &str,
+        root_override: Option<&str>,
+    ) -> Result<InputManifest, String> {
         let (graph, cwd) = action_key::load_run_from_dir(trace_dir)?;
-        Ok(action_key::input_manifest(&graph, &cwd))
+        let root = effective_root(root_override, &cwd);
+        Ok(action_key::input_manifest(&graph, &root))
     }
 
     /// The build-root-relative output paths a traced run produced (observed
@@ -171,9 +220,26 @@ impl AgentCache {
     ///
     /// [`record`]: AgentCache::record
     /// [`resolve`]: AgentCache::resolve
-    pub fn outputs_from_trace_dir(&self, trace_dir: &str) -> Result<Vec<String>, String> {
+    pub fn outputs_from_trace_dir(
+        &self,
+        trace_dir: &str,
+        root_override: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         let (graph, cwd) = action_key::load_run_from_dir(trace_dir)?;
-        Ok(cacheable_outputs(action_key::logical_outputs(&graph, &cwd)))
+        let root = effective_root(root_override, &cwd);
+        Ok(cacheable_outputs(action_key::logical_outputs(
+            &graph, &root,
+        )))
+    }
+}
+
+/// The action's effective build root: the declared input root (normalized once,
+/// the same value used to relativize and to publish — closing the record/resolve
+/// asymmetry of BLOCK-B), or the run's working directory when none is declared.
+fn effective_root(root_override: Option<&str>, trace_cwd: &str) -> String {
+    match root_override {
+        Some(r) if !r.trim().is_empty() => normalize_for_compare(r),
+        _ => trace_cwd.to_string(),
     }
 }
 
@@ -245,12 +311,29 @@ fn get_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
     Some(v)
 }
 
+fn kind_byte(k: InputKind) -> u8 {
+    match k {
+        InputKind::Content => 0,
+        InputKind::Absent => 1,
+    }
+}
+
+fn kind_from_byte(b: u8) -> Option<InputKind> {
+    match b {
+        0 => Some(InputKind::Content),
+        1 => Some(InputKind::Absent),
+        _ => None, // unknown discriminant → corrupt/format drift → miss
+    }
+}
+
 fn encode_manifest(m: &InputManifest) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.push(m.cacheable as u8);
     buf.extend_from_slice(&(m.inputs.len() as u32).to_le_bytes());
     for e in &m.inputs {
         put_str(&mut buf, &e.logical);
         put_str(&mut buf, &e.absolute);
+        buf.push(kind_byte(e.kind));
     }
     buf.extend_from_slice(&(m.cmds.len() as u32).to_le_bytes());
     for c in &m.cmds {
@@ -261,12 +344,20 @@ fn encode_manifest(m: &InputManifest) -> Vec<u8> {
 
 fn decode_manifest(buf: &[u8]) -> Option<InputManifest> {
     let mut pos = 0;
+    let cacheable = *buf.get(pos)? != 0;
+    pos += 1;
     let n_inputs = get_u32(buf, &mut pos)? as usize;
     let mut inputs = Vec::with_capacity(n_inputs.min(65536));
     for _ in 0..n_inputs {
         let logical = get_str(buf, &mut pos)?;
         let absolute = get_str(buf, &mut pos)?;
-        inputs.push(InputEntry { logical, absolute });
+        let kind = kind_from_byte(*buf.get(pos)?)?;
+        pos += 1;
+        inputs.push(InputEntry {
+            logical,
+            absolute,
+            kind,
+        });
     }
     let n_cmds = get_u32(buf, &mut pos)? as usize;
     let mut cmds = Vec::with_capacity(n_cmds.min(65536));
@@ -276,7 +367,11 @@ fn decode_manifest(buf: &[u8]) -> Option<InputManifest> {
     if pos != buf.len() {
         return None; // trailing junk → corrupt
     }
-    Some(InputManifest { inputs, cmds })
+    Some(InputManifest {
+        inputs,
+        cmds,
+        cacheable,
+    })
 }
 
 #[cfg(test)]
@@ -302,9 +397,11 @@ mod tests {
                 .map(|(logical, abs)| InputEntry {
                     logical: (*logical).to_string(),
                     absolute: abs.to_string_lossy().into_owned(),
+                    kind: InputKind::Content,
                 })
                 .collect(),
             cmds: vec!["clang-cl /c a.cpp".into()],
+            cacheable: true,
         }
     }
 
@@ -337,19 +434,23 @@ mod tests {
                 InputEntry {
                     logical: "a.cpp".into(),
                     absolute: "c:\\w\\a.cpp".into(),
+                    kind: InputKind::Content,
                 },
                 InputEntry {
-                    logical: "h\\b.h".into(),
-                    absolute: "c:\\w\\h\\b.h".into(),
+                    logical: "missing.h".into(),
+                    absolute: "c:\\w\\missing.h".into(),
+                    kind: InputKind::Absent,
                 },
             ],
             cmds: vec!["cc /c a.cpp".into(), "link a.obj".into()],
+            cacheable: true,
         };
         assert_eq!(decode_manifest(&encode_manifest(&m)), Some(m));
         // Trailing junk is rejected.
         let mut bytes = encode_manifest(&InputManifest {
             inputs: vec![],
             cmds: vec![],
+            cacheable: true,
         });
         bytes.push(0);
         assert_eq!(decode_manifest(&bytes), None);
