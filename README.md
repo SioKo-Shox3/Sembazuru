@@ -149,37 +149,39 @@ Milestones advance by a **"Done when"** condition, not by date. This is a spare-
 | **M6** | Build-system integrations | Existing projects build distributed with minimal setup | ✅ |
 | **M7** | Hardening | Reliable enough for daily use (signing, AV allowlist, OS-update CI) | ✅ |
 | **M8** | Beyond compilation | Non-compile workloads distribute with no special support | ✅ |
-| **M9** | Real two-machine LAN | Byte-identical output across physically separate machines, no latency collapse, fallback on disconnect | ⬜ planned |
-| **M10** | Productization & UX | A non-developer installs from a signed wizard and drives the resident GUI to distribute a build | ⬜ planned |
+| **M9** | Productization & UX | A non-developer installs from a signed wizard and drives the resident GUI to distribute a build | ⬜ planned |
+| **M10** | Real two-machine LAN | Byte-identical output across physically separate machines, no latency collapse, fallback on disconnect | ⬜ planned |
 
 M0–M8 each meet their "Done when" on the **single-machine** path, gated in CI
 (`.github/workflows/ci.yml`): M1–M4 and M6–M8 by end-to-end `hooks/test/*.ps1`
 gates, M5 by the scheduler tests under `cargo test --workspace`, and M0's hooking
-deliverable transitively via the build + M1 smoke. M9–M10 — going truly
-multi-machine and shipping installable software — are the remaining work (see
-**What's not done yet**). The process tracer (M1) still ships standalone as a "build dependency
+deliverable transitively via the build + M1 smoke. M9–M10 — shipping installable
+software, then going truly multi-machine — are the remaining work (see **What's not
+done yet**). The process tracer (M1) still ships standalone as a "build dependency
 tracer": it exercises the hardest primitive (hooking) in a safe, observe-only mode
 and is useful by itself.
 
 ## What's not done yet
 
 The mechanism is proven end to end on one box; the gap to *daily, real-world use by
-others* is two things — going multi-machine, and becoming installable software.
+others* is two things, in order — becoming installable software, then going truly
+multi-machine. Packaging comes first so that a second machine is "install, configure,
+done" before any real-LAN measurement begins.
 
-- **Real two-machine LAN (M9).** Everything above runs daemon + worker + build on a
-  single host (speed numbers use RTT emulation). The cross-machine specifics —
-  `cwd`=input-root drift, returning the trace over the data plane, write-back scope,
-  authoritative root binding — are deliberately deferred behind decision-owner
-  approval (`docs/deferred.md`, ADR 0007 §M8.x).
-- **Windows install wizard (M10).** Today you build from source in a VS developer
+- **Windows install wizard (M9).** Today you build from source in a VS developer
   shell (`cmake` + `cargo`) and wire env vars by hand. A signed installer
   (MSI/winget/WiX) that drops the daemon, worker, launcher, and hook DLLs in place,
   registers the service, and configures firewall/auth — wired to the M7.2 signing
   pipeline and EDR allowlist — is **not built yet**.
-- **Resident GUI application (M10).** The daemon and worker are headless CLI
+- **Resident GUI application (M9).** The daemon and worker are headless CLI
   processes you start in terminals. A Windows tray/GUI app that runs the daemon
   resident, shows cluster/worker/cache status, and exposes start/stop and config is
   **not built yet**.
+- **Real two-machine LAN (M10).** Everything above runs daemon + worker + build on a
+  single host (speed numbers use RTT emulation). The cross-machine specifics —
+  `cwd`=input-root drift, returning the trace over the data plane, write-back scope,
+  authoritative root binding — are deliberately deferred behind decision-owner
+  approval (`docs/deferred.md`, ADR 0007 §M8.x).
 - **Smaller open items** (all tracked in `docs/deferred.md`): MSVC cross-dir
   byte-identity (best-effort today), Unreal Engine / UnrealBuildTool integration
   (design-only — EULA/clean-room), disk eviction for long-lived daemons, and
@@ -202,8 +204,8 @@ Running MSVC's `cl.exe` on remote machines sits in a licensing grey area under t
 
 Pre-alpha, but the full compile-distribution pipeline (M1–M8) works and is gated in
 CI on the single-machine path. The two things standing between this and other people
-using it daily are **real two-machine LAN** and **end-user packaging** (an install
-wizard and a resident GUI app) — see [What's not done yet](#whats-not-done-yet). If
+using it daily are **end-user packaging** (an install wizard and a resident GUI app)
+and then **real two-machine LAN** — see [What's not done yet](#whats-not-done-yet). If
 the mission resonates, those, plus widening compiler/build-system coverage and
 hammering on determinism, are where help matters most.
 
