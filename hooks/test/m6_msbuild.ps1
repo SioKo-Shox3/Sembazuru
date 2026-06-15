@@ -4,15 +4,19 @@
 # at the sembazuru launcher (with SEMBAZURU_SHIM_CC naming the real compiler) routes
 # every compile through the agent daemon — the same production path CMake/Ninja use
 # via CMAKE_<LANG>_COMPILER_LAUNCHER, but for projects MSBuild drives. A multi-TU
-# (a/b/c.cpp) static library asserts:
+# (a/b/c.cpp) /Zi static library hard-asserts:
 #   1. the objects are produced by a compile that ran through the daemon ("remote");
-#   2. with the daemon down, the build still completes (local fallback).
-# Action caching across the MSBuild shim is reported as a non-fatal DIAG: MSBuild
-# batches all sources into one CL invocation (often via a response file), which the
-# launcher's per-file /Fo inference + argv key do not cache the way the CMake/Ninja
-# per-file path does (KNOWN LIMITATION, docs/deferred.md). Byte-identity is the
-# clang-cl gate elsewhere; the MSVC toolset here is byte-best-effort, so this gate
-# checks the mechanism, not the bytes.
+#   2. a second build with the daemon up but NO worker is a cache HIT that restores
+#      every object AND the shared /Zi PDB (a separate bin\ subtree) — batched
+#      response-file action caching, keyed on the right sources under one declared
+#      input root (SEMBAZURU_INPUT_ROOT);
+#   3. after a breaking edit to a.cpp the build FAILS — a stale object is never served
+#      (the strong key covers the response-file source content; BLOCK-A);
+#   4. with the daemon down, the build still completes (local fallback).
+# Byte-identity remains the clang-cl gate's job elsewhere; the MSVC toolset here is
+# byte-best-effort, so this gate asserts the caching mechanism and the stale-serve
+# guarantee, not raw MSVC bytes. (Caching was a non-fatal DIAG before — now a hard
+# gate; docs/deferred.md.)
 #
 # Requires MSBuild + cl + cargo on PATH (CI hooks job, after msvc-dev-cmd).
 param(
@@ -117,19 +121,30 @@ function Start-Worker {
 # batches all sources into ONE cl invocation, so the shim sees a single multi-source
 # action -> the daemon discovers the object set from the action trace (the /Fo
 # heuristic only names one).
+# The artifacts MSBuild produces: one object per source in IntDir (obj\) plus the
+# shared /Zi PDB in OutDir (bin\) — a SEPARATE subtree. A correct cache HIT must
+# restore EVERY one of these, proving the declared input root spans both obj\ and
+# bin\ (the BLOCK-B fix: obj\ and bin\ relativize/publish under one root).
 $objPaths = @('a.obj', 'b.obj', 'c.obj') | ForEach-Object { Join-Path $proj "obj\$_" }
-function Clean-Objs { foreach ($o in $objPaths) { if (Test-Path $o) { Remove-Item -Force $o } } }
-function Objs-Present { foreach ($o in $objPaths) { if (-not (Test-Path $o) -or (Get-Item $o).Length -eq 0) { return $false } } ; return $true }
-# Run msbuild; the CL task invokes the sembazuru shim. Cleans the objects first so a
-# build actually recompiles (and so a cache-served build must restore every object).
+$pdbPath = Join-Path $proj 'bin\test.pdb'
+$outPaths = @($objPaths) + @($pdbPath)
+function Clean-Outputs { foreach ($o in $outPaths) { if (Test-Path $o) { Remove-Item -Force $o } } }
+function Outputs-Present { foreach ($o in $outPaths) { if (-not (Test-Path $o) -or (Get-Item $o).Length -eq 0) { return $false } } ; return $true }
+# Run msbuild; the CL task invokes the sembazuru shim. Cleans every output first so a
+# build actually recompiles (and so a cache-served build must RESTORE every output).
+# SEMBAZURU_INPUT_ROOT = the project root spanning obj\, bin\, and the response file,
+# so the action cache keys on the real sources and republishes obj\ + the PDB on a hit
+# (the production-recommended MSBuild config, docs/integrations/msbuild).
 function Invoke-MSBuild {
-    Clean-Objs
+    param([switch]$NoInputRoot)
+    Clean-Outputs
     $env:SEMBAZURU_SHIM_CC = 'cl'      # the real compiler the shim prepends
     $env:SEMBAZURU_DAEMON = "http://$intake"
+    if (-not $NoInputRoot) { $env:SEMBAZURU_INPUT_ROOT = $proj }
     $out = & msbuild (Join-Path $proj 'test.vcxproj') /nologo /v:minimal /t:Build `
         /p:Configuration=Release /p:Platform=x64 2>&1 | Out-String
     $code = $LASTEXITCODE
-    Remove-Item Env:\SEMBAZURU_SHIM_CC, Env:\SEMBAZURU_DAEMON -ErrorAction SilentlyContinue
+    Remove-Item Env:\SEMBAZURU_SHIM_CC, Env:\SEMBAZURU_DAEMON, Env:\SEMBAZURU_INPUT_ROOT -ErrorAction SilentlyContinue
     return @{ exit = $code; out = $out }
 }
 
@@ -148,44 +163,75 @@ try {
     Write-Host "MSBUILD1 exit=$($r.exit) remote=$([bool]($r.out -match 'sembazuru: remote'))"
     if ($r.exit -ne 0) { $failures += "msbuild via shim did not succeed (exit=$($r.exit))`n$($r.out)" }
     if ($r.out -notmatch 'sembazuru: remote') { $failures += 'compile did not run through the daemon (no "remote" note)' }
-    if (-not (Objs-Present)) { $failures += 'msbuild produced missing/empty objects via the shim' }
+    if (-not (Outputs-Present)) { $failures += 'msbuild produced missing/empty outputs via the shim' }
 } finally {
     foreach ($p in @($workerProc, $daemon)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
 }
 
-# 2. Action cache — DIAGNOSTIC (non-fatal). Restart the daemon (same cache root) with
-# NO worker; a cache HIT would serve the recorded objects without a worker. MSBuild's
-# CL task batches all sources into ONE compiler invocation (commonly via a response
-# file), so the shim sees a single multi-source action. The launcher's /Fo output
-# inference names only one object and the argv-based key is not stable across the
-# batched/response-file form, so the action does not cache the way the per-file
-# CMake/Ninja path does (which hits reliably — see m6_ninja.ps1). This is a KNOWN
-# LIMITATION (docs/deferred.md), reported here; the build still completes (a miss just
-# local-falls-back with the worker stopped). The build must still produce every object.
+# 2. Action cache — HARD assert (was DIAG). Restart the daemon (same cache root) with
+# NO worker, then clean every output. A correct HIT must serve the recorded objects
+# AND the shared /Zi PDB (a separate bin\ subtree) with no worker running — proving the
+# batched response-file action now caches and the declared input root spans obj\+bin\.
+# (Previously a KNOWN LIMITATION; fixed — docs/deferred.md.)
 $daemon2 = Start-Daemon
 try {
     Start-Sleep -Milliseconds 600
     $rc = Invoke-MSBuild
     $cacheHit = [bool]($rc.out -match 'sembazuru: cache hit')
-    Write-Host "MSBUILD2 exit=$($rc.exit) cache-hit=$cacheHit"
+    Write-Host "MSBUILD2 exit=$($rc.exit) cache-hit=$cacheHit outputs=$(Outputs-Present)"
     if ($rc.exit -ne 0) { $failures += "cached msbuild did not succeed (exit=$($rc.exit))`n$($rc.out)" }
-    if (-not (Objs-Present)) { $failures += 'second build did not produce every object' }
-    if ($cacheHit) {
-        Write-Host 'MSBUILD CACHE: action cache HIT through the MSBuild shim (batched-action caching now works)'
-    } else {
-        Write-Host 'MSBUILD CACHE DIAG (non-fatal): no cache hit through the MSBuild shim — batched multi-source / response-file actions are not cached like the per-file CMake/Ninja path (KNOWN LIMITATION, docs/deferred.md)'
+    if (-not $cacheHit) { $failures += "no action-cache HIT through the MSBuild shim (worker down)`n$($rc.out)" }
+    if (-not (Outputs-Present)) { $failures += 'cache HIT did not restore every output (objects + /Zi PDB)' }
+    if ($cacheHit -and (Outputs-Present)) {
+        Write-Host 'MSBUILD CACHE: action cache HIT restored all objects + the shared PDB with no worker (batched-action caching works)'
     }
 } finally {
     if ($daemon2 -and -not $daemon2.HasExited) { Stop-Process -Id $daemon2.Id -Force -ErrorAction SilentlyContinue }
 }
 
-# 3. Local fallback: daemon down -> msbuild still builds via the shim's local exec.
+# 3. Stale-serve guard — HARD assert (the BLOCK-A correctness gate). Break a.cpp, then
+# rebuild against the SAME populated cache with NO worker. The edit changes a.cpp's
+# content but not the response-file name, so a buggy strong key (one that dropped the
+# bare-relative source) would still HIT and serve the stale, good object — and the build
+# would SUCCEED. A correct strong key re-hashes a.cpp, MISSES, and local-falls-back to a
+# real compile of the now-broken source, which FAILS. So: after a breaking edit the build
+# MUST fail. A success here means a stale object was served (the bug we are gating).
+$daemon3 = Start-Daemon
+try {
+    Start-Sleep -Milliseconds 600
+    # 3a. Break a SOURCE (a.cpp). A correct strong key re-hashes it and MISSES.
+    $goodA = Get-Content (Join-Path $proj 'a.cpp') -Raw
+    Set-Content (Join-Path $proj 'a.cpp') "#include `"shared.h`"`nint f(){ return SHARED_VALUE  /* unterminated" -Encoding ascii
+    $rs = Invoke-MSBuild
+    Set-Content (Join-Path $proj 'a.cpp') $goodA -Encoding ascii   # restore
+    $staleSrc = ($rs.exit -eq 0)
+    Write-Host "MSBUILD3-EDIT-SRC exit=$($rs.exit) served-stale=$staleSrc"
+    if ($staleSrc) {
+        $failures += 'STALE SERVE (source): a broken a.cpp still built successfully — the cache served a stale object (strong key did not cover the edited source)'
+    }
+    # 3b. Break a HEADER (shared.h), included by every TU. A VFS-supplied header
+    # must also be in the strong key (the hook records redirected reads), so this
+    # too must MISS and fail the compile — not serve stale objects.
+    $goodH = Get-Content (Join-Path $proj 'shared.h') -Raw
+    Set-Content (Join-Path $proj 'shared.h') "#define SHARED_VALUE 42 +`n#error broken-header" -Encoding ascii
+    $rh = Invoke-MSBuild
+    Set-Content (Join-Path $proj 'shared.h') $goodH -Encoding ascii   # restore
+    $staleHdr = ($rh.exit -eq 0)
+    Write-Host "MSBUILD3-EDIT-HDR exit=$($rh.exit) served-stale=$staleHdr"
+    if ($staleHdr) {
+        $failures += 'STALE SERVE (header): a broken shared.h still built successfully — the cache served stale objects (strong key did not cover the VFS-supplied header)'
+    }
+} finally {
+    if ($daemon3 -and -not $daemon3.HasExited) { Stop-Process -Id $daemon3.Id -Force -ErrorAction SilentlyContinue }
+}
+
+# 4. Local fallback: daemon down -> msbuild still builds via the shim's local exec.
 Start-Sleep -Milliseconds 300
 $rf = Invoke-MSBuild
 Write-Host "MSBUILD-FALLBACK exit=$($rf.exit) fallback=$([bool]($rf.out -match 'running locally'))"
 if ($rf.exit -ne 0) { $failures += "msbuild fallback did not succeed (exit=$($rf.exit))`n$($rf.out)" }
 if ($rf.out -notmatch 'running locally') { $failures += 'fallback did not run locally (no "running locally" note)' }
-if (-not (Objs-Present)) { $failures += 'fallback produced missing/empty objects' }
+if (-not (Outputs-Present)) { $failures += 'fallback produced missing/empty outputs' }
 
 if ($failures.Count -gt 0) {
     Write-Host ''
@@ -193,4 +239,4 @@ if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Host "  - $_" }
     exit 1
 }
-Write-Host 'M6.2 MSBUILD GATE PASS (multi-TU MSBuild CL task routed through the daemon via the CLToolExe shim; local fallback works; action caching reported as DIAG)'
+Write-Host 'M6.2 MSBUILD GATE PASS (multi-TU /Zi MSBuild CL task routed through the daemon via the CLToolExe shim; action cache HIT restores all objects + the shared PDB with no worker; a breaking edit is never served stale; local fallback works)'

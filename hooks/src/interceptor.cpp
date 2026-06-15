@@ -617,7 +617,17 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR path, DWORD access, DWORD share,
     HANDLE redirected = VfsTryRedirect(path, access, share, sa, disposition,
                                        flags, templ, &handled);
     if (handled) {
-        return redirected;  // GetLastError is the redirected open's own
+        // Record the redirected read under its LOGICAL (requested) path so the
+        // action's true input set — the VFS-supplied sources and headers — is
+        // captured in the trace. Without this a redirected read is invisible to
+        // the trace, so a changed source would not move the action cache's strong
+        // key and a stale result could be served (BLOCK-A). Preserve the
+        // redirected open's own GetLastError across the recording I/O.
+        DWORD saved = GetLastError();
+        RecordCreateFile(path, -1, access, disposition,
+                         redirected == INVALID_HANDLE_VALUE ? saved : 0);
+        SetLastError(saved);
+        return redirected;
     }
 
     HANDLE h =
@@ -643,6 +653,13 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR path, DWORD access, DWORD share,
                                                disposition, flags, templ,
                                                &handled);
             if (handled) {
+                // Record the redirected read under its logical (requested) path,
+                // same as the W variant — keep VFS-supplied inputs in the trace
+                // so the action cache's strong key covers them (BLOCK-A).
+                DWORD saved = GetLastError();
+                RecordCreateFile(wp.get(), wp.length(), access, disposition,
+                                 redirected == INVALID_HANDLE_VALUE ? saved : 0);
+                SetLastError(saved);
                 return redirected;
             }
         }

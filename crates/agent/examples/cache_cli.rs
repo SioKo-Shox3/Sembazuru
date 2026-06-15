@@ -89,7 +89,10 @@ fn main() -> ExitCode {
                 eprintln!("cache_cli record: --trace-dir is required");
                 return ExitCode::from(2);
             };
-            let manifest = match agent.manifest_from_trace_dir(&trace_dir) {
+            // Root the manifest at the same build root used to record/publish,
+            // so logical paths line up (mirrors the daemon's effective-root use).
+            let root_s = build_root.to_string_lossy().into_owned();
+            let manifest = match agent.manifest_from_trace_dir(&trace_dir, Some(&root_s)) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("cache_cli record: load trace: {e}");

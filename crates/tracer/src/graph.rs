@@ -88,7 +88,10 @@ pub struct DependencyGraph {
 /// another machine). UNC/device paths and the rare drive-relative (`c:foo`) or
 /// current-drive-rooted (`\foo`) forms are not `.`/`..`-resolved — guessing
 /// their base would be worse than a verbatim entry.
-fn normalize_path(raw: &str, cwd: &str) -> String {
+/// Exposed for `action_key`: anchoring a traced input to a re-readable absolute
+/// path on a later build uses these exact rules, so the anchored path folds to
+/// the same logical entry the graph emits.
+pub fn normalize_path(raw: &str, cwd: &str) -> String {
     let u = unify(raw);
     match classify(&u) {
         PathKind::DriveAbsolute => canonicalize(&u),

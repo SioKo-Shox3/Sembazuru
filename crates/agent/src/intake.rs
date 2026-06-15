@@ -191,7 +191,26 @@ async fn run_submission(
         return;
     };
 
-    let build_root = PathBuf::from(&command.cwd);
+    // The action's effective build root for the cache: the declared input root
+    // (so the relativize/anchor/publish root spans obj\ and bin\ in one tree),
+    // or the command's cwd when none is declared. The *same* value roots both
+    // record (relativize) and resolve (publish), so the two stay symmetric
+    // (BLOCK-B). `root_decl` is the normalized-once override threaded into the
+    // trace adapters; `None` falls back to the run's cwd inside the adapter.
+    // Normalize the declared input root EXACTLY ONCE; this single value roots
+    // relativize/anchor (record), publish (resolve), and the trace adapters, so
+    // the gate and the `build_root.join(logical)` write use the identical string
+    // (closes the record/resolve asymmetry — BLOCK-B, ADR 0007 §b). Trimmed the
+    // same way `effective_root` trims, so a whitespace-only value falls back to
+    // cwd consistently on both sides.
+    let root_decl: Option<String> = {
+        let t = input_root.trim();
+        (!t.is_empty()).then(|| sembazuru_tracer::normalize_for_compare(t))
+    };
+    let build_root = match &root_decl {
+        Some(r) => PathBuf::from(r),
+        None => PathBuf::from(&command.cwd),
+    };
 
     // The weak key keys resolve, predicted_paths, and record. Computed off the
     // async runtime: weak_key hashes the toolchain binary from disk.
@@ -297,14 +316,20 @@ async fn run_submission(
         let br = build_root.clone();
         let declared = declared_outputs.clone();
         let td = trace_dir.clone();
+        let rd = root_decl.clone();
         let _ = tokio::task::spawn_blocking(move || {
+            let root = rd.as_deref();
             let outs: Vec<String> = if !declared.is_empty() {
                 declared
             } else {
-                cache.outputs_from_trace_dir(&td).unwrap_or_default()
+                cache.outputs_from_trace_dir(&td, root).unwrap_or_default()
             };
+            // record() self-gates on manifest.cacheable (input-side fail-closed)
+            // and on each output staying under the build root, so a manifest that
+            // could not cover a real source, or an out-of-scope output, simply
+            // does not get stored — the build stays correct, just uncached.
             if !outs.is_empty()
-                && let Ok(manifest) = cache.manifest_from_trace_dir(&td)
+                && let Ok(manifest) = cache.manifest_from_trace_dir(&td, root)
             {
                 let _ = cache.record(&weak, &manifest, &br, &outs, 0);
             }

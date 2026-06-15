@@ -284,28 +284,36 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   実証済み（ゲートは clang-cl で hard 強制、cl では DIAG）。非英語 cl の堅牢化が要るなら worker の出力コードページを CMake
   サンプルに合わせる（コンソール CP 固定）か、depfile ベース（`/sourceDependencies` JSON）への移行が将来余地。クリーンビルドと
   cached/distributed のバイト経路は元々無影響。出所: M6.3 直接プローブ＋CI 実測(2026-06-15)、launcher.cpp/worker lib.rs/agent intake.rs。
-- **【要対応・繰延】MSBuild シム経路の action cache 命中（分散・フォールバックは動く／キャッシュは未命中）。** 真因は
-  トレースの実コマンドラインで確定: MSBuild の CL タスクは全ソースを **1 つの `cl @<temp>\tmp<RANDOM>.rsp`（レスポンス
-  ファイル）で起動した単一バッチアクション**で、(a) ランダム rsp パスで weak key が毎ビルド変わる、(b) `/Zi` の共有 PDB
-  （`bin\test.pdb`）が obj（`obj\`）と別サブツリーの絶対パス出力として cwd 外に落ち `cacheable_outputs` の root 外
-  fail-close に当たる、の二重で常時 miss（m6_msbuild は cache を非致命 DIAG で可視化）。
-  **修正プロトタイプ（rsp 内容アドレス安定化＋`SEMBAZURU_INPUT_ROOT` スコープ＋root 正規化）は実装したが、品質ゲートで
-  二つの BLOCK を検出し差し戻した（2026-06-15）:**
-  - **キャッシュ汚染（determinism FAIL・最重要）:** rsp 経由のソースが**裸の相対名でトレース**され、`manifest_hash` が
-    daemon cwd から読めず「build-root-relative な読めない入力＝一時物」ヒューリスティック（`action_key.rs` input_components
-    L113-120／manifest_hash L224-231）で**落とす**ため、ソースが strong key に入らない（記録 manifest はツールチェーン DLL のみ）。
-    結果、命中を有効化すると **`a.cpp` 編集後も hit し stale な obj を serve**（ハッシュ実測で確認）。ADR 0007 §c の「同一入力
-    なら一貫セット」前提が、強キーの入力カバレッジ欠落で崩れる。
-  - **書き込みスコープ脱出（security BLOCK）:** `is_under_build_root`（`action_key.rs:85-89`）が `..` を弾かず、resolve の
-    `build_root.join(logical)`（`action_cache.rs:94`）で root 外へ任意書き込みの理論的余地（M7.1 BLOCK-1 同種）。加えて
-    resolve は**未正規化のクライアント供給 `input_root`** を使い record（正規化）と非対称、広い root 宣言で書き込み拡大。
-  - **正しい修正に必要な作業（別タスク）:** ① manifest がコンパイル対象ソースを**解決可能な絶対パス**で捕捉し、入力を
-    確実に拾えないアクションは fail-closed で無キャッシュ（ADR 0007 §b.3 を入力側にも）。② `is_under_build_root` を `..`／
-    rooted／UNC に対し自己完結で拒否、`input_root` を一度だけ正規化して gate と publish で同一値、書き込み root を cwd に
-    clamp（or 明示許容）。③ rsp の content-addressed temp は atomic-rename＋digest 再検証で TOCTOU 硬化。
-  - 据え置きの低リスク: 共有 PDB を**複数アクション横断**でキャッシュ（MSBuild バッチでは非発生）／cross-machine の出力
-    パス整合（M8.x）／`/Zi` PDB の非決定（命中時は build1 一貫セット・MSVC byte best-effort）。
-  出所: M6.2 訂正＋トレース command_line＋品質ゲート（verifier/determinism/security, 2026-06-15）。
+- **MSBuild シム経路の action cache 命中 — 解消（本修正、2026-06-15）。** MSBuild の CL タスクは全ソースを **1 つの
+  `cl @<temp>\tmp<RANDOM>.rsp`（レスポンスファイル）で起動した単一バッチアクション**（出力 `obj\{a,b,c}.obj` ＋ 共有 `/Zi`
+  PDB `bin\test.pdb`）。これを正しくキャッシュ命中させた。**真因は当初の記述（「ソースが裸相対名でトレースされ一時物
+  ヒューリスティックで落ちる」）ではなく、実トレース実測で別物だった**: VFS 実行ではコンパイル対象ソースも `shared.h` も
+  **トレース入力に一切現れなかった**（出るのはツールチェーン DLL・PDB・システムファイルのみ）。原因は hook
+  （`hooks/src/interceptor.cpp` の `HookedCreateFileW/A`）が **VFS リダイレクトした読み取りを `RecordCreateFile` せずに即
+  return** していたため＝VFS 供給入力が trace に乗らず、strong key が空（ツールチェーンのみ）。よって編集しても key が動かず
+  stale を serve しえた。
+  - **修正 ①（真の BLOCK-A 核心）:** hook がリダイレクト読み取りを**論理（要求）パスで `RecordCreateFile` 記録**
+    （GetLastError 退避・True\* のみ・二重記録/再帰なし、security-reviewer 確認済み）。これで a.cpp/b.cpp/c.cpp/shared.h が
+    `read` 入力としてトレースに乗る（実測確認）。
+  - **修正 ②（入力カバレッジ＋fail-closed）:** `action_key.rs` の `input_manifest` が入力を**実効ルートへ anchor**し、
+    `AccessKind::Read` の内容依存を `InputKind::Content`（`manifest_hash` で再読込、読めなければ `<missing>` で force-miss、
+    **絶対に silent drop しない**）に。anchor 不能な実 read は `cacheable=false`＝**無キャッシュ**（ADR 0007 §b.3 を入力側にも）。
+    cwd 未記録（root_pid cwd=None 実測）でも宣言 `SEMBAZURU_INPUT_ROOT` への anchor で救う。
+  - **修正 ③（BLOCK-B 書き込みスコープ）:** `is_under_build_root` を `..`／UNC／device／drive-relative(`c:foo`)／rooted(`\foo`)
+    に対し**自己完結で拒否**（`/`区切りの `..` も）。`action_cache.rs` の record/resolve が publish/ingest 前に同関数で全 output
+    を再検証（違反は hard error）。`input_root` を **intake で一度だけ `normalize_for_compare` 正規化**し、その単一値を
+    relativize（record）と publish join（resolve）で共用＝非対称解消。
+  - **修正 ④（weak key 安定化＋TOCTOU）:** launcher が `@<rsp>` を実効ルート配下の content-addressed 安定パス
+    （`<root>\.sembazuru\sbz-rsp-<digest>.rsp`）へ**atomic-rename＋書込後 digest 再検証＋symlink 拒否**で実体化し argv を書換え、
+    weak key を再現可能化（ランダム rsp パス問題を解消）。
+  - **修正 ⑤（恒久ゲート化）:** `hooks/test/m6_msbuild.ps1` を hard アサート化＝ MSBUILD1 remote / MSBUILD2 cache-hit＋全
+    obj＋PDB 復元（worker 停止下）/ MSBUILD3 ソース破壊編集→FAIL（stale 不可）/ MSBUILD3b ヘッダ破壊編集→FAIL（VFS 供給
+    ヘッダもカバー）/ FALLBACK。MSBuild 統合（Directory.Build.targets / quickstart.md）が `SEMBAZURU_INPUT_ROOT` を宣言。
+  - 据え置きの低リスク（変わらず）: 共有 PDB の複数アクション横断キャッシュ（MSBuild バッチでは非発生）／cross-machine 出力
+    パス整合（M8.x）／`/Zi` PDB の MSVC 非決定（命中時は build1 一貫セット・byte best-effort）。
+  出所: 実トレース実測（VFS リダイレクト読み取りが未記録）＋ローカルゲート PASS＋品質ゲート（verifier/determinism/security,
+  model opus, BLOCK 無し・H1/M1/M2 修正後 CLOSED, 2026-06-15）。`hooks/src/interceptor.cpp`、`crates/tracer/src/action_key.rs`、
+  `crates/agent/src/{action_cache,intake}.rs`、`crates/agent/src/bin/sembazuru_launcher.rs`。
 
 ## M7（堅牢化・セキュリティ）
 

@@ -105,10 +105,21 @@ compiler-launcher variable, so Sembazuru substitutes the CL task's executable.
    ```powershell
    $env:SEMBAZURU_LAUNCHER_DIR = "$PWD\target\release"   # dir holding sembazuru.exe
    $env:SEMBAZURU_SHIM_CC      = "cl"                     # or clang-cl
+   $env:SEMBAZURU_INPUT_ROOT   = "$PWD"                   # solution/repo root (for caching)
    ```
 3. `msbuild your.sln /p:Configuration=Release /p:Platform=x64`
 
 Set `SEMBAZURU_DISABLE=true` to bypass the shim entirely.
+
+**Why `SEMBAZURU_INPUT_ROOT` for MSBuild.** MSBuild compiles all sources in one
+batched `cl @<response-file>` call, and a `/Zi` build splits its outputs across
+`obj\` (objects) and `bin\` (the shared PDB). Pointing `SEMBAZURU_INPUT_ROOT` at
+the one root that contains them all lets the action cache key on the real sources
+and republish *every* output on a hit. Leave it unset and a compile is still
+correct and distributed, but a `/Zi` build whose outputs fall outside its working
+directory is simply left uncached (never miscached). The launcher writes
+content-addressed response files under `<root>\.sembazuru\` — add that to
+`.gitignore`.
 
 If the daemon's intake is not at the default `http://127.0.0.1:50071`, point the
 launcher at it with `SEMBAZURU_DAEMON`.
