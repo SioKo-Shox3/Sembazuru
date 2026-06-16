@@ -299,6 +299,13 @@ service Status {
   // lookup into a miss, never a wrong result. A no-op when no cache or no cap is
   // configured (cap_configured = false).
   rpc TriggerEviction(TriggerEvictionRequest) returns (TriggerEvictionResponse);
+  // GUI -> daemon: read the persisted daemon config — the GUI's editable view of
+  // the SEMBAZURU_* settings (M9.3, ADR 0008 §3). The cluster token is NEVER
+  // returned, only whether one is set, so the secret is not echoed over the wire.
+  rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
+  // GUI -> daemon: persist the daemon config to %ProgramData%\Sembazuru\daemon.toml.
+  // Applied on the next daemon start (no live reload, ADR 0008).
+  rpc SetConfig(SetConfigRequest) returns (SetConfigResponse);
 }
 
 message GetStatusRequest {}
@@ -309,6 +316,45 @@ message TriggerEvictionResponse {
   uint64 freed_bytes = 1;       // bytes evicted by this call
   uint64 size_bytes_after = 2;  // CAS size after eviction
   bool cap_configured = 3;      // false when no SEMBAZURU_CACHE_MAX_BYTES is set
+}
+
+message GetConfigRequest {}
+
+// The persisted daemon config (M9.3). Mirrors crates/agent/src/config.rs
+// DaemonConfig, EXCEPT the cluster token, which is never echoed — only its
+// presence (cluster_token_set). Empty string = unset; 0 = uncapped.
+message GetConfigResponse {
+  string config_path = 1;       // where the file is read from / written to
+  bool file_exists = 2;         // whether a daemon.toml is present on disk
+  string coord_addr = 3;
+  string intake_addr = 4;
+  string fileserver_addr = 5;
+  string status_addr = 6;
+  string cache_root = 7;        // empty = caching disabled
+  string trace_root = 8;        // empty = use a temp dir
+  uint64 cache_max_bytes = 9;   // 0 = uncapped
+  bool cluster_token_set = 10;  // presence only — the secret is never echoed
+}
+
+// Writes the persisted daemon config. Addresses are kept (not cleared) when sent
+// empty, so a GUI that only edits one knob need not re-send valid addresses; the
+// optional fields are cleared by an empty value.
+message SetConfigRequest {
+  string coord_addr = 1;        // empty = keep the existing value
+  string intake_addr = 2;       // empty = keep the existing value
+  string fileserver_addr = 3;   // empty = keep the existing value
+  string status_addr = 4;       // empty = keep the existing value
+  string cache_root = 5;        // empty = unset (caching disabled)
+  string trace_root = 6;        // empty = unset (temp dir)
+  uint64 cache_max_bytes = 7;   // 0 = uncapped
+  // The cluster token, kept out of the read path. absent = leave unchanged;
+  // present-and-empty = clear (disable auth); present-and-nonempty = set.
+  optional string cluster_token = 8;
+}
+
+message SetConfigResponse {
+  bool ok = 1;
+  string detail = 2;  // e.g. "saved to <path>; restart the daemon to apply"
 }
 
 // One connected worker as seen by the agent. Mirrors the live WorkerTable entry

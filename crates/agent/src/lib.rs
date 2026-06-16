@@ -13,6 +13,7 @@ use sembazuru_proto::v0::{
 };
 
 pub mod action_cache;
+pub mod config;
 pub mod coordination;
 pub mod env_filter;
 pub mod fileserver;

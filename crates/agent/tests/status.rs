@@ -80,6 +80,7 @@ async fn start_intake_and_status(table: WorkerTable, auth_enabled: bool) -> (Str
         cache_max_bytes: None,
         metrics,
         auth_enabled,
+        config_path: std::env::temp_dir().join("sbz-status-test-unused.toml"),
     };
     let status_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let status_addr = status_listener.local_addr().unwrap();
