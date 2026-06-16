@@ -38,10 +38,17 @@ tokio = { version = "1", features = [
     "io-util",
     "sync",
     "process",
+    "signal",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# Windows Service support for `sembazuru-daemon --service` (M9.3b). Windows-only;
+# the daemon's plain-CLI mode has no service dependency.
+windows-service = "0.7"
 
 [dev-dependencies]
 sembazuru-worker = { path = "../worker" }
