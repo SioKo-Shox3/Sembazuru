@@ -237,6 +237,8 @@ Incredibuild の本当の堀である「プロセス仮想化」を OSS で再�
 
 「ビルドして使えるソフト」から「入れて使えるソフト」へ。OSS が日常採用される最後の壁であり、設計原則「**無設定で動く**」（§2）を導入・運用の UX として実現するフェーズ。**2 台目の PC をインストール＋設定だけで worker として参加させられる**状態を作り、M10 の実測の前提を整える。
 
+> **技術選定は ADR `0008-productization-installer-gui-residency.md`（ACCEPTED, 2026-06-16）。** インストーラ＝**WiX(MSI)**（winget は MSI 配布チャネル）、GUI＝**egui(eframe)＋tray-icon**、常駐＝**daemon/worker を Windows Service（自動起動）**＋GUI は別プロセスのトレイ、GUI↔daemon＝**新規 loopback 限定 `Status`/Admin gRPC サービス**（既存 Coordination には混ぜない）、disk eviction＝**総量上限（LRU）＋セッション境界クリーンアップ**。
+
 - **Windows インストールウィザード** — 署名済み MSI／winget。バイナリ群（`sembazuru-daemon`／`sembazuru-worker`／`sembazuru`(launcher)／`launcher.exe`＋`sbz_interceptor{64,32}.dll`／`Directory.Build.targets`）の配置・PATH 登録・**daemon の Windows サービス登録（常駐化）**・ファイアウォール規則（Coordination/fileserver/worker ポート）・`SEMBAZURU_AGENT`／`SEMBAZURU_CLUSTER_TOKEN` 等の初期設定・アンインストールまで。**M7.2 の Authenticode 署名パイプライン**と EDR 許可リスト申請（`docs/security/edr-allowlist.md`）に必ず接続する（フック DLL 注入は EDR 誤検知の的＝署名・申請なしでは採用が止まる）。
 - **常駐 GUI アプリ** — daemon をトレイ常駐／サービスとして動かし、接続 worker 一覧と health・キャッシュヒット率・in-flight アクション・remote/local/fallback の内訳を可視化。daemon/worker の start/stop と `SEMBAZURU_*`（agent アドレス・cache root・cluster token 等）の設定を GUI に隠蔽する。実装は Rust GUI（Tauri／egui／windows-rs トレイ）で既存 gRPC Coordination を叩く＝スタックと整合。
 - **長寿命 daemon の disk eviction**（deferred #8：per-action scratch/trace・agent セッション CAS の累積）を併せて対応。常駐サービス化で必ず顕在化するため M9 で同時に片付ける。
