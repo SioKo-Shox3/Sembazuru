@@ -18,7 +18,10 @@ pub mod coordination;
 pub mod env_filter;
 pub mod fileserver;
 pub mod intake;
+pub mod run;
 pub mod scheduler;
+#[cfg(windows)]
+pub mod service;
 pub mod status;
 
 /// Per-action execution extras carried alongside the command into `Execute`
