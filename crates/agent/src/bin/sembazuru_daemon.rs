@@ -16,6 +16,8 @@
 //!   SEMBAZURU_COORD       Coordination listen addr   (default 127.0.0.1:50070)
 //!   SEMBAZURU_INTAKE      LocalIntake listen addr     (default 127.0.0.1:50071)
 //!   SEMBAZURU_FILESERVER  file-supply listen addr     (default 127.0.0.1:50072)
+//!   SEMBAZURU_STATUS      Status (GUI) listen addr    (default 127.0.0.1:50073,
+//!                         loopback-only — the resident GUI reads it, M9.1)
 
 use std::sync::Arc;
 
@@ -25,9 +27,11 @@ use sembazuru_agent::coordination::{
 };
 use sembazuru_agent::fileserver::{ServerStats, serve_files_with_stats_token};
 use sembazuru_agent::intake::{
-    IntakeService, IntakeVfsContext, resolve_loopback_intake, serve_intake_service,
+    IntakeService, IntakeVfsContext, require_loopback, resolve_loopback_intake,
+    serve_intake_service,
 };
 use sembazuru_agent::scheduler::Scheduler;
+use sembazuru_agent::status::{StatusState, serve_status_service};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -52,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let coord_addr = env_or("SEMBAZURU_COORD", "127.0.0.1:50070");
     let intake_addr = env_or("SEMBAZURU_INTAKE", "127.0.0.1:50071");
     let file_addr = env_or("SEMBAZURU_FILESERVER", "127.0.0.1:50072");
+    let status_addr = env_or("SEMBAZURU_STATUS", "127.0.0.1:50073");
 
     // Shared cluster token (ADR 0006). When set, workers must present it on both
     // the control plane (Register) and the data-plane handshake; when unset the
@@ -98,8 +103,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let fileserver_addr = file_listener.local_addr()?;
     eprintln!("sembazuru-daemon: file server on {fileserver_addr}");
     warn_if_exposed("file server", fileserver_addr, cluster_token.is_some());
+    // Stats are shared with the Status surface (M9.1) so the GUI can see the
+    // content bytes pushed over the data plane (≈0 on a cache-hit rebuild, M4).
+    let server_stats = Arc::new(ServerStats::default());
     {
-        let stats = Arc::new(ServerStats::default());
+        let stats = server_stats.clone();
         let tok = cluster_token.clone();
         tokio::spawn(async move {
             if let Err(e) = serve_files_with_stats_token(file_listener, stats, tok).await {
@@ -141,10 +149,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         scheduler,
         IntakeVfsContext {
             agent_fileserver: fileserver_addr.to_string(),
-            cache,
+            cache: cache.clone(),
             scratch_root: std::path::PathBuf::from(trace_root),
         },
     );
+
+    // Status surface (M9.1, ADR 0008 §4): a loopback-only, read-only plane the
+    // resident GUI polls for worker health, cache hit rate, in-flight actions,
+    // and the remote/local/fallback breakdown. Like LocalIntake it refuses any
+    // non-loopback bind — it exposes operational state to a same-machine GUI, not
+    // to workers, so it never rides the LAN-reachable Coordination port. It shares
+    // the live worker table, the file-server stats, the action cache, and the
+    // intake's metrics, so the GUI sees exactly what the daemon is doing.
+    let status_sockaddr = require_loopback(&status_addr, "Status")?;
+    let status_listener = tokio::net::TcpListener::bind(status_sockaddr).await?;
+    eprintln!(
+        "sembazuru-daemon: Status on {}",
+        status_listener.local_addr()?
+    );
+    {
+        let state = StatusState {
+            table: table.clone(),
+            server_stats: server_stats.clone(),
+            cache: cache.clone(),
+            metrics: intake.metrics(),
+            auth_enabled: cluster_token.is_some(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = serve_status_service(status_listener, state).await {
+                eprintln!("sembazuru-daemon: Status server exited: {e}");
+            }
+        });
+    }
 
     // LocalIntake: the blocking server. The daemon runs until killed; the
     // launcher submits actions here over loopback. Intake runs arbitrary

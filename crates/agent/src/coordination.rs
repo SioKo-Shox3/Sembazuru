@@ -43,6 +43,15 @@ pub struct WorkerEntry {
     last_ping: Instant,
 }
 
+impl WorkerEntry {
+    /// How long since the agent last heard from this worker (a heartbeat or the
+    /// initial register). `last_ping` is private so liveness stays derived in this
+    /// module; the status surface (M9.1) needs the age to show per-worker health.
+    pub fn last_ping_age(&self) -> Duration {
+        self.last_ping.elapsed()
+    }
+}
+
 /// Shared, cloneable worker registry. Cloning shares the underlying map (the
 /// Coordination server and the scheduler hold the same table).
 #[derive(Clone)]

@@ -54,6 +54,13 @@ impl AgentCache {
         })
     }
 
+    /// Current total size of the CAS on disk, in bytes. A full blob scan (O(N)
+    /// blobs, ADR 0003 simple version), so callers run it off the async runtime.
+    /// Surfaced for the status dashboard and the disk-eviction work (M9.1/M9.2).
+    pub fn cas_size(&self) -> io::Result<u64> {
+        self.store.total_size()
+    }
+
     /// The weak fingerprint of an action: argv + non-volatile env + the
     /// toolchain binary's content digest. `argv[0]` is hashed by content when it
     /// is a readable file (so a compiler upgrade invalidates the cache), else by

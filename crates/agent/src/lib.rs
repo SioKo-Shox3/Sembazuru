@@ -18,6 +18,7 @@ pub mod env_filter;
 pub mod fileserver;
 pub mod intake;
 pub mod scheduler;
+pub mod status;
 
 /// Per-action execution extras carried alongside the command into `Execute`
 /// (M6.1). Empty by default — the M5 scale path and the single-shot CLI send
