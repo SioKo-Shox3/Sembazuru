@@ -29,6 +29,7 @@ use tonic::{Request, Response, Status};
 
 use crate::action_cache::{AgentCache, CacheLookup};
 use crate::scheduler::Scheduler;
+use crate::status::Metrics;
 use crate::{ExecOptions, ExecuteError, Execution};
 
 /// Per-action options the launcher hands to the daemon alongside the command
@@ -101,6 +102,10 @@ pub struct IntakeService {
     seq: Arc<AtomicU64>,
     /// Read-VFS + cache context; `None` → plain dispatch (M6.0/tests).
     vfs: Option<Arc<IntakeVfsContext>>,
+    /// Daemon-wide counters (M9.1): every submission feeds cache hit/miss, the
+    /// remote/local/fallback exec breakdown, and the in-flight gauge here. The
+    /// daemon hands the same `Arc` to the Status service via [`Self::metrics`].
+    metrics: Arc<Metrics>,
 }
 
 impl IntakeService {
@@ -110,6 +115,7 @@ impl IntakeService {
             scheduler,
             seq: Arc::new(AtomicU64::new(0)),
             vfs: None,
+            metrics: Arc::new(Metrics::default()),
         }
     }
 
@@ -120,7 +126,15 @@ impl IntakeService {
             scheduler,
             seq: Arc::new(AtomicU64::new(0)),
             vfs: Some(Arc::new(ctx)),
+            metrics: Arc::new(Metrics::default()),
         }
+    }
+
+    /// The daemon-wide metrics this intake feeds. The daemon grabs this `Arc`
+    /// after construction and hands it to the Status service, so the GUI reads the
+    /// exact counters the action path increments (M9.1).
+    pub fn metrics(&self) -> Arc<Metrics> {
+        Arc::clone(&self.metrics)
     }
 }
 
@@ -150,6 +164,7 @@ impl LocalIntake for IntakeService {
         tokio::spawn(run_submission(
             self.scheduler.clone(),
             self.vfs.clone(),
+            self.metrics.clone(),
             command,
             req.declared_outputs,
             req.non_deterministic,
@@ -172,6 +187,7 @@ impl LocalIntake for IntakeService {
 async fn run_submission(
     scheduler: Scheduler,
     vfs: Option<Arc<IntakeVfsContext>>,
+    metrics: Arc<Metrics>,
     command: Command,
     declared_outputs: Vec<String>,
     non_deterministic: bool,
@@ -182,11 +198,16 @@ async fn run_submission(
     n: u64,
     tx: mpsc::Sender<Result<SubmitActionEvent, Status>>,
 ) {
+    // Counts this action toward the in-flight gauge until it terminates — every
+    // return path below (cache hit, plain dispatch, VFS dispatch) drops it (M9.1).
+    let _in_flight = metrics.in_flight_guard();
+
     let Some(ctx) = vfs else {
         // Plain dispatch (M6.0 / tests): no VFS config, no cache.
         let outcome = scheduler
             .dispatch(command, action_id, session_id, ExecOptions::default())
             .await;
+        metrics.record_outcome(&outcome);
         emit_outcome(&tx, outcome).await;
         return;
     };
@@ -236,14 +257,18 @@ async fn run_submission(
         let cache = cache.clone();
         let weak = weak.clone();
         let br = build_root.clone();
-        if let Ok(Ok(CacheLookup::Hit { exit_code })) =
-            tokio::task::spawn_blocking(move || cache.resolve(&weak, &br)).await
-        {
-            let _ = tx
-                .send(Ok(state_ev(ActionState::Completed, "cache hit")))
-                .await;
-            let _ = tx.send(Ok(exit_ev(exit_code, 0))).await;
-            return;
+        match tokio::task::spawn_blocking(move || cache.resolve(&weak, &br)).await {
+            Ok(Ok(CacheLookup::Hit { exit_code })) => {
+                metrics.record_cache_hit();
+                let _ = tx
+                    .send(Ok(state_ev(ActionState::Completed, "cache hit")))
+                    .await;
+                let _ = tx.send(Ok(exit_ev(exit_code, 0))).await;
+                return;
+            }
+            // A miss, a resolve error, or a join error all mean "run the action":
+            // the cache was consulted and did not serve it, so count one miss.
+            _ => metrics.record_cache_miss(),
         }
     }
 
@@ -337,6 +362,7 @@ async fn run_submission(
         .await;
     }
 
+    metrics.record_outcome(&outcome);
     emit_outcome(&tx, outcome).await;
 }
 
@@ -368,35 +394,37 @@ async fn emit_outcome(tx: &mpsc::Sender<Result<SubmitActionEvent, Status>>, outc
     let _ = tx.send(Ok(exit_ev(code, wall))).await;
 }
 
-/// Resolves `addr` for the LocalIntake listener, **refusing any non-loopback
-/// address**. Intake executes arbitrary submitted commands and is unauthenticated
-/// until M7, so it must never be reachable off-box: the launcher only ever dials
-/// `127.0.0.1` (see `sembazuru_launcher.rs`), so loopback-only costs nothing.
-/// Without this guard, `SEMBAZURU_INTAKE=0.0.0.0:50071` would expose
-/// unauthenticated remote command execution (security-reviewer M6.0, MEDIUM).
+/// Resolves `addr` for a **loopback-only** listener, refusing any non-loopback
+/// address. Used by the two same-machine planes: LocalIntake (executes arbitrary
+/// submitted commands, unauthenticated until M7 — `SEMBAZURU_INTAKE=0.0.0.0:…`
+/// would expose remote command execution, security-reviewer M6.0 MEDIUM) and the
+/// Status surface (operational state for a same-machine GUI, ADR 0008 §4).
 /// Coordination and the file server are deliberately *not* guarded — they
-/// legitimately need LAN reach for workers; intake does not.
-pub fn resolve_loopback_intake(addr: &str) -> Result<std::net::SocketAddr, String> {
+/// legitimately need LAN reach for workers; these planes do not. `plane` names
+/// the plane in error messages. Fails closed if *any* resolved address is
+/// non-loopback (a hostname could resolve to both).
+pub fn require_loopback(addr: &str, plane: &str) -> Result<std::net::SocketAddr, String> {
     use std::net::ToSocketAddrs;
     let resolved: Vec<std::net::SocketAddr> = addr
         .to_socket_addrs()
-        .map_err(|e| format!("invalid intake address {addr:?}: {e}"))?
+        .map_err(|e| format!("invalid {plane} address {addr:?}: {e}"))?
         .collect();
     let first = resolved
         .first()
         .copied()
-        .ok_or_else(|| format!("intake address {addr:?} resolved to no socket address"))?;
-    // Refuse if *any* resolved address is non-loopback (a hostname could resolve
-    // to both; binding the loopback one while a routable one exists would still
-    // be surprising, so fail closed).
+        .ok_or_else(|| format!("{plane} address {addr:?} resolved to no socket address"))?;
     if let Some(bad) = resolved.iter().find(|a| !a.ip().is_loopback()) {
         return Err(format!(
-            "refusing to bind LocalIntake to non-loopback address {bad}: intake executes \
-             arbitrary commands and is unauthenticated (M7). Use a loopback address such as \
-             127.0.0.1:<port>; the launcher only ever dials loopback."
+            "refusing to bind {plane} to non-loopback address {bad}: this plane is loopback-only \
+             (same-machine access). Use a loopback address such as 127.0.0.1:<port>."
         ));
     }
     Ok(first)
+}
+
+/// Loopback guard for the LocalIntake listener (see [`require_loopback`]).
+pub fn resolve_loopback_intake(addr: &str) -> Result<std::net::SocketAddr, String> {
+    require_loopback(addr, "LocalIntake")
 }
 
 /// Serves a plain LocalIntake (no VFS, no cache) on an already-bound listener.

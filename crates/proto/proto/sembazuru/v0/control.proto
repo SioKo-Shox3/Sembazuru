@@ -276,3 +276,72 @@ message SubmitActionEvent {
     OutputChunk stdio = 3;
   }
 }
+
+// ---- Status: daemon status surface for the resident GUI (M9.1, ADR 0008) ---
+
+// The daemon's operational status surface for the resident GUI (M9, ADR 0008
+// §4). Like LocalIntake this plane is LOOPBACK-ONLY: it exposes operational
+// state (the connected workers and their health, the action-cache hit rate,
+// in-flight actions, and where actions ran) to a SAME-MACHINE GUI, never to
+// workers. Keeping it off the worker-facing Coordination port (which is
+// LAN-reachable and cluster-token authenticated, ADR 0006) means the GUI needs
+// no token and admin/status never rides the network-facing endpoint.
+//
+// Read-only in M9.1. The admin RPCs the GUI also needs — reading/writing the
+// daemon's SEMBAZURU_* config and triggering cache eviction — are added with the
+// config (M9.3) and disk-eviction (M9.2) work, as non-breaking additions here.
+service Status {
+  // GUI -> daemon: a snapshot of the daemon's live operational state.
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+}
+
+message GetStatusRequest {}
+
+// One connected worker as seen by the agent. Mirrors the live WorkerTable entry
+// (coordination.rs): caps + the last heartbeat-reported load, plus how long ago
+// the agent last heard from it. Only currently-live workers are listed.
+message WorkerStatus {
+  string worker_id = 1;
+  string execution_endpoint = 2;
+  uint32 cpu_count = 3;
+  string os_build = 4;
+  string arch = 5;
+  uint32 running_actions = 6;    // last heartbeat-reported running count
+  uint32 idle_slots = 7;        // last heartbeat-reported idle slots
+  uint64 last_ping_age_ms = 8;  // ms since the agent last heard from this worker
+  bool healthy = 9;             // live within the dead-detection window
+}
+
+// Action-cache state. hits/misses are counted since this daemon started; the GUI
+// derives the hit rate as hits / (hits + misses) so no float rides the wire.
+message CacheStatus {
+  bool enabled = 1;        // a cache root is configured (SEMBAZURU_CACHE_ROOT)
+  uint64 size_bytes = 2;   // current on-disk CAS size (0 when disabled)
+  uint64 hits = 3;
+  uint64 misses = 4;
+}
+
+// Where completed actions ran (ADR 0008 §4): remote = ran on a worker;
+// local = deliberately kept local by the route-away screen (ADR 0007 §a①);
+// fallback = wanted a worker but every remote attempt failed / none were live.
+message ExecBreakdown {
+  uint64 remote = 1;
+  uint64 local = 2;
+  uint64 fallback = 3;
+}
+
+// Data-plane file-server counters (content bytes the agent pushed to workers).
+message FileServerStatus {
+  uint64 read_ops = 1;
+  uint64 read_bytes = 2;     // content bytes returned in Read responses
+  uint64 inline_bytes = 3;   // content bytes inlined in OpenRead first chunks
+}
+
+message GetStatusResponse {
+  repeated WorkerStatus workers = 1;
+  CacheStatus cache = 2;
+  uint32 in_flight = 3;       // actions the daemon is currently driving
+  ExecBreakdown exec = 4;
+  FileServerStatus fileserver = 5;
+  bool auth_enabled = 6;      // the daemon requires a cluster token (ADR 0006)
+}
