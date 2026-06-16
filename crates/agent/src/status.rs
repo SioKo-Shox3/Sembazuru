@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use sembazuru_proto::v0::{
     CacheStatus, ExecBreakdown, FileServerStatus, GetStatusRequest, GetStatusResponse,
-    WorkerStatus, status_server::Status as StatusRpc,
+    TriggerEvictionRequest, TriggerEvictionResponse, WorkerStatus,
+    status_server::Status as StatusRpc,
 };
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -122,6 +123,9 @@ pub struct StatusState {
     pub server_stats: Arc<ServerStats>,
     /// Action cache; `None` when the daemon runs without `SEMBAZURU_CACHE_ROOT`.
     pub cache: Option<Arc<AgentCache>>,
+    /// Configured CAS size cap in bytes (`SEMBAZURU_CACHE_MAX_BYTES`); `None` =
+    /// uncapped. Drives TriggerEviction and is surfaced for the dashboard (M9.2).
+    pub cache_max_bytes: Option<u64>,
     /// Daemon-wide counters (shared with the intake path that feeds them).
     pub metrics: Arc<Metrics>,
     /// Whether the daemon requires a cluster token (ADR 0006) — surfaced so the
@@ -158,6 +162,7 @@ impl StatusState {
                 size_bytes: cas_size_bytes,
                 hits: m.cache_hits.load(Ordering::Relaxed),
                 misses: m.cache_misses.load(Ordering::Relaxed),
+                max_bytes: self.cache_max_bytes.unwrap_or(0),
             }),
             in_flight: m.in_flight() as u32,
             exec: Some(ExecBreakdown {
@@ -196,6 +201,59 @@ impl StatusRpc for StatusState {
         };
         Ok(Response::new(self.snapshot(cas_size)))
     }
+
+    async fn trigger_eviction(
+        &self,
+        _request: Request<TriggerEvictionRequest>,
+    ) -> Result<Response<TriggerEvictionResponse>, Status> {
+        match (&self.cache, self.cache_max_bytes) {
+            (Some(cache), Some(max)) => {
+                let (freed, after) = evict_cache_to_cap(Arc::clone(cache), max)
+                    .await
+                    .map_err(|e| Status::internal(format!("eviction failed: {e}")))?;
+                Ok(Response::new(TriggerEvictionResponse {
+                    freed_bytes: freed,
+                    size_bytes_after: after,
+                    cap_configured: true,
+                }))
+            }
+            // No cache, or no cap configured: nothing to evict. Report the current
+            // size (if any) and cap_configured = false so the GUI can explain why.
+            (cache, _) => {
+                let after = match cache {
+                    Some(c) => {
+                        let c = Arc::clone(c);
+                        tokio::task::spawn_blocking(move || c.cas_size().unwrap_or(0))
+                            .await
+                            .unwrap_or(0)
+                    }
+                    None => 0,
+                };
+                Ok(Response::new(TriggerEvictionResponse {
+                    freed_bytes: 0,
+                    size_bytes_after: after,
+                    cap_configured: false,
+                }))
+            }
+        }
+    }
+}
+
+/// Evicts `cache` down to `max_bytes` off the async runtime, returning
+/// `(freed_bytes, size_bytes_after)` (M9.2 / deferred #8). Shared by the Status
+/// `TriggerEviction` RPC and the daemon's periodic sweep so both behave and log
+/// identically. Eviction is correctness-safe (see [`AgentCache::evict_to`]).
+pub async fn evict_cache_to_cap(
+    cache: Arc<AgentCache>,
+    max_bytes: u64,
+) -> std::io::Result<(u64, u64)> {
+    tokio::task::spawn_blocking(move || {
+        let freed = cache.evict_to(max_bytes)?;
+        let after = cache.cas_size()?;
+        std::io::Result::Ok((freed, after))
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
 
 /// Serves the loopback-only `Status` service on an already-bound listener. The

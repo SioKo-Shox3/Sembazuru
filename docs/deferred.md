@@ -251,10 +251,10 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   `SEMBAZURU_*` はワイヤに乗らない。ローカルフォールバック（run_local）は継承 env で従来どおり動作（off-box
   流出は元々なし）。determinism は CI バイトゲートで確認（allowlist が出力影響 env を取りこぼさない）。
   出所: env_filter.rs、tests(env_filter)、security(M6.1 Low/M6.0 LOW)。
-- **per-action scratch/trace ディレクトリの無制限増加（disk DoS）。** in-flight 資源（pipe/job/task）は admission で
-  有界かつ終了時清掃。だが worker の hydrated scratch（`lib.rs` 注: M3.3/M7）と daemon の per-action `trace-{n}`
-  （`SEMBAZURU_TRACE_ROOT` 下）はビルド毎に残置・累積。長寿命 daemon/worker で disk 枯渇。セッション境界 eviction
-  （deferred #8）と併せ M7。出所: security(M6.1 Low)。
+- **per-action scratch/trace ディレクトリの無制限増加（disk DoS）— 解消（M9.2）。** worker の hydrated scratch は
+  アクション完了後（Job クローズ＋child reap の後）に `remove_dir_all`、daemon の per-action `trace-{n}`
+  （`SEMBAZURU_TRACE_ROOT` 下）は run_submission 末尾で削除（記録の有無に依らず）。どちらも全 return 経路を被覆。
+  これでビルド反復で scratch/trace は累積しない（プラトー）。出所: security(M6.1 Low)、verifier/determinism-checker(M9.2)。
 - **注入が production コンパイル経路に。** worker の DLL 注入（launcher.exe＋DetourCreateProcessWithDll）は M3 と
   同一機構だが、M6.1 で**テスト足場でなく常時動作**に。新たなマルウェア的シグナル（RWX/直接 syscall/スレッド
   注入）は無く署名可能。M7 のベンダ許可リスト申請は steady-state の挙動（injector が cl.exe を子に注入）を明記。
@@ -420,8 +420,14 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   daemon/worker での disk 累積。境界破棄はセッションライフサイクル（M5.5 部分対応）に依存し、ビルド単位
   eviction は daemon のセッション寿命管理が要る。WorkerTable reaper（M7.4）でテーブルは有界化したが、
   scratch/trace/CAS の eviction は別途。出所: deferred #8、security(M6.1 Low)、M7.4。
-  **方針確定（ADR 0008, 2026-06-16）:** 総量上限（LRU、`SEMBAZURU_CACHE_MAX_BYTES`、`BlobStore::evict_to` 自動駆動）
-  ＋セッション境界クリーンアップで **M9.2 にて回収**予定。常駐サービス化（M9.3）で必ず顕在化するため M9 で同時対応。
+  **回収（M9.2, ADR 0008）:** (1) per-action scratch/trace はアクション後に削除（上記「解消（M9.2）」）。
+  (2) 永続 agent CAS は総量上限（LRU、`SEMBAZURU_CACHE_MAX_BYTES`、`AgentCache::evict_to`→`BlobStore::evict_to`）
+  を daemon の周期スイープ＋Status `TriggerEviction` RPC で自動駆動。eviction は correctness-safe（evict は miss を
+  生むのみで誤結果は生まない＝determinism 不変、unit/determinism-checker で実証）。
+  **残（据え置き）:** fileserver の **agent セッション CAS（temp pin ストア）** の per-build 境界破棄は未実装。
+  現状 daemon 1 プロセス＝1 Session のため、同一プロジェクト反復ではタッチ済みファイル集合でプラトーするが、
+  多数の異なるプロジェクト/ファイルを跨ぐ超長寿命 daemon では増える。per-build セッションライフサイクル（M5.5 系）
+  が要るため別途。出所: deferred #8、verifier(M9.2)。
 
 ## M8（汎用化 / Beyond Compilation）— ADR 0007
 

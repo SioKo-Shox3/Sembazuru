@@ -31,7 +31,7 @@ use sembazuru_agent::intake::{
     serve_intake_service,
 };
 use sembazuru_agent::scheduler::Scheduler;
-use sembazuru_agent::status::{StatusState, serve_status_service};
+use sembazuru_agent::status::{StatusState, evict_cache_to_cap, serve_status_service};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -135,6 +135,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         },
         None => None,
     };
+    // Optional CAS size cap (M9.2 / deferred #8). When set, the daemon evicts the
+    // action cache down to this many bytes — on a periodic sweep below, and on a
+    // GUI-driven Status TriggerEviction. Without a cap a long-lived daemon's cache
+    // grows until the disk does (the #8 hazard). Eviction is correctness-safe: a
+    // wrongly-evicted blob only causes a later cache miss (re-run), never a wrong
+    // result. Bytes; a non-numeric or zero value disables the cap.
+    let cache_max_bytes: Option<u64> = std::env::var("SEMBAZURU_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0);
+    if let Some(max) = cache_max_bytes {
+        eprintln!("sembazuru-daemon: action cache size cap {max} bytes");
+    }
     let trace_root = env_or(
         "SEMBAZURU_TRACE_ROOT",
         &std::env::temp_dir()
@@ -172,12 +185,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             table: table.clone(),
             server_stats: server_stats.clone(),
             cache: cache.clone(),
+            cache_max_bytes,
             metrics: intake.metrics(),
             auth_enabled: cluster_token.is_some(),
         };
         tokio::spawn(async move {
             if let Err(e) = serve_status_service(status_listener, state).await {
                 eprintln!("sembazuru-daemon: Status server exited: {e}");
+            }
+        });
+    }
+
+    // Periodic CAS eviction sweep (M9.2 / deferred #8): a long-lived daemon's
+    // action cache would otherwise grow until the disk fills. With a cap set, the
+    // daemon sweeps the cache down to it on an interval (the first tick fires at
+    // startup, cleaning up after a prior run); the GUI can also force it now via
+    // the Status TriggerEviction RPC. Eviction is correctness-safe — only ever a
+    // miss, never a wrong result — so this never threatens the determinism gate.
+    if let (Some(c), Some(max)) = (cache.clone(), cache_max_bytes) {
+        const EVICTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(EVICTION_INTERVAL);
+            loop {
+                tick.tick().await;
+                match evict_cache_to_cap(c.clone(), max).await {
+                    Ok((freed, after)) if freed > 0 => eprintln!(
+                        "sembazuru-daemon: cache eviction freed {freed} bytes \
+                         (now {after} / cap {max})"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => eprintln!("sembazuru-daemon: cache eviction failed: {e}"),
+                }
             }
         });
     }
