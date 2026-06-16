@@ -420,6 +420,8 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
   daemon/worker での disk 累積。境界破棄はセッションライフサイクル（M5.5 部分対応）に依存し、ビルド単位
   eviction は daemon のセッション寿命管理が要る。WorkerTable reaper（M7.4）でテーブルは有界化したが、
   scratch/trace/CAS の eviction は別途。出所: deferred #8、security(M6.1 Low)、M7.4。
+  **方針確定（ADR 0008, 2026-06-16）:** 総量上限（LRU、`SEMBAZURU_CACHE_MAX_BYTES`、`BlobStore::evict_to` 自動駆動）
+  ＋セッション境界クリーンアップで **M9.2 にて回収**予定。常駐サービス化（M9.3）で必ず顕在化するため M9 で同時対応。
 
 ## M8（汎用化 / Beyond Compilation）— ADR 0007
 
