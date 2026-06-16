@@ -61,6 +61,18 @@ impl AgentCache {
         self.store.total_size()
     }
 
+    /// Evicts least-recently-modified output blobs until the CAS is at or below
+    /// `max_bytes`, returning the bytes freed (M9.2 / deferred #8). Eviction is
+    /// **correctness-safe**: a wrongly-evicted blob only turns a later cache
+    /// lookup into a miss (the action re-runs and produces byte-identical output),
+    /// never a wrong result — `resolve` already treats a missing blob as a miss.
+    /// The action-cache index entries (weak→manifest, strong→result) are left in
+    /// place; they self-heal into misses when their blobs are gone. Like
+    /// [`cas_size`] this is a full blob scan, so callers run it off the runtime.
+    pub fn evict_to(&self, max_bytes: u64) -> io::Result<u64> {
+        self.store.evict_to(max_bytes)
+    }
+
     /// The weak fingerprint of an action: argv + non-volatile env + the
     /// toolchain binary's content digest. `argv[0]` is hashed by content when it
     /// is a readable file (so a compiler upgrade invalidates the cache), else by
@@ -496,6 +508,73 @@ mod tests {
         assert_eq!(
             std::fs::read(build2.join(out_logical)).unwrap(),
             b"OBJECT-BYTES-v1"
+        );
+    }
+
+    #[test]
+    fn eviction_caps_the_cas_and_is_correctness_safe() {
+        // M9.2 / deferred #8: evicting the CAS down to a cap must (a) actually
+        // shrink it, (b) only ever turn a later lookup into a MISS — never a wrong
+        // or partial result — and (c) leave determinism intact: re-running the
+        // (deterministic) action reproduces the identical bytes. This is exactly
+        // what lets the daemon's periodic eviction sweep run against a live cache
+        // without threatening the determinism gate.
+        let root = tmp("evict");
+        let build = tmp("evict-build");
+        let cache = AgentCache::open(&root).unwrap();
+
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"int main(){return 0;}").unwrap();
+        let out_logical = "a.obj";
+        let out_bytes = b"OBJECT-BYTES-deterministic";
+        std::fs::write(build.join(out_logical), out_bytes).unwrap();
+
+        let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
+        let weak = cache.weak_key(&argv, &[]);
+        let manifest = manifest_for(&[("a.cpp", &input)]);
+        cache
+            .record(&weak, &manifest, &build, &[out_logical.to_string()], 0)
+            .unwrap();
+
+        // The output blob is in the CAS and a fresh build hits.
+        assert!(
+            cache.cas_size().unwrap() > 0,
+            "the recorded output occupies the CAS"
+        );
+        assert_eq!(
+            cache.resolve(&weak, &tmp("evict-r1")).unwrap(),
+            CacheLookup::Hit { exit_code: 0 }
+        );
+
+        // (a) Evict everything (cap 0): the CAS shrinks to empty. The action-cache
+        // index entries remain but their output blobs are gone.
+        let freed = cache.evict_to(0).unwrap();
+        assert!(freed > 0, "eviction freed the output blob");
+        assert_eq!(cache.cas_size().unwrap(), 0, "the CAS is now empty");
+
+        // (b) Correctness-safe: the now-blobless action resolves to a MISS (re-run)
+        // — never a wrong or half-published result.
+        assert_eq!(
+            cache.resolve(&weak, &tmp("evict-r2")).unwrap(),
+            CacheLookup::Miss,
+            "an evicted action must miss, never serve a wrong result"
+        );
+
+        // (c) Determinism after eviction: re-running reproduces the same output,
+        // re-records, and the next resolve republishes the byte-identical bytes.
+        std::fs::write(build.join(out_logical), out_bytes).unwrap();
+        cache
+            .record(&weak, &manifest, &build, &[out_logical.to_string()], 0)
+            .unwrap();
+        let r3 = tmp("evict-r3");
+        assert_eq!(
+            cache.resolve(&weak, &r3).unwrap(),
+            CacheLookup::Hit { exit_code: 0 }
+        );
+        assert_eq!(
+            std::fs::read(r3.join(out_logical)).unwrap(),
+            out_bytes,
+            "republished bytes are byte-identical after eviction + re-run"
         );
     }
 

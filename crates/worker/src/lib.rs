@@ -325,11 +325,12 @@ async fn run_action(
 
     let start = Instant::now();
     // For VFS mode, `pipe_task` keeps the per-action pipe server alive for the
-    // run; `job` is the process-tree kill handle. Both are cleaned up after the
-    // child exits.
-    let (mut child, pipe_task, job, unvirt_marker) =
+    // run; `job` is the process-tree kill handle; `scratch_dir` is the hydrated
+    // input tree to remove after the run (deferred #8 / M9.2). All are cleaned up
+    // after the child exits.
+    let (mut child, pipe_task, job, unvirt_marker, scratch_dir) =
         match build_child(&cmd, vfs_plan, predicted_paths).await {
-            Ok(quad) => quad,
+            Ok(parts) => parts,
             Err(detail) => {
                 let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
                 return;
@@ -423,8 +424,7 @@ async fn run_action(
     }
     // Stop the per-action VFS pipe server (if any). The serve loop runs forever
     // by design, so it must be aborted once the action is done or it leaks one
-    // task (and one listening pipe instance) per action. The hydrated scratch
-    // tree is left for now; session/output cleanup is M3.3/M7.
+    // task (and one listening pipe instance) per action.
     if let Some(t) = pipe_task {
         t.abort();
     }
@@ -435,6 +435,29 @@ async fn run_action(
         .lock()
         .expect("aborts map poisoned")
         .remove(&action_id);
+    // Make sure the action's process tree is fully gone before removing its
+    // scratch. On the normal path the child already exited; on the cancel/ceiling
+    // paths closing the Job Object above kills the tree, and the launcher (which
+    // WaitForSingleObject's the compiler) exits once the compiler dies — so
+    // awaiting the launcher here means no surviving process still holds a scratch
+    // file open. This makes the cleanup reliable on EVERY path, not just normal
+    // exit. A second wait on an already-exited child returns immediately, and a
+    // killed tree exits promptly, so this never hangs.
+    let _ = child.wait().await;
+    // Remove the per-action hydrated scratch tree (deferred #8 / M9.2). Best-effort:
+    // a residual lock just leaves one tree behind (a later run with the same suffix
+    // cannot occur — EXEC_SEQ is monotonic), never a wrong result, so a failure is
+    // logged, not fatal. This is what bounds a long-lived worker's disk: previously
+    // every action's scratch was left forever ("left for now").
+    if let Some(dir) = scratch_dir
+        && let Err(e) = tokio::fs::remove_dir_all(&dir).await
+        && dir.exists()
+    {
+        eprintln!(
+            "sembazuru-worker: failed to remove scratch {}: {e}",
+            dir.display()
+        );
+    }
 }
 
 /// Builds the child process for an action. Plain mode spawns the command
@@ -454,6 +477,9 @@ async fn build_child(
         Option<JobObject>,
         // Strict-VFS unvirtualized-access marker path to check after exit (M8.2
         // ②); `None` in plain mode or when strict VFS is off.
+        Option<std::path::PathBuf>,
+        // Per-action hydrated scratch dir to remove after the run (deferred #8 /
+        // M9.2); `None` in plain mode, where no scratch tree is created.
         Option<std::path::PathBuf>,
     ),
     String,
@@ -488,7 +514,7 @@ async fn build_child(
                 None => Ok(j), // already exited; nothing to assign
             })
             .map_err(|e| setup_err("job object setup failed", e))?;
-        return Ok((child, None, Some(job), None));
+        return Ok((child, None, Some(job), None, None));
     };
 
     // VFS mode. Per-action unique pipe + scratch so concurrent actions never
@@ -500,6 +526,10 @@ async fn build_child(
     );
     let pipe_name = format!("sbz-exec-{suffix}");
     let scratch = cfg.scratch_root.join(&suffix);
+    // Keep a copy of the scratch path so the action removes the hydrated input
+    // tree after the run (deferred #8 / M9.2); `scratch` itself is moved into the
+    // per-action pipe server task below.
+    let scratch_for_cleanup = scratch.clone();
     let agent_addr: SocketAddr = v
         .agent_fileserver
         .parse()
@@ -586,6 +616,7 @@ async fn build_child(
         Ok(child) => child,
         Err(e) => {
             pipe_task.abort();
+            let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
             return Err(setup_err("launcher spawn failed", e));
         }
     };
@@ -604,11 +635,18 @@ async fn build_child(
         Ok(j) => j,
         Err(e) => {
             pipe_task.abort();
+            let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
             // `child` drops here; kill_on_drop terminates at least the launcher.
             return Err(setup_err("job object setup failed", e));
         }
     };
-    Ok((child, Some(pipe_task), Some(job), unvirt_marker))
+    Ok((
+        child,
+        Some(pipe_task),
+        Some(job),
+        unvirt_marker,
+        Some(scratch_for_cleanup),
+    ))
 }
 
 #[tonic::async_trait]

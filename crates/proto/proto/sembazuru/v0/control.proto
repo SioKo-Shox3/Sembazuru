@@ -287,15 +287,29 @@ message SubmitActionEvent {
 // LAN-reachable and cluster-token authenticated, ADR 0006) means the GUI needs
 // no token and admin/status never rides the network-facing endpoint.
 //
-// Read-only in M9.1. The admin RPCs the GUI also needs — reading/writing the
-// daemon's SEMBAZURU_* config and triggering cache eviction — are added with the
-// config (M9.3) and disk-eviction (M9.2) work, as non-breaking additions here.
+// GetStatus is read-only. TriggerEviction (M9.2) is the first admin RPC; the
+// config get/set RPCs the GUI also needs arrive with the config work (M9.3) as
+// non-breaking additions here.
 service Status {
   // GUI -> daemon: a snapshot of the daemon's live operational state.
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  // GUI -> daemon: evict the action cache down to the configured size cap
+  // (SEMBAZURU_CACHE_MAX_BYTES) now, instead of waiting for the daemon's periodic
+  // sweep (M9.2). Eviction is correctness-safe — it can only turn a later cache
+  // lookup into a miss, never a wrong result. A no-op when no cache or no cap is
+  // configured (cap_configured = false).
+  rpc TriggerEviction(TriggerEvictionRequest) returns (TriggerEvictionResponse);
 }
 
 message GetStatusRequest {}
+
+message TriggerEvictionRequest {}
+
+message TriggerEvictionResponse {
+  uint64 freed_bytes = 1;       // bytes evicted by this call
+  uint64 size_bytes_after = 2;  // CAS size after eviction
+  bool cap_configured = 3;      // false when no SEMBAZURU_CACHE_MAX_BYTES is set
+}
 
 // One connected worker as seen by the agent. Mirrors the live WorkerTable entry
 // (coordination.rs): caps + the last heartbeat-reported load, plus how long ago
@@ -319,6 +333,7 @@ message CacheStatus {
   uint64 size_bytes = 2;   // current on-disk CAS size (0 when disabled)
   uint64 hits = 3;
   uint64 misses = 4;
+  uint64 max_bytes = 5;    // configured size cap (SEMBAZURU_CACHE_MAX_BYTES); 0 = uncapped
 }
 
 // Where completed actions ran (ADR 0008 §4): remote = ran on a worker;

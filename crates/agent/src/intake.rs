@@ -362,6 +362,17 @@ async fn run_submission(
         .await;
     }
 
+    // Remove this action's trace dir now that the manifest has been ingested
+    // (deferred #8 / M9.2). Previously every traced submission left a `trace-{n}`
+    // dir under SEMBAZURU_TRACE_ROOT for the daemon's whole life — the agent-side
+    // monotonic disk grower. It is created whenever a cache is configured, so it
+    // is cleaned regardless of whether recording ran (a non-deterministic action
+    // skips recording but still made the dir). Best-effort: a uniquely-named
+    // residual dir is harmless, so a failure is not fatal.
+    if !trace_dir.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&trace_dir).await;
+    }
+
     metrics.record_outcome(&outcome);
     emit_outcome(&tx, outcome).await;
 }

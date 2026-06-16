@@ -77,6 +77,7 @@ async fn start_intake_and_status(table: WorkerTable, auth_enabled: bool) -> (Str
         table,
         server_stats: Arc::new(ServerStats::default()),
         cache: None,
+        cache_max_bytes: None,
         metrics,
         auth_enabled,
     };
