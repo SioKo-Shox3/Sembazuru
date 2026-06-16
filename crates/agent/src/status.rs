@@ -20,11 +20,13 @@
 //! Coordination port and the GUI needs no cluster token (ADR 0008 §4). Read-only
 //! in M9.1; the config/eviction admin RPCs arrive with M9.2/M9.3.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sembazuru_proto::v0::{
-    CacheStatus, ExecBreakdown, FileServerStatus, GetStatusRequest, GetStatusResponse,
+    CacheStatus, ExecBreakdown, FileServerStatus, GetConfigRequest, GetConfigResponse,
+    GetStatusRequest, GetStatusResponse, SetConfigRequest, SetConfigResponse,
     TriggerEvictionRequest, TriggerEvictionResponse, WorkerStatus,
     status_server::Status as StatusRpc,
 };
@@ -34,6 +36,7 @@ use tonic::{Request, Response, Status};
 
 use crate::Execution;
 use crate::action_cache::AgentCache;
+use crate::config::DaemonConfig;
 use crate::coordination::WorkerTable;
 use crate::fileserver::ServerStats;
 
@@ -131,6 +134,9 @@ pub struct StatusState {
     /// Whether the daemon requires a cluster token (ADR 0006) — surfaced so the
     /// GUI can show the cluster's auth posture.
     pub auth_enabled: bool,
+    /// Path of the persisted daemon config the GetConfig/SetConfig RPCs read and
+    /// write (M9.3a). The GUI edits this file; the daemon applies it on next start.
+    pub config_path: PathBuf,
 }
 
 impl StatusState {
@@ -237,6 +243,79 @@ impl StatusRpc for StatusState {
             }
         }
     }
+
+    async fn get_config(
+        &self,
+        _request: Request<GetConfigRequest>,
+    ) -> Result<Response<GetConfigResponse>, Status> {
+        let path = self.config_path.clone();
+        // Read off the runtime (file I/O). The token is deliberately reduced to a
+        // presence bool here — never echo the secret over the wire (M9.3a).
+        let (cfg, file_exists) = tokio::task::spawn_blocking(move || {
+            let exists = path.exists();
+            (DaemonConfig::load_from(&path), exists)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("config read failed: {e}")))?;
+        Ok(Response::new(GetConfigResponse {
+            config_path: self.config_path.to_string_lossy().into_owned(),
+            file_exists,
+            coord_addr: cfg.coord_addr,
+            intake_addr: cfg.intake_addr,
+            fileserver_addr: cfg.fileserver_addr,
+            status_addr: cfg.status_addr,
+            cache_root: cfg.cache_root.unwrap_or_default(),
+            trace_root: cfg.trace_root.unwrap_or_default(),
+            cache_max_bytes: cfg.cache_max_bytes.unwrap_or(0),
+            cluster_token_set: cfg.cluster_token.is_some(),
+        }))
+    }
+
+    async fn set_config(
+        &self,
+        request: Request<SetConfigRequest>,
+    ) -> Result<Response<SetConfigResponse>, Status> {
+        let path = self.config_path.clone();
+        let req = request.into_inner();
+        let written_path = tokio::task::spawn_blocking(move || {
+            // Start from the existing persisted config so an absent optional field
+            // (cluster_token unchanged) and empty addresses keep their stored
+            // values — a GUI editing one knob need not re-send everything.
+            let mut cfg = DaemonConfig::load_from(&path);
+            let keep = |new: String, old: String| if new.trim().is_empty() { old } else { new };
+            cfg.coord_addr = keep(req.coord_addr, cfg.coord_addr);
+            cfg.intake_addr = keep(req.intake_addr, cfg.intake_addr);
+            cfg.fileserver_addr = keep(req.fileserver_addr, cfg.fileserver_addr);
+            cfg.status_addr = keep(req.status_addr, cfg.status_addr);
+            // Optional fields: an empty value clears them (unset).
+            cfg.cache_root = empty_to_none(req.cache_root);
+            cfg.trace_root = empty_to_none(req.trace_root);
+            cfg.cache_max_bytes = (req.cache_max_bytes > 0).then_some(req.cache_max_bytes);
+            // Token: absent = unchanged; present-empty = clear; present-value = set.
+            if let Some(t) = req.cluster_token {
+                cfg.cluster_token = empty_to_none(t);
+            }
+            cfg.save_to(&path).map(|()| path)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("config write failed: {e}")))?
+        .map_err(|e| Status::internal(format!("config write failed: {e}")))?;
+        Ok(Response::new(SetConfigResponse {
+            ok: true,
+            detail: format!(
+                "saved to {}; restart the daemon to apply",
+                written_path.to_string_lossy()
+            ),
+        }))
+    }
+}
+
+/// Maps an empty wire string to `None`, keeping a non-empty value **verbatim**
+/// (the convention that an empty optional field means "unset"). Deliberately does
+/// NOT trim: the cluster token must round-trip byte-for-byte so the daemon and the
+/// worker agree on it (ADR 0006; see `config::empty_to_none`).
+fn empty_to_none(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
 }
 
 /// Evicts `cache` down to `max_bytes` off the async runtime, returning

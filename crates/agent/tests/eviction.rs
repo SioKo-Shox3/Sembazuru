@@ -94,6 +94,7 @@ fn status_state(cache: Option<Arc<AgentCache>>, cap: Option<u64>) -> StatusState
         cache_max_bytes: cap,
         metrics: Arc::new(Metrics::default()),
         auth_enabled: false,
+        config_path: std::env::temp_dir().join("sbz-eviction-test-unused.toml"),
     }
 }
 

@@ -10,18 +10,23 @@
 //!
 //! The single-shot `sembazuru-agent` CLI (M3.1) runs one command against one
 //! explicit worker; this daemon is the production front door the launcher talks
-//! to. Addresses are taken from the environment so a launcher and a worker can
-//! be pointed at the same daemon without code changes:
+//! to. Configuration loads from a TOML file then the `SEMBAZURU_*` environment
+//! variables override individual fields (**env > file**, M9.3a / ADR 0008 §3), so
+//! the dev/CLI workflow (export env vars) keeps working while a Windows Service —
+//! which has no per-shell environment — reads its settings from the file:
 //!
+//!   SEMBAZURU_CONFIG      config file path (default %ProgramData%\Sembazuru\daemon.toml)
 //!   SEMBAZURU_COORD       Coordination listen addr   (default 127.0.0.1:50070)
 //!   SEMBAZURU_INTAKE      LocalIntake listen addr     (default 127.0.0.1:50071)
 //!   SEMBAZURU_FILESERVER  file-supply listen addr     (default 127.0.0.1:50072)
 //!   SEMBAZURU_STATUS      Status (GUI) listen addr    (default 127.0.0.1:50073,
 //!                         loopback-only — the resident GUI reads it, M9.1)
+//!   SEMBAZURU_CACHE_ROOT / _TRACE_ROOT / _CLUSTER_TOKEN / _CACHE_MAX_BYTES
 
 use std::sync::Arc;
 
 use sembazuru_agent::action_cache::AgentCache;
+use sembazuru_agent::config::DaemonConfig;
 use sembazuru_agent::coordination::{
     DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination_with_token,
 };
@@ -32,10 +37,6 @@ use sembazuru_agent::intake::{
 };
 use sembazuru_agent::scheduler::Scheduler;
 use sembazuru_agent::status::{StatusState, evict_cache_to_cap, serve_status_service};
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
 
 /// Warns loudly when an unauthenticated daemon exposes a LAN-reachable listener:
 /// auth disabled **and** a non-loopback bind means any host on the network can
@@ -53,16 +54,21 @@ fn warn_if_exposed(role: &str, addr: std::net::SocketAddr, auth_enabled: bool) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let coord_addr = env_or("SEMBAZURU_COORD", "127.0.0.1:50070");
-    let intake_addr = env_or("SEMBAZURU_INTAKE", "127.0.0.1:50071");
-    let file_addr = env_or("SEMBAZURU_FILESERVER", "127.0.0.1:50072");
-    let status_addr = env_or("SEMBAZURU_STATUS", "127.0.0.1:50073");
+    // Effective config = the persisted file (if any) with SEMBAZURU_* env vars
+    // overlaid on top (env > file, M9.3a). The file is the source for a Windows
+    // Service (no env); the env keeps the dev/CLI workflow unchanged.
+    let config_path = DaemonConfig::path_from_env();
+    let config = DaemonConfig::load_effective(&config_path);
+    let coord_addr = config.coord_addr.clone();
+    let intake_addr = config.intake_addr.clone();
+    let file_addr = config.fileserver_addr.clone();
+    let status_addr = config.status_addr.clone();
 
     // Shared cluster token (ADR 0006). When set, workers must present it on both
     // the control plane (Register) and the data-plane handshake; when unset the
     // daemon runs unauthenticated (M5/M6 LAN behaviour). Distributed out-of-band
-    // via SEMBAZURU_CLUSTER_TOKEN to the daemon and every worker.
-    let cluster_token = sembazuru_proto::auth::cluster_token_from_env();
+    // via the config file or SEMBAZURU_CLUSTER_TOKEN to the daemon and every worker.
+    let cluster_token = config.cluster_token.clone();
     eprintln!(
         "sembazuru-daemon: worker auth {}",
         if cluster_token.is_some() {
@@ -116,16 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         });
     }
 
-    // Action cache (M4): a 2nd identical build skips the worker. Opt-in via
-    // SEMBAZURU_CACHE_ROOT (persisted across builds); absent → compile without
-    // caching. Per-action trace dirs go under SEMBAZURU_TRACE_ROOT (or a temp).
-    let cache = match std::env::var_os("SEMBAZURU_CACHE_ROOT") {
-        Some(root) => match AgentCache::open(&root) {
+    // Action cache (M4): a 2nd identical build skips the worker. Opt-in via the
+    // config's cache_root (SEMBAZURU_CACHE_ROOT), persisted across builds; absent
+    // → compile without caching. Per-action trace dirs go under trace_root.
+    let cache = match &config.cache_root {
+        Some(root) => match AgentCache::open(root) {
             Ok(c) => {
-                eprintln!(
-                    "sembazuru-daemon: action cache at {}",
-                    root.to_string_lossy()
-                );
+                eprintln!("sembazuru-daemon: action cache at {root}");
                 Some(std::sync::Arc::new(c))
             }
             Err(e) => {
@@ -140,20 +143,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // GUI-driven Status TriggerEviction. Without a cap a long-lived daemon's cache
     // grows until the disk does (the #8 hazard). Eviction is correctness-safe: a
     // wrongly-evicted blob only causes a later cache miss (re-run), never a wrong
-    // result. Bytes; a non-numeric or zero value disables the cap.
-    let cache_max_bytes: Option<u64> = std::env::var("SEMBAZURU_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0);
+    // result.
+    let cache_max_bytes = config.cache_max_bytes;
     if let Some(max) = cache_max_bytes {
         eprintln!("sembazuru-daemon: action cache size cap {max} bytes");
     }
-    let trace_root = env_or(
-        "SEMBAZURU_TRACE_ROOT",
-        &std::env::temp_dir()
+    let trace_root = config.trace_root.clone().unwrap_or_else(|| {
+        std::env::temp_dir()
             .join("sembazuru-trace")
-            .to_string_lossy(),
-    );
+            .to_string_lossy()
+            .into_owned()
+    });
 
     // Intake runs submissions under the read-VFS, pointing workers at this
     // daemon's file server. The daemon always has a file server, so VFS is always
@@ -188,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cache_max_bytes,
             metrics: intake.metrics(),
             auth_enabled: cluster_token.is_some(),
+            config_path: config_path.clone(),
         };
         tokio::spawn(async move {
             if let Err(e) = serve_status_service(status_listener, state).await {
