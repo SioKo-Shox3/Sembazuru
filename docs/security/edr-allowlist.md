@@ -85,9 +85,10 @@ named-pipe IPC — no network sockets are opened by the hook DLL itself.
 - No kernel driver of any kind.
 - No AMSI, ETW, or EDR/AV tampering, unhooking, or bypass.
 - No process hollowing / doppelgänging / herpaderping.
-- Exactly one persistence mechanism: the `SembazuruDaemon` auto-start service
-  (disclosed under "Persistence" below). No Run keys, no scheduled tasks, no WMI
-  subscriptions, no startup-folder entries, no Event Log source registration.
+- Exactly two persistence mechanisms: the `SembazuruDaemon` and `SembazuruWorker`
+  auto-start services (both disclosed under "Persistence" below). No Run keys, no
+  scheduled tasks, no WMI subscriptions, no startup-folder entries, no Event Log
+  source registration.
 - No credential, browser, or keystroke access; no anti-debug / anti-VM evasion.
 - No code obfuscation or string encryption — the binaries are debuggable and the
   source is public.
@@ -109,12 +110,14 @@ So an EDR will repeatedly see `launcher.exe` (signed) spawn a Microsoft/LLVM
 compiler (signed) with an injected, signed DLL. This is the normal, expected
 behavior of the product, not anomalous activity.
 
-## Persistence (the one auto-start service)
+## Persistence (the two auto-start services)
 
-The installer registers **exactly one** Windows Service so the daemon is available
-without a logged-in user (a worker PC must be reachable before login). This is the
-*only* persistence mechanism Sembazuru creates; it is disclosed here in full so the
-registered behavior matches this document exactly.
+The installer registers **exactly two** Windows Services so both the daemon and the
+worker are available without a logged-in user (a worker PC must be reachable before
+login). These are the *only* persistence mechanisms Sembazuru creates; they are
+disclosed here in full so the registered behavior matches this document exactly.
+
+The **daemon** service:
 
 - **Service name:** `SembazuruDaemon` — **Display name:** `Sembazuru Build Daemon`
 - **Type / start:** `SERVICE_WIN32_OWN_PROCESS`, `AUTO_START` (registered via the
@@ -127,9 +130,26 @@ registered behavior matches this document exactly.
   LocalSystem for zero-config convenience. The daemon itself performs **no DLL
   injection** (it schedules actions and serves files); injection happens only in the
   worker's compiler children (the steady-state above).
-- **No other persistence:** no second service, no Run keys, scheduled tasks, WMI
-  subscriptions, or startup-folder entries. Uninstall (`sembazuru-daemon uninstall`,
-  or the MSI) stops and deletes this service and adds nothing else.
+
+The **worker** service is registered identically (added M9.3c):
+
+- **Service name:** `SembazuruWorker` — **Display name:** `Sembazuru Build Worker`
+- **Type / start:** `SERVICE_WIN32_OWN_PROCESS`, `AUTO_START` (registered via the
+  documented `windows-service` crate → `CreateServiceW`; MITRE T1543.003).
+- **ImagePath:** `…\sembazuru-worker.exe --service` (the same signed binary; the
+  `--service` argument selects SCM mode over the plain CLI).
+- **Account:** least-privilege **by default** — a virtual service account
+  (`NT SERVICE\SembazuruWorker`). Unlike the daemon, the worker needs no broad file
+  access: it injects the Sembazuru hook only into the compilers it spawns and
+  receives build inputs over the data plane, so it does **not** read the developer's
+  source tree directly and does not default to LocalSystem. That injection is exactly
+  the steady-state behavior disclosed above — confined to the worker's own child
+  processes, never an already-running process.
+
+- **No other persistence:** these two services are the only persistence Sembazuru
+  creates — no Run keys, scheduled tasks, WMI subscriptions, or startup-folder
+  entries. Uninstall (`sembazuru-daemon uninstall` / `sembazuru-worker uninstall`, or
+  the MSI) stops and deletes them and adds nothing else.
 
 ## Signing
 
