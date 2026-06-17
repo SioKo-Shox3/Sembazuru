@@ -860,8 +860,10 @@ dependencies = [
  "sembazuru-dataplane",
  "sembazuru-proto",
  "sembazuru-tracer",
+ "serde",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "windows-sys 0.59.0",
 ]

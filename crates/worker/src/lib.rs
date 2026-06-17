@@ -9,6 +9,7 @@
 //! later; keeping the worker filesystem-agnostic here avoids baking in an
 //! assumption that M3.2 would have to tear out.
 
+pub mod config;
 pub mod coordination;
 pub mod fileclient;
 mod job;
@@ -148,6 +149,18 @@ impl WorkerService {
     /// rejected (it would otherwise plain-spawn the compiler with no inputs).
     pub fn with_vfs(mut self, cfg: WorkerVfsConfig) -> Self {
         self.vfs = Some(Arc::new(cfg));
+        self
+    }
+
+    /// Overrides the per-action wall-clock ceiling from configuration (M9.3c). A
+    /// service has no per-shell environment, so the timeout must be settable from
+    /// `worker.toml`, not only `SEMBAZURU_ACTION_TIMEOUT_SECS`. `None` (or a zero
+    /// value) keeps the default resolved at construction by [`default_action_ceiling`]
+    /// — so the env path is unchanged and the file path now works too.
+    pub fn with_action_timeout_secs(mut self, secs: Option<u64>) -> Self {
+        if let Some(s) = secs.filter(|&s| s > 0) {
+            self.ceiling = std::time::Duration::from_secs(s);
+        }
         self
     }
 

@@ -33,6 +33,10 @@ sembazuru-cas = { path = "../cas" }
 tonic = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "net", "io-util", "fs"] }
 tokio-stream = { version = "0.1", features = ["net", "time"] }
+# Persisted worker.toml config (M9.3c): a Windows Service has no per-shell env, so
+# settings load from a TOML file (then SEMBAZURU_* override). Mirrors the daemon.
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 # Job Objects for process-tree kill (M6.1e): killing the injected launcher must
 # also kill its grandchild (the real compiler), which kill_on_drop cannot do.
 windows-sys = { version = "0.59", features = [
