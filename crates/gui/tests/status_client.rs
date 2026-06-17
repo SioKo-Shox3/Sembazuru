@@ -60,6 +60,19 @@ fn table_with_one_worker() -> WorkerTable {
     table
 }
 
+/// Polls `pred` until it holds or `limit` elapses, yielding to the runtime between
+/// checks so spawned tasks make progress on the current-thread test runtime.
+async fn wait_until(limit: Duration, mut pred: impl FnMut() -> bool) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if pred() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    pred()
+}
+
 #[tokio::test]
 async fn fetch_status_maps_a_registered_worker() {
     let endpoint = start_status(table_with_one_worker(), tmp_config()).await;
@@ -163,6 +176,10 @@ async fn config_round_trip_with_token_presence_clear_set() {
     let c2 = fetch_config(&endpoint).await.expect("get_config");
     assert!(c2.cluster_token_set, "Keep leaves the token in place");
     assert_eq!(c2.cache_max_bytes, 4096, "the other field updated");
+    assert!(
+        !format!("{c2:?}").contains("s3cret"),
+        "the token must not surface while it is still set"
+    );
 
     // Clear: an empty token disables auth.
     apply_config(
@@ -176,4 +193,54 @@ async fn config_round_trip_with_token_presence_clear_set() {
     .expect("set_config clear");
     let c3 = fetch_config(&endpoint).await.expect("get_config");
     assert!(!c3.cluster_token_set, "Clear removes the token");
+    assert!(
+        !format!("{c3:?}").contains("s3cret"),
+        "the token must not surface across any config response"
+    );
+}
+
+#[tokio::test]
+async fn run_client_polls_serves_commands_and_stops_on_channel_close() {
+    use std::sync::atomic::AtomicU64;
+
+    use sembazuru_gui::client::{SharedState, UiCommand, Waker, run_client};
+    use sembazuru_gui::model::ConfigModel;
+    use tokio::sync::{mpsc, oneshot};
+
+    let endpoint = start_status(table_with_one_worker(), tmp_config()).await;
+    let shared = SharedState::new();
+    let (tx, rx) = mpsc::channel::<UiCommand>(4);
+    let woke = Arc::new(AtomicU64::new(0));
+    let w = woke.clone();
+    let wake: Waker = Arc::new(move || {
+        w.fetch_add(1, Ordering::Relaxed);
+    });
+
+    let handle = tokio::spawn(run_client(endpoint.clone(), shared.clone(), rx, wake));
+
+    // The first interval tick fires immediately: the dashboard becomes Connected
+    // well under one POLL_INTERVAL (1.5s), not after a blank.
+    let connected = wait_until(Duration::from_secs(2), || {
+        matches!(shared.snapshot(), ConnectionState::Connected(_))
+    })
+    .await;
+    assert!(connected, "run_client did not produce a snapshot promptly");
+    assert!(
+        woke.load(Ordering::Relaxed) >= 1,
+        "the wake callback fired after a poll"
+    );
+
+    // A command routed through the loop round-trips off the poll path.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(UiCommand::GetConfig(reply_tx)).await.unwrap();
+    let cfg: ConfigModel = reply_rx.await.unwrap().expect("GetConfig via run_client");
+    assert!(!cfg.cluster_token_set);
+
+    // Dropping every sender closes the channel; the loop returns.
+    drop(tx);
+    let stopped = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    assert!(
+        stopped.is_ok(),
+        "run_client did not stop when the command channel closed"
+    );
 }

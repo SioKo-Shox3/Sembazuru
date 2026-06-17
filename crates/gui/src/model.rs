@@ -121,10 +121,56 @@ pub struct EvictionOutcome {
     pub cap_configured: bool,
 }
 
+/// A write-only secret (the cluster token). It redacts itself in `Debug`, refuses
+/// to be `Clone`d, and zeroizes its buffer on drop, so the plaintext does not
+/// linger in freed heap memory or get copied around the UI by accident.
+///
+/// This bounds the *GUI-side* exposure, which is where the config text box will
+/// hold the value. Once lowered to the wire ([`ConfigEdit::into_request`]) the
+/// value transiently exists in tonic's serialization buffer, which is outside the
+/// GUI's control — that residual copy is unavoidable for a write that must send
+/// the token, and is acknowledged rather than zeroized here.
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Moves the inner plaintext out for lowering to the wire, without letting the
+    /// zeroizing `Drop` wipe the buffer we are handing on.
+    fn into_inner(self) -> String {
+        let mut held = std::mem::ManuallyDrop::new(self);
+        std::mem::take(&mut held.0)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString(<redacted>)")
+    }
+}
+
 /// How a config save should treat the cluster token. The GUI's token text box is
 /// write-only; this enum is the only channel a token value travels through, and
-/// it maps 1:1 onto the `optional string cluster_token` wire semantics.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// it maps 1:1 onto the `optional string cluster_token` wire semantics. It is
+/// deliberately neither `Clone` nor value-printing in `Debug`.
+#[derive(Default)]
 pub enum TokenAction {
     /// Leave the stored token unchanged (the box was untouched) → absent.
     #[default]
@@ -132,13 +178,24 @@ pub enum TokenAction {
     /// Clear the token, disabling auth → present-and-empty.
     Clear,
     /// Set the token to this value → present-and-nonempty.
-    Set(String),
+    Set(SecretString),
+}
+
+impl std::fmt::Debug for TokenAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keep => f.write_str("Keep"),
+            Self::Clear => f.write_str("Clear"),
+            Self::Set(_) => f.write_str("Set(<redacted>)"),
+        }
+    }
 }
 
 /// A config edit from the GUI, before it becomes a wire request. Empty addresses
 /// mean "keep the existing value" (matching `SetConfigRequest` semantics); the
-/// token follows [`TokenAction`].
-#[derive(Clone, Debug, Default)]
+/// token follows [`TokenAction`]. Not `Clone` — the secret it may carry must not
+/// be copied; the edit is built once and moved to the runtime.
+#[derive(Debug, Default)]
 pub struct ConfigEdit {
     pub coord_addr: String,
     pub intake_addr: String,
@@ -165,7 +222,7 @@ impl ConfigEdit {
             cluster_token: match self.token {
                 TokenAction::Keep => None,
                 TokenAction::Clear => Some(String::new()),
-                TokenAction::Set(value) => Some(value),
+                TokenAction::Set(secret) => Some(secret.into_inner()),
             },
         }
     }
@@ -274,7 +331,10 @@ pub fn humanize_age(ms: u64) -> String {
     if ms < 1_000 {
         "just now".to_string()
     } else if ms < 60_000 {
-        format!("{:.1}s ago", ms as f64 / 1000.0)
+        // Truncate to tenths so 59_999ms reads "59.9s ago" — never rounding up to a
+        // "60.0s" that should have rolled into the minutes bucket.
+        let tenths = ms / 100;
+        format!("{}.{}s ago", tenths / 10, tenths % 10)
     } else {
         let secs = ms / 1000;
         format!("{}m {:02}s ago", secs / 60, secs % 60)
@@ -298,6 +358,8 @@ mod tests {
         assert_eq!(humanize_age(0), "just now");
         assert_eq!(humanize_age(999), "just now");
         assert_eq!(humanize_age(1_500), "1.5s ago");
+        // Just under a minute must not round up into a bogus "60.0s ago".
+        assert_eq!(humanize_age(59_999), "59.9s ago");
         assert_eq!(humanize_age(65_000), "1m 05s ago");
         assert_eq!(humanize_age(3_661_000), "61m 01s ago");
     }
@@ -327,6 +389,22 @@ mod tests {
         }
         .into_request();
         assert_eq!(req.cluster_token.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn secret_token_is_redacted_in_debug() {
+        // A `{:?}` on an edit carrying a token must never print the plaintext —
+        // the only way the value reaches the wire is `into_request`.
+        let edit = ConfigEdit {
+            token: TokenAction::Set("s3cret".into()),
+            ..Default::default()
+        };
+        let dbg = format!("{edit:?}");
+        assert!(!dbg.contains("s3cret"), "token leaked into Debug: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "token field should be redacted: {dbg}"
+        );
     }
 
     #[test]

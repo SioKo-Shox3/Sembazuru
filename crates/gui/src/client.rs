@@ -10,6 +10,7 @@
 //! The GUI only ever dials loopback; it never binds a listener and never speaks
 //! the cluster-facing Coordination plane.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,37 +32,47 @@ pub const DEFAULT_STATUS_ADDR: &str = "127.0.0.1:50073";
 pub const STATUS_ADDR_ENV: &str = "SEMBAZURU_STATUS";
 /// How often the dashboard refreshes.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(1500);
+/// Bounds a TCP connect so a half-open daemon does not stall the poll task.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Backstop deadline per RPC so a daemon that accepts the connection then stalls
+/// cannot wedge a request forever. Generous (a `GetStatus` walks the CAS to size
+/// it); the point is only to bound a true hang, not to clip a slow-but-live call.
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolves the Status address from the environment and verifies it is loopback,
-/// returning the `http://` URL to dial. The GUI dials loopback only (ADR 0008 §4):
-/// a non-loopback `SEMBAZURU_STATUS` is refused rather than reaching out over the
-/// network. This is defense in depth — the daemon already binds the Status plane
-/// loopback-only (`intake::require_loopback`) — and keeps the GUI from ever
-/// speaking the operational surface to a routable host.
+/// returning the loopback `SocketAddr` to dial. The GUI dials loopback only
+/// (ADR 0008 §4): a non-loopback `SEMBAZURU_STATUS` is refused rather than
+/// reaching out over the network. Returning the *resolved* address (not the raw
+/// string) means the address we checked is the address we dial — there is no
+/// second, unchecked resolution inside the transport. Defense in depth: the
+/// daemon already binds the Status plane loopback-only (`intake::require_loopback`).
 pub fn status_endpoint() -> Result<String, String> {
-    let addr = std::env::var(STATUS_ADDR_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_STATUS_ADDR.to_string());
-    require_loopback(&addr)?;
-    Ok(format!("http://{addr}"))
+    let resolved = resolve_loopback(&status_addr())?;
+    Ok(format!("http://{resolved}"))
 }
 
-/// Fails closed unless every address `addr` resolves to is loopback. Mirrors the
-/// daemon's `require_loopback` so the GUI never dials a routable host.
-fn require_loopback(addr: &str) -> Result<(), String> {
+fn status_addr() -> String {
+    std::env::var(STATUS_ADDR_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_STATUS_ADDR.to_string())
+}
+
+/// Resolves `addr` and returns a loopback `SocketAddr`, failing closed unless
+/// every address it resolves to is loopback. Mirrors the daemon's `require_loopback`.
+fn resolve_loopback(addr: &str) -> Result<SocketAddr, String> {
     use std::net::ToSocketAddrs;
     let resolved: Vec<_> = addr
         .to_socket_addrs()
         .map_err(|e| format!("invalid Status address {addr:?}: {e}"))?
         .collect();
-    if resolved.is_empty() {
+    let Some(first) = resolved.first().copied() else {
         return Err(format!(
             "Status address {addr:?} resolved to no socket address"
         ));
-    }
+    };
     if resolved.iter().all(|s| s.ip().is_loopback()) {
-        Ok(())
+        Ok(first)
     } else {
         Err(format!(
             "refusing to dial non-loopback Status address {addr:?}: the GUI talks to \
@@ -132,7 +143,7 @@ pub enum UiCommand {
 /// Connects, fetches one status snapshot, and maps it. Connection-refused is a
 /// [`ConnectionState::DaemonDown`], not an error — the daemon is simply not up.
 pub async fn fetch_status(endpoint: &str) -> ConnectionState {
-    let mut client = match StatusClient::connect(endpoint.to_string()).await {
+    let mut client = match connect(endpoint).await {
         Ok(client) => client,
         Err(_) => return ConnectionState::DaemonDown,
     };
@@ -176,9 +187,14 @@ pub async fn trigger_eviction(endpoint: &str) -> Result<EvictionOutcome, ClientE
 }
 
 async fn connect(endpoint: &str) -> Result<StatusClient<tonic::transport::Channel>, ClientError> {
-    StatusClient::connect(endpoint.to_string())
+    let channel = tonic::transport::Endpoint::from_shared(endpoint.to_string())
+        .map_err(|e| ClientError(format!("invalid Status endpoint: {e}")))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(RPC_TIMEOUT)
+        .connect()
         .await
-        .map_err(|e| ClientError(format!("cannot reach the daemon: {e}")))
+        .map_err(|e| ClientError(format!("cannot reach the daemon: {e}")))?;
+    Ok(StatusClient::new(channel))
 }
 
 fn classify(status: &tonic::Status) -> ConnectionState {
@@ -203,45 +219,74 @@ pub async fn run_client(
     mut commands: mpsc::Receiver<UiCommand>,
     wake: Waker,
 ) {
+    let endpoint: Arc<str> = Arc::from(endpoint);
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                shared.set(fetch_status(&endpoint).await);
-                wake();
+                // Poll off the select path so a slow GetStatus never starves command
+                // servicing (last-writer-wins on SharedState if two ever overlap).
+                let endpoint = endpoint.clone();
+                let shared = shared.clone();
+                let wake = wake.clone();
+                tokio::spawn(async move {
+                    shared.set(fetch_status(&endpoint).await);
+                    wake();
+                });
             }
             command = commands.recv() => match command {
-                Some(UiCommand::GetConfig(reply)) => {
-                    let _ = reply.send(fetch_config(&endpoint).await);
-                }
-                Some(UiCommand::SetConfig(edit, reply)) => {
-                    let _ = reply.send(apply_config(&endpoint, edit).await);
-                }
-                Some(UiCommand::TriggerEviction(reply)) => {
-                    let _ = reply.send(trigger_eviction(&endpoint).await);
-                }
+                Some(command) => spawn_command(endpoint.clone(), command),
                 None => break,
             }
         }
     }
 }
 
+/// Runs one user command on its own task so a slow RPC never blocks the loop or
+/// other commands. The reply `oneshot` is dropped (the caller sees `Err`) if the
+/// UI dropped its receiver.
+fn spawn_command(endpoint: Arc<str>, command: UiCommand) {
+    tokio::spawn(async move {
+        match command {
+            UiCommand::GetConfig(reply) => {
+                let _ = reply.send(fetch_config(&endpoint).await);
+            }
+            UiCommand::SetConfig(edit, reply) => {
+                let _ = reply.send(apply_config(&endpoint, edit).await);
+            }
+            UiCommand::TriggerEviction(reply) => {
+                let _ = reply.send(trigger_eviction(&endpoint).await);
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::require_loopback;
+    use super::resolve_loopback;
 
     #[test]
     fn loopback_addresses_are_accepted() {
-        assert!(require_loopback("127.0.0.1:50073").is_ok());
-        assert!(require_loopback("[::1]:50073").is_ok());
-        assert!(require_loopback("localhost:50073").is_ok());
+        assert!(
+            resolve_loopback("127.0.0.1:50073")
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
+        assert!(resolve_loopback("[::1]:50073").unwrap().ip().is_loopback());
+        assert!(
+            resolve_loopback("localhost:50073")
+                .unwrap()
+                .ip()
+                .is_loopback()
+        );
     }
 
     #[test]
     fn routable_addresses_are_refused() {
-        assert!(require_loopback("0.0.0.0:50073").is_err());
-        assert!(require_loopback("10.0.0.5:50073").is_err());
-        assert!(require_loopback("not a socket addr").is_err());
+        assert!(resolve_loopback("0.0.0.0:50073").is_err());
+        assert!(resolve_loopback("10.0.0.5:50073").is_err());
+        assert!(resolve_loopback("not a socket addr").is_err());
     }
 }
