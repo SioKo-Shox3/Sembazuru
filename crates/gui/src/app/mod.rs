@@ -14,21 +14,31 @@ use tokio::sync::mpsc;
 use crate::client::{POLL_INTERVAL, SharedState, UiCommand, Waker, run_client};
 use crate::tray::{Tray, TrayMessage};
 
+mod config;
 mod dashboard;
+
+/// Which view the window is showing.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    #[default]
+    Dashboard,
+    Settings,
+}
 
 pub struct SembazuruApp {
     // The background runtime must outlive the app; dropping it cancels the poll.
     _runtime: tokio::runtime::Runtime,
     shared: SharedState,
-    // Held to keep the command channel open (so the poll loop keeps running) and
-    // wired to the config / service controls in M9.4d–e.
-    #[allow(dead_code)]
+    // Keeps the command channel open (so the poll loop keeps running) and carries
+    // the config / service-control requests.
     commands: mpsc::Sender<UiCommand>,
     // The tray icon (`None` if the platform tray could not be created); polled each
     // frame for Show / Quit.
     tray: Option<Tray>,
     // Set when the user picks "Quit" so the close handler stops minimizing-to-tray.
     quitting: bool,
+    tab: Tab,
+    config: config::ConfigPanel,
 }
 
 impl SembazuruApp {
@@ -55,6 +65,8 @@ impl SembazuruApp {
             commands,
             tray,
             quitting: false,
+            tab: Tab::default(),
+            config: config::ConfigPanel::default(),
         }
     }
 
@@ -92,8 +104,22 @@ impl eframe::App for SembazuruApp {
         let ctx = ui.ctx().clone();
         self.handle_tray(&ctx);
 
-        let state = self.shared.snapshot();
-        dashboard::render(ui, &state);
+        egui::Panel::top("nav").show_inside(ui, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Dashboard, "Dashboard");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+            });
+            ui.add_space(2.0);
+        });
+
+        match self.tab {
+            Tab::Dashboard => {
+                let state = self.shared.snapshot();
+                dashboard::render(ui, &state);
+            }
+            Tab::Settings => self.config.render(ui, &self.commands),
+        }
 
         // Keep heartbeat ages ticking even if a repaint signal is ever missed.
         ctx.request_repaint_after(POLL_INTERVAL);
