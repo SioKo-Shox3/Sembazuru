@@ -12,8 +12,15 @@ const HEALTHY: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
 const UNHEALTHY: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
 const MUTED: Color32 = Color32::from_rgb(0x9e, 0x9e, 0x9e);
 
-/// Renders the dashboard for the current connection state into `ui`.
-pub fn render(ui: &mut egui::Ui, state: &ConnectionState) {
+/// An interaction the dashboard surfaces back to the app.
+pub enum DashAction {
+    /// Switch to the Services tab (from the "daemon down" affordance).
+    OpenServices,
+}
+
+/// Renders the dashboard for the current connection state into `ui`, returning any
+/// action the user requested.
+pub fn render(ui: &mut egui::Ui, state: &ConnectionState) -> Option<DashAction> {
     ui.horizontal(|ui| {
         ui.heading("Sembazuru");
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -22,19 +29,26 @@ pub fn render(ui: &mut egui::Ui, state: &ConnectionState) {
     });
     ui.separator();
 
-    egui::ScrollArea::vertical().show(ui, |ui| match state {
-        ConnectionState::Connecting => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Connecting to the local daemon…");
-            });
-        }
-        ConnectionState::DaemonDown => render_daemon_down(ui),
-        ConnectionState::Error(message) => {
-            ui.colored_label(UNHEALTHY, format!("Status error: {message}"));
-        }
-        ConnectionState::Connected(dash) => render_dashboard(ui, dash),
-    });
+    egui::ScrollArea::vertical()
+        .show(ui, |ui| match state {
+            ConnectionState::Connecting => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Connecting to the local daemon…");
+                });
+                None
+            }
+            ConnectionState::DaemonDown => render_daemon_down(ui),
+            ConnectionState::Error(message) => {
+                ui.colored_label(UNHEALTHY, format!("Status error: {message}"));
+                None
+            }
+            ConnectionState::Connected(dash) => {
+                render_dashboard(ui, dash);
+                None
+            }
+        })
+        .inner
 }
 
 fn connection_badge(ui: &mut egui::Ui, state: &ConnectionState) {
@@ -47,7 +61,7 @@ fn connection_badge(ui: &mut egui::Ui, state: &ConnectionState) {
     ui.colored_label(color, RichText::new(format!("● {text}")).small());
 }
 
-fn render_daemon_down(ui: &mut egui::Ui) {
+fn render_daemon_down(ui: &mut egui::Ui) -> Option<DashAction> {
     ui.add_space(8.0);
     ui.label(RichText::new("The local daemon is not running.").strong());
     ui.label(
@@ -57,8 +71,12 @@ fn render_daemon_down(ui: &mut egui::Ui) {
         )
         .color(MUTED),
     );
-    // The "Start daemon" control (Windows Service start, with elevation) arrives
-    // in M9.4e; for now this is an informational state.
+    ui.add_space(6.0);
+    if ui.button("Open Services to start the daemon").clicked() {
+        Some(DashAction::OpenServices)
+    } else {
+        None
+    }
 }
 
 fn render_dashboard(ui: &mut egui::Ui, dash: &DashboardModel) {

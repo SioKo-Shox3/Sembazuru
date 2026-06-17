@@ -9,6 +9,15 @@ use sembazuru_gui::app::SembazuruApp;
 use sembazuru_gui::client::status_endpoint;
 
 fn main() -> eframe::Result<()> {
+    // The hidden elevated helper path: when re-launched with `--svcctl <action>
+    // <service>` (via "runas"), do the SCM op and exit — no window, no single-
+    // instance lock. Dispatched before anything else, mirroring the daemon's
+    // thin-bin arg handling.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--svcctl") {
+        std::process::exit(sembazuru_gui::svcctl::run_cli(&args));
+    }
+
     if !acquire_single_instance() {
         eprintln!("sembazuru-gui: another instance is already running");
         return Ok(());

@@ -16,12 +16,14 @@ use crate::tray::{Tray, TrayMessage};
 
 mod config;
 mod dashboard;
+mod services;
 
 /// Which view the window is showing.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     #[default]
     Dashboard,
+    Services,
     Settings,
 }
 
@@ -39,6 +41,7 @@ pub struct SembazuruApp {
     quitting: bool,
     tab: Tab,
     config: config::ConfigPanel,
+    services: services::ServicesPanel,
 }
 
 impl SembazuruApp {
@@ -67,6 +70,7 @@ impl SembazuruApp {
             quitting: false,
             tab: Tab::default(),
             config: config::ConfigPanel::default(),
+            services: services::ServicesPanel::default(),
         }
     }
 
@@ -108,6 +112,7 @@ impl eframe::App for SembazuruApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Dashboard, "Dashboard");
+                ui.selectable_value(&mut self.tab, Tab::Services, "Services");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
             ui.add_space(2.0);
@@ -116,8 +121,12 @@ impl eframe::App for SembazuruApp {
         match self.tab {
             Tab::Dashboard => {
                 let state = self.shared.snapshot();
-                dashboard::render(ui, &state);
+                if let Some(dashboard::DashAction::OpenServices) = dashboard::render(ui, &state) {
+                    self.tab = Tab::Services;
+                    self.services.start_daemon(&ctx);
+                }
             }
+            Tab::Services => self.services.render(ui, &ctx),
             Tab::Settings => self.config.render(ui, &self.commands),
         }
 
