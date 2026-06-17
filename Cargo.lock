@@ -833,6 +833,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "sembazuru-gui"
+version = "0.0.1"
+dependencies = [
+ "sembazuru-agent",
+ "sembazuru-proto",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "sembazuru-proto"
 version = "0.0.1"
 dependencies = [
