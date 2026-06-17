@@ -22,6 +22,18 @@ zeroize = "1"
 # its own egui; the glow (OpenGL) renderer is the default and the lightest on
 # Windows. Tauri / native-tray were rejected in the ADR.
 eframe = "0.34"
+# Tray residency (M9.4c, ADR 0008 §2/§4): minimize-to-tray + a Show/Quit menu.
+tray-icon = "0.24"
+
+[target.'cfg(windows)'.dependencies]
+# Single-instance guard (named mutex) for the resident GUI, and — in M9.4e — the
+# ShellExecuteEx "runas" self-elevation for service start/stop. Same major as the
+# worker's windows-sys. Windows-only.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
 
 # The resident GUI's automated coverage stands up the *real* loopback Status
 # service in-process (StatusState + serve_status_service, exactly as
