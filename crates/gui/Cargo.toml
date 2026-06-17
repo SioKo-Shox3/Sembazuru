@@ -26,14 +26,26 @@ eframe = "0.34"
 tray-icon = "0.24"
 
 [target.'cfg(windows)'.dependencies]
-# Single-instance guard (named mutex) for the resident GUI, and — in M9.4e — the
-# ShellExecuteEx "runas" self-elevation for service start/stop. Same major as the
+# Windows Service control (start/stop/query) for the local daemon and worker —
+# same crate and version the daemon/worker register themselves with (M9.4e).
+windows-service = "0.7"
+# Single-instance guard (named mutex) and the ShellExecuteEx "runas" self-elevation
+# that relaunches this exe to start/stop a service (M9.4c/e). Same major as the
 # worker's windows-sys. Windows-only.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+# Embeds an application manifest declaring requestedExecutionLevel=asInvoker so the
+# resident GUI runs NON-elevated (ADR 0008 §4); only the per-action service control
+# elevates, via a re-launch with the "runas" verb. Pure Rust (no mt.exe).
+embed-manifest = "1"
 
 # The resident GUI's automated coverage stands up the *real* loopback Status
 # service in-process (StatusState + serve_status_service, exactly as
