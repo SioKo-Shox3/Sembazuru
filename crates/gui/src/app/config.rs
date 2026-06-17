@@ -209,9 +209,11 @@ impl ConfigPanel {
     }
 
     fn request_config(&mut self, commands: &mpsc::Sender<UiCommand>) {
-        self.requested = true;
         let (tx, rx) = oneshot::channel();
+        // Only mark "requested" once the send actually lands, so a transiently full
+        // channel self-heals on the next frame instead of wedging the auto-load.
         if commands.try_send(UiCommand::GetConfig(tx)).is_ok() {
+            self.requested = true;
             self.pending_config = Some(rx);
         }
     }

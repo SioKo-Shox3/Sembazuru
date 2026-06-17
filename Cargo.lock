@@ -3726,6 +3726,7 @@ dependencies = [
  "embed-manifest",
  "sembazuru-agent",
  "sembazuru-proto",
+ "sembazuru-worker",
  "tokio",
  "tonic",
  "tray-icon",

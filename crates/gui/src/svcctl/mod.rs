@@ -12,7 +12,7 @@
 
 /// One of the two local Sembazuru services the GUI can control. Remote workers on
 /// other machines are not controllable from here (ADR 0008 §4).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Service {
     Daemon,
     Worker,
@@ -53,7 +53,7 @@ impl Service {
 }
 
 /// The control action. A closed set: only start and stop cross the boundary.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Action {
     Start,
     Stop,
@@ -203,15 +203,21 @@ mod imp {
     pub fn request_action(service: Service, action: Action) -> Result<i32, String> {
         use std::os::windows::ffi::OsStrExt;
 
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError};
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_CANCELLED, GetLastError, WAIT_TIMEOUT,
+        };
         use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
         use windows_sys::Win32::UI::Shell::{
             SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-        const STILL_ACTIVE: u32 = 259;
-
+        // We launch the FULL path of our own image (lpFile below), so ShellExecuteEx
+        // does no PATH/CWD search — a peer process cannot redirect the elevated launch
+        // by planting an exe. The remaining trust assumption is the on-disk integrity
+        // of this image itself: the installer must place it where standard users
+        // cannot write (Program Files / %ProgramData% with default ACLs), and code
+        // signing (M7) is what ultimately ties "elevate this image" to "our binary".
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let exe_w: Vec<u16> = exe
             .as_os_str()
@@ -250,15 +256,19 @@ mod imp {
             return Err("no handle to the elevated helper".to_string());
         }
 
+        // SAFETY: `handle` is a live process handle from ShellExecuteExW. The child
+        // settles its own state within ~8s (`wait_until`), so 120s only bounds a true
+        // hang; on timeout we report it explicitly rather than inferring from the exit
+        // code. The handle is closed exactly once on each path.
+        let wait = unsafe { WaitForSingleObject(handle, 120_000) };
+        if wait == WAIT_TIMEOUT {
+            unsafe { CloseHandle(handle) };
+            return Err("the elevated helper did not finish in time".to_string());
+        }
         let mut code: u32 = 0;
-        // SAFETY: `handle` is a live process handle from ShellExecuteExW; closed once.
         unsafe {
-            WaitForSingleObject(handle, 120_000);
             GetExitCodeProcess(handle, &mut code);
             CloseHandle(handle);
-        }
-        if code == STILL_ACTIVE {
-            return Err("the elevated helper did not finish in time".to_string());
         }
         Ok(code as i32)
     }
@@ -278,5 +288,67 @@ mod imp {
 
     pub fn request_action(_service: Service, _action: Action) -> Result<i32, String> {
         Err("service control is only available on Windows".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, Service, run_cli};
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn run_cli_rejects_bad_or_missing_args_with_code_2() {
+        // Bad-args returns 2 BEFORE ever attempting the SCM op (run_elevated).
+        assert_eq!(run_cli(&args(&["exe", "--svcctl", "bogus", "bogus"])), 2);
+        assert_eq!(
+            run_cli(&args(&["exe", "--svcctl", "start"])),
+            2,
+            "missing service"
+        );
+        assert_eq!(run_cli(&args(&["exe", "--svcctl"])), 2, "missing both");
+        assert_eq!(
+            run_cli(&args(&["exe", "--svcctl", "restart", "daemon"])),
+            2,
+            "unknown action"
+        );
+    }
+
+    #[test]
+    fn arg_parsing_is_a_closed_set() {
+        assert_eq!(Action::from_arg("start"), Some(Action::Start));
+        assert_eq!(Action::from_arg("stop"), Some(Action::Stop));
+        assert_eq!(Action::from_arg("Start"), None, "case-sensitive, closed");
+        assert_eq!(Service::from_arg("daemon"), Some(Service::Daemon));
+        assert_eq!(Service::from_arg("worker"), Some(Service::Worker));
+        assert_eq!(Service::from_arg("../evil"), None);
+        // The arg strings round-trip with the parser (what the parent sends, the
+        // child accepts).
+        assert_eq!(
+            Action::from_arg(Action::Start.as_arg()),
+            Some(Action::Start)
+        );
+        assert_eq!(
+            Service::from_arg(Service::Worker.as_arg()),
+            Some(Service::Worker)
+        );
+    }
+
+    // The hardcoded service names that cross the elevation boundary must match the
+    // names the daemon and worker actually register, or start/stop silently targets
+    // a non-existent service. (Service modules are Windows-only.)
+    #[cfg(windows)]
+    #[test]
+    fn service_names_match_the_registered_services() {
+        assert_eq!(
+            Service::Daemon.name(),
+            sembazuru_agent::service::SERVICE_NAME
+        );
+        assert_eq!(
+            Service::Worker.name(),
+            sembazuru_worker::service::SERVICE_NAME
+        );
     }
 }
