@@ -14,6 +14,8 @@ pub mod coordination;
 pub mod fileclient;
 mod job;
 pub mod run;
+#[cfg(windows)]
+pub mod service;
 pub mod vfs_pipe;
 
 use std::collections::HashMap;
