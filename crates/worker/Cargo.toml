@@ -31,8 +31,11 @@ sembazuru-dataplane = { path = "../dataplane", features = ["tokio"] }
 sembazuru-tracer = { path = "../tracer" }
 sembazuru-cas = { path = "../cas" }
 tonic = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "net", "io-util", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "net", "io-util", "fs", "signal"] }
 tokio-stream = { version = "0.1", features = ["net", "time"] }
+# Graceful shutdown (M9.3c): the CLI's Ctrl-C and the service's SCM Stop both cancel
+# a CancellationToken that folds the Execution server (mirrors the daemon).
+tokio-util = "0.7"
 # Persisted worker.toml config (M9.3c): a Windows Service has no per-shell env, so
 # settings load from a TOML file (then SEMBAZURU_* override). Mirrors the daemon.
 serde = { version = "1", features = ["derive"] }
