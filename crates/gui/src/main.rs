@@ -1,9 +1,14 @@
-//! `sembazuru-gui` entry point (M9.4b–c).
+//! `sembazuru-gui` entry point (M9.4b–e).
 //!
 //! Enforces a single resident instance, resolves the loopback Status endpoint
 //! (refusing a non-loopback override), then launches the resident, tray-backed
 //! dashboard window. The config editor (M9.4d) and the `--svcctl` elevation
 //! dispatch + service controls (M9.4e) build on this.
+
+// Release builds are windowless (no console flashes behind the tray-resident GUI,
+// and the elevated `--svcctl` child shows no console). Debug builds keep the
+// console so the CLI smoke (`--svcctl ...`) and dev diagnostics stay visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use sembazuru_gui::app::SembazuruApp;
 use sembazuru_gui::client::status_endpoint;
