@@ -151,6 +151,14 @@ pub fn run_as_service() -> windows_service::Result<()> {
 /// A least-privilege virtual account is therefore the *default* for the worker (the
 /// daemon defaults to System); this matches the rationale already noted in
 /// `sembazuru_agent::service::ServiceAccount` and the EDR disclosure.
+///
+/// Least privilege is not zero-setup, though: the virtual account still needs write
+/// access to the worker's scratch and CAS roots (`crate::WorkerVfsConfig`) and
+/// read+execute on `launcher.exe` + the hook DLL. LocalSystem has those implicitly;
+/// the virtual account does not, so the production installer (M9.5) must ACL-grant
+/// `NT SERVICE\SembazuruWorker` those paths or VFS-mode actions fail at runtime (not
+/// at install). This is the worker's analogue of the daemon's "grant read on the
+/// served source roots" caveat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAccount {
     /// LocalSystem (`account_name = None`). Most powerful; rarely needed for the
