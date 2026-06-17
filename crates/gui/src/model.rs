@@ -326,6 +326,22 @@ pub fn hit_rate(hits: u64, misses: u64) -> Option<f64> {
     (total > 0).then(|| hits as f64 / total as f64 * 100.0)
 }
 
+/// A byte count as a short human string (binary units) for the dashboard.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// A heartbeat age in milliseconds as a short human string for the worker table.
 pub fn humanize_age(ms: u64) -> String {
     if ms < 1_000 {
@@ -351,6 +367,16 @@ mod tests {
         assert_eq!(hit_rate(1, 0), Some(100.0));
         assert_eq!(hit_rate(0, 1), Some(0.0));
         assert_eq!(hit_rate(1, 3), Some(25.0));
+    }
+
+    #[test]
+    fn format_bytes_scales_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
     }
 
     #[test]

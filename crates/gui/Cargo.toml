@@ -18,6 +18,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net",
 # Zeroize the cluster token's GUI-side copy on drop so the plaintext credential
 # does not linger in freed heap memory (security review, M9.4a).
 zeroize = "1"
+# Immediate-mode GUI for the dashboard window (M9.4b, ADR 0008 §2). eframe brings
+# its own egui; the glow (OpenGL) renderer is the default and the lightest on
+# Windows. Tauri / native-tray were rejected in the ADR.
+eframe = "0.34"
 
 # The resident GUI's automated coverage stands up the *real* loopback Status
 # service in-process (StatusState + serve_status_service, exactly as

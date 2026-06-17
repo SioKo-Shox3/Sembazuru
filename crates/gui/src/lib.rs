@@ -12,8 +12,9 @@
 //! - [`client`]: the async loopback Status client — integration-tested headless
 //!   against an in-process `serve_status_service`.
 //!
-//! The egui window, tray residency, and the (elevation-gated) service controls
-//! land in later sub-commits and depend only on these two.
+//! The tray residency and the (elevation-gated) service controls land in later
+//! sub-commits and depend only on these.
 
+pub mod app;
 pub mod client;
 pub mod model;

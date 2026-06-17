@@ -1,14 +1,14 @@
-//! `sembazuru-gui` entry point.
+//! `sembazuru-gui` entry point (M9.4b).
 //!
-//! For M9.4a this is a headless smoke utility: it dials the daemon's loopback
-//! Status service once and prints the mapped snapshot, exercising the client and
-//! view-model end-to-end before the UI exists. The egui window, tray residency,
-//! and service controls land in the following sub-commits (M9.4b–e), at which
-//! point this `main` grows the `--svcctl` arg dispatch and launches the app.
+//! Resolves the loopback Status endpoint (refusing a non-loopback override), then
+//! launches the resident dashboard window. Tray residency (M9.4c), the config
+//! editor (M9.4d), and the `--svcctl` elevation dispatch + service controls
+//! (M9.4e) build on this.
 
-use sembazuru_gui::client::{fetch_status, status_endpoint};
+use sembazuru_gui::app::SembazuruApp;
+use sembazuru_gui::client::status_endpoint;
 
-fn main() {
+fn main() -> eframe::Result<()> {
     let endpoint = match status_endpoint() {
         Ok(endpoint) => endpoint,
         Err(message) => {
@@ -16,10 +16,18 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    let state = runtime.block_on(fetch_status(&endpoint));
-    println!("sembazuru-gui: status @ {endpoint}\n{state:#?}");
+
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([900.0, 600.0])
+            .with_min_inner_size([560.0, 360.0])
+            .with_title("Sembazuru"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Sembazuru",
+        native_options,
+        Box::new(move |cc| Ok(Box::new(SembazuruApp::new(cc, endpoint)))),
+    )
 }
