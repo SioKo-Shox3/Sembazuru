@@ -1,0 +1,24 @@
+[package]
+name = "sembazuru-gui"
+description = "Resident user-session GUI: cluster/cache dashboard and daemon controls (M9.4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "sembazuru-gui"
+path = "src/main.rs"
+
+[dependencies]
+sembazuru-proto = { path = "../proto" }
+tonic = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+
+# The resident GUI's automated coverage stands up the *real* loopback Status
+# service in-process (StatusState + serve_status_service, exactly as
+# crates/agent/tests/status.rs does) and points the GUI's client at it. The agent
+# is a dev-dependency only, so it never enters the GUI's production dependencies.
+[dev-dependencies]
+sembazuru-agent = { path = "../agent" }
