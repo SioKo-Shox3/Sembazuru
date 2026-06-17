@@ -48,3 +48,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows Service support for `sembazuru-worker --service` (M9.3c). Windows-only;
+# the worker's plain-CLI mode has no service dependency. Same version as the daemon.
+windows-service = "0.7"
