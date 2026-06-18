@@ -25,4 +25,9 @@
     <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Firewall extension for the LAN listen-port exceptions (M9.5b). -->
+    <PackageReference Include="WixToolset.Firewall.wixext" Version="5.0.2" />
+  </ItemGroup>
+
 </Project>
