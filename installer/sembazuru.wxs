@@ -45,10 +45,16 @@
       <Directory Id="AppProgramsFolder" Name="Sembazuru" />
     </StandardDirectory>
 
+    <!-- All-users Startup folder for the per-user GUI autostart (ALLUSERS=1, so
+         StartupFolder is the common Startup). The shortcut must sit directly in
+         StartupFolder (Windows only runs loose shortcuts there, not subfolders). -->
+    <StandardDirectory Id="StartupFolder" />
+
     <Feature Id="Main" Title="Sembazuru" Level="1">
       <ComponentGroupRef Id="Binaries" />
       <ComponentGroupRef Id="Integration" />
       <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="GuiAutostartShortcut" />
     </Feature>
   </Package>
 
@@ -140,6 +146,23 @@
            (ALLUSERS=1), so the Start Menu folder still resolves to the all-users
            location; only the component's install-state marker is per-user. -->
       <RegistryValue Root="HKCU" Key="Software\Sembazuru" Name="StartMenuShortcut"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Fragment>
+
+  <!-- Per-user GUI autostart (M9.5c, ADR 0008 §3 amendment 2026-06-18): launch the
+       resident dashboard at logon. The GUI is non-elevated (asInvoker) and never
+       injects — it only reads the loopback Status RPC and drives the SCM via the
+       UAC-prompted svcctl path. This is the project's only persistence beyond the
+       two services, disclosed in docs/security/edr-allowlist.md. Removed cleanly on
+       uninstall. No Run key / scheduled task / WMI is used (those stay forbidden). -->
+  <Fragment>
+    <Component Id="GuiAutostartShortcut" Directory="StartupFolder">
+      <Shortcut Id="GuiStartupShortcut" Name="Sembazuru"
+                Description="Sembazuru dashboard — starts at logon, resident in the tray"
+                Target="[INSTALLFOLDER]sembazuru-gui.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue Root="HKCU" Key="Software\Sembazuru" Name="StartupShortcut"
                      Type="integer" Value="1" KeyPath="yes" />
     </Component>
   </Fragment>

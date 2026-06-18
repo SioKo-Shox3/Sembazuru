@@ -29,6 +29,7 @@ rationale are public: <https://github.com/SioKo-Shox3/Sembazuru> (see
 | `sembazuru.exe` | Build-system launcher (the compiler wrapper a build invokes) | yes |
 | `sembazuru-daemon.exe` | Local agent: schedules actions, serves files | yes |
 | `sembazuru-worker.exe` | Remote worker: runs the compiler under virtualization | yes |
+| `sembazuru-gui.exe` | Resident dashboard (user-session tray; **non-elevated, no injection**) | yes |
 | `launcher.exe` | Injector: starts the compiler with the hook DLL loaded | **yes — EDR-relevant** |
 | `sbz_interceptor64.dll` (and `…32.dll`) | The injected hook DLL | **yes — EDR-relevant** |
 
@@ -85,10 +86,11 @@ named-pipe IPC — no network sockets are opened by the hook DLL itself.
 - No kernel driver of any kind.
 - No AMSI, ETW, or EDR/AV tampering, unhooking, or bypass.
 - No process hollowing / doppelgänging / herpaderping.
-- Exactly two persistence mechanisms: the `SembazuruDaemon` and `SembazuruWorker`
-  auto-start services (both disclosed under "Persistence" below). No Run keys, no
-  scheduled tasks, no WMI subscriptions, no startup-folder entries, no Event Log
-  source registration.
+- Persistence is limited to **two auto-start services** (`SembazuruDaemon`,
+  `SembazuruWorker`) **plus one per-user Startup-folder shortcut** that launches the
+  non-elevated, non-injecting GUI dashboard at logon — all three disclosed under
+  "Persistence" below. No Run keys, no scheduled tasks, no WMI subscriptions, no
+  Event Log source registration.
 - No credential, browser, or keystroke access; no anti-debug / anti-VM evasion.
 - No code obfuscation or string encryption — the binaries are debuggable and the
   source is public.
@@ -110,12 +112,14 @@ So an EDR will repeatedly see `launcher.exe` (signed) spawn a Microsoft/LLVM
 compiler (signed) with an injected, signed DLL. This is the normal, expected
 behavior of the product, not anomalous activity.
 
-## Persistence (the two auto-start services)
+## Persistence (two auto-start services + one GUI autostart)
 
-The installer registers **exactly two** Windows Services so both the daemon and the
-worker are available without a logged-in user (a worker PC must be reachable before
-login). These are the *only* persistence mechanisms Sembazuru creates; they are
-disclosed here in full so the registered behavior matches this document exactly.
+The installer registers **two** Windows Services so both the daemon and the worker
+are available without a logged-in user (a worker PC must be reachable before login),
+and creates **one** per-user Startup-folder shortcut so the user-session dashboard
+GUI starts at logon. These three are the *only* persistence mechanisms Sembazuru
+creates; they are disclosed here in full so the registered behavior matches this
+document exactly.
 
 The **daemon** service:
 
@@ -146,10 +150,28 @@ The **worker** service is registered identically (added M9.3c):
   the steady-state behavior disclosed above — confined to the worker's own child
   processes, never an already-running process.
 
-- **No other persistence:** these two services are the only persistence Sembazuru
-  creates — no Run keys, scheduled tasks, WMI subscriptions, or startup-folder
-  entries. Uninstall (`sembazuru-daemon uninstall` / `sembazuru-worker uninstall`, or
-  the MSI) stops and deletes them and adds nothing else.
+The **GUI autostart** (added M9.5c) is the one persistence mechanism that is *not* a
+service:
+
+- **Mechanism:** a single shortcut in the **all-users Startup folder**
+  (`…\Start Menu\Programs\StartUp\Sembazuru.lnk`), created by the MSI (MITRE
+  T1547.001, Startup folder). It launches `sembazuru-gui.exe` at logon.
+- **What it launches:** the resident dashboard GUI — **non-elevated** (asInvoker
+  manifest), with **no DLL injection** and no network sockets beyond the loopback
+  Status RPC it reads. It controls the services only through a UAC-prompted
+  elevation (the `svcctl` path), so the autostart itself grants no elevated
+  capability.
+- **Why not a service:** a session-0 service cannot draw a user-session UI, so the
+  dashboard must run in the interactive session and needs a per-user logon trigger
+  (ADR 0008 §3, amended 2026-06-18). A Run key or scheduled task was deliberately
+  *not* used — the Startup-folder shortcut is the most visible, least-privileged
+  option and is removed cleanly on uninstall.
+
+- **No other persistence:** the two services and this one GUI Startup-folder shortcut
+  are the *only* persistence Sembazuru creates — no Run keys, no scheduled tasks, no
+  WMI subscriptions, no Event Log source registration. Uninstall (the MSI, or the dev
+  `sembazuru-daemon uninstall` / `sembazuru-worker uninstall`) stops and deletes the
+  services and removes the shortcut, adding nothing else.
 
 ## Signing
 
