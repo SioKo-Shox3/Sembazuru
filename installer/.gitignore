@@ -1,0 +1,6 @@
+# WiX / MSBuild build outputs
+bin/
+obj/
+*.msi
+*.wixpdb
+*.cab
