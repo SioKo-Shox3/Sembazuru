@@ -67,4 +67,19 @@ fn wxs_service_definitions_match_rust_constants() {
         "ServiceInstall Arguments must register the SCM arg {}",
         daemon::SERVICE_ARG
     );
+
+    // Each service name must appear on BOTH its ServiceInstall and its ServiceControl
+    // element, so the MSI controls exactly the service it installs. A bare `contains`
+    // would pass if only one of the two carried the right name (internal .wxs drift).
+    let occurrences = |needle: &str| wxs.matches(needle).count();
+    assert!(
+        occurrences(&format!("Name=\"{}\"", daemon::SERVICE_NAME)) >= 2,
+        "{} must name both its ServiceInstall and ServiceControl",
+        daemon::SERVICE_NAME
+    );
+    assert!(
+        occurrences(&format!("Name=\"{}\"", worker::SERVICE_NAME)) >= 2,
+        "{} must name both its ServiceInstall and ServiceControl",
+        worker::SERVICE_NAME
+    );
 }

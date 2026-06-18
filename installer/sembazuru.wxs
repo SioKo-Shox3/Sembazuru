@@ -75,10 +75,13 @@
          its VFS-wired config on first start. The exes' `seed-config` subcommand is
          only-if-absent (idempotent) and never writes the cluster token. These live in
          the Package (not a Fragment) so they are always linked into the product. -->
+    <!-- Return="ignore": config seeding is a best-effort convenience. A seed hiccup
+         (or a packaged binary that predates seed-config) must NOT abort the install —
+         the services still install and run on built-in defaults (zero-config). -->
     <CustomAction Id="SeedDaemonConfig" FileRef="DaemonExeFile" ExeCommand="seed-config"
-                  Execute="deferred" Impersonate="no" Return="check" />
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <CustomAction Id="SeedWorkerConfig" FileRef="WorkerExeFile" ExeCommand="seed-config"
-                  Execute="deferred" Impersonate="no" Return="check" />
+                  Execute="deferred" Impersonate="no" Return="ignore" />
     <!-- RemoveFolderEx (below) needs the data path available early (AppSearch) at
          uninstall, but the WixRemoveFoldersEx action runs before CostFinalize so a
          SetProperty from [DataFolder] would be too late. Canonical fix: persist the
