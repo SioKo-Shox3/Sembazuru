@@ -20,7 +20,8 @@
     $(var.Integration)  dir holding Directory.Build.targets
     $(var.ProductVersion)
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
   <Package
       Name="Sembazuru"
       Manufacturer="Sembazuru Project"
@@ -54,11 +55,45 @@
   <!-- The shipped binaries, all under INSTALLFOLDER. -->
   <Fragment>
     <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+      <!-- Daemon: registered as the auto-start SembazuruDaemon service (LocalSystem,
+           reads the developer source tree to serve it). Service identity/args/account
+           mirror crates/agent/src/service.rs; the exe's own `install`/`uninstall`
+           subcommands stay dev-only so the MSI is the single registrar (no double
+           registration). Firewall opens the two LAN listen ports. -->
       <Component Id="DaemonExe">
-        <File Id="DaemonExeFile" Source="$(var.RustTarget)\sembazuru-daemon.exe" KeyPath="yes" />
+        <File Id="DaemonExeFile" Source="$(var.RustTarget)\sembazuru-daemon.exe" KeyPath="yes">
+          <!-- Coordination (worker register/heartbeat) + file-supply data plane.
+               Loopback Status (50073) gets no rule; localSubnet keeps it on the LAN. -->
+          <fw:FirewallException Id="FwCoordination" Name="Sembazuru Coordination"
+                                Port="50070" Protocol="tcp" Scope="localSubnet" />
+          <fw:FirewallException Id="FwFileSupply" Name="Sembazuru File Supply"
+                                Port="50072" Protocol="tcp" Scope="localSubnet" />
+        </File>
+        <ServiceInstall Id="DaemonServiceInstall" Name="SembazuruDaemon"
+                        DisplayName="Sembazuru Build Daemon"
+                        Description="Sembazuru distributed-build daemon: schedules compile actions across workers and serves inputs on demand (loopback control + LAN data plane)."
+                        Type="ownProcess" Start="auto" ErrorControl="normal"
+                        Account="LocalSystem" Arguments="--service" Vital="yes" />
+        <ServiceControl Id="DaemonServiceControl" Name="SembazuruDaemon"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
+      <!-- Worker: registered as the auto-start SembazuruWorker service under the
+           least-privilege virtual account NT SERVICE\SembazuruWorker (mirrors
+           crates/worker/src/service.rs default). The virtual account is created by
+           the SCM on first service create (no password). Firewall opens the
+           Execution port the agent dials. -->
       <Component Id="WorkerExe">
-        <File Id="WorkerExeFile" Source="$(var.RustTarget)\sembazuru-worker.exe" KeyPath="yes" />
+        <File Id="WorkerExeFile" Source="$(var.RustTarget)\sembazuru-worker.exe" KeyPath="yes">
+          <fw:FirewallException Id="FwWorkerExecution" Name="Sembazuru Worker Execution"
+                                Port="50061" Protocol="tcp" Scope="localSubnet" />
+        </File>
+        <ServiceInstall Id="WorkerServiceInstall" Name="SembazuruWorker"
+                        DisplayName="Sembazuru Build Worker"
+                        Description="Sembazuru distributed-build worker: executes compile actions and streams their outputs back to the agent. Injects the Sembazuru hook only into the compilers it spawns (never an already-running process)."
+                        Type="ownProcess" Start="auto" ErrorControl="normal"
+                        Account="NT SERVICE\SembazuruWorker" Arguments="--service" Vital="yes" />
+        <ServiceControl Id="WorkerServiceControl" Name="SembazuruWorker"
+                        Start="install" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
       <Component Id="LauncherCliExe">
         <File Id="LauncherCliExeFile" Source="$(var.RustTarget)\sembazuru.exe" KeyPath="yes" />
