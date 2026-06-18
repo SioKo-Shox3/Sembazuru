@@ -7,22 +7,51 @@
 #
 # A REAL release signs with an OV Authenticode certificate from an HSM/hardware
 # token (CA/B Forum requires hardware key storage since 2023; ADR 0001 discusses
-# the personal-developer path). That purchase is deferred (decider, M7.2). Here we
-# prove the sign->verify mechanism end to end with an EPHEMERAL self-signed cert,
-# trusted only for this run, so CI gates the pipeline without a real cert.
+# the personal-developer path) and timestamps via RFC3161 (-TimestampServer). That
+# purchase is deferred (decider, M7.2). Here we prove the sign->verify mechanism end
+# to end with an EPHEMERAL self-signed cert, trusted only for this run, so CI gates
+# the pipeline without a real cert.
 #
-# Generic over whatever signable artifacts the build produced, so when the 32-bit
-# interceptor lands (M7.3) it is signed automatically.
+# Generic over whatever signable artifacts the build produced. By default it signs
+# the C++ injector PEs (launcher.exe + the interceptor DLLs). M9.5e adds the
+# distributable signing surface: pass -RustDir to also sign the four shipped Rust
+# binaries (daemon/worker/launcher/GUI) and -Msi to sign the MSI itself — i.e. the
+# whole "shipped set == signed set" the EDR disclosure promises. Same placeholder
+# cert proves the structure; a real release passes a real cert + -TimestampServer.
 param(
-    [string]$BuildDir = (Join-Path $PSScriptRoot '..\build\Release')
+    [string]$BuildDir = (Join-Path $PSScriptRoot '..\build\Release'),
+    # Optional: also sign the Rust distributables from this dir. The four the MSI
+    # ships; the dev-only tools (sembazuru-agent, sembazuru-trace) are not signed
+    # because they are not shipped (DESIGN §7).
+    [string]$RustDir = '',
+    # Optional: also sign the built MSI (proves the MSI signing structure, M9.5e).
+    [string]$Msi = '',
+    # Optional RFC3161 timestamp authority URL. Empty keeps the mechanism gate
+    # network-free; a real release passes a TSA (e.g. http://timestamp.digicert.com).
+    [string]$TimestampServer = ''
 )
 $ErrorActionPreference = 'Stop'
 
-# Our produced, distributable PE artifacts. The injector pieces come first because
-# they carry the EDR-relevant TTPs (inline hook + DLL injection).
-$names = @('launcher.exe', 'sbz_interceptor64.dll', 'sbz_interceptor32.dll')
-$targets = $names | ForEach-Object { Join-Path $BuildDir $_ } | Where-Object { Test-Path $_ }
-if ($targets.Count -eq 0) { throw "no signable artifacts under $BuildDir (build the hooks first)" }
+# Collect the produced, distributable artifacts. The injector pieces come first
+# because they carry the EDR-relevant TTPs (inline hook + DLL injection).
+$targets = @()
+foreach ($n in @('launcher.exe', 'sbz_interceptor64.dll', 'sbz_interceptor32.dll')) {
+    $p = Join-Path $BuildDir $n
+    if (Test-Path $p) { $targets += $p }
+}
+# The four Rust binaries the MSI ships (M9.5e). Dev-only tools are excluded.
+if ($RustDir) {
+    foreach ($n in @('sembazuru-daemon.exe', 'sembazuru-worker.exe', 'sembazuru.exe', 'sembazuru-gui.exe')) {
+        $p = Join-Path $RustDir $n
+        if (Test-Path $p) { $targets += $p }
+    }
+}
+# The MSI itself, signed last — the order a real release uses (sign the payload
+# files, harvest them, then sign the package).
+if ($Msi) {
+    if (Test-Path $Msi) { $targets += $Msi } else { throw "MSI not found: $Msi" }
+}
+if ($targets.Count -eq 0) { throw "no signable artifacts (BuildDir=$BuildDir RustDir=$RustDir Msi=$Msi)" }
 
 # Ephemeral self-signed code-signing cert, valid for a day, trusted only here.
 $cert = New-SelfSignedCertificate -Type CodeSigningCert `
@@ -30,14 +59,14 @@ $cert = New-SelfSignedCertificate -Type CodeSigningCert `
     -CertStoreLocation 'Cert:\CurrentUser\My' -KeyUsage DigitalSignature `
     -KeyExportPolicy Exportable -NotAfter (Get-Date).AddDays(1)
 
-# What this gate proves with a PLACEHOLDER cert: the binary can be Authenticode-
-# signed and the signature reads back as OURS (the signer thumbprint matches the
-# cert we just signed with). It deliberately does NOT require a trusted chain
-# (`Status -eq 'Valid'`): a self-signed cert terminates in an untrusted root, so
-# `Get-AuthenticodeSignature` returns `UnknownError` by design. Chain validity is
-# a property of the REAL OV certificate (from a CA), not of the sign->embed->read
-# mechanism. A real release additionally runs `signtool verify /pa` to assert the
-# trusted chain; here we assert the mechanism.
+# What this gate proves with a PLACEHOLDER cert: each artifact (PE *and* the MSI)
+# can be Authenticode-signed and the signature reads back as OURS (the signer
+# thumbprint matches the cert we just signed with). It deliberately does NOT require
+# a trusted chain (`Status -eq 'Valid'`): a self-signed cert terminates in an
+# untrusted root, so `Get-AuthenticodeSignature` returns `UnknownError` by design.
+# Chain validity is a property of the REAL OV certificate (from a CA), not of the
+# sign->embed->read mechanism. A real release additionally runs `signtool verify /pa`
+# to assert the trusted chain; here we assert the mechanism.
 function Remove-FromStore($storeName, $thumbprint) {
     try {
         $store = New-Object System.Security.Cryptography.X509Certificates.X509Store($storeName, 'CurrentUser')
@@ -52,10 +81,13 @@ $failures = @()
 try {
     foreach ($t in $targets) {
         $leaf = Split-Path $t -Leaf
-        $res = Set-AuthenticodeSignature -FilePath $t -Certificate $cert -HashAlgorithm SHA256
+        $signArgs = @{ FilePath = $t; Certificate = $cert; HashAlgorithm = 'SHA256' }
+        if ($TimestampServer) { $signArgs['TimestampServer'] = $TimestampServer }
+        $res = Set-AuthenticodeSignature @signArgs
         $v = Get-AuthenticodeSignature -FilePath $t
         $thumb = if ($v.SignerCertificate) { $v.SignerCertificate.Thumbprint } else { '(none)' }
-        Write-Host "SIGNED ${leaf}: set=$($res.Status) verify=$($v.Status) signer=$thumb"
+        $ts = if ($v.TimeStamperCertificate) { 'timestamped' } else { 'no-ts' }
+        Write-Host "SIGNED ${leaf}: set=$($res.Status) verify=$($v.Status) signer=$thumb $ts"
         # A signature must be present (not NotSigned) and be the one we applied.
         if ($v.Status -eq 'NotSigned') {
             $failures += "${leaf}: no signature was applied"
