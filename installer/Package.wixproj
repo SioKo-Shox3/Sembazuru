@@ -1,0 +1,28 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputName>Sembazuru</OutputName>
+    <OutputType>Package</OutputType>
+    <!-- 64-bit package so binaries land under Program Files (not the x86 view),
+         which the GUI self-elevation image-integrity assumption requires. -->
+    <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU'">x64</Platform>
+  </PropertyGroup>
+
+  <!--
+    File-source and version inputs. Defaults assume a release build at the repo
+    root (target/release + hooks/build/Release); CI overrides them on the command
+    line, e.g.:
+      dotnet build installer/Package.wixproj -c Release -p:Platform=x64 \
+        -p:SbzVersion=0.0.1 -p:SbzRustTarget=... -p:SbzHooks=...
+    These flow to the .wxs as $(var.RustTarget) / $(var.Hooks) / $(var.Integration)
+    / $(var.ProductVersion).
+  -->
+  <PropertyGroup>
+    <SbzRustTarget Condition="'$(SbzRustTarget)' == ''">$(MSBuildProjectDirectory)\..\target\release</SbzRustTarget>
+    <SbzHooks Condition="'$(SbzHooks)' == ''">$(MSBuildProjectDirectory)\..\hooks\build\Release</SbzHooks>
+    <SbzIntegration Condition="'$(SbzIntegration)' == ''">$(MSBuildProjectDirectory)\..\docs\integrations\msbuild</SbzIntegration>
+    <SbzVersion Condition="'$(SbzVersion)' == ''">0.0.1</SbzVersion>
+    <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
+  </PropertyGroup>
+
+</Project>

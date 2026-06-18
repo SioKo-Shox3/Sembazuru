@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Sembazuru MSI — binary placement (M9.5a, ADR 0008 §1).
+
+  This authors only the file layout: the four Rust executables, the C++ hook
+  launcher + both-bitness interceptor DLLs, and the MSBuild integration targets,
+  installed under Program Files (a standard-user non-writable location, required
+  by the GUI's self-elevation image-integrity assumption — ADR 0008 §3), plus a
+  Start Menu shortcut to the resident GUI and a PATH entry for the build-system
+  launcher.
+
+  Service registration (M9.5b), the per-user GUI autostart (M9.5c), and config
+  seeding / clean uninstall (M9.5d) are added by later fragments. Shipped set ==
+  signed/disclosed set (docs/security/edr-allowlist.md). Dev-only binaries
+  (sembazuru-agent, sembazuru-trace, probe) are deliberately not shipped.
+
+  File sources resolve from preprocessor variables defined in Package.wixproj:
+    $(var.RustTarget)   release dir holding the Rust .exe set
+    $(var.Hooks)        Release dir holding launcher.exe + sbz_interceptor{64,32}.dll
+    $(var.Integration)  dir holding Directory.Build.targets
+    $(var.ProductVersion)
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Sembazuru"
+      Manufacturer="Sembazuru Project"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="7B3C2E9A-1D4F-4C8B-9E6A-0F2D5A7C1B30"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Program Files\Sembazuru\ (64-bit). -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Sembazuru">
+        <Directory Id="IntegrationFolder" Name="integration" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start Menu\Sembazuru\ for the manual-launch GUI shortcut. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppProgramsFolder" Name="Sembazuru" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Sembazuru" Level="1">
+      <ComponentGroupRef Id="Binaries" />
+      <ComponentGroupRef Id="Integration" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+
+  <!-- The shipped binaries, all under INSTALLFOLDER. -->
+  <Fragment>
+    <ComponentGroup Id="Binaries" Directory="INSTALLFOLDER">
+      <Component Id="DaemonExe">
+        <File Id="DaemonExeFile" Source="$(var.RustTarget)\sembazuru-daemon.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="WorkerExe">
+        <File Id="WorkerExeFile" Source="$(var.RustTarget)\sembazuru-worker.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="LauncherCliExe">
+        <File Id="LauncherCliExeFile" Source="$(var.RustTarget)\sembazuru.exe" KeyPath="yes" />
+        <!-- Expose the build-system launcher on PATH so CMAKE_<LANG>_COMPILER_LAUNCHER
+             (docs/integrations) resolves `sembazuru`. Removed on uninstall. -->
+        <Environment Id="PathInstallFolder" Name="PATH" Value="[INSTALLFOLDER]"
+                     Part="last" Action="set" System="yes" Permanent="no" />
+      </Component>
+      <Component Id="GuiExe">
+        <File Id="GuiExeFile" Source="$(var.RustTarget)\sembazuru-gui.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="HookLauncherExe">
+        <File Id="HookLauncherExeFile" Source="$(var.Hooks)\launcher.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="Interceptor64">
+        <File Id="Interceptor64File" Source="$(var.Hooks)\sbz_interceptor64.dll" KeyPath="yes" />
+      </Component>
+      <Component Id="Interceptor32">
+        <File Id="Interceptor32File" Source="$(var.Hooks)\sbz_interceptor32.dll" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- MSBuild integration targets, shipped for drop-in CLToolExe routing. -->
+  <Fragment>
+    <ComponentGroup Id="Integration" Directory="IntegrationFolder">
+      <Component Id="DirectoryBuildTargets">
+        <File Id="DirectoryBuildTargetsFile" Source="$(var.Integration)\Directory.Build.targets" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+  <!-- Start Menu shortcut to the resident GUI (on-demand manual launch; the
+       per-user logon autostart is a separate Common Startup shortcut, M9.5c). -->
+  <Fragment>
+    <Component Id="StartMenuShortcut" Directory="AppProgramsFolder">
+      <Shortcut Id="GuiStartMenuShortcut" Name="Sembazuru"
+                Description="Sembazuru distributed-build dashboard"
+                Target="[INSTALLFOLDER]sembazuru-gui.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveAppProgramsFolder" Directory="AppProgramsFolder" On="uninstall" />
+      <!-- A non-advertised shortcut is per-user data to MSI, so its keypath lives
+           under HKCU (the canonical WiX shortcut pattern). The package is perMachine
+           (ALLUSERS=1), so the Start Menu folder still resolves to the all-users
+           location; only the component's install-state marker is per-user. -->
+      <RegistryValue Root="HKCU" Key="Software\Sembazuru" Name="StartMenuShortcut"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>
