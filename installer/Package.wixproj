@@ -28,6 +28,9 @@
   <ItemGroup>
     <!-- Firewall extension for the LAN listen-port exceptions (M9.5b). -->
     <PackageReference Include="WixToolset.Firewall.wixext" Version="5.0.2" />
+    <!-- Util extension for PermissionEx (data-dir ACLs) + RemoveFolderEx (clean
+         uninstall of the seeded config / runtime data) (M9.5d). -->
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
   </ItemGroup>
 
 </Project>

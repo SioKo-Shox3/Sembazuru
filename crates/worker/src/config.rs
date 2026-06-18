@@ -214,6 +214,44 @@ impl WorkerConfig {
             cas_root: PathBuf::from(self.cas_root.as_ref()?),
         })
     }
+
+    /// Builds the installer's default `worker.toml` (M9.5d): a VFS-ready config wired
+    /// to the hook binaries the MSI lays beside the worker exe (`install_dir`) and to
+    /// the per-machine runtime roots under `data_dir` (`%ProgramData%\Sembazuru`). It
+    /// also points the worker at the local daemon so a single-machine install
+    /// distributes out of the box; a second worker host repoints `agent` (and sets
+    /// the token) via the GUI.
+    ///
+    /// The cluster token is deliberately NOT seeded: a per-deployment secret must
+    /// never be written into a file the installer generates (it would otherwise leak
+    /// into installer logs / golden images). The operator supplies it via the GUI.
+    pub fn installer_seed(install_dir: &Path, data_dir: &Path) -> Self {
+        let at = |dir: &Path, name: &str| dir.join(name).to_string_lossy().into_owned();
+        Self {
+            // Register with the local daemon's default loopback Coordination address
+            // (mirrors sembazuru_agent::config::DEFAULT_COORD). A second host changes
+            // this to the daemon host's LAN address via the GUI.
+            agent: Some("http://127.0.0.1:50070".to_string()),
+            // Read-VFS wired to the installed hook binaries + per-machine data roots,
+            // so the worker supplies inputs on demand with no manual setup.
+            launcher: Some(at(install_dir, "launcher.exe")),
+            dll: Some(at(install_dir, "sbz_interceptor64.dll")),
+            scratch_root: Some(at(data_dir, "scratch")),
+            cas_root: Some(at(data_dir, "cas")),
+            ..Self::default()
+        }
+    }
+
+    /// Writes `self` to `path` as the seed config, but only if no file exists there
+    /// yet — re-running the installer (repair/upgrade) must never clobber an
+    /// operator-edited config. Returns whether a file was written.
+    pub fn seed_if_absent(&self, path: &Path) -> std::io::Result<bool> {
+        if path.exists() {
+            return Ok(false);
+        }
+        self.save_to(path)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +342,51 @@ mod tests {
         let vfs = full.vfs().expect("all four paths set");
         assert_eq!(vfs.launcher, PathBuf::from("l"));
         assert_eq!(vfs.cas_root, PathBuf::from("c"));
+    }
+
+    #[test]
+    fn installer_seed_wires_vfs_without_token() {
+        let install = PathBuf::from("C:\\Program Files\\Sembazuru");
+        let data = PathBuf::from("C:\\ProgramData\\Sembazuru");
+        let cfg = WorkerConfig::installer_seed(&install, &data);
+        // All four VFS paths set → the worker is read-VFS-capable out of the box.
+        let vfs = cfg.vfs().expect("the seed must enable VFS");
+        assert_eq!(vfs.launcher, install.join("launcher.exe"));
+        assert_eq!(vfs.dll, install.join("sbz_interceptor64.dll"));
+        assert_eq!(vfs.scratch_root, data.join("scratch"));
+        assert_eq!(vfs.cas_root, data.join("cas"));
+        // Registers with the local daemon, but the per-deployment token is never seeded.
+        assert_eq!(cfg.agent.as_deref(), Some("http://127.0.0.1:50070"));
+        assert!(
+            cfg.cluster_token.is_none(),
+            "the installer must not seed a cluster token (per-deployment secret)"
+        );
+    }
+
+    #[test]
+    fn seed_if_absent_is_idempotent() {
+        let path = tmp_file();
+        let seed =
+            WorkerConfig::installer_seed(&PathBuf::from("C:\\inst"), &PathBuf::from("C:\\data"));
+        assert!(
+            seed.seed_if_absent(&path).unwrap(),
+            "first seed writes the file"
+        );
+        // An operator edit must survive a re-seed (installer repair / upgrade).
+        let edited = WorkerConfig {
+            capacity: Some(99),
+            ..seed.clone()
+        };
+        edited.save_to(&path).unwrap();
+        assert!(
+            !seed.seed_if_absent(&path).unwrap(),
+            "a second seed is a no-op when the file exists"
+        );
+        assert_eq!(
+            WorkerConfig::load_from(&path).capacity,
+            Some(99),
+            "the operator's edit is preserved"
+        );
     }
 
     // Env-override tests mutate process-global env, so they take ENV_LOCK to avoid

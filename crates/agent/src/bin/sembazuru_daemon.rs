@@ -46,9 +46,26 @@ fn main() -> Result<(), BoxError> {
         }
         #[cfg(windows)]
         Some("--service") => Ok(sembazuru_agent::service::run_as_service()?),
+        // Seed the default config if absent (run by the MSI; cross-platform).
+        Some("seed-config") => seed_config(),
         // Default (and any unrecognized arg): run in the foreground.
         _ => run_cli(),
     }
+}
+
+/// Seeds the default `daemon.toml` at the configured path if absent (M9.5d). The MSI
+/// runs this as a deferred action so the file exists for discovery / GUI editing.
+/// Idempotent (never overwrites an operator-edited file) and never writes the
+/// cluster token.
+fn seed_config() -> Result<(), BoxError> {
+    let path = DaemonConfig::path_from_env();
+    let wrote = DaemonConfig::installer_seed().seed_if_absent(&path)?;
+    eprintln!(
+        "sembazuru-daemon: seed-config {} {}",
+        if wrote { "wrote" } else { "kept existing" },
+        path.display()
+    );
+    Ok(())
 }
 
 /// `--account <system|virtual|networkservice>`, default System. The daemon reads

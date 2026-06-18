@@ -21,7 +21,8 @@
     $(var.ProductVersion)
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
       Name="Sembazuru"
       Manufacturer="Sembazuru Project"
@@ -50,12 +51,47 @@
          StartupFolder (Windows only runs loose shortcuts there, not subfolders). -->
     <StandardDirectory Id="StartupFolder" />
 
+    <!-- %ProgramData%\Sembazuru: per-machine config + runtime data root (M9.5d). The
+         seeded daemon.toml/worker.toml live here; scratch/cas are the worker's VFS
+         roots. The whole tree is removed on uninstall (no residue). -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DataFolder" Name="Sembazuru">
+        <Directory Id="ScratchFolder" Name="scratch" />
+        <Directory Id="CasFolder" Name="cas" />
+      </Directory>
+    </StandardDirectory>
+
     <Feature Id="Main" Title="Sembazuru" Level="1">
       <ComponentGroupRef Id="Binaries" />
       <ComponentGroupRef Id="Integration" />
+      <ComponentGroupRef Id="DataDirs" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="GuiAutostartShortcut" />
     </Feature>
+
+    <!-- Seed default daemon.toml/worker.toml if absent (M9.5d). Deferred, no
+         impersonation (LocalSystem) so it can write under %ProgramData%; runs after
+         the binaries are laid down and before the services start, so the worker reads
+         its VFS-wired config on first start. The exes' `seed-config` subcommand is
+         only-if-absent (idempotent) and never writes the cluster token. These live in
+         the Package (not a Fragment) so they are always linked into the product. -->
+    <CustomAction Id="SeedDaemonConfig" FileRef="DaemonExeFile" ExeCommand="seed-config"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="SeedWorkerConfig" FileRef="WorkerExeFile" ExeCommand="seed-config"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <!-- RemoveFolderEx (below) needs the data path available early (AppSearch) at
+         uninstall, but the WixRemoveFoldersEx action runs before CostFinalize so a
+         SetProperty from [DataFolder] would be too late. Canonical fix: persist the
+         resolved path in the registry at install (DataFolderComp) and read it back
+         here via a RegistrySearch, so it is populated by AppSearch on uninstall. -->
+    <Property Id="SBZ_DATADIR">
+      <RegistrySearch Id="SbzDataDirSearch" Root="HKLM" Key="Software\Sembazuru"
+                      Name="DataDirPath" Type="raw" />
+    </Property>
+    <InstallExecuteSequence>
+      <Custom Action="SeedDaemonConfig" After="InstallFiles" Condition="NOT REMOVE" />
+      <Custom Action="SeedWorkerConfig" After="SeedDaemonConfig" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
   </Package>
 
   <!-- The shipped binaries, all under INSTALLFOLDER. -->
@@ -166,4 +202,44 @@
                      Type="integer" Value="1" KeyPath="yes" />
     </Component>
   </Fragment>
+
+  <!-- Per-machine data root + ACLs + clean-uninstall removal (M9.5d). -->
+  <Fragment>
+    <ComponentGroup Id="DataDirs">
+      <!-- %ProgramData%\Sembazuru itself. RemoveFolderEx recursively deletes the
+           whole tree (incl. the seeded *.toml and any operator edits) on uninstall,
+           so the only-MSI-tracked files leave nothing behind. -->
+      <Component Id="DataFolderComp" Directory="DataFolder">
+        <CreateFolder />
+        <util:RemoveFolderEx On="uninstall" Property="SBZ_DATADIR" />
+        <!-- Persist the resolved data path so the RegistrySearch above can read it
+             back at uninstall; doubles as the component keypath. -->
+        <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="DataDirPath"
+                       Type="string" Value="[DataFolder]" KeyPath="yes" />
+      </Component>
+      <!-- scratch + cas: the worker runs least-privilege (NT SERVICE\SembazuruWorker)
+           and must create/read/delete files and per-action subtrees here, so grant it
+           modify (read/write/execute/delete + delete-child). The daemon runs as
+           LocalSystem and needs no explicit grant. -->
+      <Component Id="ScratchFolderComp" Directory="ScratchFolder">
+        <CreateFolder>
+          <util:PermissionEx User="SembazuruWorker" Domain="NT SERVICE"
+                             GenericRead="yes" GenericWrite="yes" GenericExecute="yes"
+                             Delete="yes" DeleteChild="yes" />
+        </CreateFolder>
+        <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="ScratchDir"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="CasFolderComp" Directory="CasFolder">
+        <CreateFolder>
+          <util:PermissionEx User="SembazuruWorker" Domain="NT SERVICE"
+                             GenericRead="yes" GenericWrite="yes" GenericExecute="yes"
+                             Delete="yes" DeleteChild="yes" />
+        </CreateFolder>
+        <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="CasDir"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
 </Wix>
