@@ -94,6 +94,16 @@ add-on であり、single point of failure にしない。
 **追加の persistence** なので、許可リスト申請に**サービス 1 つを明示開示**する。Run キー／スケジュールタスク／
 WMI 購読など**開示外の persistence 機構は一切足さない**（ADR 0007 ④「EDR steady-state に新 TTP を足さない」と整合）。
 
+**改訂（2026-06-18, M9.5）:** 上の「persistence はサービスのみ」に、**per-user の GUI 自動起動を 1 つだけ
+開示付きで許可**する例外を加える。常駐 GUI（`sembazuru-gui.exe`）は session 0 のサービスからは描けずユーザー
+セッションに常駐する必要があるが、ログオン時の起動導線が無いと「常駐」が成立しない（M9.4 のトレイは起動後に
+のみ常駐）。導線は**全ユーザー共通 Startup フォルダの署名済みショートカット**（非昇格 asInvoker・非注入・
+loopback Status 面のみ・UAC プロンプト付きの svcctl 経由でのみ SCM を叩く）とする。これは Run キー／スケジュール
+タスク／WMI のような昇格・隠蔽的 TTP とは異なり、最小・可視・アンインストールで完全除去できる。よって持続化は
+**「2 サービス＋この Startup ショートカット 1 つ」**に限定し、`docs/security/edr-allowlist.md` に 3 つすべてを開示、
+同梱バイナリ集合＝署名/開示集合を保つ。HKCU/HKLM Run キー・スケジュールタスクは引き続き不採用。
+（リード決定 2026-06-18：選択肢「Startup ショートカット＋ADR 改訂」を採用。）
+
 **設定ソース:** サービスは per-shell env を持てないため、設定は `%ProgramData%\Sembazuru\config.toml` から読む。
 既存の `SEMBAZURU_*` env は **dev/CLI override** として後方互換で残す（env > config.toml の優先）。GUI と (4) の
 Admin RPC はこの config.toml を書く。反映は単純化のため**サービス再起動で適用**（live-reload は当面しない）。
