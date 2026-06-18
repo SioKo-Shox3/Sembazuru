@@ -23,6 +23,8 @@
 //!   SEMBAZURU_CLUSTER_TOKEN / _CAPACITY / _ACTION_TIMEOUT_SECS
 //!   SEMBAZURU_LAUNCHER / _DLL / _SCRATCH_ROOT / _CAS_ROOT   read-VFS install (M6.1)
 
+use std::path::Path;
+
 use sembazuru_worker::config::WorkerConfig;
 use sembazuru_worker::run::run_worker;
 use tokio_util::sync::CancellationToken;
@@ -51,9 +53,39 @@ fn main() -> Result<(), BoxError> {
         }
         #[cfg(windows)]
         Some("--service") => Ok(sembazuru_worker::service::run_as_service()?),
+        // Seed the default config if absent (run by the MSI; cross-platform).
+        Some("seed-config") => seed_config(),
         // Default (and a bare `[listen_addr]`): run in the foreground.
         _ => run_cli(),
     }
+}
+
+/// Seeds the default `worker.toml` at the configured path if absent (M9.5d). The MSI
+/// runs this as a deferred action after the binaries are laid down: it wires the
+/// read-VFS paths to the installed hook binaries (resolved from this exe's own
+/// directory = the install folder) and the per-machine data roots
+/// (`%ProgramData%\Sembazuru`), so a fresh install is distribution-ready with no
+/// manual setup. Idempotent (never overwrites an operator-edited file) and never
+/// writes the cluster token.
+fn seed_config() -> Result<(), BoxError> {
+    let path = WorkerConfig::path_from_env();
+    let install_dir = std::env::current_exe()?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or("cannot resolve the install directory from the current exe")?;
+    // The data roots live under %ProgramData%\Sembazuru regardless of any config-path
+    // override, because the MSI creates them (ACL'd for the worker) there.
+    let data_dir = WorkerConfig::default_path()
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or("cannot resolve the data directory")?;
+    let wrote = WorkerConfig::installer_seed(&install_dir, &data_dir).seed_if_absent(&path)?;
+    eprintln!(
+        "sembazuru-worker: seed-config {} {}",
+        if wrote { "wrote" } else { "kept existing" },
+        path.display()
+    );
+    Ok(())
 }
 
 /// `--account <virtual|system|networkservice>`, default **Virtual** (least

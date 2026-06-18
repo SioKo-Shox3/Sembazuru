@@ -173,6 +173,26 @@ impl DaemonConfig {
         let s = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, s)
     }
+
+    /// Builds the installer's default `daemon.toml` (M9.5d) — just the defaults. The
+    /// daemon needs no wiring to be useful (it binds its loopback + LAN listeners
+    /// from the built-in defaults); the file is seeded only so it exists for
+    /// discovery and GUI editing. No cluster token is seeded (a per-deployment
+    /// secret; the operator sets it via the GUI).
+    pub fn installer_seed() -> Self {
+        Self::default()
+    }
+
+    /// Writes `self` to `path` only if no file exists there yet — idempotent
+    /// installer seeding that never clobbers an operator-edited config. Returns
+    /// whether a file was written.
+    pub fn seed_if_absent(&self, path: &Path) -> std::io::Result<bool> {
+        if path.exists() {
+            return Ok(false);
+        }
+        self.save_to(path)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -280,6 +300,33 @@ mod tests {
             Some("C:\\from-file"),
             "a field with no env var keeps the file value"
         );
+    }
+
+    #[test]
+    fn seed_if_absent_writes_then_preserves() {
+        let path = tmp_file();
+        assert!(
+            DaemonConfig::installer_seed()
+                .seed_if_absent(&path)
+                .unwrap(),
+            "first seed writes the file"
+        );
+        // The seed carries defaults and never a token.
+        assert!(DaemonConfig::load_from(&path).cluster_token.is_none());
+        // A re-seed never clobbers an operator-edited file.
+        DaemonConfig {
+            cache_max_bytes: Some(123),
+            ..DaemonConfig::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        assert!(
+            !DaemonConfig::installer_seed()
+                .seed_if_absent(&path)
+                .unwrap(),
+            "a second seed is a no-op when the file exists"
+        );
+        assert_eq!(DaemonConfig::load_from(&path).cache_max_bytes, Some(123));
     }
 
     #[test]
