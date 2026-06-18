@@ -128,12 +128,17 @@ The **daemon** service:
   documented `windows-service` crate → `CreateServiceW`; MITRE T1543.003).
 - **ImagePath:** `…\sembazuru-daemon.exe --service` (the same signed binary; the
   `--service` argument selects SCM mode over the plain CLI).
-- **Account:** least-privilege in the production installer — a virtual service
-  account (`NT SERVICE\SembazuruDaemon`) granted read access to the configured
-  source roots it serves; the dev self-install (`sembazuru-daemon install`) may use
-  LocalSystem for zero-config convenience. The daemon itself performs **no DLL
+- **Account:** **LocalSystem by default** in the production MSI. The daemon READS the
+  developer's *arbitrary* source tree to serve it to workers, and those roots are not
+  known at install time (they vary per build), so a least-privilege virtual account
+  would need per-build ACL grants that defeat the zero-config goal. A hardened
+  identity is still available for operators who pre-grant source-root read access:
+  `sembazuru-daemon install --account virtual` registers the daemon under
+  `NT SERVICE\SembazuruDaemon` instead. The daemon itself performs **no DLL
   injection** (it schedules actions and serves files); injection happens only in the
-  worker's compiler children (the steady-state above).
+  worker's compiler children (the steady-state above). Contrast the **worker**, which
+  needs no broad read and therefore defaults to the least-privilege virtual account
+  (below).
 
 The **worker** service is registered identically (added M9.3c):
 
