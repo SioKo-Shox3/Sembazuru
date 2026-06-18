@@ -155,3 +155,45 @@ jobs:
       # mechanism; a real release swaps in an OV cert (docs/security/edr-allowlist.md).
       - name: M7.2 Authenticode signing pipeline (sign+verify, placeholder cert)
         run: pwsh -NoProfile -File hooks/test/sign_smoke.ps1
+
+  m9-installer:
+    name: M9.5 installer (WiX MSI build + signing structure)
+    # Builds the signed-capable MSI green gate (ADR 0008 §1). The MSI only packages
+    # prebuilt binaries, so it stays compiler-agnostic; this job does not run the
+    # compile/determinism gates (the `hooks` job owns those). The MSI is built
+    # UNSIGNED here — a real release swaps in an OV cert (M7 / docs/security/
+    # edr-allowlist.md); this gate proves the build + the signing structure.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The Rust target dir + WiX intermediate paths can exceed 260 chars on the
+      # runner; enable long-path support before building.
+      - name: Enable long paths
+        run: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
+      # The four shipped Rust binaries (release): sembazuru-agent yields
+      # sembazuru-daemon/sembazuru(launcher), plus worker and gui.
+      - run: cargo build --release -p sembazuru-agent -p sembazuru-worker -p sembazuru-gui
+      # The C++ hooks, both bitnesses, staged together (mirrors the hooks job) so the
+      # MSI finds launcher.exe + sbz_interceptor{64,32}.dll side by side.
+      - run: cmake -S hooks -B hooks/build -A x64
+      - run: cmake --build hooks/build --config Release
+      - run: cmake -S hooks -B hooks/build32 -A Win32
+      - run: cmake --build hooks/build32 --config Release
+      - name: Stage 32-bit interceptor next to the 64-bit one
+        run: Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
+      # Build the (unsigned) MSI. `dotnet build` restores the WiX v5 SDK + the Util/
+      # Firewall extensions from NuGet; no global `wix` tool is needed. Green gate.
+      - name: Build MSI (unsigned)
+        run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64
+      - name: Upload MSI artifact (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sembazuru-msi-unsigned
+          path: installer/bin/x64/Release/Sembazuru.msi
+      # Prove the signing STRUCTURE over the whole shipped set + the MSI with a
+      # placeholder cert (M9.5e). Runs after the upload so the published artifact
+      # stays unsigned. A real release swaps in an OV cert + signtool + RFC3161
+      # (-TimestampServer).
+      - name: Signing structure (Rust + hooks + MSI, placeholder cert)
+        run: pwsh -NoProfile -File hooks/test/sign_smoke.ps1 -BuildDir hooks/build/Release -RustDir target/release -Msi installer/bin/x64/Release/Sembazuru.msi
