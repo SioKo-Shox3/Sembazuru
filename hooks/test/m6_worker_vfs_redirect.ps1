@@ -9,9 +9,17 @@
 # Provenance (same trick as vfs_redirect.ps1): the logical path holds STALE local
 # bytes; the agent (remap) serves DIFFERENT correct bytes from a backing dir. The
 # read is correct ONLY if the worker actually pulled from the agent through the
-# VFS. We assert on the hydrated SCRATCH copy (the worker doesn't mirror child
-# stdout yet, M6.1), which also proves the redirect happened (the file only
-# appears in scratch if the DLL intercepted the open and hydrated it).
+# VFS. The probe READS THE FILE AND COMPARES IT to the agent-served content,
+# exiting 0 only on an exact match — so the action's own exit code proves both that
+# the open was redirected (a non-redirected open would read the STALE local bytes)
+# and the provenance (the bytes came from the agent).
+#
+# Why content, not the scratch file: since M9.2 (deferred #8) the worker removes the
+# per-action hydrated scratch tree once the action completes, to bound a resident
+# worker's disk. So the scratch copy no longer exists by the time this script could
+# inspect it. Checking what the process actually READ (live, before cleanup) is the
+# robust, eviction-proof way to prove the redirect — and a strictly stronger check
+# than inspecting the hydrated file after the fact.
 #
 # Requires cl.exe + cargo on PATH and the cmake-built launcher/DLL (CI hooks job).
 param(
@@ -46,20 +54,34 @@ $WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
 if (Test-Path $WorkRoot) { Remove-Item -Recurse -Force $WorkRoot }
 New-Item -ItemType Directory -Force $WorkRoot | Out-Null
 
-# Probe: open a file (read-only) and exit 0; the open is what the DLL redirects.
+# Probe: open argv[1] (read-only, the open the DLL redirects), read it, and assert
+# the content EXACTLY equals argv[2] (the agent-served bytes). Exit codes encode the
+# provenance so the gate needs no post-run scratch file (cleaned up since M9.2):
+#   0 = content matched the agent bytes  -> redirect + provenance proven
+#   1 = open failed / read failed
+#   2 = bad args
+#   3 = content mismatch (STALE local bytes) -> NOT redirected through the VFS
 # Static CRT (/MT) so it needs no runtime DLL beyond the cleared+rebuilt env.
 $probeSrc = @'
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <string.h>
 int wmain(int argc, wchar_t** argv) {
-    if (argc < 2) return 2;
+    if (argc < 3) return 2;
     HANDLE h = CreateFileW(argv[1], GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, 0, nullptr);
     if (h == INVALID_HANDLE_VALUE) return 1;
     char buf[256]; DWORD r = 0;
-    ReadFile(h, buf, sizeof(buf), &r, nullptr);
+    BOOL ok = ReadFile(h, buf, sizeof(buf), &r, nullptr);
     CloseHandle(h);
-    return 0;
+    if (!ok) return 1;
+    char exp[256];
+    int en = WideCharToMultiByte(CP_UTF8, 0, argv[2], -1, exp, sizeof(exp),
+                                 nullptr, nullptr);
+    if (en <= 1) return 2;
+    DWORD elen = (DWORD)(en - 1); // drop the NUL
+    if (r != elen) return 3;
+    return memcmp(buf, exp, elen) == 0 ? 0 : 3;
 }
 '@
 Set-Content (Join-Path $WorkRoot 'probe.cpp') $probeSrc -Encoding ascii
@@ -114,7 +136,7 @@ try {
     }
     if (-not $ready) { throw 'worker Execution port did not come up' }
 
-    & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- $probe $logicalInput 2>&1 |
+    & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- $probe $logicalInput $correct 2>&1 |
         Out-String | Write-Host
     $exit = $LASTEXITCODE
 } finally {
@@ -125,22 +147,25 @@ try {
     }
 }
 
+# The action's exit code IS the provenance proof (the probe compared the bytes it
+# read to the agent-served content). No post-run scratch inspection: the worker
+# removes the per-action scratch tree on completion (M9.2 / deferred #8).
 $failures = @()
-if ($exit -ne 0) { $failures += "action did not exit 0 (exit=$exit): the VFS-mode Execute failed" }
+switch ($exit) {
+    0 { }
+    1 { $failures += 'the redirected open/read failed (exit 1): the VFS-mode Execute did not produce a readable handle' }
+    2 { $failures += 'probe argument error (exit 2): the test harness invoked the probe incorrectly' }
+    3 { $failures += 'the probe read the STALE local bytes, not the agent-served content (exit 3): the read was NOT redirected through the VFS' }
+    default { $failures += "the VFS-mode Execute failed (exit=$exit)" }
+}
 
-# The hydrated scratch copy proves the redirect AND the provenance.
-$hydrated = Get-ChildItem -Recurse -File -Filter 'input.txt' $scratchRoot -ErrorAction SilentlyContinue |
+# Belt-and-suspenders: the per-action scratch tree must NOT linger after the run
+# (M9.2 eviction). Its absence is expected; a lingering tree is a disk-leak
+# regression, not a redirect failure, so report it distinctly (still a failure).
+$leftover = Get-ChildItem -Recurse -File -Filter 'input.txt' $scratchRoot -ErrorAction SilentlyContinue |
     Select-Object -First 1
-if (-not $hydrated) {
-    $failures += 'no hydrated copy under the worker scratch root: the read was not redirected through the VFS'
-} else {
-    $bytes = Get-Content $hydrated.FullName -Raw
-    if ($bytes -ne $correct) {
-        $failures += "hydrated bytes are not the agent-served content (got '$bytes'): provenance check failed"
-    }
-    if ($bytes -eq $stale) {
-        $failures += 'STALE local bytes were hydrated: the worker read the local copy, not the agent'
-    }
+if ($leftover) {
+    $failures += "per-action scratch was not cleaned up after the run ($($leftover.FullName)): M9.2 eviction regressed"
 }
 
 if ($failures.Count -gt 0) {
@@ -149,4 +174,4 @@ if ($failures.Count -gt 0) {
     $failures | ForEach-Object { Write-Host "  - $_" }
     exit 1
 }
-Write-Host 'M6.1b WORKER VFS GATE PASS (worker Execute redirected the read to agent-served bytes in a per-action scratch copy)'
+Write-Host 'M6.1b WORKER VFS GATE PASS (worker Execute redirected the read to the agent-served bytes; per-action scratch cleaned up)'
