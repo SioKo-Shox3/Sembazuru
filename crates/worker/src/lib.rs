@@ -11,6 +11,7 @@
 
 pub mod config;
 pub mod coordination;
+mod cpu_monitor;
 pub mod fileclient;
 mod job;
 pub mod run;

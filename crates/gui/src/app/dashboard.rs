@@ -116,7 +116,7 @@ fn render_workers(ui: &mut egui::Ui, dash: &DashboardModel) {
     }
     egui::Grid::new("workers")
         .striped(true)
-        .num_columns(7)
+        .num_columns(8)
         .show(ui, |ui| {
             for h in [
                 "",
@@ -125,6 +125,7 @@ fn render_workers(ui: &mut egui::Ui, dash: &DashboardModel) {
                 "CPU",
                 "Running",
                 "Idle",
+                "Idle CPU",
                 "Last ping",
             ] {
                 ui.label(RichText::new(h).strong());
@@ -143,6 +144,18 @@ fn render_workers(ui: &mut egui::Ui, dash: &DashboardModel) {
                 ui.label(w.cpu.to_string());
                 ui.label(w.running.to_string());
                 ui.label(w.idle.to_string());
+                // Host idle CPU (ADR 0010). "—" when the worker reports no CPU
+                // signal, so it reads as "not reported", not a literal 0%.
+                match w.idle_cpu_pct {
+                    Some(pct) => {
+                        ui.label(format!("{pct}%"))
+                            .on_hover_text("host idle CPU the worker last reported");
+                    }
+                    None => {
+                        ui.colored_label(MUTED, "—")
+                            .on_hover_text("worker reports no CPU signal");
+                    }
+                }
                 ui.label(&w.last_ping);
                 ui.end_row();
             }
