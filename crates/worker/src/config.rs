@@ -34,6 +34,41 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:50061";
 /// read separate files on the same host.
 pub const CONFIG_PATH_ENV: &str = "SEMBAZURU_WORKER_CONFIG";
 
+/// Default idle headroom kept for the local user, in percent of the machine
+/// (ADR 0010). A gentle "good neighbour" default; tunable on real LAN data (M10).
+pub const DEFAULT_IDLE_CPU_RESERVE_PCT: u32 = 10;
+/// Default hysteresis band (percent) above the reserve required to *resume*
+/// participating after dropping out — stops the worker flapping at the threshold.
+pub const DEFAULT_IDLE_CPU_HYSTERESIS_PCT: u32 = 10;
+/// Default EMA weight (percent) for the newest idle sample; ~3-4 sample memory.
+pub const DEFAULT_IDLE_CPU_EMA_ALPHA_PCT: u32 = 30;
+
+/// Resolved CPU-aware admission policy (ADR 0010): the optional [`WorkerConfig`]
+/// knobs with their defaults applied. `enabled` defaults to `true` (the good
+/// neighbour is on out of the box); the percentages are tuning constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleCpuSettings {
+    /// Whether the worker samples and reports idle CPU at all. When `false` the
+    /// worker sends no CPU signal and the agent schedules it exactly as pre-0010.
+    pub enabled: bool,
+    pub reserve_pct: u32,
+    pub hysteresis_pct: u32,
+    pub ema_alpha_pct: u32,
+}
+
+impl IdleCpuSettings {
+    /// The policy with the feature off (no CPU signal). Used by callers that opt
+    /// out (e.g. coordination tests) so they keep the legacy slot-based behaviour.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            reserve_pct: DEFAULT_IDLE_CPU_RESERVE_PCT,
+            hysteresis_pct: DEFAULT_IDLE_CPU_HYSTERESIS_PCT,
+            ema_alpha_pct: DEFAULT_IDLE_CPU_EMA_ALPHA_PCT,
+        }
+    }
+}
+
 /// The worker's persisted configuration. Field names are the TOML keys; every field
 /// has a default (via [`Default`]) so a partial or absent file still yields a
 /// complete config. Optional fields are "unset" when `None`.
@@ -74,6 +109,19 @@ pub struct WorkerConfig {
     /// Worker-local content store, persisted across builds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cas_root: Option<String>,
+    /// CPU-aware admission (ADR 0010): sample idle CPU and scale participation.
+    /// `None` → enabled (good neighbour on by default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_cpu_enabled: Option<bool>,
+    /// Idle headroom kept for the local user, percent; `None` → the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_cpu_reserve_pct: Option<u32>,
+    /// Hysteresis band above the reserve, percent; `None` → the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_cpu_hysteresis_pct: Option<u32>,
+    /// EMA smoothing weight for the newest idle sample, percent; `None` → default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_cpu_ema_alpha_pct: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -89,6 +137,10 @@ impl Default for WorkerConfig {
             dll: None,
             scratch_root: None,
             cas_root: None,
+            idle_cpu_enabled: None,
+            idle_cpu_reserve_pct: None,
+            idle_cpu_hysteresis_pct: None,
+            idle_cpu_ema_alpha_pct: None,
         }
     }
 }
@@ -102,6 +154,17 @@ impl Default for WorkerConfig {
 /// from under the operator.
 fn empty_to_none(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+/// Parses a permissive boolean for `SEMBAZURU_IDLE_CPU_ENABLED`: `1/true/on/yes`
+/// (case-insensitive) → `true`, `0/false/off/no` → `false`, anything else → `None`
+/// (the caller then leaves the field unchanged rather than guessing).
+fn parse_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" | "yes" => Some(true),
+        "0" | "false" | "off" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 impl WorkerConfig {
@@ -182,6 +245,21 @@ impl WorkerConfig {
         if let Some(v) = std::env::var_os("SEMBAZURU_CAS_ROOT") {
             self.cas_root = empty_to_none(v.to_string_lossy().into_owned());
         }
+        // CPU-aware admission knobs (ADR 0010). A present-but-unparseable percent is
+        // ignored (keeps the file/default), matching the conservative parses above;
+        // a recognized SEMBAZURU_IDLE_CPU_ENABLED toggles the feature explicitly.
+        if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_ENABLED") {
+            self.idle_cpu_enabled = parse_bool(&v).or(self.idle_cpu_enabled);
+        }
+        if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_RESERVE_PCT") {
+            self.idle_cpu_reserve_pct = v.trim().parse::<u32>().ok().map(|n| n.min(100));
+        }
+        if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_HYSTERESIS_PCT") {
+            self.idle_cpu_hysteresis_pct = v.trim().parse::<u32>().ok().map(|n| n.min(100));
+        }
+        if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_EMA_ALPHA_PCT") {
+            self.idle_cpu_ema_alpha_pct = v.trim().parse::<u32>().ok().map(|n| n.clamp(1, 100));
+        }
     }
 
     /// Loads from `path` then applies the env overrides — the worker's effective
@@ -201,6 +279,25 @@ impl WorkerConfig {
         }
         let s = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, s)
+    }
+
+    /// The resolved CPU-aware admission policy (ADR 0010): the optional knobs with
+    /// their defaults applied. `enabled` defaults to `true` so the good-neighbour
+    /// behaviour is on out of the box; an operator opts out with
+    /// `idle_cpu_enabled = false` (or `SEMBAZURU_IDLE_CPU_ENABLED=0`).
+    pub fn idle_cpu(&self) -> IdleCpuSettings {
+        IdleCpuSettings {
+            enabled: self.idle_cpu_enabled.unwrap_or(true),
+            reserve_pct: self
+                .idle_cpu_reserve_pct
+                .unwrap_or(DEFAULT_IDLE_CPU_RESERVE_PCT),
+            hysteresis_pct: self
+                .idle_cpu_hysteresis_pct
+                .unwrap_or(DEFAULT_IDLE_CPU_HYSTERESIS_PCT),
+            ema_alpha_pct: self
+                .idle_cpu_ema_alpha_pct
+                .unwrap_or(DEFAULT_IDLE_CPU_EMA_ALPHA_PCT),
+        }
     }
 
     /// The read-VFS install config (M6.1), present only when **all four** VFS paths
@@ -297,6 +394,10 @@ mod tests {
             dll: Some("C:\\sbz\\sbz_interceptor64.dll".into()),
             scratch_root: Some("C:\\sbz\\scratch".into()),
             cas_root: Some("C:\\sbz\\cas".into()),
+            idle_cpu_enabled: Some(false),
+            idle_cpu_reserve_pct: Some(15),
+            idle_cpu_hysteresis_pct: Some(5),
+            idle_cpu_ema_alpha_pct: Some(40),
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(WorkerConfig::load_from(&path), cfg);
@@ -426,6 +527,49 @@ mod tests {
             Some("  pad  "),
             "the cluster token is taken verbatim (no trim), matching the daemon's reader"
         );
+    }
+
+    #[test]
+    fn idle_cpu_defaults_to_enabled_with_gentle_constants() {
+        // An absent file / no knobs → the good neighbour is on with the defaults.
+        let s = WorkerConfig::default().idle_cpu();
+        assert!(s.enabled, "CPU-aware admission is on by default");
+        assert_eq!(s.reserve_pct, DEFAULT_IDLE_CPU_RESERVE_PCT);
+        assert_eq!(s.hysteresis_pct, DEFAULT_IDLE_CPU_HYSTERESIS_PCT);
+        assert_eq!(s.ema_alpha_pct, DEFAULT_IDLE_CPU_EMA_ALPHA_PCT);
+        // Explicit knobs are passed through.
+        let cfg = WorkerConfig {
+            idle_cpu_enabled: Some(false),
+            idle_cpu_reserve_pct: Some(25),
+            ..WorkerConfig::default()
+        };
+        let s = cfg.idle_cpu();
+        assert!(!s.enabled);
+        assert_eq!(s.reserve_pct, 25);
+    }
+
+    #[test]
+    fn idle_cpu_env_overrides_win() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let absent = tmp_file(); // no file → values come purely from env
+        // SAFETY: serialized by ENV_LOCK; set, load, clear.
+        unsafe {
+            std::env::set_var("SEMBAZURU_IDLE_CPU_ENABLED", "off");
+            std::env::set_var("SEMBAZURU_IDLE_CPU_RESERVE_PCT", "20");
+            std::env::set_var("SEMBAZURU_IDLE_CPU_EMA_ALPHA_PCT", "50");
+        }
+        let s = WorkerConfig::load_effective(&absent).idle_cpu();
+        unsafe {
+            std::env::remove_var("SEMBAZURU_IDLE_CPU_ENABLED");
+            std::env::remove_var("SEMBAZURU_IDLE_CPU_RESERVE_PCT");
+            std::env::remove_var("SEMBAZURU_IDLE_CPU_EMA_ALPHA_PCT");
+        }
+        assert!(
+            !s.enabled,
+            "SEMBAZURU_IDLE_CPU_ENABLED=off disables the feature"
+        );
+        assert_eq!(s.reserve_pct, 20, "env reserve wins");
+        assert_eq!(s.ema_alpha_pct, 50, "env alpha wins");
     }
 
     #[test]

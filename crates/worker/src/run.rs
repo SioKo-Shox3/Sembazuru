@@ -91,6 +91,9 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
         // cluster runs without auth; the agent then accepts unconditionally. Read
         // verbatim from config (== cluster_token_from_env's bytes), never trimmed.
         let auth_token = config.cluster_token.clone().unwrap_or_default();
+        // CPU-aware admission policy (ADR 0010), resolved from worker.toml /
+        // SEMBAZURU_IDLE_CPU_* (good neighbour on by default).
+        let idle_cpu = config.idle_cpu();
         eprintln!("sembazuru-worker: registering with agent {agent} as {worker_id}");
         tokio::spawn(async move {
             if let Err(e) = register_and_heartbeat(
@@ -102,6 +105,7 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
                 Duration::from_secs(5),
                 stop,
                 auth_token,
+                idle_cpu,
             )
             .await
             {

@@ -87,6 +87,7 @@ fn spawn_worker(
             interval,
             stop,
             token,
+            sembazuru_worker::config::IdleCpuSettings::disabled(),
         )
         .await;
     });
@@ -215,6 +216,7 @@ async fn rejected_registration_surfaces_a_safe_reason() {
         Duration::from_millis(100),
         Arc::new(AtomicBool::new(false)),
         "wrong".to_string(),
+        sembazuru_worker::config::IdleCpuSettings::disabled(),
     )
     .await
     .expect_err("registration with the wrong token must fail");
