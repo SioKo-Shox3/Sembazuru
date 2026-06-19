@@ -157,7 +157,7 @@ impl StatusState {
                 healthy: true, // live_snapshot returns only currently-live workers
                 worker_id: w.worker_id,
                 execution_endpoint: w.execution_endpoint,
-                idle_cpu_pct: None, // filled once WorkerEntry carries it (ADR 0010)
+                idle_cpu_pct: w.idle_cpu_pct, // ADR 0010: None when the worker reports no CPU signal
             })
             .collect();
 
