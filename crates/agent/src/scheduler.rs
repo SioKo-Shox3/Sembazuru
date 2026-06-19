@@ -180,15 +180,34 @@ impl Scheduler {
         chans.retain(|ep, _| live.contains(ep));
     }
 
-    /// Effective free slots on a worker = its advertised capacity (clamped, as
-    /// the worker is untrusted) minus the actions this agent currently has
-    /// assigned to it.
+    /// How many concurrent actions a worker is *willing* to run right now: its
+    /// advertised admission capacity (clamped, as the worker is untrusted), scaled
+    /// down by its smoothed idle CPU when it reports one (ADR 0010 "good
+    /// neighbour"). A worker with no CPU signal (`None` — pre-0010 or feature off)
+    /// keeps its full capacity, so the scheduler behaves exactly as before for it.
+    ///
+    /// Integer math only: the scheduler is float-free so identical inputs schedule
+    /// identically (determinism). `base * pct` never overflows (`base <= 256`,
+    /// `pct <= 100`). The exact `f()` (here a linear scale; reserve/floor live in
+    /// the worker's reported value) is tunable on real LAN data (M10) without
+    /// touching this shape.
+    fn effective_capacity(w: &WorkerEntry) -> u32 {
+        let base = w.caps.cpu_count.clamp(1, MAX_TRUSTED_CPU);
+        match w.idle_cpu_pct {
+            None => base,
+            Some(pct) => base.saturating_mul(pct.min(100)) / 100,
+        }
+    }
+
+    /// Effective free slots on a worker = its CPU-aware effective capacity
+    /// ([`effective_capacity`]) minus the actions this agent currently has
+    /// assigned to it. Subtracting `used` from the *scaled* capacity is what
+    /// controls bursts: a freshly reserved slot drops this immediately, before the
+    /// worker's (EMA-lagged) idle CPU has caught up, so concurrent dispatchers
+    /// spread instead of piling onto one worker.
     fn effective_idle(&self, w: &WorkerEntry, in_flight: &HashMap<String, u32>) -> u32 {
         let used = in_flight.get(&w.worker_id).copied().unwrap_or(0);
-        w.caps
-            .cpu_count
-            .clamp(1, MAX_TRUSTED_CPU)
-            .saturating_sub(used)
+        Self::effective_capacity(w).saturating_sub(used)
     }
 
     /// Atomically choose the best live worker for `key` (excluding `tried`) AND
@@ -201,7 +220,15 @@ impl Scheduler {
     /// dispatcher see the others' reservations and spread.
     ///
     /// Returns the chosen worker and a guard that frees the reservation on drop,
-    /// or `None` when no live, untried worker remains.
+    /// or `None` when no live, untried, CPU-eligible worker remains.
+    ///
+    /// A worker whose CPU-aware [`effective_capacity`] is 0 (its host is too busy,
+    /// ADR 0010) is *ineligible* — filtered out here so it is never tried, not even
+    /// as a last resort. When every live worker is busy, this returns `None` and
+    /// `dispatch` falls back to local, the same path as "no live workers". This is
+    /// distinct from a worker whose `effective_idle` is 0 only because this agent
+    /// has already reserved its capacity (`used >= effective_capacity`): such a
+    /// worker stays eligible so the fan-out pipeline keeps its next action queued.
     fn pick_and_reserve(
         &self,
         key: u64,
@@ -210,7 +237,7 @@ impl Scheduler {
         let snapshot = self.table.live_snapshot();
         let live: Vec<WorkerEntry> = snapshot
             .into_iter()
-            .filter(|w| !tried.contains(&w.worker_id))
+            .filter(|w| !tried.contains(&w.worker_id) && Self::effective_capacity(w) > 0)
             .collect();
         if live.is_empty() {
             return None;
@@ -707,5 +734,145 @@ mod tests {
         tried.insert(pref.clone());
         let (w, _g) = sched.pick_and_reserve(key, &tried).unwrap();
         assert_ne!(w.worker_id, pref, "a tried worker is skipped");
+    }
+
+    // ---- ADR 0010: CPU-aware effective capacity -------------------------------
+
+    #[test]
+    fn effective_capacity_scales_with_reported_idle_cpu() {
+        let mut w = entry("w", "http://w", 8);
+        // No CPU signal → full advertised capacity (legacy behaviour).
+        assert_eq!(Scheduler::effective_capacity(&w), 8);
+        w.idle_cpu_pct = Some(100);
+        assert_eq!(Scheduler::effective_capacity(&w), 8);
+        w.idle_cpu_pct = Some(50);
+        assert_eq!(Scheduler::effective_capacity(&w), 4);
+        // Integer floor: just under one core's worth of idle reads as busy (0).
+        w.idle_cpu_pct = Some(13); // 8*13/100 = 1
+        assert_eq!(Scheduler::effective_capacity(&w), 1);
+        w.idle_cpu_pct = Some(12); // 8*12/100 = 0
+        assert_eq!(Scheduler::effective_capacity(&w), 0);
+        w.idle_cpu_pct = Some(0);
+        assert_eq!(Scheduler::effective_capacity(&w), 0);
+        // pct is clamped at 100 so a misreporting worker cannot inflate capacity.
+        w.idle_cpu_pct = Some(250);
+        assert_eq!(Scheduler::effective_capacity(&w), 8);
+
+        // base = 4 boundary: 25% → 1 core, 24% → 0 (busy).
+        let mut s = entry("s", "http://s", 4);
+        s.idle_cpu_pct = Some(25);
+        assert_eq!(Scheduler::effective_capacity(&s), 1);
+        s.idle_cpu_pct = Some(24);
+        assert_eq!(Scheduler::effective_capacity(&s), 0);
+    }
+
+    #[test]
+    fn effective_idle_subtracts_reservations_from_scaled_capacity() {
+        let sched = Scheduler::new(WorkerTable::new(Duration::from_secs(60)));
+        let mut w = entry("w", "http://w", 8);
+        w.idle_cpu_pct = Some(50); // scaled capacity = 4
+        let mut m = HashMap::new();
+        assert_eq!(
+            sched.effective_idle(&w, &m),
+            4,
+            "no reservations → full scaled capacity"
+        );
+        m.insert("w".to_string(), 3);
+        assert_eq!(
+            sched.effective_idle(&w, &m),
+            1,
+            "reservations cut the scaled capacity (burst control)"
+        );
+        m.insert("w".to_string(), 9);
+        assert_eq!(
+            sched.effective_idle(&w, &m),
+            0,
+            "over-reserved saturates at 0, never underflows"
+        );
+    }
+
+    #[test]
+    fn pick_skips_a_cpu_busy_worker_even_when_it_is_affinity_preferred() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        for id in ["w1", "w2", "w3"] {
+            table.upsert_register(
+                id.to_string(),
+                format!("http://{id}"),
+                Capabilities {
+                    cpu_count: 4,
+                    ..Default::default()
+                },
+            );
+        }
+        let snap = table.live_snapshot();
+        let key = affinity_key(&["cc".into(), "busy.cpp".into()]);
+        let pref = snap[preferred_index(&snap, key)].worker_id.clone();
+        // The affinity-preferred worker is fully busy; its peers are fully idle.
+        for w in &snap {
+            let pct = if w.worker_id == pref { 0 } else { 100 };
+            table.on_ping(&w.worker_id, 0, 0, Some(pct));
+        }
+        let sched = Scheduler::new(table);
+        let (chosen, _g) = sched.pick_and_reserve(key, &HashSet::new()).unwrap();
+        assert_ne!(
+            chosen.worker_id, pref,
+            "a CPU-busy affinity-preferred worker is skipped for an idle peer"
+        );
+    }
+
+    #[test]
+    fn pick_returns_none_when_every_live_worker_is_cpu_busy() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        for id in ["w1", "w2"] {
+            table.upsert_register(
+                id.to_string(),
+                format!("http://{id}"),
+                Capabilities {
+                    cpu_count: 4,
+                    ..Default::default()
+                },
+            );
+            table.on_ping(id, 0, 0, Some(0)); // host busy → effective_capacity 0
+        }
+        let sched = Scheduler::new(table);
+        let key = affinity_key(&["cc".into(), "x.cpp".into()]);
+        assert!(
+            sched.pick_and_reserve(key, &HashSet::new()).is_none(),
+            "all workers CPU-busy → no eligible worker → dispatch falls back to local"
+        );
+    }
+
+    #[test]
+    fn an_in_flight_saturated_but_cpu_idle_worker_stays_eligible() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register(
+            "w1".into(),
+            "http://w1".into(),
+            Capabilities {
+                cpu_count: 2,
+                ..Default::default()
+            },
+        );
+        table.on_ping("w1", 0, 0, Some(100)); // fully idle host, scaled capacity 2
+        let sched = Scheduler::new(table);
+        let none = HashSet::new();
+        // Reserve past capacity (2): the worker is in_flight-saturated
+        // (effective_idle 0) but NOT CPU-busy, so the pipeline keeps choosing it
+        // to stay full rather than starving — the two zeros are distinct.
+        let (_w, _g1) = sched
+            .pick_and_reserve(affinity_key(&["a".into()]), &none)
+            .unwrap();
+        let (_w, _g2) = sched
+            .pick_and_reserve(affinity_key(&["b".into()]), &none)
+            .unwrap();
+        assert!(
+            sched
+                .pick_and_reserve(affinity_key(&["c".into()]), &none)
+                .is_some(),
+            "an in_flight-saturated but CPU-idle worker still accepts queued work"
+        );
     }
 }

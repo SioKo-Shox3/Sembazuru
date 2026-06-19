@@ -30,9 +30,9 @@ use tonic::{Request, Response, Status, Streaming};
 /// it once it has been silent this long.
 pub const DEFAULT_DEAD_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// One worker's record in the table. `running_actions`/`idle_slots` are the last
-/// values the worker pushed on a heartbeat; `last_ping` is when the agent last
-/// heard from it (register counts as a ping).
+/// One worker's record in the table. `running_actions`/`idle_slots`/`idle_cpu_pct`
+/// are the last values the worker pushed on a heartbeat; `last_ping` is when the
+/// agent last heard from it (register counts as a ping).
 #[derive(Clone, Debug)]
 pub struct WorkerEntry {
     pub worker_id: String,
@@ -40,6 +40,11 @@ pub struct WorkerEntry {
     pub caps: Capabilities,
     pub running_actions: u32,
     pub idle_slots: u32,
+    /// Smoothed host idle-CPU percent (0-100) from the last heartbeat, the ADR
+    /// 0010 "good neighbour" signal. `None` = the worker reports no CPU signal
+    /// (pre-0010 binary or the feature disabled); the scheduler then falls back to
+    /// its legacy slot-based capacity for this worker.
+    pub idle_cpu_pct: Option<u32>,
     last_ping: Instant,
 }
 
@@ -108,18 +113,29 @@ impl WorkerTable {
                 caps,
                 running_actions: 0,
                 idle_slots: idle,
+                idle_cpu_pct: None, // no CPU sample until the first heartbeat
                 last_ping: Instant::now(),
             },
         );
     }
 
-    /// Record a heartbeat: refresh capacity and the liveness clock. A ping for an
-    /// unknown worker is ignored — registration must come first.
-    pub fn on_ping(&self, worker_id: &str, running_actions: u32, idle_slots: u32) {
+    /// Record a heartbeat: refresh capacity, the CPU signal, and the liveness
+    /// clock. A ping for an unknown worker is ignored — registration must come
+    /// first. `idle_cpu_pct` is `None` when the worker reports no CPU signal
+    /// (pre-0010 or feature off); it is stored verbatim so the scheduler can tell
+    /// "no signal" from a genuine low reading.
+    pub fn on_ping(
+        &self,
+        worker_id: &str,
+        running_actions: u32,
+        idle_slots: u32,
+        idle_cpu_pct: Option<u32>,
+    ) {
         let mut map = self.lock();
         if let Some(e) = map.get_mut(worker_id) {
             e.running_actions = running_actions;
             e.idle_slots = idle_slots;
+            e.idle_cpu_pct = idle_cpu_pct;
             e.last_ping = Instant::now();
         }
     }
@@ -233,7 +249,12 @@ impl Coordination for CoordinationService {
             // pong only keeps the stream alive (the agent dates liveness by ping
             // arrival, not pong content).
             while let Ok(Some(ping)) = inbound.message().await {
-                table.on_ping(&ping.worker_id, ping.running_actions, ping.idle_slots);
+                table.on_ping(
+                    &ping.worker_id,
+                    ping.running_actions,
+                    ping.idle_slots,
+                    ping.idle_cpu_pct,
+                );
                 let pong = HeartbeatPong {
                     agent_monotonic_us: u64::try_from(start.elapsed().as_micros())
                         .unwrap_or(u64::MAX),
