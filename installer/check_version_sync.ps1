@@ -1,12 +1,14 @@
-# Release-hygiene gate (ADR 0009): the workspace Cargo version and the installer's
-# default WiX ProductVersion (SbzVersion) must agree.
+# Release-hygiene gate: the workspace Cargo version and the installer's default WiX
+# ProductVersion (SbzVersion) must agree.
 #
-# Why this matters: the GUI self-update compares the latest GitHub release tag
-# against CARGO_PKG_VERSION (the Cargo version), while the installed MSI advertises
-# its own ProductVersion (SbzVersion) for MajorUpgrade. If the two drift, a freshly
-# built release reports one version to the updater and another to Windows Installer,
-# so the update check and the in-place upgrade disagree. Run this in CI / before a
-# release; a non-zero exit means "reconcile the versions before shipping".
+# Why this matters: a release MSI advertises its ProductVersion (SbzVersion) to
+# Windows Installer for MajorUpgrade, while the running binaries report
+# CARGO_PKG_VERSION — which the cluster's version-gated admission (ADR 0011) compares
+# to decide which workers may join a build. If the two drift, a freshly built release
+# ships one version to Windows Installer and another to the admission gate, so a
+# manually installed node could register at a version the agent then excludes. Run
+# this in CI / before cutting a (manual-distribution) release; a non-zero exit means
+# "reconcile the versions before shipping".
 #
 # Note: CI may pass -p:SbzVersion=<cargo version> explicitly (the recommended path);
 # this gate checks the *default* in Package.wixproj so the checked-in fallback never
@@ -37,7 +39,7 @@ Write-Host "WiX default SbzVersion   : $wixVersion"
 if ($cargoVersion -ne $wixVersion) {
     Write-Error ("VERSION MISMATCH: Cargo '$cargoVersion' != WiX SbzVersion '$wixVersion'. " +
         "Update installer/Package.wixproj's <SbzVersion> default (or pass -p:SbzVersion=$cargoVersion) " +
-        "so the self-update check and the MSI ProductVersion agree (ADR 0009).")
+        "so the MSI ProductVersion and the binaries' reported version (version-gated admission, ADR 0011) agree.")
     exit 1
 }
 

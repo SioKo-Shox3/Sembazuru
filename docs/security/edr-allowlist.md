@@ -91,11 +91,6 @@ named-pipe IPC — no network sockets are opened by the hook DLL itself.
   non-elevated, non-injecting GUI dashboard at logon — all three disclosed under
   "Persistence" below. No Run keys, no scheduled tasks, no WMI subscriptions, no
   Event Log source registration.
-- No automatic or silent updates, and no background update polling. The GUI checks
-  GitHub for a newer release only when the **user** asks (or at most once per launch),
-  downloads only on an explicit click, and **verifies the Authenticode signature and
-  pins the publisher before running anything** — see "Outbound network" below. No
-  scheduled task, Run key, or resident poller is added for updates.
 - No credential, browser, or keystroke access; no anti-debug / anti-VM evasion.
 - No code obfuscation or string encryption — the binaries are debuggable and the
   source is public.
@@ -168,10 +163,9 @@ service:
   T1547.001, Startup folder). It launches `sembazuru-gui.exe` at logon.
 - **What it launches:** the resident dashboard GUI — **non-elevated** (asInvoker
   manifest), with **no DLL injection** and no network sockets beyond the loopback
-  Status RPC it reads. The one exception is a **user-initiated** update check over
-  HTTPS to GitHub (never automatic, never a background poller — see "Outbound
-  network" below). It controls the services only through a UAC-prompted elevation
-  (the `svcctl` path), so the autostart itself grants no elevated capability.
+  Status RPC it reads. It controls the services only through a UAC-prompted
+  elevation (the `svcctl` path), so the autostart itself grants no elevated
+  capability.
 - **Why not a service:** a session-0 service cannot draw a user-session UI, so the
   dashboard must run in the interactive session and needs a per-user logon trigger
   (ADR 0008 §3, amended 2026-06-18). A Run key or scheduled task was deliberately
@@ -183,44 +177,6 @@ service:
   WMI subscriptions, no Event Log source registration. Uninstall (the MSI, or the dev
   `sembazuru-daemon uninstall` / `sembazuru-worker uninstall`) stops and deletes the
   services and removes the shortcut, adding nothing else.
-
-## Outbound network (GUI self-update, user-initiated)
-
-The resident GUI is the **only** component that ever makes an outbound network
-connection, and it does so **only when the user asks** (ADR 0009). Steady-state
-distributed compilation is LAN-internal (agent ↔ workers) and the hook DLL opens
-**no** sockets at all; nothing in Sembazuru contacts the internet on its own.
-
-The self-update flow, end to end:
-
-1. **Check (user-initiated).** On the tray "Check for updates…" action — or at most
-   once per GUI launch — `sembazuru-gui.exe` issues an HTTPS GET to
-   `https://api.github.com/repos/SioKo-Shox3/Sembazuru/releases/latest` and compares
-   the release tag to its own version. There is **no background poller**: no scheduled
-   task, no Run key, no resident polling loop.
-2. **Download (explicit click).** Only if the user chooses to update does the GUI
-   stream the release's signed MSI over HTTPS (GitHub asset host,
-   `objects.githubusercontent.com`) to a temp file.
-3. **Verify (before any execution).** The downloaded MSI is checked with
-   `WinVerifyTrust` (Authenticode) **and** its signer subject is pinned to the
-   Sembazuru publisher, and the file is re-verified immediately before it is handed
-   to msiexec (closing any swap window). A file that fails verification or whose
-   publisher does not match is **never executed** — host trust in GitHub is not
-   relied upon (TLS + signature + publisher pin is the gate). Certificate
-   *revocation* is not checked online (`WTD_REVOKE_NONE`, to avoid a network
-   dependency at verify time); the publisher pin is the compensating control, and a
-   future hardening may opt into whole-chain revocation.
-4. **Apply (UAC-approved).** Only after verification and a second explicit click does
-   the GUI launch `msiexec /i "<temp>.msi" /passive` through the same UAC "runas"
-   elevation used for service control. The MSI's `MajorUpgrade` performs an in-place
-   upgrade; the GUI itself stays non-elevated.
-
-All connections are TLS (rustls), `https_only`. The transport (`reqwest`) is the one
-new outbound dependency and is justified solely by this disclosed flow.
-
-**Persistence is unchanged.** Self-update adds **no** persistence or autostart — no
-scheduled task, Run key, WMI subscription, or resident poller. The persistence set
-remains exactly the two services + one GUI Startup shortcut documented above.
 
 ## Signing
 
