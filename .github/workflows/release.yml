@@ -1,17 +1,19 @@
-# Release pipeline (M9.6, ADR 0008 / 0009).
+# Release pipeline (M9.6, ADR 0008). Manual-distribution publisher: there is no
+# in-app self-update (ADR 0009 was withdrawn); this just makes a versioned MSI that
+# users download and install by hand from the GitHub Releases page.
 #
 # Push a tag `vX.Y.Z` to cut a release: this builds the shipped binaries + C++ hooks,
 # packages the versioned MSI, signs everything with the real release certificate (if
-# one is configured), and publishes a GitHub Release with the MSI attached — the same
-# `releases/latest` asset the GUI self-update (ADR 0009) detects, downloads, verifies,
-# and applies.
+# one is configured), and publishes a GitHub Release with the MSI attached for manual
+# download.
 #
-# Signing is conditional. When the signing secrets are set, the MSI is signed and the
-# release is published normally (so self-update can consume it). When they are NOT set
-# (the default until the OV certificate is provisioned, ADR 0006), signing is skipped
-# and the release is published as a DRAFT — so an UNSIGNED MSI never becomes the
-# "latest" release that self-update would try to apply (and reject). Configure these
-# repository secrets to enable signing:
+# Signing is conditional and non-gating (ADR 0009 withdrawal): the cluster gates on
+# version (ADR 0011), not on signature. When the signing secrets are set, the MSI is
+# signed and the release is published normally. When they are NOT set (the default
+# until the OV certificate is provisioned, ADR 0006), signing is skipped and the
+# release is published as a DRAFT — so a maintainer must deliberately publish an
+# UNSIGNED MSI rather than it auto-surfacing as the public "latest" download.
+# Configure these repository secrets to enable signing:
 #   SBZ_SIGNING_PFX_BASE64  — base64 of the release code-signing PFX
 #   SBZ_SIGNING_PASSWORD    — the PFX password
 #   SBZ_TIMESTAMP_URL       — RFC3161 TSA, e.g. http://timestamp.digicert.com
@@ -65,9 +67,10 @@ jobs:
           "tag=$ref"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Release version: $ver (ref $ref)"
 
-      # Version integrity (ADR 0009): the Cargo version, the WiX default ProductVersion,
-      # and (on a tag) the tag must all agree — self-update compares the tag against
-      # CARGO_PKG_VERSION while Windows Installer keys MajorUpgrade off ProductVersion.
+      # Version integrity: the Cargo version, the WiX default ProductVersion, and (on a
+      # tag) the tag must all agree — the installed binaries report CARGO_PKG_VERSION to
+      # the version-gated admission (ADR 0011) while Windows Installer keys MajorUpgrade
+      # off ProductVersion, so a drift would ship a node the agent then excludes.
       - name: Version sync (Cargo == WiX ProductVersion)
         run: pwsh -NoProfile -File installer/check_version_sync.ps1
       - name: Tag matches the crate version
@@ -115,7 +118,8 @@ jobs:
       - name: Build MSI
         run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64 -p:SbzVersion=${{ steps.ver.outputs.version }}
 
-      # Sign the MSI itself — this is the signature the self-update verifier checks.
+      # Sign the MSI itself, so a manual-download install carries a trusted publisher
+      # (avoids the unknown-publisher SmartScreen warning). Skipped when no cert is set.
       - name: Sign the MSI (real cert)
         if: env.HAS_SIGNING_CERT == 'true'
         shell: pwsh
@@ -125,7 +129,7 @@ jobs:
           TSA: ${{ secrets.SBZ_TIMESTAMP_URL }}
         run: ./installer/sign_release.ps1 -Files 'installer/bin/x64/Release/Sembazuru.msi' -PfxBase64 $env:PFX -Password $env:PFX_PW -TimestampServer $env:TSA
 
-      # Name the asset with the version (self-update accepts any *.msi asset name).
+      # Name the asset with the version so manual downloaders can tell releases apart.
       - name: Name the MSI asset
         shell: pwsh
         run: Copy-Item installer/bin/x64/Release/Sembazuru.msi "Sembazuru-${{ steps.ver.outputs.version }}-x64.msi" -Force
@@ -136,8 +140,9 @@ jobs:
           name: Sembazuru-${{ steps.ver.outputs.version }}-msi
           path: Sembazuru-${{ steps.ver.outputs.version }}-x64.msi
 
-      # Publish the GitHub Release with the MSI attached (tag pushes only). Unsigned
-      # builds are published as a DRAFT so self-update never treats them as "latest".
+      # Publish the GitHub Release with the MSI attached for manual download (tag pushes
+      # only). Unsigned builds are published as a DRAFT, so a maintainer must explicitly
+      # publish an unsigned MSI rather than it auto-surfacing as the public "latest".
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -151,7 +156,7 @@ jobs:
             '--title', "Sembazuru ${{ steps.ver.outputs.version }}"
           )
           if ($signed) {
-            gh release create @common --notes 'Signed release. The MSI is Authenticode-signed; the GUI self-update verifies its signature and publisher before applying.'
+            gh release create @common --notes 'Signed release. The MSI is Authenticode-signed; download and install it manually. Updating is a manual reinstall (no in-app self-update).'
           } else {
-            gh release create @common --draft --notes 'UNSIGNED build (no release certificate configured). Published as a DRAFT: the GUI self-update will not consume it until a signed release is published. Configure SBZ_SIGNING_* secrets to sign.'
+            gh release create @common --draft --notes 'UNSIGNED build (no release certificate configured). Published as a DRAFT for manual download; installing it triggers SmartScreen (unknown publisher). Configure SBZ_SIGNING_* secrets to sign.'
           }

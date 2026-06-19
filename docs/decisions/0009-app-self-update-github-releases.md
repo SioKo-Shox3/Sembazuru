@@ -1,8 +1,9 @@
 # 0009 — アプリ自己更新（GitHub Releases 確認 → DL → 署名検証 → ユーザー承認で MSI 更新）
 
-- ステータス: **採択（ACCEPTED）。** 起案: 2026-06-19。決定者承認: 2026-06-19（プロジェクトリード）。
-  方針はプロジェクトリードが決定（2026-06-19、選択肢「DL＋ユーザー承認で適用」）。
-  M9.6 で実装着手（本文の方針は確定。実 OV cert subject の publisher pin は M7/リリースへ繰延）。
+- ステータス: **廃止（SUPERSEDED）。** 2026-06-19 採択・同日 M9.6 で実装着手したが、同日リード判断で**撤回**。
+  手動更新（GitHub Releases から MSI を DL して入れ直す）＋**版ゲート admission（[ADR 0011](0011-version-gated-admission.md)）**
+  に置換。撤回理由と詳細は本文末尾「## 廃止（2026-06-19）」を参照。
+  （以下の決定内容は歴史的記録として残す。実装は `m9/finalize` で surgical に撤回済み＝外向き通信ゼロに復帰。）
 - 決めること: 常駐 GUI が GitHub Releases を見て新版を検知し、ユーザーの明示承認のもとで
   署名済み MSI を取得・適用する仕組みの **(1) 起点と置き場所**、**(2) 検知/取得/適用フロー**、
   **(3) 信頼境界（TLS＋署名/publisher 検証）**、**(4) EDR 整合と新規ネットワーク挙動の開示**、
@@ -107,3 +108,27 @@ GUI はインターネット側に出てよい唯一のコンポーネント（�
 - winget（`winget upgrade`）を補完的な手動更新経路として案内するか（ADR 0008 の配布チャネルと整合）。
 - 自動ロールバックは持たない（`MajorUpgrade`＋旧リリース再導入で対応）。デルタ更新も持たない（フル MSI）。
 - 更新確認を「起動時 1 回」に加えてユーザー任意の頻度に広げるか（**スケジュールタスクは使わない**前提で）。
+
+## 廃止（2026-06-19）
+
+本 ADR は採択・実装着手と同日にリード判断で **撤回（SUPERSEDED）** された。判断の根拠:
+
+1. **更新は手動 DL で足りる。** GitHub Releases の MSI を DL して入れ直す運用で十分（Incredibuild も手動）。
+   アプリ内のバージョンアップ案内は持たない。
+2. **分散ビルドでは自己更新が害になる。** 各ノードが勝手に版を上げると **version skew → 決定性/キャッシュ
+   整合の崩壊**を招く。クラスタは「1 版に揃える」のが正しく、版整合は**サーバー役（agent/daemon）の版を基準に
+   不一致 worker をスケジューリングから除外する版ゲート**（[ADR 0011](0011-version-gated-admission.md)）で担保する。
+3. **CI 署名では守り切れない。** 自己更新を CI 署名で守っても完全乗っ取りには無力で、実 OV cert のコストに
+   見合わない。→ 署名/実 OV cert は**任意降格**（機能 gate ではない）。
+
+### 撤回フットプリント（`m9/finalize` で実施）
+
+- **削除**: `crates/gui/src/{update,verify}/mod.rs`、`crates/gui/src/app/updates.rs`。
+- **revert**: `crates/gui/src/{lib.rs,tray.rs,app/mod.rs,svcctl/mod.rs}` を自己更新前の形へ。
+- **依存撤去**: `crates/gui/Cargo.toml` の `reqwest`/`semver`/`serde`、`windows-sys` の
+  `Win32_Security_WinTrust`/`Win32_Security_Cryptography`。→ **GUI は loopback-only・外向き通信ゼロに復帰**。
+- **docs**: `docs/security/edr-allowlist.md` の外向き開示を撤回（「外向きなし」へ）。
+- **保持・転用**: `installer/check_version_sync.ps1`、`.github/workflows/release.yml`、`installer/sign_release.ps1`、
+  CI の version-sync ステップは **手動配布用の MSI 発行パイプライン**として残す（自己更新前提の文面のみ除去）。
+
+置換先: [ADR 0011（版ゲート admission）](0011-version-gated-admission.md)、[ADR 0012（worker 参加モード）](0012-worker-participation-modes.md)。

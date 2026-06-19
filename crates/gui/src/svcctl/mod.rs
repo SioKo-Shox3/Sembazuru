@@ -119,7 +119,7 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
 }
 
-pub use imp::{elevate_and_run, query_state, request_action, run_elevated};
+pub use imp::{query_state, request_action, run_elevated};
 
 #[cfg(windows)]
 mod imp {
@@ -201,28 +201,6 @@ mod imp {
     /// waits for it, and returns the child's exit code (0 ok / 1 failed). The only
     /// data crossing the boundary is the closed `action`/`service` enum.
     pub fn request_action(service: Service, action: Action) -> Result<i32, String> {
-        // We launch the FULL path of our own image, so ShellExecuteEx does no
-        // PATH/CWD search — a peer process cannot redirect the elevated launch by
-        // planting an exe. The remaining trust assumption is the on-disk integrity
-        // of this image itself: the installer must place it where standard users
-        // cannot write (Program Files / %ProgramData% with default ACLs), and code
-        // signing (M7) is what ultimately ties "elevate this image" to "our binary".
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let params = format!("--svcctl {} {}", action.as_arg(), service.as_arg());
-        elevate_and_run(exe.as_os_str(), &params)
-    }
-
-    /// Launches `program` elevated via the UAC `runas` verb with `params`, waits for
-    /// it to finish (up to 120 s), and returns its process exit code. A declined UAC
-    /// prompt is reported as an error, never a silent success. This is the shared
-    /// core behind both service control (`request_action`, launching our own exe)
-    /// and applying an update (ADR 0009, launching msiexec).
-    ///
-    /// `program` MUST be a full, trusted path — the caller is responsible for not
-    /// passing an attacker-controllable location (we resolve no PATH/CWD search).
-    /// `params` is the command line passed to that program; for the update path it
-    /// is built from a fixed template with only our own temp-file path interpolated.
-    pub fn elevate_and_run(program: &std::ffi::OsStr, params: &str) -> Result<i32, String> {
         use std::os::windows::ffi::OsStrExt;
 
         use windows_sys::Win32::Foundation::{
@@ -234,8 +212,20 @@ mod imp {
         };
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-        let program_w: Vec<u16> = program.encode_wide().chain(std::iter::once(0)).collect();
+        // We launch the FULL path of our own image (lpFile below), so ShellExecuteEx
+        // does no PATH/CWD search — a peer process cannot redirect the elevated launch
+        // by planting an exe. The remaining trust assumption is the on-disk integrity
+        // of this image itself: the installer must place it where standard users
+        // cannot write (Program Files / %ProgramData% with default ACLs), and code
+        // signing (M7) is what ultimately ties "elevate this image" to "our binary".
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_w: Vec<u16> = exe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
         let verb_w: Vec<u16> = "runas".encode_utf16().chain(std::iter::once(0)).collect();
+        let params = format!("--svcctl {} {}", action.as_arg(), service.as_arg());
         let params_w: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
 
         // SAFETY: zeroing then filling a plain C struct; the wide strings outlive
@@ -244,7 +234,7 @@ mod imp {
         info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
         info.fMask = SEE_MASK_NOCLOSEPROCESS;
         info.lpVerb = verb_w.as_ptr();
-        info.lpFile = program_w.as_ptr();
+        info.lpFile = exe_w.as_ptr();
         info.lpParameters = params_w.as_ptr();
         info.nShow = SW_HIDE;
 
@@ -257,22 +247,23 @@ mod imp {
                 return Err("elevation was declined".to_string());
             }
             return Err(format!(
-                "could not launch the elevated process (error {err})"
+                "could not launch the elevated helper (error {err})"
             ));
         }
 
         let handle = info.hProcess;
         if handle.is_null() {
-            return Err("no handle to the elevated process".to_string());
+            return Err("no handle to the elevated helper".to_string());
         }
 
-        // SAFETY: `handle` is a live process handle from ShellExecuteExW. 120s bounds
-        // a true hang; on timeout we report it explicitly rather than inferring from
-        // the exit code. The handle is closed exactly once on each path.
+        // SAFETY: `handle` is a live process handle from ShellExecuteExW. The child
+        // settles its own state within ~8s (`wait_until`), so 120s only bounds a true
+        // hang; on timeout we report it explicitly rather than inferring from the exit
+        // code. The handle is closed exactly once on each path.
         let wait = unsafe { WaitForSingleObject(handle, 120_000) };
         if wait == WAIT_TIMEOUT {
             unsafe { CloseHandle(handle) };
-            return Err("the elevated process did not finish in time".to_string());
+            return Err("the elevated helper did not finish in time".to_string());
         }
         let mut code: u32 = 0;
         unsafe {
@@ -297,10 +288,6 @@ mod imp {
 
     pub fn request_action(_service: Service, _action: Action) -> Result<i32, String> {
         Err("service control is only available on Windows".to_string())
-    }
-
-    pub fn elevate_and_run(_program: &std::ffi::OsStr, _params: &str) -> Result<i32, String> {
-        Err("elevation is only available on Windows".to_string())
     }
 }
 

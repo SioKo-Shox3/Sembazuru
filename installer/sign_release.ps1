@@ -1,13 +1,15 @@
-# Real-certificate Authenticode signing for a release (ADR 0008 / 0009).
+# Real-certificate Authenticode signing for a release (ADR 0008). Optional: signing is
+# a downgraded, non-gating step (ADR 0009 withdrawal) — the cluster gates on version,
+# not on signature. A release is signed only when a signing secret is configured;
+# otherwise the MSI ships unsigned and manual-download users click through SmartScreen.
 #
 # Signs each given file with the REAL release code-signing certificate and an
 # RFC3161 timestamp, then asserts every signature reads back as VALID (a trusted
 # chain). This is the release counterpart of hooks/test/sign_smoke.ps1, which only
 # proves the sign->verify *mechanism* with an ephemeral self-signed cert and so
-# accepts an untrusted chain. Here we require `Valid`, because the whole point of a
-# release is a publicly trusted signature — and because the GUI self-update
-# (crates/gui/src/verify) refuses to run an MSI whose Authenticode does not validate
-# and whose publisher does not match the pin.
+# accepts an untrusted chain. Here we require `Valid`, because when we DO sign, the
+# point is a publicly trusted signature so manual-download users avoid the
+# unknown-publisher SmartScreen warning.
 #
 # The cert is supplied as a base64 PFX (works for a software OV cert or for testing
 # the pipeline). NOTE: a real OV cert is required by the CA/Browser Forum to live on
@@ -15,8 +17,9 @@
 # For that, swap THIS step for the signing provider's tool — Azure Trusted Signing,
 # DigiCert KeyLocker, or `signtool` with the token's KSP — keeping the same contract:
 # sign the listed files, then verify each is `Valid`. The release workflow only calls
-# this script when a signing secret is configured; with no secret it skips signing
-# and publishes a draft (so self-update never consumes an unsigned MSI).
+# this script when a signing secret is configured; with no secret it skips signing and
+# publishes the MSI for manual download anyway (signing is non-gating; the unsigned MSI
+# just triggers SmartScreen on first run).
 param(
     [Parameter(Mandatory)][string[]]$Files,
     # Base64-encoded PFX (from a CI secret).
