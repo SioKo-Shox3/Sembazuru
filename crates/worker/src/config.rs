@@ -245,20 +245,37 @@ impl WorkerConfig {
         if let Some(v) = std::env::var_os("SEMBAZURU_CAS_ROOT") {
             self.cas_root = empty_to_none(v.to_string_lossy().into_owned());
         }
-        // CPU-aware admission knobs (ADR 0010). A present-but-unparseable percent is
-        // ignored (keeps the file/default), matching the conservative parses above;
-        // a recognized SEMBAZURU_IDLE_CPU_ENABLED toggles the feature explicitly.
+        // CPU-aware admission knobs (ADR 0010). A present-but-unparseable percent
+        // keeps the existing file/default for that knob (`.or` below) — unlike
+        // SEMBAZURU_CAPACITY which clears, because these are gentle tuning knobs
+        // where preserving an operator's file setting over a typo'd env is the
+        // safer default. A recognized SEMBAZURU_IDLE_CPU_ENABLED toggles explicitly.
         if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_ENABLED") {
             self.idle_cpu_enabled = parse_bool(&v).or(self.idle_cpu_enabled);
         }
         if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_RESERVE_PCT") {
-            self.idle_cpu_reserve_pct = v.trim().parse::<u32>().ok().map(|n| n.min(100));
+            self.idle_cpu_reserve_pct = v
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .map(|n| n.min(100))
+                .or(self.idle_cpu_reserve_pct);
         }
         if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_HYSTERESIS_PCT") {
-            self.idle_cpu_hysteresis_pct = v.trim().parse::<u32>().ok().map(|n| n.min(100));
+            self.idle_cpu_hysteresis_pct = v
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .map(|n| n.min(100))
+                .or(self.idle_cpu_hysteresis_pct);
         }
         if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_EMA_ALPHA_PCT") {
-            self.idle_cpu_ema_alpha_pct = v.trim().parse::<u32>().ok().map(|n| n.clamp(1, 100));
+            self.idle_cpu_ema_alpha_pct = v
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .map(|n| n.clamp(1, 100))
+                .or(self.idle_cpu_ema_alpha_pct);
         }
     }
 
@@ -570,6 +587,30 @@ mod tests {
         );
         assert_eq!(s.reserve_pct, 20, "env reserve wins");
         assert_eq!(s.ema_alpha_pct, 50, "env alpha wins");
+    }
+
+    #[test]
+    fn idle_cpu_unparseable_env_keeps_the_file_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = tmp_file();
+        WorkerConfig {
+            idle_cpu_reserve_pct: Some(33),
+            ..WorkerConfig::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        // SAFETY: serialized by ENV_LOCK; set, load, clear.
+        unsafe {
+            std::env::set_var("SEMBAZURU_IDLE_CPU_RESERVE_PCT", "not-a-number");
+        }
+        let s = WorkerConfig::load_effective(&path).idle_cpu();
+        unsafe {
+            std::env::remove_var("SEMBAZURU_IDLE_CPU_RESERVE_PCT");
+        }
+        assert_eq!(
+            s.reserve_pct, 33,
+            "an unparseable env percent keeps the file value (documented contract)"
+        );
     }
 
     #[test]
