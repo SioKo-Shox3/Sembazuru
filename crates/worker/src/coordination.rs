@@ -63,6 +63,11 @@ pub async fn register_and_heartbeat(
     // Shared cluster token to present on Register (ADR 0006). Empty when the
     // cluster runs without auth; the agent then accepts unconditionally.
     auth_token: String,
+    // CPU-aware admission policy (ADR 0010). When enabled, a background sampler
+    // publishes this worker's smoothed idle CPU and every heartbeat carries it so
+    // the agent can scale scheduling to host load; when disabled, heartbeats carry
+    // no CPU signal and the worker is scheduled exactly as pre-0010.
+    idle_cpu: crate::config::IdleCpuSettings,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let caps = local_capabilities(capacity);
     let cpu_count = caps.cpu_count;
@@ -88,6 +93,18 @@ pub async fn register_and_heartbeat(
         return Err(format!("agent rejected registration: {}", resp.detail).into());
     }
 
+    // Start the idle-CPU sampler (ADR 0010) when the feature is on; it publishes
+    // the latest smoothed reading into `cpu_signal`, which the heartbeat closure
+    // reads each tick. The sentinel keeps heartbeats sending `None` (no CPU signal)
+    // until the first real reading exists, and the sampler stops with `stop`.
+    let cpu_signal = if idle_cpu.enabled {
+        let sig = Arc::new(AtomicU32::new(crate::cpu_monitor::NOT_READY));
+        crate::cpu_monitor::spawn_idle_cpu_sampler(Arc::clone(&sig), idle_cpu, Arc::clone(&stop));
+        Some(sig)
+    } else {
+        None
+    };
+
     // Outbound ping stream: one ping per interval tick carrying current
     // capacity, ending when `stop` is set (graceful worker drain). `take_while`
     // terminates the stream — the gRPC body lives in tonic's connection task, so
@@ -98,11 +115,19 @@ pub async fn register_and_heartbeat(
         .take_while(move |_| !stop.load(Ordering::SeqCst))
         .map(move |_| {
             let in_flight = running.load(Ordering::SeqCst);
+            // Latest smoothed idle CPU, or None until the sampler is ready / when
+            // the feature is off — the agent reads None as "no CPU signal" and
+            // schedules this worker by slots alone (ADR 0010).
+            let idle_cpu_pct = cpu_signal.as_ref().and_then(|s| {
+                let v = s.load(Ordering::Relaxed);
+                (v <= 100).then_some(v)
+            });
             HeartbeatPing {
                 worker_id: worker_id.clone(),
                 monotonic_qpc: u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
                 running_actions: in_flight,
                 idle_slots: cpu_count.saturating_sub(in_flight),
+                idle_cpu_pct,
             }
         });
 

@@ -54,6 +54,10 @@ pub struct WorkerRow {
     pub arch: String,
     pub running: u32,
     pub idle: u32,
+    /// Smoothed host idle-CPU percent the worker last reported (ADR 0010), or
+    /// `None` when it reports no CPU signal (pre-0010 / feature off) — the UI then
+    /// shows "—" so it reads as "not reported", not "0% idle".
+    pub idle_cpu_pct: Option<u32>,
     /// Heartbeat age rendered as a short human string (e.g. "1.5s ago").
     pub last_ping: String,
     pub healthy: bool,
@@ -249,6 +253,7 @@ fn map_worker(w: WorkerStatus) -> WorkerRow {
         arch: w.arch,
         running: w.running_actions,
         idle: w.idle_slots,
+        idle_cpu_pct: w.idle_cpu_pct,
         last_ping: humanize_age(w.last_ping_age_ms),
         healthy: w.healthy,
     }

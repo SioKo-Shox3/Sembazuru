@@ -160,6 +160,74 @@ async fn dispatch_falls_back_to_local_when_all_workers_dead() {
 }
 
 #[tokio::test]
+async fn dispatch_falls_back_to_local_when_all_workers_cpu_busy() {
+    // ADR 0010: live, reachable, capable workers — but every one reports 0% idle
+    // CPU (its host is busy with the user's own work). The scheduler must not
+    // burden them; it routes the action to local execution instead, and the build
+    // still completes. This is the CPU-aware analogue of the all-dead fallback.
+    let (w1, served1) = start_worker().await;
+    let (w2, served2) = start_worker().await;
+    let table = table_with(&[("w1", &w1, 2), ("w2", &w2, 2)]);
+    // A heartbeat carrying idle_cpu_pct = 0 marks each host as busy.
+    table.on_ping("w1", 0, 0, Some(0));
+    table.on_ping("w2", 0, 0, Some(0));
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "5"]),
+            "act-busy".into(),
+            "sess".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    match exec {
+        Execution::LocalFallback { exit_code, reason } => {
+            assert_eq!(exit_code, 5, "ran locally; reason: {reason}");
+        }
+        other => panic!("expected local fallback when all workers are CPU-busy, got {other:?}"),
+    }
+    // The busy workers were genuinely avoided, not merely out-raced.
+    assert_eq!(
+        served1.load(Ordering::SeqCst),
+        0,
+        "CPU-busy worker w1 must receive no action"
+    );
+    assert_eq!(
+        served2.load(Ordering::SeqCst),
+        0,
+        "CPU-busy worker w2 must receive no action"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_runs_remotely_when_worker_reports_idle_cpu() {
+    // The complement of the busy case: a worker reporting plenty of idle CPU is
+    // still scheduled remotely — CPU-awareness must not block an idle worker.
+    let (w1, served) = start_worker().await;
+    let table = table_with(&[("w1", &w1, 2)]);
+    table.on_ping("w1", 0, 2, Some(100)); // fully idle host
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "3"]),
+            "act-idle".into(),
+            "sess".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    match exec {
+        Execution::Remote(o) => assert_eq!(o.exit_code, Some(3), "idle worker ran the action"),
+        other => panic!("an idle worker must still run remotely, got {other:?}"),
+    }
+    assert!(
+        served.load(Ordering::SeqCst) >= 1,
+        "the idle worker actually served the action"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_falls_back_to_local_with_no_workers() {
     let table = WorkerTable::new(Duration::from_secs(60)); // empty
     let sched = Scheduler::new(table);
