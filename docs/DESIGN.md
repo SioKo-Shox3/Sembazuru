@@ -242,6 +242,7 @@ Incredibuild の本当の堀である「プロセス仮想化」を OSS で再�
 - **Windows インストールウィザード** — 署名済み MSI／winget。バイナリ群（`sembazuru-daemon`／`sembazuru-worker`／`sembazuru`(launcher)／`launcher.exe`＋`sbz_interceptor{64,32}.dll`／`Directory.Build.targets`）の配置・PATH 登録・**daemon の Windows サービス登録（常駐化）**・ファイアウォール規則（Coordination/fileserver/worker ポート）・`SEMBAZURU_AGENT`／`SEMBAZURU_CLUSTER_TOKEN` 等の初期設定・アンインストールまで。**M7.2 の Authenticode 署名パイプライン**と EDR 許可リスト申請（`docs/security/edr-allowlist.md`）に必ず接続する（フック DLL 注入は EDR 誤検知の的＝署名・申請なしでは採用が止まる）。
 - **常駐 GUI アプリ** — daemon をトレイ常駐／サービスとして動かし、接続 worker 一覧と health・キャッシュヒット率・in-flight アクション・remote/local/fallback の内訳を可視化。daemon/worker の start/stop と `SEMBAZURU_*`（agent アドレス・cache root・cluster token 等）の設定を GUI に隠蔽する。実装は Rust GUI（Tauri／egui／windows-rs トレイ）で既存 gRPC Coordination を叩く＝スタックと整合。
 - **長寿命 daemon の disk eviction**（deferred #8：per-action scratch/trace・agent セッション CAS の累積）を併せて対応。常駐サービス化で必ず顕在化するため M9 で同時に片付ける。
+- **導入後の運用導線（M9.6）** — 配布物が整った後の二つの運用 UX。**GUI 自己更新**（ADR `0009-app-self-update-github-releases.md`：GitHub Releases 検知 → DL → Authenticode＋publisher 検証 → ユーザー承認 → UAC `msiexec` 適用。**サイレント更新・定期ポーリングは作らない**、外向き通信は GUI・ユーザー起点のみ、持続化を増やさない）。**CPU 連動 worker admission**（ADR `0010-cpu-aware-worker-admission.md`：worker が自機の idle CPU を測り、スケジューラが実効容量を動的に絞る「良き隣人」制御。全 worker 飽和でもローカルフォールバックで完走＝**成果物バイト一致は不変**）。
 - **Done when:** 非開発者が署名済みインストーラから導入し、GUI から daemon／worker を起動して既存プロジェクトを分散ビルドでき、クラスタ／キャッシュの状態を目視確認できる。**2 台目の PC も同じインストーラ＋設定だけで worker として参加できる**（M10 実測の前提が整う）。
 
 ### M10 — 実 2 台 LAN（cross-machine の本番化・実測）
