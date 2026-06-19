@@ -4,7 +4,7 @@
 running checklist です。AI セッションは push・実機 SCM 操作・管理者操作・GUI の視覚確認・秘密値の
 配布をできないため、それらをここに残します。完了したら ✅ にして残すか、節ごと削除してください。
 
-最終更新: 2026-06-19（M9.6: ADR 0009 自己更新 / 0010 CPU 連動 admission 実装・リリース Actions 整備）。
+最終更新: 2026-06-20（M9.6 改訂: ADR 0009 自己更新を撤回し、版ゲート admission=ADR 0011 と worker 参加モード=ADR 0012 を実装。release pipeline は手動配布用に保持）。
 
 ---
 
@@ -14,10 +14,11 @@ running checklist です。AI セッションは push・実機 SCM 操作・管�
       `m9/foundation` に統合する。**main 直 push は不可**（分類器が拒否。work ブランチ経由）。
 - [ ] **M9.4 の起点。** GUI セッションは、M9.3c 取り込み後の `m9/foundation` tip から `m9/gui` を
       切って開始する（起動プロンプトは別途用意済み）。
-- [ ] **M9.6 を取り込む。** `m9/finalize`（`m9/installer` から分岐し、`m9/cpu-admission`＝ADR 0010 と
-      `m9/self-update`＝ADR 0009 を `--no-ff` 統合、その上に CI 版同期ゲート・M9.6 docs・リリース Actions）
-      を push して main へ。個別 2 ブランチを別々に push したい場合も、内容は finalize に内包される。
-      **main 直 push は不可。**
+- [ ] **M9.6（改訂）を取り込む。** `m9/finalize` を push して main へ。**main 直 push は不可**（分類器が拒否・
+      work ブランチ経由）。内容: ADR 0010 CPU 連動 admission ＋ **自己更新（ADR 0009）の surgical 撤回**
+      （GUI を loopback-only に復帰）＋ **版ゲート admission（ADR 0011）** ＋ **worker 参加モード（ADR 0012）**
+      ＋ docs/CI/release pipeline（手動配布用に保持）。撤回→再実装の add→remove churn が履歴に残るので、
+      **push 前に squash したい場合はリード判断で**（A 撤回 → B 版ゲート → C 参加モード → docs の 4 コミット構成）。
 
 ## 1. M10（実 2 台 LAN）着手前 — 実機 SCM ライフサイクル gate
 
@@ -45,8 +46,9 @@ running checklist です。AI セッションは push・実機 SCM 操作・管�
       **scratch_root / cas_root への書込み**と **launcher.exe / hook DLL の読取実行**を ACL 付与する。
       最小権限アカウントは既定でこれを持たず、未付与だと **VFS アクションが install 時でなく実行時に失敗**。
       （根拠と意図は `crates/worker/src/service.rs` の `ServiceAccount` doc に明記済み。）
-- [ ] **署名 × EDR 申請の接続。** M7.2 の Authenticode 署名パイプラインに新規 exe を載せ、
-      `docs/security/edr-allowlist.md`（2 サービス構成に更新済み）で申請する。
+- [ ] **署名 × EDR 申請の接続（任意降格）。** 自己更新撤回（ADR 0009）で署名は機能 gate でなくなった＝必須でない。
+      公開配布で SmartScreen/EDR 警告を消したい時のみ、M7.2 の Authenticode 署名パイプラインに新規 exe を載せ、
+      `docs/security/edr-allowlist.md`（2 サービス構成・GUI は loopback-only/外向きなしに更新済み）で申請する。
 - [ ] **ファイアウォール規則・PATH 登録・初期設定**（Coordination/fileserver/worker ポート、
       `SEMBAZURU_AGENT` / `SEMBAZURU_CLUSTER_TOKEN` 等）を MSI に組み込む（ADR 0008 / DESIGN §7 M9）。
 
@@ -62,31 +64,35 @@ running checklist です。AI セッションは push・実機 SCM 操作・管�
       daemon/worker/データプレーンの全 reader を**非 UTF-8 トークンでも一致**させる。M9.3c の verifier が
       検出した既存差異（ASCII では無影響）。**chip 起票済み: `task_eba5301f`**（ワンクリックで別 worktree 着手可）。
 
-## 4. リリース（M9.6・GitHub Release・ADR 0008 / 0009）
+## 4. リリース（M9.6・GitHub Release・ADR 0008、**手動配布**）
 
-自己更新（ADR 0009）が消費する `releases/latest` の MSI を発行する手順。Actions は整備済み
-（`.github/workflows/release.yml`、`v*` タグ起動）。署名 secret 未設定なら **draft** で publish するため、
-未署名 MSI が誤って `latest`（＝自己更新の取得対象）になることはない。
+**更新は手動 DL**（自己更新 ADR 0009 は撤回）。この手順は GitHub Releases に MSI を発行し、利用者が手で DL して
+入れ直すためのもの。Actions は整備済み（`.github/workflows/release.yml`、`v*` タグ起動）。署名は**任意降格**
+（機能 gate でない）：secret 未設定なら未署名 MSI を **draft** で publish するので、未署名物が勝手に公開
+`latest` にならない（公開はリードが draft を明示 publish）。
 
-### 署名なしの動作確認（cert 取得前・今すぐ可）
+> **版整合の要点（ADR 0011）**: リリースは「クラスタを 1 版に揃える」ための配布物。利用者が古い版のまま worker を
+> 動かすと、agent（サーバー役）の版と一致せずスケジューリングから除外される（ダッシュボードに `version-mismatch`）。
+> よって**全ノードを同じ MSI で更新**すること。
+
+### 未署名リリース／dry-run（今すぐ可）
 - [ ] タグを打って push（リードのみ・main 直 push 不可）: `git tag v0.0.1 && git push origin v0.0.1`。
-      → `release.yml` がビルド → 版整合検証 → MSI 生成 → **draft** リリース作成。検知→DL の経路や GUI を
-      draft で手動確認できる（署名検証で弾かれるところまで）。
+      → `release.yml` がビルド → 版整合検証（`check_version_sync.ps1`）→ MSI 生成 → **draft** リリース作成。
+      利用者向けに公開するならリードが draft を publish。未署名 MSI は導入時に SmartScreen（不明な発行元）が出る。
 - [ ] あるいは Actions の **workflow_dispatch** で MSI 成果物のみ生成する dry-run（リリースは作らない）。
 
-### 署名つき正式リリース（実 OV cert 取得後）
+### 署名つきリリース（任意・公開配布で警告を消したい時のみ）
 - [ ] 実 OV cert を **GitHub Secrets** に設定: `SBZ_SIGNING_PFX_BASE64`（PFX の base64）/
-      `SBZ_SIGNING_PASSWORD` / `SBZ_TIMESTAMP_URL`（例 `http://timestamp.digicert.com`）。
+      `SBZ_SIGNING_PASSWORD` / `SBZ_TIMESTAMP_URL`（例 `http://timestamp.digicert.com`）。設定されていれば
+      `release.yml` が MSI を署名して publish する。
       ※ HSM/ハードウェアトークンの OV cert は PFX 化不可。その場合は `release.yml` の「Sign …」2 ステップを
       署名プロバイダ（Azure Trusted Signing / DigiCert KeyLocker / token KSP の signtool）へ差し替える
       （契約は `installer/sign_release.ps1` と同じ＝署名して `Valid` 検証）。
-- [ ] `crates/gui/src/verify/mod.rs` の `EXPECTED_PUBLISHER` を実 cert subject(CN) に差し替えてマージ
-      （未差し替えだと自己更新は実署名 MSI も弾く＝fail-closed で安全側だが更新は機能しない）。
 - [ ] バージョンを上げる場合は **Cargo `[workspace.package] version` と WiX `SbzVersion`（`installer/Package.wixproj`）
-      を一致**させる（CI / release の `check_version_sync.ps1` が不一致を弾く）。タグは `v<version>`。
-- [ ] タグ push → 署名つきで publish された Release が `releases/latest` になり、旧版 GUI の
-      「Check for updates…」→ DL → Authenticode＋publisher 検証通過 → UAC msiexec → in-place 更新が通る。
-- [ ] 更新適用の実機一周（検知→DL→検証→昇格適用→再起動）を管理者 PC で確認（§1 の SCM 一周と同枠）。
+      を一致**させる（CI / release の `check_version_sync.ps1` が不一致を弾く＝MSI の版と worker 申告版=ADR 0011 が
+      揃う）。タグは `v<version>`。
+- [ ] 導入の実機一周（DL → インストール → 起動 → 既存版アンインストール/MajorUpgrade）を管理者 PC で確認
+      （§1 の SCM 一周と同枠）。
 
 ## （参考）M9.4 セッションで判断を仰がれ得る点 — リードの事前作業ではない
 

@@ -495,40 +495,55 @@ M8 の汎化作業（単機+RTT で実証）から分離。承認後に着手:
 - **WriteBack の declared-output スコープ**（M7.1 繰越）。**authoritative root binding**（M7.1 HIGH-2）。
 - 環境準備（実 2 台）と決定者承認が前提（M3 以来の方針踏襲）。出所: ADR 0007、AskUser(2026-06-14)。
 
-## M9（配布物と常駐 UX）— ADR 0008 / 0009 / 0010
+## M9（配布物と常駐 UX）— ADR 0008 / 0010 / 0011 / 0012（ADR 0009 は撤回）
 
-### M9.6 自己更新（ADR 0009）実装後の繰延（2026-06-19）
-- **実 OV 証明書 subject による publisher pin の差し替え（リリースゲート）。** `crates/gui/src/verify/mod.rs`
-  の `EXPECTED_PUBLISHER` は placeholder。実 OV cert 確定まで自己更新は機能しない（実署名版も弾く fail-closed＝
-  安全側）。実 cert 取得は M7/リリース所有・決定者（ADR 0006）。出所: ADR 0009 §繰延、security-reviewer/verifier(M9.6)。
-- **GitHub API レート制限（未認証 60/h）への対応は据え置き。** on-demand 主体（起動時 1 回＋手動）なら十分。
-  必要になれば `ETag`/`If-None-Match` を足す。出所: ADR 0009 §繰延。
+### M9.6 自己更新（ADR 0009）の撤回（2026-06-19）
+ADR 0009（GUI 自己更新）はリード判断で **撤回（SUPERSEDED）**。更新は GitHub Releases の MSI を手動 DL して
+入れ直す運用に変更（理由は ADR 0009 末尾「廃止」／ADR 0011 §背景）。撤回に伴い旧・自己更新繰延（publisher pin
+差し替え・GitHub API レート制限・自動ロールバック・更新適用の実機一周）は **消滅**。残る関連繰延:
+- **署名/実 OV cert は任意降格（機能 gate でない）。** 自己更新が消えたため署名は必須でなくなった。当面未署名で
+  運用可（手動 DL は SmartScreen クリック）。実 OV cert（HSM）取得・実 Authenticode 署名は「公開配布で警告を
+  消したい時のみ」。`installer/sign_release.ps1`／`.github/workflows/release.yml` は **手動配布用 MSI 発行**として
+  保持。出所: ADR 0009 §廃止、ADR 0011 方針（2026-06-19）。
 - **winget manifest の作成・winget-pkgs 提出は据え置き。** MSI が配布物の本体、winget はその配布チャネル
-  （ADR 0008）。実 OV 署名後のリリース作業。出所: ADR 0008 §(1)、ADR 0009。
-- **自動ロールバック・デルタ更新は持たない（設計判断）。** `MajorUpgrade`＋旧リリース再導入で代替、フル MSI のみ。
-  出所: ADR 0009 §繰延。
-- **更新適用の実機一周は未消化（実機ゲート）。** 検知 → DL → 署名検証 → UAC `msiexec` 適用 → 再起動は
-  管理者実機でしか通せない（cargo test 不能）。実 OV 署名済み MSI を Release に置いてリードが一周する。
-  出所: verifier(M9.6 missed item)、lead-actions §1 と同根。
+  （ADR 0008）。実 OV 署名後のリリース作業。出所: ADR 0008 §(1)。
+
+### M9.6 版ゲート admission（ADR 0011）実装後の繰延（2026-06-19）
+- **版一致を「完全一致」から semver 互換範囲へ緩める余地は据え置き。** 当面は決定性安全側に倒し完全一致のみ。
+  出所: ADR 0011 §繰延。
+- **混在クラスタの運用 UX（不一致ノード検知時に GUI から一括更新を案内等）は表示のみで開始。** ダッシュボードに
+  `version-mismatch` 表示は実装済み。出所: ADR 0011 §繰延。
+- **版基準を daemon 設定で固定/上書きする経路は据え置き。** 現状は agent 自身の `CARGO_PKG_VERSION` 固定。
+  出所: ADR 0011 §繰延。
 
 ### M9.6 CPU 連動 admission（ADR 0010）実装後の繰延（2026-06-19）
-- **`f()` の関数形・EMA 窓・ヒステリシス帯・reserve 既定値の実 LAN チューニングは M10 送り。** 機構は M9.6 で
-  完成、定数は控えめな既定値（reserve 10%／hysteresis 10%／alpha 30%）で動作。実測チューニングは M10 実 LAN。
-  worker config（`idle_cpu_*`）／`SEMBAZURU_IDLE_CPU_*` で調整可。出所: ADR 0010 §繰延。
+- **`f()` の関数形・EMA 窓・ヒステリシス帯・reserve／floor 既定値の実 LAN チューニングは M10 送り。** 機構は M9.6
+  で完成、定数は控えめな既定値（reserve 10%／hysteresis 10%／alpha 30%／floor 0%）で動作。実測チューニングは
+  M10 実 LAN。worker config（`idle_cpu_*`）／`SEMBAZURU_IDLE_CPU_*` で調整可。出所: ADR 0010/0012 §繰延。
 - **メモリ/IO 圧の admission 組み込みは据え置き。** `Capabilities.memory_bytes` は現状 0/未使用
-  （`crates/worker/src/coordination.rs`）。需要が出たら CPU と同様に信号化。出所: ADR 0010 §繰延。
-- **per-worker しきい値を GUI から編集する UI は据え置き（まずは表示のみ）。** M9.6 で idle CPU／実効容量の
-  ダッシュボード表示は実装済み。編集 UI は需要次第。出所: ADR 0010 §繰延。
-- **「一時停止/再開」モード（しきい値で完全停止）は当面不要。** 動的 capacity の縮退形として後付け可能。
-  出所: ADR 0010 §繰延。
+  （`crates/worker/src/coordination.rs`）。需要が出たら CPU と同様に信号化（ADR 0012 の参加モードに信号を足す形）。
+  出所: ADR 0010/0012 §繰延。
+- **per-worker しきい値を GUI から編集する UI は据え置き（まずは表示のみ）。** M9.6 で idle CPU／実効容量／版／
+  参加状態のダッシュボード表示は実装済み。編集 UI は需要次第。出所: ADR 0010/0012 §繰延。
+
+### M9.6 worker 参加モード（ADR 0012）実装後の繰延（2026-06-19）
+- **状態信号の拡張（memory/IO 圧・在席・時間帯）は拡張枠のみ確保し未実装。** 当面は idle CPU 信号のみ
+  （スコープ膨張回避）。adaptive の入力として後から足せる構造。出所: ADR 0012 §繰延。
+- **per-worker のモード/しきい値を GUI から編集する UI は据え置き（表示のみ）。** participation_mode／
+  exclusion_reason のダッシュボード表示は実装済み。出所: ADR 0012 §繰延。
+- **モードの live-reload は未対応。** 現状は worker 起動時に config を 1 回読む（変更は再起動で反映）。
+  出所: ADR 0012 §繰延、config.rs（no live reload）。
+- ※ ADR 0010 で「当面不要」としていた「一時停止/再開」は、ADR 0012 の `off`（完全不参加）／`always`（常時参加）
+  として **実装済み**＝この繰延は消化。
 
 ### M9 完了の前提（リード実機ゲート・出荷ゲート）
 - **実機 SCM 一周（daemon/worker：install→AutoStart→start→stop→uninstall・残骸ゼロ）、MSI の ACL/FW/PATH/
   初期設定の実機反映確認、アンインストール総合残骸ゼロ。** 実装は MSI（`installer/sembazuru.wxs` の
   `util:PermissionEx`／`FirewallException`／`Environment PATH`／seed-config）に済み＝残るは実機確認。
   出所: docs/handoff/lead-actions.md §1/§2、verifier(M9 audit 2026-06-19)。
-- **実 OV cert（HSM）取得・実 Authenticode 署名・EDR 許可リスト提出。** DESIGN §7 M9 Done-when「署名済み
-  インストーラ」の最終充足ゲート。CI は placeholder cert で署名「機構」のみ検証。出所: ADR 0006/0008、lead-actions。
+- **実 OV cert（HSM）取得・実 Authenticode 署名・EDR 許可リスト提出は任意降格（ブロッカーでない）。** 自己更新撤回
+  （ADR 0009）で署名は機能 gate でなくなった＝当面未署名で運用可（手動 DL は SmartScreen クリック）。公開配布で警告
+  を消したい時のみ実施。CI は placeholder cert で署名「機構」のみ検証。出所: ADR 0006/0008/0011、lead-actions。
 
 ## 横断・既知の制約
 
