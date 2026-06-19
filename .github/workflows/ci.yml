@@ -157,16 +157,25 @@ jobs:
         run: pwsh -NoProfile -File hooks/test/sign_smoke.ps1
 
   m9-installer:
-    name: M9.5 installer (WiX MSI build + signing structure)
+    name: M9.6 installer (MSI build + version sync + signing structure)
     # Builds the signed-capable MSI green gate (ADR 0008 §1). The MSI only packages
     # prebuilt binaries, so it stays compiler-agnostic; this job does not run the
     # compile/determinism gates (the `hooks` job owns those). The MSI is built
     # UNSIGNED here — a real release swaps in an OV cert (M7 / docs/security/
     # edr-allowlist.md); this gate proves the build + the signing structure.
+    #
+    # ADR 0009/0010 (M9.6) unit + integration tests (gui update/verify, agent
+    # scheduler CPU-admission) ride the `rust` job's `cargo test --workspace`; this
+    # job adds the ADR 0009 release-hygiene gate: Cargo version == WiX ProductVersion.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # ADR 0009 release-hygiene gate: a Cargo/WiX version mismatch would make the
+      # self-update version compare disagree with the MSI ProductVersion. Run it
+      # first so a mismatch fails fast before the expensive build.
+      - name: Version sync (Cargo == WiX ProductVersion)
+        run: pwsh -NoProfile -File installer/check_version_sync.ps1
       # The Rust target dir + WiX intermediate paths can exceed 260 chars on the
       # runner; enable long-path support before building.
       - name: Enable long paths
