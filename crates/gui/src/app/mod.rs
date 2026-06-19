@@ -17,6 +17,7 @@ use crate::tray::{Tray, TrayMessage};
 mod config;
 mod dashboard;
 mod services;
+mod updates;
 
 /// Which view the window is showing.
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,8 @@ pub struct SembazuruApp {
     tab: Tab,
     config: config::ConfigPanel,
     services: services::ServicesPanel,
+    // Self-update controller (ADR 0009): tray-triggered check + the update dialog.
+    updates: updates::Updates,
 }
 
 impl SembazuruApp {
@@ -62,6 +65,12 @@ impl SembazuruApp {
 
         let tray = Tray::new(&cc.egui_ctx);
 
+        // Self-update controller, and one silent check at launch (ADR 0009): it
+        // surfaces the update dialog only if a newer release is actually available;
+        // an up-to-date or offline result stays quiet. No background polling.
+        let updates = updates::Updates::new(runtime.handle().clone(), cc.egui_ctx.clone());
+        updates.start_check(false);
+
         Self {
             _runtime: runtime,
             shared,
@@ -71,6 +80,7 @@ impl SembazuruApp {
             tab: Tab::default(),
             config: config::ConfigPanel::default(),
             services: services::ServicesPanel::default(),
+            updates,
         }
     }
 
@@ -84,6 +94,12 @@ impl SembazuruApp {
                     TrayMessage::Show => {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    TrayMessage::CheckForUpdates => {
+                        // Surface the window so the user sees the result, then check.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.updates.start_check(true);
                     }
                     TrayMessage::Quit => {
                         self.quitting = true;
@@ -129,6 +145,10 @@ impl eframe::App for SembazuruApp {
             Tab::Services => self.services.render(ui, &ctx),
             Tab::Settings => self.config.render(ui, &self.commands),
         }
+
+        // The self-update dialog (ADR 0009) overlays the current tab when a check /
+        // download / install is in progress or an update is available.
+        self.updates.render(&ctx);
 
         // Keep heartbeat ages ticking even if a repaint signal is ever missed.
         ctx.request_repaint_after(POLL_INTERVAL);
