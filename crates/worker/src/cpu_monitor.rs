@@ -69,6 +69,11 @@ pub(crate) struct IdleCpuPolicy {
     /// Extra idle (above the reserve) required to *resume* participating after
     /// dropping out — the hysteresis band that stops flapping at the threshold.
     hysteresis_pct: u32,
+    /// Minimum schedulable idle to offer while participating (ADR 0012). Raises the
+    /// reported value up to this floor so an operator can guarantee a baseline
+    /// contribution; 0 leaves the pure good-neighbour behaviour unchanged. Does NOT
+    /// apply while latched out (a dropped-out worker still offers 0).
+    participation_floor_pct: u32,
     /// Smoothed raw idle percent; `None` until the first sample seeds it.
     ema: Option<u32>,
     /// Whether the worker currently offers itself to the cluster. Starts `true`
@@ -84,14 +89,16 @@ impl IdleCpuPolicy {
             alpha_pct: settings.ema_alpha_pct.clamp(1, 100),
             reserve_pct: settings.reserve_pct.min(100),
             hysteresis_pct: settings.hysteresis_pct.min(100),
+            participation_floor_pct: settings.participation_floor_pct.min(100),
             ema: None,
             participating: true,
         }
     }
 
     /// Feed one raw idle sample (0-100); returns the schedulable idle percent to
-    /// report this tick: the smoothed idle minus the reserve while participating,
-    /// or 0 while the latch holds the worker out.
+    /// report this tick: the smoothed idle minus the reserve (raised to the
+    /// participation floor, ADR 0012) while participating, or 0 while the latch
+    /// holds the worker out.
     pub(crate) fn observe(&mut self, raw_idle_pct: u32) -> u32 {
         let raw = raw_idle_pct.min(100);
         let ema = match self.ema {
@@ -115,7 +122,11 @@ impl IdleCpuPolicy {
         }
 
         if self.participating {
+            // Offer idle above the reserve, but never below the operator's floor
+            // (ADR 0012). The floor only applies while participating; a latched-out
+            // worker still offers nothing.
             ema.saturating_sub(self.reserve_pct)
+                .max(self.participation_floor_pct)
         } else {
             0
         }
@@ -212,12 +223,24 @@ pub(crate) fn spawn_idle_cpu_sampler(
 mod tests {
     use super::*;
 
-    fn settings(enabled: bool, reserve: u32, hysteresis: u32, alpha: u32) -> IdleCpuSettings {
+    fn settings(reserve: u32, hysteresis: u32, alpha: u32) -> IdleCpuSettings {
         IdleCpuSettings {
-            enabled,
             reserve_pct: reserve,
             hysteresis_pct: hysteresis,
             ema_alpha_pct: alpha,
+            participation_floor_pct: 0,
+        }
+    }
+
+    fn settings_with_floor(
+        reserve: u32,
+        hysteresis: u32,
+        alpha: u32,
+        floor: u32,
+    ) -> IdleCpuSettings {
+        IdleCpuSettings {
+            participation_floor_pct: floor,
+            ..settings(reserve, hysteresis, alpha)
         }
     }
 
@@ -238,7 +261,7 @@ mod tests {
     #[test]
     fn policy_with_alpha_100_tracks_the_raw_signal_minus_reserve() {
         // alpha 100 = no smoothing; reserve 10, no hysteresis.
-        let mut p = IdleCpuPolicy::new(&settings(true, 10, 0, 100));
+        let mut p = IdleCpuPolicy::new(&settings(10, 0, 100));
         assert_eq!(p.observe(100), 90, "100% idle, 10% reserved → offer 90%");
         assert_eq!(p.observe(50), 40);
         assert_eq!(p.observe(10), 0, "at the reserve, nothing schedulable");
@@ -249,7 +272,7 @@ mod tests {
     fn ema_smooths_a_transient_spike() {
         // alpha 30: a single busy sample only partially pulls the average down,
         // so one transient does not yank the worker out of scheduling.
-        let mut p = IdleCpuPolicy::new(&settings(true, 0, 0, 30));
+        let mut p = IdleCpuPolicy::new(&settings(0, 0, 30));
         assert_eq!(p.observe(100), 100, "first sample seeds the EMA");
         // 0.3*0 + 0.7*100 = 70 (rounded).
         assert_eq!(p.observe(0), 70, "one busy tick is smoothed, not obeyed");
@@ -259,12 +282,36 @@ mod tests {
     fn hysteresis_prevents_flapping_at_the_threshold() {
         // reserve 20, hysteresis 10 → drop out below 20, resume only at/above 30.
         // alpha 100 so the EMA equals the raw sample and we test the latch alone.
-        let mut p = IdleCpuPolicy::new(&settings(true, 20, 10, 100));
+        let mut p = IdleCpuPolicy::new(&settings(20, 10, 100));
         assert_eq!(p.observe(50), 30, "participating: 50 - 20 reserve");
         assert_eq!(p.observe(15), 0, "below reserve → drops out");
         // 25 is above the reserve (20) but below resume (30): stays out (no flap).
         assert_eq!(p.observe(25), 0, "in the hysteresis band → stays out");
         assert_eq!(p.observe(30), 10, "at resume threshold → rejoins, 30 - 20");
+    }
+
+    #[test]
+    fn participation_floor_raises_the_offer_while_participating() {
+        // reserve 10, floor 30, alpha 100 (no smoothing). While participating, the
+        // offer is max(idle - reserve, floor): at 50% idle that is max(40,30)=40,
+        // but at 25% idle the floor lifts max(15,30) to 30.
+        let mut p = IdleCpuPolicy::new(&settings_with_floor(10, 0, 100, 30));
+        assert_eq!(p.observe(50), 40, "above the floor: idle - reserve wins");
+        assert_eq!(p.observe(25), 30, "below the floor: lifted to the floor");
+    }
+
+    #[test]
+    fn participation_floor_does_not_apply_once_latched_out() {
+        // reserve 20, floor 50, hysteresis 0, alpha 100. Dropping below the reserve
+        // latches the worker out, and a latched-out worker offers 0 regardless of
+        // the floor (the floor is a participating-only baseline, ADR 0012).
+        let mut p = IdleCpuPolicy::new(&settings_with_floor(20, 0, 100, 50));
+        assert_eq!(p.observe(60), 50, "participating: max(40, 50 floor) = 50");
+        assert_eq!(
+            p.observe(10),
+            0,
+            "below reserve → latched out → 0, floor ignored"
+        );
     }
 
     #[cfg(windows)]

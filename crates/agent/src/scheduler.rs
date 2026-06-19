@@ -194,23 +194,32 @@ impl Scheduler {
         w.caps.worker_version == AGENT_VERSION
     }
 
+    /// ADR 0012: the worker is not opted out of participation. An empty mode (a
+    /// pre-0012 worker) is treated as participating — the version gate already
+    /// excludes such an old binary.
+    fn mode_participating(w: &WorkerEntry) -> bool {
+        w.caps.participation_mode != "off"
+    }
+
     /// Static scheduling eligibility — independent of momentary CPU load. A worker
-    /// is admissible when its version matches (ADR 0011). ADR 0012 also requires
-    /// `participation_mode != "off"` here. `pick_and_reserve` further requires a
-    /// non-zero [`effective_capacity`] (the transient CPU gate, ADR 0010);
-    /// `cluster_capacity` counts admissible workers regardless of that transient.
+    /// is admissible when its version matches (ADR 0011) and it is not opted out
+    /// (ADR 0012). `pick_and_reserve` further requires a non-zero
+    /// [`effective_capacity`] (the transient CPU gate, ADR 0010); `cluster_capacity`
+    /// counts admissible workers regardless of that transient.
     fn admissible(w: &WorkerEntry) -> bool {
-        Self::version_matched(w)
+        Self::version_matched(w) && Self::mode_participating(w)
     }
 
     /// Why a worker is excluded from scheduling, or "" when eligible. Single source
     /// of truth for the dashboard (status.rs) and the admission filter, so the
-    /// reason shown can never drift from the reason enforced. Priority: a hard
-    /// static exclusion (version) outranks the transient CPU one (ADR 0011/0010;
-    /// ADR 0012 inserts "off" between them).
+    /// reason shown can never drift from the reason enforced. Priority: the hard
+    /// static exclusions (version, then opted-out) outrank the transient CPU one
+    /// (ADR 0011 / 0012 / 0010).
     pub(crate) fn exclusion_reason(w: &WorkerEntry) -> &'static str {
         if !Self::version_matched(w) {
             "version-mismatch"
+        } else if !Self::mode_participating(w) {
+            "off"
         } else if Self::effective_capacity(w) == 0 {
             "cpu-busy"
         } else {
@@ -1021,6 +1030,121 @@ mod tests {
             sched.cluster_capacity(),
             4,
             "only the version-matched worker contributes to the throttle"
+        );
+    }
+
+    // ---- ADR 0012: worker participation mode ----------------------------------
+
+    /// A version-matched, CPU-idle worker whose mode is "off" is excluded from
+    /// scheduling — the operator opted it out, so the build runs elsewhere / local.
+    #[test]
+    fn pick_excludes_worker_with_mode_off() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register(
+            "opted-out".into(),
+            "http://opted-out".into(),
+            Capabilities {
+                cpu_count: 8,
+                worker_version: AGENT_VERSION.to_string(),
+                participation_mode: "off".to_string(),
+                ..Default::default()
+            },
+        );
+        let sched = Scheduler::new(table);
+        let key = affinity_key(&["cc".into(), "x.cpp".into()]);
+        assert!(
+            sched.pick_and_reserve(key, &HashSet::new()).is_none(),
+            "a mode=off worker is never scheduled → dispatch falls back to local"
+        );
+    }
+
+    /// An "always" worker (no CPU signal) contributes its full static capacity and
+    /// is eligible regardless of host load — the inverse of "off".
+    #[test]
+    fn pick_includes_worker_with_mode_always() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register(
+            "always".into(),
+            "http://always".into(),
+            Capabilities {
+                cpu_count: 4,
+                worker_version: AGENT_VERSION.to_string(),
+                participation_mode: "always".to_string(),
+                ..Default::default()
+            },
+        );
+        let sched = Scheduler::new(table);
+        let key = affinity_key(&["cc".into(), "y.cpp".into()]);
+        let (w, _g) = sched
+            .pick_and_reserve(key, &HashSet::new())
+            .expect("an always-mode worker is eligible");
+        assert_eq!(w.worker_id, "always");
+    }
+
+    /// Unified eligibility (ADR 0011 ∧ 0012): admission requires BOTH a version
+    /// match AND a non-off mode. Failing either excludes the worker.
+    #[test]
+    fn unified_eligibility_requires_version_and_mode() {
+        // version-matched but opted out → not admissible.
+        let mut off = entry("off", "http://off", 4);
+        off.caps.participation_mode = "off".to_string();
+        assert!(!Scheduler::admissible(&off));
+        assert_eq!(Scheduler::exclusion_reason(&off), "off");
+
+        // participating but version-mismatched → not admissible (version wins).
+        let mut bad = entry("bad", "http://bad", 4);
+        bad.caps.worker_version = "9.9.9".to_string();
+        bad.caps.participation_mode = "adaptive".to_string();
+        assert!(!Scheduler::admissible(&bad));
+        assert_eq!(Scheduler::exclusion_reason(&bad), "version-mismatch");
+
+        // both off AND mismatched → version-mismatch outranks off in the reason.
+        let mut both = entry("both", "http://both", 4);
+        both.caps.worker_version = "9.9.9".to_string();
+        both.caps.participation_mode = "off".to_string();
+        assert_eq!(Scheduler::exclusion_reason(&both), "version-mismatch");
+
+        // matched AND adaptive AND idle → admissible, eligible.
+        let mut ok = entry("ok", "http://ok", 4);
+        ok.caps.participation_mode = "adaptive".to_string();
+        ok.idle_cpu_pct = Some(100);
+        assert!(Scheduler::admissible(&ok));
+        assert_eq!(Scheduler::exclusion_reason(&ok), "");
+    }
+
+    /// "off" outranks the transient cpu-busy reason: an opted-out worker reads as
+    /// "off" on the dashboard even when its host also happens to be busy.
+    #[test]
+    fn exclusion_reason_off_outranks_cpu_busy() {
+        let mut w = entry("w", "http://w", 4);
+        w.caps.participation_mode = "off".to_string();
+        w.idle_cpu_pct = Some(0); // also cpu-busy, but off wins
+        assert_eq!(Scheduler::exclusion_reason(&w), "off");
+    }
+
+    /// cluster_capacity excludes opted-out workers (same admission predicate as
+    /// pick), so the fan-out throttle reflects actually-schedulable capacity.
+    #[test]
+    fn cluster_capacity_excludes_mode_off_workers() {
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register("on".into(), "http://on".into(), caps(4));
+        table.upsert_register(
+            "off".into(),
+            "http://off".into(),
+            Capabilities {
+                cpu_count: 16,
+                worker_version: AGENT_VERSION.to_string(),
+                participation_mode: "off".to_string(),
+                ..Default::default()
+            },
+        );
+        let sched = Scheduler::new(table);
+        assert_eq!(
+            sched.cluster_capacity(),
+            4,
+            "an opted-out worker does not contribute to the throttle"
         );
     }
 }

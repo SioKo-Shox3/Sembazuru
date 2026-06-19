@@ -42,31 +42,77 @@ pub const DEFAULT_IDLE_CPU_RESERVE_PCT: u32 = 10;
 pub const DEFAULT_IDLE_CPU_HYSTERESIS_PCT: u32 = 10;
 /// Default EMA weight (percent) for the newest idle sample; ~3-4 sample memory.
 pub const DEFAULT_IDLE_CPU_EMA_ALPHA_PCT: u32 = 30;
+/// Default minimum schedulable idle the worker offers while participating (ADR
+/// 0012). 0 = pure good-neighbour (offer only what is idle above the reserve); an
+/// operator raises it to guarantee a baseline contribution even under some load.
+pub const DEFAULT_PARTICIPATION_FLOOR_PCT: u32 = 0;
 
-/// Resolved CPU-aware admission policy (ADR 0010): the optional [`WorkerConfig`]
-/// knobs with their defaults applied. `enabled` defaults to `true` (the good
-/// neighbour is on out of the box); the percentages are tuning constants.
+/// How a worker participates in the cluster (ADR 0012, generalizing the ADR 0010
+/// CPU-aware admission). The agent admits a worker to scheduling only when its mode
+/// is not [`Off`](ParticipationMode::Off) (and its version matches, ADR 0011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParticipationMode {
+    /// Always contribute up to the static admission capacity, regardless of host
+    /// load: the worker reports no CPU signal, so the agent uses its full capacity.
+    /// (This is the behaviour of the pre-0012 `idle_cpu_enabled = false`.)
+    Always,
+    /// Contribute dynamically, scaled by smoothed idle CPU — the "good neighbour"
+    /// default (ADR 0010): back off while the local user is busy, recover when idle.
+    #[default]
+    Adaptive,
+    /// Do not participate. The worker stays registered and heartbeating, but the
+    /// agent excludes it from scheduling entirely (shown as "off" on the dashboard).
+    Off,
+}
+
+impl ParticipationMode {
+    /// The wire string carried in `Capabilities.participation_mode` / shown on the
+    /// dashboard. Matches the serde `snake_case` rename so TOML, the wire, and the
+    /// agent's `!= "off"` check all agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParticipationMode::Always => "always",
+            ParticipationMode::Adaptive => "adaptive",
+            ParticipationMode::Off => "off",
+        }
+    }
+}
+
+/// Resolved participation policy (ADR 0012): the worker's [`ParticipationMode`] plus
+/// the idle-CPU tuning [`IdleCpuSettings`] used when the mode is `Adaptive`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParticipationSettings {
+    pub mode: ParticipationMode,
+    /// Adaptive-mode CPU thresholds; ignored when the mode is `Always`/`Off` (no
+    /// CPU sampling happens in those modes).
+    pub idle: IdleCpuSettings,
+}
+
+impl ParticipationSettings {
+    /// `Always` participation with default idle tuning: the worker contributes its
+    /// full static capacity regardless of host load (no CPU sampling). The
+    /// no-CPU-signal behaviour callers that opt out of the good neighbour want
+    /// (e.g. coordination tests). The idle tuning is unused in this mode.
+    pub fn always() -> Self {
+        Self {
+            mode: ParticipationMode::Always,
+            idle: WorkerConfig::default().idle_cpu(),
+        }
+    }
+}
+
+/// Idle-CPU tuning for `Adaptive` participation (ADR 0010): the optional
+/// [`WorkerConfig`] knobs with their defaults applied. The percentages are tuning
+/// constants; only consulted when [`ParticipationMode::Adaptive`] is in effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdleCpuSettings {
-    /// Whether the worker samples and reports idle CPU at all. When `false` the
-    /// worker sends no CPU signal and the agent schedules it exactly as pre-0010.
-    pub enabled: bool,
     pub reserve_pct: u32,
     pub hysteresis_pct: u32,
     pub ema_alpha_pct: u32,
-}
-
-impl IdleCpuSettings {
-    /// The policy with the feature off (no CPU signal). Used by callers that opt
-    /// out (e.g. coordination tests) so they keep the legacy slot-based behaviour.
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            reserve_pct: DEFAULT_IDLE_CPU_RESERVE_PCT,
-            hysteresis_pct: DEFAULT_IDLE_CPU_HYSTERESIS_PCT,
-            ema_alpha_pct: DEFAULT_IDLE_CPU_EMA_ALPHA_PCT,
-        }
-    }
+    /// Minimum schedulable idle offered while participating (ADR 0012). 0 = pure
+    /// good neighbour; a higher value guarantees a baseline contribution.
+    pub participation_floor_pct: u32,
 }
 
 /// The worker's persisted configuration. Field names are the TOML keys; every field
@@ -109,10 +155,11 @@ pub struct WorkerConfig {
     /// Worker-local content store, persisted across builds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cas_root: Option<String>,
-    /// CPU-aware admission (ADR 0010): sample idle CPU and scale participation.
-    /// `None` → enabled (good neighbour on by default).
+    /// How the worker participates (ADR 0012): `always` / `adaptive` / `off`.
+    /// `None` → `adaptive` (the good-neighbour default). Replaces the pre-0012
+    /// `idle_cpu_enabled` bool (`false` is now `always`; `true` is `adaptive`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub idle_cpu_enabled: Option<bool>,
+    pub participation_mode: Option<ParticipationMode>,
     /// Idle headroom kept for the local user, percent; `None` → the default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_cpu_reserve_pct: Option<u32>,
@@ -122,6 +169,10 @@ pub struct WorkerConfig {
     /// EMA smoothing weight for the newest idle sample, percent; `None` → default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_cpu_ema_alpha_pct: Option<u32>,
+    /// Minimum schedulable idle offered while participating, percent (ADR 0012);
+    /// `None` → the default (0 = pure good neighbour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_cpu_floor_pct: Option<u32>,
 }
 
 impl Default for WorkerConfig {
@@ -137,10 +188,11 @@ impl Default for WorkerConfig {
             dll: None,
             scratch_root: None,
             cas_root: None,
-            idle_cpu_enabled: None,
+            participation_mode: None,
             idle_cpu_reserve_pct: None,
             idle_cpu_hysteresis_pct: None,
             idle_cpu_ema_alpha_pct: None,
+            idle_cpu_floor_pct: None,
         }
     }
 }
@@ -156,13 +208,14 @@ fn empty_to_none(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
 }
 
-/// Parses a permissive boolean for `SEMBAZURU_IDLE_CPU_ENABLED`: `1/true/on/yes`
-/// (case-insensitive) → `true`, `0/false/off/no` → `false`, anything else → `None`
-/// (the caller then leaves the field unchanged rather than guessing).
-fn parse_bool(s: &str) -> Option<bool> {
+/// Parses `SEMBAZURU_PARTICIPATION_MODE` (case-insensitive): `always` / `adaptive` /
+/// `off`; anything else → `None` (the caller then leaves the field unchanged rather
+/// than guessing). Matches the serde `snake_case` spelling used in the TOML file.
+fn parse_participation_mode(s: &str) -> Option<ParticipationMode> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "on" | "yes" => Some(true),
-        "0" | "false" | "off" | "no" => Some(false),
+        "always" => Some(ParticipationMode::Always),
+        "adaptive" => Some(ParticipationMode::Adaptive),
+        "off" => Some(ParticipationMode::Off),
         _ => None,
     }
 }
@@ -245,13 +298,13 @@ impl WorkerConfig {
         if let Some(v) = std::env::var_os("SEMBAZURU_CAS_ROOT") {
             self.cas_root = empty_to_none(v.to_string_lossy().into_owned());
         }
-        // CPU-aware admission knobs (ADR 0010). A present-but-unparseable percent
-        // keeps the existing file/default for that knob (`.or` below) — unlike
-        // SEMBAZURU_CAPACITY which clears, because these are gentle tuning knobs
-        // where preserving an operator's file setting over a typo'd env is the
-        // safer default. A recognized SEMBAZURU_IDLE_CPU_ENABLED toggles explicitly.
-        if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_ENABLED") {
-            self.idle_cpu_enabled = parse_bool(&v).or(self.idle_cpu_enabled);
+        // Participation / CPU-aware admission knobs (ADR 0012 / 0010). A present-but-
+        // unparseable percent keeps the existing file/default for that knob (`.or`
+        // below) — unlike SEMBAZURU_CAPACITY which clears, because these are gentle
+        // tuning knobs where preserving an operator's file setting over a typo'd env
+        // is the safer default. A recognized SEMBAZURU_PARTICIPATION_MODE sets it.
+        if let Ok(v) = std::env::var("SEMBAZURU_PARTICIPATION_MODE") {
+            self.participation_mode = parse_participation_mode(&v).or(self.participation_mode);
         }
         if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_RESERVE_PCT") {
             self.idle_cpu_reserve_pct = v
@@ -277,6 +330,14 @@ impl WorkerConfig {
                 .map(|n| n.clamp(1, 100))
                 .or(self.idle_cpu_ema_alpha_pct);
         }
+        if let Ok(v) = std::env::var("SEMBAZURU_IDLE_CPU_FLOOR_PCT") {
+            self.idle_cpu_floor_pct = v
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .map(|n| n.min(100))
+                .or(self.idle_cpu_floor_pct);
+        }
     }
 
     /// Loads from `path` then applies the env overrides — the worker's effective
@@ -298,13 +359,11 @@ impl WorkerConfig {
         std::fs::write(path, s)
     }
 
-    /// The resolved CPU-aware admission policy (ADR 0010): the optional knobs with
-    /// their defaults applied. `enabled` defaults to `true` so the good-neighbour
-    /// behaviour is on out of the box; an operator opts out with
-    /// `idle_cpu_enabled = false` (or `SEMBAZURU_IDLE_CPU_ENABLED=0`).
+    /// The resolved idle-CPU tuning (ADR 0010): the optional knobs with their
+    /// defaults applied. Only consulted in `Adaptive` participation (see
+    /// [`participation`](Self::participation)).
     pub fn idle_cpu(&self) -> IdleCpuSettings {
         IdleCpuSettings {
-            enabled: self.idle_cpu_enabled.unwrap_or(true),
             reserve_pct: self
                 .idle_cpu_reserve_pct
                 .unwrap_or(DEFAULT_IDLE_CPU_RESERVE_PCT),
@@ -314,6 +373,20 @@ impl WorkerConfig {
             ema_alpha_pct: self
                 .idle_cpu_ema_alpha_pct
                 .unwrap_or(DEFAULT_IDLE_CPU_EMA_ALPHA_PCT),
+            participation_floor_pct: self
+                .idle_cpu_floor_pct
+                .unwrap_or(DEFAULT_PARTICIPATION_FLOOR_PCT),
+        }
+    }
+
+    /// The resolved participation policy (ADR 0012): the mode (defaulting to
+    /// `Adaptive`, the good neighbour) plus the idle-CPU tuning used in that mode.
+    /// This is what the worker hands to coordination to decide how it reports
+    /// capacity and whether it samples CPU at all.
+    pub fn participation(&self) -> ParticipationSettings {
+        ParticipationSettings {
+            mode: self.participation_mode.unwrap_or_default(),
+            idle: self.idle_cpu(),
         }
     }
 
@@ -411,10 +484,11 @@ mod tests {
             dll: Some("C:\\sbz\\sbz_interceptor64.dll".into()),
             scratch_root: Some("C:\\sbz\\scratch".into()),
             cas_root: Some("C:\\sbz\\cas".into()),
-            idle_cpu_enabled: Some(false),
+            participation_mode: Some(ParticipationMode::Always),
             idle_cpu_reserve_pct: Some(15),
             idle_cpu_hysteresis_pct: Some(5),
             idle_cpu_ema_alpha_pct: Some(40),
+            idle_cpu_floor_pct: Some(20),
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(WorkerConfig::load_from(&path), cfg);
@@ -547,46 +621,72 @@ mod tests {
     }
 
     #[test]
-    fn idle_cpu_defaults_to_enabled_with_gentle_constants() {
-        // An absent file / no knobs → the good neighbour is on with the defaults.
-        let s = WorkerConfig::default().idle_cpu();
-        assert!(s.enabled, "CPU-aware admission is on by default");
-        assert_eq!(s.reserve_pct, DEFAULT_IDLE_CPU_RESERVE_PCT);
-        assert_eq!(s.hysteresis_pct, DEFAULT_IDLE_CPU_HYSTERESIS_PCT);
-        assert_eq!(s.ema_alpha_pct, DEFAULT_IDLE_CPU_EMA_ALPHA_PCT);
+    fn participation_defaults_to_adaptive_with_gentle_constants() {
+        // An absent file / no knobs → adaptive (good neighbour) with the defaults.
+        let p = WorkerConfig::default().participation();
+        assert_eq!(
+            p.mode,
+            ParticipationMode::Adaptive,
+            "participation defaults to adaptive (good neighbour)"
+        );
+        assert_eq!(p.idle.reserve_pct, DEFAULT_IDLE_CPU_RESERVE_PCT);
+        assert_eq!(p.idle.hysteresis_pct, DEFAULT_IDLE_CPU_HYSTERESIS_PCT);
+        assert_eq!(p.idle.ema_alpha_pct, DEFAULT_IDLE_CPU_EMA_ALPHA_PCT);
+        assert_eq!(
+            p.idle.participation_floor_pct,
+            DEFAULT_PARTICIPATION_FLOOR_PCT
+        );
         // Explicit knobs are passed through.
         let cfg = WorkerConfig {
-            idle_cpu_enabled: Some(false),
+            participation_mode: Some(ParticipationMode::Off),
             idle_cpu_reserve_pct: Some(25),
+            idle_cpu_floor_pct: Some(30),
             ..WorkerConfig::default()
         };
-        let s = cfg.idle_cpu();
-        assert!(!s.enabled);
-        assert_eq!(s.reserve_pct, 25);
+        let p = cfg.participation();
+        assert_eq!(p.mode, ParticipationMode::Off);
+        assert_eq!(p.idle.reserve_pct, 25);
+        assert_eq!(p.idle.participation_floor_pct, 30);
     }
 
     #[test]
-    fn idle_cpu_env_overrides_win() {
+    fn participation_mode_round_trips_through_toml() {
+        // The serde snake_case spelling matches ParticipationMode::as_str / the
+        // agent's "off" check, so the TOML, the wire, and the gate all agree.
+        let path = tmp_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "participation_mode = \"off\"\n").unwrap();
+        let cfg = WorkerConfig::load_from(&path);
+        assert_eq!(cfg.participation_mode, Some(ParticipationMode::Off));
+        assert_eq!(cfg.participation().mode.as_str(), "off");
+    }
+
+    #[test]
+    fn participation_and_idle_env_overrides_win() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let absent = tmp_file(); // no file → values come purely from env
         // SAFETY: serialized by ENV_LOCK; set, load, clear.
         unsafe {
-            std::env::set_var("SEMBAZURU_IDLE_CPU_ENABLED", "off");
+            std::env::set_var("SEMBAZURU_PARTICIPATION_MODE", "always");
             std::env::set_var("SEMBAZURU_IDLE_CPU_RESERVE_PCT", "20");
             std::env::set_var("SEMBAZURU_IDLE_CPU_EMA_ALPHA_PCT", "50");
+            std::env::set_var("SEMBAZURU_IDLE_CPU_FLOOR_PCT", "35");
         }
-        let s = WorkerConfig::load_effective(&absent).idle_cpu();
+        let p = WorkerConfig::load_effective(&absent).participation();
         unsafe {
-            std::env::remove_var("SEMBAZURU_IDLE_CPU_ENABLED");
+            std::env::remove_var("SEMBAZURU_PARTICIPATION_MODE");
             std::env::remove_var("SEMBAZURU_IDLE_CPU_RESERVE_PCT");
             std::env::remove_var("SEMBAZURU_IDLE_CPU_EMA_ALPHA_PCT");
+            std::env::remove_var("SEMBAZURU_IDLE_CPU_FLOOR_PCT");
         }
-        assert!(
-            !s.enabled,
-            "SEMBAZURU_IDLE_CPU_ENABLED=off disables the feature"
+        assert_eq!(
+            p.mode,
+            ParticipationMode::Always,
+            "SEMBAZURU_PARTICIPATION_MODE=always wins"
         );
-        assert_eq!(s.reserve_pct, 20, "env reserve wins");
-        assert_eq!(s.ema_alpha_pct, 50, "env alpha wins");
+        assert_eq!(p.idle.reserve_pct, 20, "env reserve wins");
+        assert_eq!(p.idle.ema_alpha_pct, 50, "env alpha wins");
+        assert_eq!(p.idle.participation_floor_pct, 35, "env floor wins");
     }
 
     #[test]
@@ -610,6 +710,31 @@ mod tests {
         assert_eq!(
             s.reserve_pct, 33,
             "an unparseable env percent keeps the file value (documented contract)"
+        );
+    }
+
+    #[test]
+    fn unparseable_participation_mode_env_keeps_the_file_value() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = tmp_file();
+        WorkerConfig {
+            participation_mode: Some(ParticipationMode::Off),
+            ..WorkerConfig::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        // SAFETY: serialized by ENV_LOCK; set, load, clear.
+        unsafe {
+            std::env::set_var("SEMBAZURU_PARTICIPATION_MODE", "bogus");
+        }
+        let cfg = WorkerConfig::load_effective(&path);
+        unsafe {
+            std::env::remove_var("SEMBAZURU_PARTICIPATION_MODE");
+        }
+        assert_eq!(
+            cfg.participation_mode,
+            Some(ParticipationMode::Off),
+            "an unrecognized SEMBAZURU_PARTICIPATION_MODE keeps the file value (no guessing, no panic)"
         );
     }
 

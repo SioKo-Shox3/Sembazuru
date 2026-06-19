@@ -54,6 +54,13 @@ message Capabilities {
   // separate admission/scheduling layer that protects build-output determinism,
   // not protocol compatibility (ADR 0011 §5).
   string worker_version = 8;
+  // How the worker participates (ADR 0012): "always" | "adaptive" | "off". The
+  // agent excludes a worker whose mode is "off" from scheduling (it stays
+  // registered and visible). "always" reports no idle_cpu_pct (full static
+  // capacity); "adaptive" rides idle CPU (ADR 0010). Empty (a pre-0012 worker) is
+  // treated as participating (not "off"); the version gate (worker_version) already
+  // excludes such an old worker. Generalizes ADR 0010's idle-cpu on/off toggle.
+  string participation_mode = 9;
 }
 
 message RegisterRequest {
@@ -399,6 +406,10 @@ message WorkerStatus {
   // 0011), "off" (ADR 0012 participation mode), or "cpu-busy" (ADR 0010 effective
   // capacity 0). Single source of truth: scheduler::exclusion_reason.
   string exclusion_reason = 12;
+  // The worker's participation mode (ADR 0012), mirrored from
+  // Capabilities.participation_mode for the dashboard: "always" | "adaptive" |
+  // "off" (empty for a pre-0012 worker).
+  string participation_mode = 13;
 }
 
 // Action-cache state. hits/misses are counted since this daemon started; the GUI
