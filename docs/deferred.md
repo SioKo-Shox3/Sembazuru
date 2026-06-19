@@ -495,6 +495,41 @@ M8 の汎化作業（単機+RTT で実証）から分離。承認後に着手:
 - **WriteBack の declared-output スコープ**（M7.1 繰越）。**authoritative root binding**（M7.1 HIGH-2）。
 - 環境準備（実 2 台）と決定者承認が前提（M3 以来の方針踏襲）。出所: ADR 0007、AskUser(2026-06-14)。
 
+## M9（配布物と常駐 UX）— ADR 0008 / 0009 / 0010
+
+### M9.6 自己更新（ADR 0009）実装後の繰延（2026-06-19）
+- **実 OV 証明書 subject による publisher pin の差し替え（リリースゲート）。** `crates/gui/src/verify/mod.rs`
+  の `EXPECTED_PUBLISHER` は placeholder。実 OV cert 確定まで自己更新は機能しない（実署名版も弾く fail-closed＝
+  安全側）。実 cert 取得は M7/リリース所有・決定者（ADR 0006）。出所: ADR 0009 §繰延、security-reviewer/verifier(M9.6)。
+- **GitHub API レート制限（未認証 60/h）への対応は据え置き。** on-demand 主体（起動時 1 回＋手動）なら十分。
+  必要になれば `ETag`/`If-None-Match` を足す。出所: ADR 0009 §繰延。
+- **winget manifest の作成・winget-pkgs 提出は据え置き。** MSI が配布物の本体、winget はその配布チャネル
+  （ADR 0008）。実 OV 署名後のリリース作業。出所: ADR 0008 §(1)、ADR 0009。
+- **自動ロールバック・デルタ更新は持たない（設計判断）。** `MajorUpgrade`＋旧リリース再導入で代替、フル MSI のみ。
+  出所: ADR 0009 §繰延。
+- **更新適用の実機一周は未消化（実機ゲート）。** 検知 → DL → 署名検証 → UAC `msiexec` 適用 → 再起動は
+  管理者実機でしか通せない（cargo test 不能）。実 OV 署名済み MSI を Release に置いてリードが一周する。
+  出所: verifier(M9.6 missed item)、lead-actions §1 と同根。
+
+### M9.6 CPU 連動 admission（ADR 0010）実装後の繰延（2026-06-19）
+- **`f()` の関数形・EMA 窓・ヒステリシス帯・reserve 既定値の実 LAN チューニングは M10 送り。** 機構は M9.6 で
+  完成、定数は控えめな既定値（reserve 10%／hysteresis 10%／alpha 30%）で動作。実測チューニングは M10 実 LAN。
+  worker config（`idle_cpu_*`）／`SEMBAZURU_IDLE_CPU_*` で調整可。出所: ADR 0010 §繰延。
+- **メモリ/IO 圧の admission 組み込みは据え置き。** `Capabilities.memory_bytes` は現状 0/未使用
+  （`crates/worker/src/coordination.rs`）。需要が出たら CPU と同様に信号化。出所: ADR 0010 §繰延。
+- **per-worker しきい値を GUI から編集する UI は据え置き（まずは表示のみ）。** M9.6 で idle CPU／実効容量の
+  ダッシュボード表示は実装済み。編集 UI は需要次第。出所: ADR 0010 §繰延。
+- **「一時停止/再開」モード（しきい値で完全停止）は当面不要。** 動的 capacity の縮退形として後付け可能。
+  出所: ADR 0010 §繰延。
+
+### M9 完了の前提（リード実機ゲート・出荷ゲート）
+- **実機 SCM 一周（daemon/worker：install→AutoStart→start→stop→uninstall・残骸ゼロ）、MSI の ACL/FW/PATH/
+  初期設定の実機反映確認、アンインストール総合残骸ゼロ。** 実装は MSI（`installer/sembazuru.wxs` の
+  `util:PermissionEx`／`FirewallException`／`Environment PATH`／seed-config）に済み＝残るは実機確認。
+  出所: docs/handoff/lead-actions.md §1/§2、verifier(M9 audit 2026-06-19)。
+- **実 OV cert（HSM）取得・実 Authenticode 署名・EDR 許可リスト提出。** DESIGN §7 M9 Done-when「署名済み
+  インストーラ」の最終充足ゲート。CI は placeholder cert で署名「機構」のみ検証。出所: ADR 0006/0008、lead-actions。
+
 ## 横断・既知の制約
 
 - **MSVC ネイティブのバイト一致はベストエフォート（M4.5 で S_OBJNAME のみ正規化）。**
