@@ -17,6 +17,8 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
 pub enum TrayMessage {
     /// Restore and focus the window.
     Show,
+    /// Check GitHub for a newer release (ADR 0009), user-initiated.
+    CheckForUpdates,
     /// Quit the application for real (not minimize-to-tray).
     Quit,
 }
@@ -34,10 +36,13 @@ impl Tray {
     pub fn new(ctx: &egui::Context) -> Option<Self> {
         let menu = Menu::new();
         let show = MenuItem::new("Show Sembazuru", true, None);
+        let updates = MenuItem::new("Check for updates…", true, None);
         let quit = MenuItem::new("Quit", true, None);
         menu.append(&show).ok()?;
+        menu.append(&updates).ok()?;
         menu.append(&quit).ok()?;
         let show_id = show.id().clone();
+        let updates_id = updates.id().clone();
         let quit_id = quit.id().clone();
 
         let icon = TrayIconBuilder::new()
@@ -54,6 +59,8 @@ impl Tray {
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let message = if event.id == show_id {
                 Some(TrayMessage::Show)
+            } else if event.id == updates_id {
+                Some(TrayMessage::CheckForUpdates)
             } else if event.id == quit_id {
                 Some(TrayMessage::Quit)
             } else {
