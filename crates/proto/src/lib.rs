@@ -34,11 +34,18 @@ pub mod auth {
     /// The configured cluster token, or `None` when unset/empty (auth disabled).
     /// Both the agent (to know what to require) and the worker (to know what to
     /// present) read it through this one function so they cannot disagree.
+    ///
+    /// Read with `var_os` (not `var`) and lossy-convert, EXACTLY as the agent and
+    /// worker config readers do (`agent::config` / `worker::config`, which use
+    /// `var_os` + `to_string_lossy`). `std::env::var` would return `Err` on a
+    /// non-UTF-8 value — yielding `None` (auth silently OFF) here while the config
+    /// readers keep a (lossy) token, so the two sides would disagree on whether
+    /// auth is on, a fail-open split (the M9.3a class of bug). Going through the
+    /// same `var_os` + lossy path keeps all three readers identical. Empty == unset.
     pub fn cluster_token_from_env() -> Option<String> {
-        match std::env::var(CLUSTER_TOKEN_ENV) {
-            Ok(v) if !v.is_empty() => Some(v),
-            _ => None,
-        }
+        std::env::var_os(CLUSTER_TOKEN_ENV)
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|v| !v.is_empty())
     }
 
     /// Constant-time byte comparison of two tokens. Avoids a timing oracle that
@@ -96,6 +103,37 @@ pub mod auth {
             assert!(token_eq("abc", "abc"));
             assert!(!token_eq("abc", "abd"));
             assert!(!token_eq("abc", "ab"));
+        }
+
+        // A non-UTF-8 cluster token must still be read (via var_os + lossy), not
+        // dropped to None — otherwise the proto reader would silently disable auth
+        // while the agent/worker config readers (which already use var_os + lossy)
+        // keep a token, a fail-open split (task_eba5301f). Windows-only: this is a
+        // Windows project, and constructing a non-UTF-8 env value needs OsString
+        // from a lone UTF-16 surrogate. No other test in this crate touches
+        // CLUSTER_TOKEN_ENV, so the env mutation cannot race intra-crate.
+        #[cfg(windows)]
+        #[test]
+        fn token_from_env_reads_non_utf8_via_var_os() {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            // "s3" + lone high surrogate U+D800 + "t": valid UTF-16 env storage,
+            // INVALID UTF-8 — std::env::var would Err on it.
+            let bad = OsString::from_wide(&[0x73, 0x33, 0xD800, 0x74]);
+            // SAFETY: serialized in practice (sole reader/writer of this var here);
+            // set, read, then immediately remove.
+            unsafe {
+                std::env::set_var(CLUSTER_TOKEN_ENV, &bad);
+            }
+            let got = cluster_token_from_env();
+            unsafe {
+                std::env::remove_var(CLUSTER_TOKEN_ENV);
+            }
+            assert_eq!(
+                got,
+                Some(bad.to_string_lossy().into_owned()),
+                "a non-UTF-8 token must be read via var_os + lossy (not dropped to None)"
+            );
         }
     }
 }
