@@ -127,6 +127,24 @@ fn sanitize_msi_name(name: &str) -> String {
     }
 }
 
+/// Strict "is `latest` a newer *stable* release than `current`?" by semver
+/// precedence. Two deliberate rules (each guards a real false-positive):
+///   * a prerelease tag (rc/beta) is **never** offered as an update — we ship only
+///     stable MSIs, and GitHub's `releases/latest` should already exclude these;
+///   * build metadata is **not** a version difference (semver §10), so `0.0.1+ci.5`
+///     is the same version as `0.0.1` — compare with build cleared so an identical
+///     build re-tagged with metadata is not mistaken for an update.
+fn is_newer_stable(latest: &Version, current: &Version) -> bool {
+    if !latest.pre.is_empty() {
+        return false;
+    }
+    let strip_build = |v: &Version| Version {
+        build: semver::BuildMetadata::EMPTY,
+        ..v.clone()
+    };
+    strip_build(latest) > strip_build(current)
+}
+
 /// Decides the check outcome from a parsed release and the running version. Pure
 /// (no I/O), so the version comparison and asset selection are unit-tested without
 /// the network. A newer release with no `.msi` asset is an error, not "up to date":
@@ -135,7 +153,7 @@ fn evaluate(rel: GhRelease, current: &Version) -> Result<UpdateCheck, UpdateErro
     let latest = parse_tag(&rel.tag_name).ok_or_else(|| {
         UpdateError::Parse(format!("release tag {:?} is not semver", rel.tag_name))
     })?;
-    if latest <= *current {
+    if !is_newer_stable(&latest, current) {
         return Ok(UpdateCheck::UpToDate {
             current: current.clone(),
         });
@@ -278,6 +296,28 @@ mod tests {
         // Newer, but only a zip asset — must not be reported as "up to date".
         let err = evaluate(rel("v0.0.2", &["sembazuru-0.0.2.zip"]), &current).unwrap_err();
         assert!(matches!(err, UpdateError::NoMsiAsset), "got {err:?}");
+    }
+
+    #[test]
+    fn a_prerelease_latest_is_not_offered_as_a_stable_update() {
+        // 0.0.2-rc.1 is numerically newer than 0.0.1, but a prerelease must not be
+        // pushed as a stable update.
+        let current = Version::new(0, 0, 1);
+        assert_eq!(
+            evaluate(rel("v0.0.2-rc.1", &["x.msi"]), &current).unwrap(),
+            UpdateCheck::UpToDate { current }
+        );
+    }
+
+    #[test]
+    fn build_metadata_on_the_same_version_is_not_an_update() {
+        // Build metadata is not a version difference (semver §10): a re-tagged
+        // identical version must read as up to date, not an update.
+        let current = Version::new(0, 0, 1);
+        assert_eq!(
+            evaluate(rel("v0.0.1+ci.5", &["x.msi"]), &current).unwrap(),
+            UpdateCheck::UpToDate { current }
+        );
     }
 
     #[test]
