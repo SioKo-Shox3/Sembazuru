@@ -116,7 +116,7 @@ fn render_workers(ui: &mut egui::Ui, dash: &DashboardModel) {
     }
     egui::Grid::new("workers")
         .striped(true)
-        .num_columns(8)
+        .num_columns(10)
         .show(ui, |ui| {
             for h in [
                 "",
@@ -126,6 +126,8 @@ fn render_workers(ui: &mut egui::Ui, dash: &DashboardModel) {
                 "Running",
                 "Idle",
                 "Idle CPU",
+                "Version",
+                "Status",
                 "Last ping",
             ] {
                 ui.label(RichText::new(h).strong());
@@ -154,6 +156,36 @@ fn render_workers(ui: &mut egui::Ui, dash: &DashboardModel) {
                     None => {
                         ui.colored_label(MUTED, "—")
                             .on_hover_text("worker reports no CPU signal");
+                    }
+                }
+                // Reported build version (ADR 0011). "—" when a (pre-0011) worker
+                // reports none.
+                if w.worker_version.is_empty() {
+                    ui.colored_label(MUTED, "—")
+                        .on_hover_text("worker reports no version");
+                } else {
+                    ui.label(&w.worker_version);
+                }
+                // Admission status (ADR 0011/0012/0010): "" = schedulable; otherwise
+                // the reason the agent excludes it from builds.
+                match w.exclusion_reason.as_str() {
+                    "" => {
+                        ui.colored_label(HEALTHY, "eligible");
+                    }
+                    "version-mismatch" => {
+                        ui.colored_label(UNHEALTHY, "version-mismatch")
+                            .on_hover_text("excluded: worker version does not match the agent");
+                    }
+                    "off" => {
+                        ui.colored_label(MUTED, "off")
+                            .on_hover_text("excluded: participation mode is off");
+                    }
+                    "cpu-busy" => {
+                        ui.colored_label(MUTED, "cpu-busy")
+                            .on_hover_text("excluded: host CPU too busy right now");
+                    }
+                    other => {
+                        ui.colored_label(MUTED, other);
                     }
                 }
                 ui.label(&w.last_ping);

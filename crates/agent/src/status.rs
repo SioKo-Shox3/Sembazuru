@@ -155,6 +155,12 @@ impl StatusState {
                 idle_slots: w.idle_slots,
                 last_ping_age_ms: w.last_ping_age().as_millis() as u64,
                 healthy: true, // live_snapshot returns only currently-live workers
+                // Why this live worker is (or is not) schedulable, for the
+                // dashboard. Same source of truth the scheduler enforces, so the
+                // displayed reason can never drift from the admission decision
+                // (ADR 0011 version-mismatch / ADR 0010 cpu-busy).
+                exclusion_reason: crate::scheduler::Scheduler::exclusion_reason(&w).to_string(),
+                worker_version: w.caps.worker_version.clone(),
                 worker_id: w.worker_id,
                 execution_endpoint: w.execution_endpoint,
                 idle_cpu_pct: w.idle_cpu_pct, // ADR 0010: None when the worker reports no CPU signal

@@ -44,6 +44,16 @@ message Capabilities {
   // worker that does not advertise this; an agent without a token ignores it.
   // Gating is by capability flag, not version sniffing (§6).
   bool supports_auth = 7;
+  // Build version of this worker = its CARGO_PKG_VERSION (the workspace version),
+  // for version-gated admission (ADR 0011). The agent admits a worker to
+  // scheduling only when this EXACTLY matches the agent's own version, so a
+  // mixed-version cluster cannot poison build determinism / the action cache. An
+  // empty string (a pre-0011 worker) never matches and is excluded — intended.
+  // NOTE: this is NOT the §6 "no version sniffing" wire-compat rule. That rule is
+  // about protocol back-compat (gate features by capability flag). This is a
+  // separate admission/scheduling layer that protects build-output determinism,
+  // not protocol compatibility (ADR 0011 §5).
+  string worker_version = 8;
 }
 
 message RegisterRequest {
@@ -381,6 +391,14 @@ message WorkerStatus {
   // (ADR 0010). Absent when the worker reports no CPU signal; same presence
   // semantics as HeartbeatPing.idle_cpu_pct.
   optional uint32 idle_cpu_pct = 10;
+  // The worker's reported build version, mirrored from Capabilities.worker_version
+  // for the dashboard (ADR 0011). Empty for a pre-0011 worker.
+  string worker_version = 11;
+  // Why this worker is excluded from scheduling, or "" when it is eligible. The
+  // agent-computed admission reason for the dashboard: "version-mismatch" (ADR
+  // 0011), "off" (ADR 0012 participation mode), or "cpu-busy" (ADR 0010 effective
+  // capacity 0). Single source of truth: scheduler::exclusion_reason.
+  string exclusion_reason = 12;
 }
 
 // Action-cache state. hits/misses are counted since this daemon started; the GUI
