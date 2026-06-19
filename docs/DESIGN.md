@@ -242,7 +242,12 @@ Incredibuild の本当の堀である「プロセス仮想化」を OSS で再�
 - **Windows インストールウィザード** — 署名済み MSI／winget。バイナリ群（`sembazuru-daemon`／`sembazuru-worker`／`sembazuru`(launcher)／`launcher.exe`＋`sbz_interceptor{64,32}.dll`／`Directory.Build.targets`）の配置・PATH 登録・**daemon の Windows サービス登録（常駐化）**・ファイアウォール規則（Coordination/fileserver/worker ポート）・`SEMBAZURU_AGENT`／`SEMBAZURU_CLUSTER_TOKEN` 等の初期設定・アンインストールまで。**M7.2 の Authenticode 署名パイプライン**と EDR 許可リスト申請（`docs/security/edr-allowlist.md`）に必ず接続する（フック DLL 注入は EDR 誤検知の的＝署名・申請なしでは採用が止まる）。
 - **常駐 GUI アプリ** — daemon をトレイ常駐／サービスとして動かし、接続 worker 一覧と health・キャッシュヒット率・in-flight アクション・remote/local/fallback の内訳を可視化。daemon/worker の start/stop と `SEMBAZURU_*`（agent アドレス・cache root・cluster token 等）の設定を GUI に隠蔽する。実装は Rust GUI（Tauri／egui／windows-rs トレイ）で既存 gRPC Coordination を叩く＝スタックと整合。
 - **長寿命 daemon の disk eviction**（deferred #8：per-action scratch/trace・agent セッション CAS の累積）を併せて対応。常駐サービス化で必ず顕在化するため M9 で同時に片付ける。
-- **導入後の運用導線（M9.6）** — 配布物が整った後の二つの運用 UX。**GUI 自己更新**（ADR `0009-app-self-update-github-releases.md`：GitHub Releases 検知 → DL → Authenticode＋publisher 検証 → ユーザー承認 → UAC `msiexec` 適用。**サイレント更新・定期ポーリングは作らない**、外向き通信は GUI・ユーザー起点のみ、持続化を増やさない）。**CPU 連動 worker admission**（ADR `0010-cpu-aware-worker-admission.md`：worker が自機の idle CPU を測り、スケジューラが実効容量を動的に絞る「良き隣人」制御。全 worker 飽和でもローカルフォールバックで完走＝**成果物バイト一致は不変**）。
+- **導入後の運用導線（M9.6）= 統一 worker admission（ADR 0010 + 0011 + 0012）。** 配布物が整った後、クラスタへの worker 参加を 1 つの eligibility（**版一致 ∧ 参加モード≠off ∧ 実効容量>0**）に集約する。
+  - **CPU 連動 admission**（ADR `0010-cpu-aware-worker-admission.md`）：worker が自機の idle CPU を測り、スケジューラが実効容量を動的に絞る「良き隣人」制御。
+  - **版ゲート admission**（ADR `0011-version-gated-admission.md`）：サーバー役（agent/daemon）の版を基準に、版が完全一致しない worker をスケジューリングから除外（登録維持・ダッシュボード可視化）。クラスタを 1 版に揃え、version skew による決定性/キャッシュ整合の崩壊を防ぐ。
+  - **worker 参加モード**（ADR `0012-worker-participation-modes.md`）：ADR 0010 を `always`／`adaptive`(既定)／`off` の 3 モードに一般化。
+  - いずれも **admission/scheduling のみの変更＝成果物バイト一致は不変**（determinism harness で担保）。全 worker が除外されてもローカルフォールバックで完走。
+  - **更新は手動**：GUI 自己更新（旧 ADR `0009-app-self-update-github-releases.md`）は **撤回（SUPERSEDED）**。更新は GitHub Releases の MSI を手動 DL して入れ直す（分散ビルドでは各ノードの勝手な版上げが version skew を招くため。版整合は上記 ADR 0011 で担保）。署名/実 OV cert は任意降格・release pipeline は手動配布用に保持。GUI は loopback-only・外向き通信ゼロ。
 - **Done when:** 非開発者が署名済みインストーラから導入し、GUI から daemon／worker を起動して既存プロジェクトを分散ビルドでき、クラスタ／キャッシュの状態を目視確認できる。**2 台目の PC も同じインストーラ＋設定だけで worker として参加できる**（M10 実測の前提が整う）。
 
 ### M10 — 実 2 台 LAN（cross-machine の本番化・実測）
