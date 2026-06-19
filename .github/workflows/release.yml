@@ -1,0 +1,157 @@
+# Release pipeline (M9.6, ADR 0008 / 0009).
+#
+# Push a tag `vX.Y.Z` to cut a release: this builds the shipped binaries + C++ hooks,
+# packages the versioned MSI, signs everything with the real release certificate (if
+# one is configured), and publishes a GitHub Release with the MSI attached — the same
+# `releases/latest` asset the GUI self-update (ADR 0009) detects, downloads, verifies,
+# and applies.
+#
+# Signing is conditional. When the signing secrets are set, the MSI is signed and the
+# release is published normally (so self-update can consume it). When they are NOT set
+# (the default until the OV certificate is provisioned, ADR 0006), signing is skipped
+# and the release is published as a DRAFT — so an UNSIGNED MSI never becomes the
+# "latest" release that self-update would try to apply (and reject). Configure these
+# repository secrets to enable signing:
+#   SBZ_SIGNING_PFX_BASE64  — base64 of the release code-signing PFX
+#   SBZ_SIGNING_PASSWORD    — the PFX password
+#   SBZ_TIMESTAMP_URL       — RFC3161 TSA, e.g. http://timestamp.digicert.com
+# (A hardware-token / cloud-HSM OV cert cannot be a PFX; for that, swap the two
+#  "Sign …" steps for the provider's signer — see installer/sign_release.ps1.)
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual dry run: builds + signs (if configured) and uploads the MSI as an
+  # artifact, but does NOT create a release (there is no tag to release).
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release
+
+jobs:
+  release:
+    name: Build, sign, and publish the MSI
+    runs-on: windows-latest
+    env:
+      # 'true' only when a signing PFX secret is configured. Drives the conditional
+      # signing steps and the draft-vs-published decision below.
+      HAS_SIGNING_CERT: ${{ secrets.SBZ_SIGNING_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Enable long paths
+        run: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
+
+      # Safety net: never package a release from broken code, even if a tag is cut
+      # from an un-vetted commit. The full compile/determinism gates live in CI; this
+      # is the cheap workspace test gate (correctness > speed, a project non-negotiable).
+      - name: Test gate (cargo test --workspace)
+        run: cargo test --workspace
+
+      # Resolve the release version: from the tag (strip leading 'v') on a tag push,
+      # else the workspace Cargo version (manual dry run).
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          $ver = $ref -replace '^v', ''
+          if ($ver -notmatch '^\d+\.\d+\.\d+') {
+            $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          }
+          "version=$ver"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$ref"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Release version: $ver (ref $ref)"
+
+      # Version integrity (ADR 0009): the Cargo version, the WiX default ProductVersion,
+      # and (on a tag) the tag must all agree — self-update compares the tag against
+      # CARGO_PKG_VERSION while Windows Installer keys MajorUpgrade off ProductVersion.
+      - name: Version sync (Cargo == WiX ProductVersion)
+        run: pwsh -NoProfile -File installer/check_version_sync.ps1
+      - name: Tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ("${{ steps.ver.outputs.version }}" -ne $cargo) {
+            throw "tag version '${{ steps.ver.outputs.version }}' != Cargo version '$cargo' — the release tag must match the crate version"
+          }
+
+      # The four shipped Rust binaries (release): sembazuru-agent yields
+      # sembazuru-daemon + sembazuru(launcher), plus worker and gui.
+      - run: cargo build --release -p sembazuru-agent -p sembazuru-worker -p sembazuru-gui
+      # The C++ hooks, both bitnesses, staged together (mirrors the CI installer job).
+      - run: cmake -S hooks -B hooks/build -A x64
+      - run: cmake --build hooks/build --config Release
+      - run: cmake -S hooks -B hooks/build32 -A Win32
+      - run: cmake --build hooks/build32 --config Release
+      - name: Stage 32-bit interceptor next to the 64-bit one
+        run: Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
+
+      # Sign the shipped PE binaries BEFORE packaging, so the installed files carry a
+      # trusted signature (SmartScreen / EDR). Skipped when no signing cert is set.
+      - name: Sign shipped binaries (real cert)
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: pwsh
+        env:
+          PFX: ${{ secrets.SBZ_SIGNING_PFX_BASE64 }}
+          PFX_PW: ${{ secrets.SBZ_SIGNING_PASSWORD }}
+          TSA: ${{ secrets.SBZ_TIMESTAMP_URL }}
+        run: |
+          $files = @(
+            'target/release/sembazuru-daemon.exe',
+            'target/release/sembazuru-worker.exe',
+            'target/release/sembazuru.exe',
+            'target/release/sembazuru-gui.exe',
+            'hooks/build/Release/launcher.exe',
+            'hooks/build/Release/sbz_interceptor64.dll',
+            'hooks/build/Release/sbz_interceptor32.dll'
+          )
+          ./installer/sign_release.ps1 -Files $files -PfxBase64 $env:PFX -Password $env:PFX_PW -TimestampServer $env:TSA
+
+      # Build the versioned MSI from the (now-signed, if a cert was set) binaries.
+      - name: Build MSI
+        run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64 -p:SbzVersion=${{ steps.ver.outputs.version }}
+
+      # Sign the MSI itself — this is the signature the self-update verifier checks.
+      - name: Sign the MSI (real cert)
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: pwsh
+        env:
+          PFX: ${{ secrets.SBZ_SIGNING_PFX_BASE64 }}
+          PFX_PW: ${{ secrets.SBZ_SIGNING_PASSWORD }}
+          TSA: ${{ secrets.SBZ_TIMESTAMP_URL }}
+        run: ./installer/sign_release.ps1 -Files 'installer/bin/x64/Release/Sembazuru.msi' -PfxBase64 $env:PFX -Password $env:PFX_PW -TimestampServer $env:TSA
+
+      # Name the asset with the version (self-update accepts any *.msi asset name).
+      - name: Name the MSI asset
+        shell: pwsh
+        run: Copy-Item installer/bin/x64/Release/Sembazuru.msi "Sembazuru-${{ steps.ver.outputs.version }}-x64.msi" -Force
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sembazuru-${{ steps.ver.outputs.version }}-msi
+          path: Sembazuru-${{ steps.ver.outputs.version }}-x64.msi
+
+      # Publish the GitHub Release with the MSI attached (tag pushes only). Unsigned
+      # builds are published as a DRAFT so self-update never treats them as "latest".
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $signed = "${{ env.HAS_SIGNING_CERT }}" -eq 'true'
+          $msi = "Sembazuru-${{ steps.ver.outputs.version }}-x64.msi"
+          $common = @(
+            "${{ steps.ver.outputs.tag }}", $msi,
+            '--title', "Sembazuru ${{ steps.ver.outputs.version }}"
+          )
+          if ($signed) {
+            gh release create @common --notes 'Signed release. The MSI is Authenticode-signed; the GUI self-update verifies its signature and publisher before applying.'
+          } else {
+            gh release create @common --draft --notes 'UNSIGNED build (no release certificate configured). Published as a DRAFT: the GUI self-update will not consume it until a signed release is published. Configure SBZ_SIGNING_* secrets to sign.'
+          }
