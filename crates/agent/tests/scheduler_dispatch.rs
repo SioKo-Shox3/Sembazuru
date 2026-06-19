@@ -258,6 +258,55 @@ async fn dispatch_falls_back_to_local_when_all_workers_version_mismatched() {
 }
 
 #[tokio::test]
+async fn dispatch_falls_back_to_local_when_all_workers_mode_off() {
+    // ADR 0012: live, reachable, version-matched, idle workers — but every one is
+    // configured `participation_mode = off`. The agent excludes opted-out workers
+    // from scheduling, so the action runs locally and the build still completes.
+    let (w1, served1) = start_worker().await;
+    let (w2, served2) = start_worker().await;
+    let table = WorkerTable::new(Duration::from_secs(60));
+    for (id, endpoint) in [("w1", &w1), ("w2", &w2)] {
+        table.upsert_register(
+            id.to_string(),
+            endpoint.to_string(),
+            Capabilities {
+                cpu_count: 2,
+                // Version-matched (so only the mode excludes them), opted out.
+                worker_version: env!("CARGO_PKG_VERSION").to_string(),
+                participation_mode: "off".to_string(),
+                ..Default::default()
+            },
+        );
+    }
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "4"]),
+            "act-off".into(),
+            "sess".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    match exec {
+        Execution::LocalFallback { exit_code, reason } => {
+            assert_eq!(exit_code, 4, "ran locally; reason: {reason}");
+        }
+        other => panic!("expected local fallback when all workers are mode=off, got {other:?}"),
+    }
+    assert_eq!(
+        served1.load(Ordering::SeqCst),
+        0,
+        "opted-out worker w1 must receive no action"
+    );
+    assert_eq!(
+        served2.load(Ordering::SeqCst),
+        0,
+        "opted-out worker w2 must receive no action"
+    );
+}
+
+#[tokio::test]
 async fn dispatch_runs_remotely_when_worker_reports_idle_cpu() {
     // The complement of the busy case: a worker reporting plenty of idle CPU is
     // still scheduled remotely — CPU-awareness must not block an idle worker.

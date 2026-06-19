@@ -161,6 +161,7 @@ impl StatusState {
                 // (ADR 0011 version-mismatch / ADR 0010 cpu-busy).
                 exclusion_reason: crate::scheduler::Scheduler::exclusion_reason(&w).to_string(),
                 worker_version: w.caps.worker_version.clone(),
+                participation_mode: w.caps.participation_mode.clone(),
                 worker_id: w.worker_id,
                 execution_endpoint: w.execution_endpoint,
                 idle_cpu_pct: w.idle_cpu_pct, // ADR 0010: None when the worker reports no CPU signal

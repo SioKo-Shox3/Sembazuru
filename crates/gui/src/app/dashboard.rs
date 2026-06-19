@@ -170,7 +170,13 @@ fn render_workers(ui: &mut egui::Ui, dash: &DashboardModel) {
                 // the reason the agent excludes it from builds.
                 match w.exclusion_reason.as_str() {
                     "" => {
-                        ui.colored_label(HEALTHY, "eligible");
+                        let mode = if w.participation_mode.is_empty() {
+                            "—"
+                        } else {
+                            w.participation_mode.as_str()
+                        };
+                        ui.colored_label(HEALTHY, "eligible")
+                            .on_hover_text(format!("participating (mode: {mode})"));
                     }
                     "version-mismatch" => {
                         ui.colored_label(UNHEALTHY, "version-mismatch")

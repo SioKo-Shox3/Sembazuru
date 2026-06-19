@@ -14,6 +14,8 @@ use sembazuru_proto::v0::{
     Capabilities, HeartbeatPing, PROTOCOL_VERSION, RegisterRequest,
     coordination_client::CoordinationClient,
 };
+
+use crate::config::{ParticipationMode, ParticipationSettings};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 
@@ -22,7 +24,7 @@ use tokio_stream::wrappers::IntervalStream;
 /// machine parallelism: the agent schedules against this number, so advertising
 /// more than the worker will actually admit makes the scheduler over-dispatch
 /// and the excess bounce off the backlog into slow local fallback (ADR 0004).
-pub fn local_capabilities(capacity: u32) -> Capabilities {
+pub fn local_capabilities(capacity: u32, mode: ParticipationMode) -> Capabilities {
     Capabilities {
         protocol_version: PROTOCOL_VERSION,
         os_build: std::env::var("OS").unwrap_or_default(),
@@ -40,6 +42,10 @@ pub fn local_capabilities(capacity: u32) -> Capabilities {
         // output stays byte-identical to local. Manual updates (ADR 0009 withdrawal)
         // realign the cluster to a single version.
         worker_version: env!("CARGO_PKG_VERSION").to_string(),
+        // How this worker participates (ADR 0012): the agent excludes it from
+        // scheduling when this is "off", and an "always" worker reports no CPU
+        // signal (full static capacity) while "adaptive" rides idle CPU (ADR 0010).
+        participation_mode: mode.as_str().to_string(),
     }
 }
 
@@ -69,13 +75,14 @@ pub async fn register_and_heartbeat(
     // Shared cluster token to present on Register (ADR 0006). Empty when the
     // cluster runs without auth; the agent then accepts unconditionally.
     auth_token: String,
-    // CPU-aware admission policy (ADR 0010). When enabled, a background sampler
-    // publishes this worker's smoothed idle CPU and every heartbeat carries it so
-    // the agent can scale scheduling to host load; when disabled, heartbeats carry
-    // no CPU signal and the worker is scheduled exactly as pre-0010.
-    idle_cpu: crate::config::IdleCpuSettings,
+    // Participation policy (ADR 0012, generalizing ADR 0010). `Adaptive` runs a
+    // background idle-CPU sampler and every heartbeat carries the smoothed value so
+    // the agent scales scheduling to host load. `Always` runs no sampler and sends
+    // no CPU signal (full static capacity). `Off` also sends no signal; the agent
+    // excludes it from scheduling by mode (its capability advertises "off").
+    participation: ParticipationSettings,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let caps = local_capabilities(capacity);
+    let caps = local_capabilities(capacity, participation.mode);
     let cpu_count = caps.cpu_count;
 
     // Match the agent's keepalive so a half-open TCP is noticed at the transport
@@ -99,13 +106,19 @@ pub async fn register_and_heartbeat(
         return Err(format!("agent rejected registration: {}", resp.detail).into());
     }
 
-    // Start the idle-CPU sampler (ADR 0010) when the feature is on; it publishes
-    // the latest smoothed reading into `cpu_signal`, which the heartbeat closure
-    // reads each tick. The sentinel keeps heartbeats sending `None` (no CPU signal)
-    // until the first real reading exists, and the sampler stops with `stop`.
-    let cpu_signal = if idle_cpu.enabled {
+    // Start the idle-CPU sampler only in Adaptive mode (ADR 0012); it publishes the
+    // latest smoothed reading into `cpu_signal`, which the heartbeat closure reads
+    // each tick. The sentinel keeps heartbeats sending `None` (no CPU signal) until
+    // the first real reading exists, and the sampler stops with `stop`. In `Always`
+    // and `Off` no sampler runs and the heartbeat sends `None`: `Always` then gets
+    // full static capacity from the agent, and `Off` is excluded by its mode.
+    let cpu_signal = if participation.mode == ParticipationMode::Adaptive {
         let sig = Arc::new(AtomicU32::new(crate::cpu_monitor::NOT_READY));
-        crate::cpu_monitor::spawn_idle_cpu_sampler(Arc::clone(&sig), idle_cpu, Arc::clone(&stop));
+        crate::cpu_monitor::spawn_idle_cpu_sampler(
+            Arc::clone(&sig),
+            participation.idle,
+            Arc::clone(&stop),
+        );
         Some(sig)
     } else {
         None

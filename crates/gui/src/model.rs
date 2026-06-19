@@ -60,6 +60,9 @@ pub struct WorkerRow {
     pub idle_cpu_pct: Option<u32>,
     /// The worker's reported build version (ADR 0011); empty for a pre-0011 worker.
     pub worker_version: String,
+    /// The worker's participation mode (ADR 0012): "always" | "adaptive" | "off"
+    /// (empty for a pre-0012 worker).
+    pub participation_mode: String,
     /// Why this worker is excluded from scheduling, or "" when eligible
     /// (ADR 0011/0012/0010): "version-mismatch" | "off" | "cpu-busy".
     pub exclusion_reason: String,
@@ -260,6 +263,7 @@ fn map_worker(w: WorkerStatus) -> WorkerRow {
         idle: w.idle_slots,
         idle_cpu_pct: w.idle_cpu_pct,
         worker_version: w.worker_version,
+        participation_mode: w.participation_mode,
         exclusion_reason: w.exclusion_reason,
         last_ping: humanize_age(w.last_ping_age_ms),
         healthy: w.healthy,
@@ -487,11 +491,13 @@ mod tests {
         let w = WorkerStatus {
             worker_id: "w1".into(),
             worker_version: "0.0.1".into(),
+            participation_mode: "adaptive".into(),
             exclusion_reason: "version-mismatch".into(),
             ..Default::default()
         };
         let row = map_worker(w);
         assert_eq!(row.worker_version, "0.0.1");
+        assert_eq!(row.participation_mode, "adaptive");
         assert_eq!(row.exclusion_reason, "version-mismatch");
     }
 }
