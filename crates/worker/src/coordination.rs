@@ -103,6 +103,9 @@ pub async fn register_and_heartbeat(
                 monotonic_qpc: u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX),
                 running_actions: in_flight,
                 idle_slots: cpu_count.saturating_sub(in_flight),
+                // No CPU signal yet (wired in a later commit); None keeps the
+                // agent on its legacy slot-based scheduling (ADR 0010).
+                idle_cpu_pct: None,
             }
         });
 
