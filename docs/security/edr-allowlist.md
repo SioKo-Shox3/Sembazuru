@@ -203,9 +203,13 @@ The self-update flow, end to end:
    `objects.githubusercontent.com`) to a temp file.
 3. **Verify (before any execution).** The downloaded MSI is checked with
    `WinVerifyTrust` (Authenticode) **and** its signer subject is pinned to the
-   Sembazuru publisher. A file that fails verification or whose publisher does not
-   match is **never executed** — host trust in GitHub is not relied upon (TLS +
-   signature + publisher pin is the gate).
+   Sembazuru publisher, and the file is re-verified immediately before it is handed
+   to msiexec (closing any swap window). A file that fails verification or whose
+   publisher does not match is **never executed** — host trust in GitHub is not
+   relied upon (TLS + signature + publisher pin is the gate). Certificate
+   *revocation* is not checked online (`WTD_REVOKE_NONE`, to avoid a network
+   dependency at verify time); the publisher pin is the compensating control, and a
+   future hardening may opt into whole-chain revocation.
 4. **Apply (UAC-approved).** Only after verification and a second explicit click does
    the GUI launch `msiexec /i "<temp>.msi" /passive` through the same UAC "runas"
    elevation used for service control. The MSI's `MajorUpgrade` performs an in-place
