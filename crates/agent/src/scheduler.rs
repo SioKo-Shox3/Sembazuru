@@ -34,6 +34,14 @@ use crate::{ExecOptions, ExecuteError, Execution, execute_on_channel_with, run_l
 /// black-holing every action by always looking the least loaded.
 const MAX_TRUSTED_CPU: u32 = 256;
 
+/// This agent/daemon's build version = the cluster's version authority (ADR 0011).
+/// A worker is admitted to scheduling only when its reported `worker_version`
+/// EXACTLY matches this, so a mixed-version cluster cannot poison build
+/// determinism / the action cache. All workspace crates share `version.workspace`,
+/// so a worker built from the same release reports the same string. Manual updates
+/// (ADR 0009 withdrawal) realign the cluster to a single version.
+pub(crate) const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Default per-attempt remote latency budget. Exceeding it on one worker is
 /// treated as a failure and the action is reassigned (then locally). The value
 /// is a scaffold tuned against the M5.5 efficiency measurement (ADR 0004 §5).
@@ -180,6 +188,36 @@ impl Scheduler {
         chans.retain(|ep, _| live.contains(ep));
     }
 
+    /// ADR 0011: the worker's build version EXACTLY matches this agent's. The sole
+    /// version check, so the rule lives in one place.
+    fn version_matched(w: &WorkerEntry) -> bool {
+        w.caps.worker_version == AGENT_VERSION
+    }
+
+    /// Static scheduling eligibility — independent of momentary CPU load. A worker
+    /// is admissible when its version matches (ADR 0011). ADR 0012 also requires
+    /// `participation_mode != "off"` here. `pick_and_reserve` further requires a
+    /// non-zero [`effective_capacity`] (the transient CPU gate, ADR 0010);
+    /// `cluster_capacity` counts admissible workers regardless of that transient.
+    fn admissible(w: &WorkerEntry) -> bool {
+        Self::version_matched(w)
+    }
+
+    /// Why a worker is excluded from scheduling, or "" when eligible. Single source
+    /// of truth for the dashboard (status.rs) and the admission filter, so the
+    /// reason shown can never drift from the reason enforced. Priority: a hard
+    /// static exclusion (version) outranks the transient CPU one (ADR 0011/0010;
+    /// ADR 0012 inserts "off" between them).
+    pub(crate) fn exclusion_reason(w: &WorkerEntry) -> &'static str {
+        if !Self::version_matched(w) {
+            "version-mismatch"
+        } else if Self::effective_capacity(w) == 0 {
+            "cpu-busy"
+        } else {
+            ""
+        }
+    }
+
     /// How many concurrent actions a worker is *willing* to run right now: its
     /// advertised admission capacity (clamped, as the worker is untrusted), scaled
     /// down by its smoothed idle CPU when it reports one (ADR 0010 "good
@@ -237,7 +275,14 @@ impl Scheduler {
         let snapshot = self.table.live_snapshot();
         let live: Vec<WorkerEntry> = snapshot
             .into_iter()
-            .filter(|w| !tried.contains(&w.worker_id) && Self::effective_capacity(w) > 0)
+            // Admission: version-matched (ADR 0011) and not CPU-busy (ADR 0010).
+            // A worker failing either is never tried — when all do, this returns
+            // None and `dispatch` falls back to local, exactly like "no workers".
+            .filter(|w| {
+                !tried.contains(&w.worker_id)
+                    && Self::admissible(w)
+                    && Self::effective_capacity(w) > 0
+            })
             .collect();
         if live.is_empty() {
             return None;
@@ -326,6 +371,12 @@ impl Scheduler {
         self.table
             .live_snapshot()
             .iter()
+            // Only admissible workers (version-matched, ADR 0011) can ever run an
+            // action, so a version-mismatched worker must not inflate the fan-out
+            // throttle — otherwise the gate over-dispatches against capacity that
+            // is never schedulable. CPU-busy is transient and intentionally still
+            // counted (the throttle targets steady-state, not the instant).
+            .filter(|w| Self::admissible(w))
             .map(|w| w.caps.cpu_count.clamp(1, MAX_TRUSTED_CPU) as usize)
             .sum()
     }
@@ -508,17 +559,21 @@ mod tests {
     use super::*;
     use sembazuru_proto::v0::Capabilities;
 
+    /// A version-matched capability set: the default test worker is admissible by
+    /// ADR 0011 (its `worker_version` equals this agent's). Tests that exercise the
+    /// version gate override `worker_version` explicitly.
+    fn caps(cpu: u32) -> Capabilities {
+        Capabilities {
+            cpu_count: cpu,
+            worker_version: AGENT_VERSION.to_string(),
+            ..Default::default()
+        }
+    }
+
     fn entry(id: &str, endpoint: &str, cpu: u32) -> WorkerEntry {
         // Build a WorkerEntry via the table so the private fields are set.
         let table = WorkerTable::new(Duration::from_secs(60));
-        table.upsert_register(
-            id.to_string(),
-            endpoint.to_string(),
-            Capabilities {
-                cpu_count: cpu,
-                ..Default::default()
-            },
-        );
+        table.upsert_register(id.to_string(), endpoint.to_string(), caps(cpu));
         table
             .live_snapshot()
             .into_iter()
@@ -698,14 +753,7 @@ mod tests {
         use std::collections::HashSet;
         let table = WorkerTable::new(Duration::from_secs(60));
         for id in ["w1", "w2", "w3"] {
-            table.upsert_register(
-                id.to_string(),
-                format!("http://{id}"),
-                Capabilities {
-                    cpu_count: 2,
-                    ..Default::default()
-                },
-            );
+            table.upsert_register(id.to_string(), format!("http://{id}"), caps(2));
         }
         let sched = Scheduler::new(table);
         let key = affinity_key(&["cc".into(), "x.cpp".into()]);
@@ -796,14 +844,7 @@ mod tests {
         use std::collections::HashSet;
         let table = WorkerTable::new(Duration::from_secs(60));
         for id in ["w1", "w2", "w3"] {
-            table.upsert_register(
-                id.to_string(),
-                format!("http://{id}"),
-                Capabilities {
-                    cpu_count: 4,
-                    ..Default::default()
-                },
-            );
+            table.upsert_register(id.to_string(), format!("http://{id}"), caps(4));
         }
         let snap = table.live_snapshot();
         let key = affinity_key(&["cc".into(), "busy.cpp".into()]);
@@ -826,14 +867,7 @@ mod tests {
         use std::collections::HashSet;
         let table = WorkerTable::new(Duration::from_secs(60));
         for id in ["w1", "w2"] {
-            table.upsert_register(
-                id.to_string(),
-                format!("http://{id}"),
-                Capabilities {
-                    cpu_count: 4,
-                    ..Default::default()
-                },
-            );
+            table.upsert_register(id.to_string(), format!("http://{id}"), caps(4));
             table.on_ping(id, 0, 0, Some(0)); // host busy → effective_capacity 0
         }
         let sched = Scheduler::new(table);
@@ -848,14 +882,7 @@ mod tests {
     fn an_in_flight_saturated_but_cpu_idle_worker_stays_eligible() {
         use std::collections::HashSet;
         let table = WorkerTable::new(Duration::from_secs(60));
-        table.upsert_register(
-            "w1".into(),
-            "http://w1".into(),
-            Capabilities {
-                cpu_count: 2,
-                ..Default::default()
-            },
-        );
+        table.upsert_register("w1".into(), "http://w1".into(), caps(2));
         table.on_ping("w1", 0, 0, Some(100)); // fully idle host, scaled capacity 2
         let sched = Scheduler::new(table);
         let none = HashSet::new();
@@ -873,6 +900,127 @@ mod tests {
                 .pick_and_reserve(affinity_key(&["c".into()]), &none)
                 .is_some(),
             "an in_flight-saturated but CPU-idle worker still accepts queued work"
+        );
+    }
+
+    // ---- ADR 0011: version-gated admission ------------------------------------
+
+    /// A worker built from a different release (version != this agent) is excluded
+    /// from scheduling even though its CPU is fully idle — a mixed-version cluster
+    /// must not poison build determinism / the action cache.
+    #[test]
+    fn pick_excludes_worker_with_mismatched_version() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register(
+            "old".into(),
+            "http://old".into(),
+            Capabilities {
+                cpu_count: 8,
+                worker_version: "0.0.0-other".to_string(),
+                ..Default::default()
+            },
+        );
+        let sched = Scheduler::new(table);
+        let key = affinity_key(&["cc".into(), "x.cpp".into()]);
+        assert!(
+            sched.pick_and_reserve(key, &HashSet::new()).is_none(),
+            "a version-mismatched worker is never scheduled → dispatch falls back to local"
+        );
+    }
+
+    /// A pre-0011 worker reports an empty version; it never matches and is excluded.
+    #[test]
+    fn pick_excludes_worker_with_empty_version() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register(
+            "legacy".into(),
+            "http://legacy".into(),
+            Capabilities {
+                cpu_count: 4,
+                ..Default::default()
+            }, // worker_version defaults to ""
+        );
+        let sched = Scheduler::new(table);
+        let key = affinity_key(&["cc".into(), "y.cpp".into()]);
+        assert!(
+            sched.pick_and_reserve(key, &HashSet::new()).is_none(),
+            "an empty (pre-0011) version is treated as a mismatch and excluded"
+        );
+    }
+
+    /// With one matched and one mismatched worker, only the matched one is ever
+    /// chosen — the gate filters, it does not break scheduling for good workers.
+    /// The mismatched worker advertises far more capacity (would look least-loaded)
+    /// yet is still never picked.
+    #[test]
+    fn pick_chooses_only_the_version_matched_worker() {
+        use std::collections::HashSet;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register("good".into(), "http://good".into(), caps(4));
+        table.upsert_register(
+            "bad".into(),
+            "http://bad".into(),
+            Capabilities {
+                cpu_count: 64,
+                worker_version: "9.9.9".to_string(),
+                ..Default::default()
+            },
+        );
+        let sched = Scheduler::new(table);
+        let none = HashSet::new();
+        for _ in 0..8 {
+            let (w, _g) = sched
+                .pick_and_reserve(affinity_key(&["cc".into(), "z.cpp".into()]), &none)
+                .unwrap();
+            assert_eq!(
+                w.worker_id, "good",
+                "only the version-matched worker is scheduled"
+            );
+        }
+    }
+
+    /// `exclusion_reason` is the single source of truth shown on the dashboard:
+    /// the hard version exclusion outranks the transient CPU one, and a matched +
+    /// idle worker reads as eligible ("").
+    #[test]
+    fn exclusion_reason_prioritises_version_over_cpu() {
+        let mut bad = entry("bad", "http://bad", 4);
+        bad.caps.worker_version = "0.0.0-other".to_string();
+        bad.idle_cpu_pct = Some(0); // also cpu-busy, but the version reason wins
+        assert_eq!(Scheduler::exclusion_reason(&bad), "version-mismatch");
+
+        let mut busy = entry("busy", "http://busy", 4); // version-matched (caps)
+        busy.idle_cpu_pct = Some(0);
+        assert_eq!(Scheduler::exclusion_reason(&busy), "cpu-busy");
+
+        let mut ok = entry("ok", "http://ok", 4);
+        ok.idle_cpu_pct = Some(100);
+        assert_eq!(Scheduler::exclusion_reason(&ok), "");
+    }
+
+    /// `cluster_capacity` ignores version-mismatched workers so the fan-out throttle
+    /// is sized to actually-schedulable capacity (else it over-dispatches against
+    /// capacity that can never run an action).
+    #[test]
+    fn cluster_capacity_excludes_version_mismatched_workers() {
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register("good".into(), "http://good".into(), caps(4));
+        table.upsert_register(
+            "bad".into(),
+            "http://bad".into(),
+            Capabilities {
+                cpu_count: 16,
+                worker_version: "x".to_string(),
+                ..Default::default()
+            },
+        );
+        let sched = Scheduler::new(table);
+        assert_eq!(
+            sched.cluster_capacity(),
+            4,
+            "only the version-matched worker contributes to the throttle"
         );
     }
 }

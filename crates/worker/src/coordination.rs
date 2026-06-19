@@ -34,6 +34,12 @@ pub fn local_capabilities(capacity: u32) -> Capabilities {
         // with a cluster token configured uses this to tell M7 workers from
         // pre-M7 ones; an agent without a token ignores it.
         supports_auth: true,
+        // This worker's build version (the workspace version) for version-gated
+        // admission (ADR 0011): the agent schedules to this worker only when this
+        // matches its own version, keeping the cluster on one build so distributed
+        // output stays byte-identical to local. Manual updates (ADR 0009 withdrawal)
+        // realign the cluster to a single version.
+        worker_version: env!("CARGO_PKG_VERSION").to_string(),
     }
 }
 

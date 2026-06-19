@@ -35,7 +35,9 @@ async fn start_worker() -> (String, Arc<AtomicU64>) {
 }
 
 /// A table with the given workers registered (endpoint + cpu_count), live for a
-/// generous window so they stay schedulable through the test.
+/// generous window so they stay schedulable through the test. Workers report this
+/// build's version so they pass the ADR 0011 version gate (the agent admits only
+/// version-matched workers); tests of the gate itself register a mismatch explicitly.
 fn table_with(workers: &[(&str, &str, u32)]) -> WorkerTable {
     let table = WorkerTable::new(Duration::from_secs(60));
     for (id, endpoint, cpu) in workers {
@@ -44,6 +46,7 @@ fn table_with(workers: &[(&str, &str, u32)]) -> WorkerTable {
             (*endpoint).to_string(),
             Capabilities {
                 cpu_count: *cpu,
+                worker_version: env!("CARGO_PKG_VERSION").to_string(),
                 ..Default::default()
             },
         );
@@ -197,6 +200,60 @@ async fn dispatch_falls_back_to_local_when_all_workers_cpu_busy() {
         served2.load(Ordering::SeqCst),
         0,
         "CPU-busy worker w2 must receive no action"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_falls_back_to_local_when_all_workers_version_mismatched() {
+    // ADR 0011: live, reachable, fully idle workers — but every one reports a build
+    // version that differs from this agent's. The version gate excludes them all
+    // from scheduling, so the action runs locally and the build still completes
+    // (local fallback is always available, non-negotiable #2). A mixed-version
+    // cluster never silently runs a build on a worker whose output could diverge.
+    let (w1, served1) = start_worker().await;
+    let (w2, served2) = start_worker().await;
+    // Register with a deliberately mismatched version (not via table_with, which
+    // reports this build's version and would be admitted).
+    let table = WorkerTable::new(Duration::from_secs(60));
+    for (id, endpoint) in [("w1", &w1), ("w2", &w2)] {
+        table.upsert_register(
+            id.to_string(),
+            endpoint.to_string(),
+            Capabilities {
+                cpu_count: 2,
+                worker_version: "0.0.0-mismatch".to_string(),
+                ..Default::default()
+            },
+        );
+    }
+    let sched = Scheduler::new(table);
+
+    let exec = sched
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "7"]),
+            "act-ver".into(),
+            "sess".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    match exec {
+        Execution::LocalFallback { exit_code, reason } => {
+            assert_eq!(exit_code, 7, "ran locally; reason: {reason}");
+        }
+        other => {
+            panic!("expected local fallback when all workers are version-mismatched, got {other:?}")
+        }
+    }
+    // The mismatched workers were genuinely excluded, not merely out-raced.
+    assert_eq!(
+        served1.load(Ordering::SeqCst),
+        0,
+        "version-mismatched worker w1 must receive no action"
+    );
+    assert_eq!(
+        served2.load(Ordering::SeqCst),
+        0,
+        "version-mismatched worker w2 must receive no action"
     );
 }
 

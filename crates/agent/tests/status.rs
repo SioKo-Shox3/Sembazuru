@@ -44,6 +44,9 @@ fn table_with(workers: &[(&str, &str, u32)]) -> WorkerTable {
             (*endpoint).to_string(),
             Capabilities {
                 cpu_count: *cpu,
+                // Report this build's version so the worker passes the ADR 0011
+                // version gate (the agent admits only version-matched workers).
+                worker_version: env!("CARGO_PKG_VERSION").to_string(),
                 ..Default::default()
             },
         );

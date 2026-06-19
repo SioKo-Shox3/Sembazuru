@@ -58,6 +58,11 @@ pub struct WorkerRow {
     /// `None` when it reports no CPU signal (pre-0010 / feature off) — the UI then
     /// shows "—" so it reads as "not reported", not "0% idle".
     pub idle_cpu_pct: Option<u32>,
+    /// The worker's reported build version (ADR 0011); empty for a pre-0011 worker.
+    pub worker_version: String,
+    /// Why this worker is excluded from scheduling, or "" when eligible
+    /// (ADR 0011/0012/0010): "version-mismatch" | "off" | "cpu-busy".
+    pub exclusion_reason: String,
     /// Heartbeat age rendered as a short human string (e.g. "1.5s ago").
     pub last_ping: String,
     pub healthy: bool,
@@ -254,6 +259,8 @@ fn map_worker(w: WorkerStatus) -> WorkerRow {
         running: w.running_actions,
         idle: w.idle_slots,
         idle_cpu_pct: w.idle_cpu_pct,
+        worker_version: w.worker_version,
+        exclusion_reason: w.exclusion_reason,
         last_ping: humanize_age(w.last_ping_age_ms),
         healthy: w.healthy,
     }
@@ -470,5 +477,21 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!(model.fileserver.read_ops, 0);
+    }
+
+    #[test]
+    fn map_worker_carries_version_and_exclusion_reason() {
+        // ADR 0011/0012: the dashboard surfaces the worker's reported version and
+        // the agent's admission reason verbatim, so the operator can see at a glance
+        // why a worker is (not) participating.
+        let w = WorkerStatus {
+            worker_id: "w1".into(),
+            worker_version: "0.0.1".into(),
+            exclusion_reason: "version-mismatch".into(),
+            ..Default::default()
+        };
+        let row = map_worker(w);
+        assert_eq!(row.worker_version, "0.0.1");
+        assert_eq!(row.exclusion_reason, "version-mismatch");
     }
 }
