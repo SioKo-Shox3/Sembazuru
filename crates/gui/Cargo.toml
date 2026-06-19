@@ -15,6 +15,19 @@ path = "src/main.rs"
 sembazuru-proto = { path = "../proto" }
 tonic = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+# Self-update (ADR 0009): the ONLY outbound HTTPS in Sembazuru, GUI-only and
+# user-initiated. rustls (not native-tls) so the TLS stack is vendored and
+# auditable; no http2/charset needed for the GitHub Releases API + asset GET.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "stream",
+] }
+# semver compare of the latest GitHub release tag against CARGO_PKG_VERSION.
+semver = "1"
+# Deserialize the subset of the GitHub release JSON we read (tag, notes URL, the
+# MSI asset). reqwest's `json` does the serde_json work; we only need the derive.
+serde = { version = "1", features = ["derive"] }
 # Zeroize the cluster token's GUI-side copy on drop so the plaintext credential
 # does not linger in freed heap memory (security review, M9.4a).
 zeroize = "1"
@@ -35,6 +48,11 @@ windows-service = "0.7"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    # Authenticode verification of a downloaded update MSI before it is run
+    # (ADR 0009): WinVerifyTrust + extracting the signer's subject to pin the
+    # publisher. Cryptography carries the CryptQueryObject / cert-store APIs.
+    "Win32_Security_WinTrust",
+    "Win32_Security_Cryptography",
     "Win32_System_Threading",
     # Not for registry access: the SHELLEXECUTEINFOW struct (used by the runas
     # self-elevation) is feature-gated on this because it carries an HKEY field.
