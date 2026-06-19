@@ -20,3 +20,4 @@ pub mod client;
 pub mod model;
 pub mod svcctl;
 pub mod tray;
+pub mod update;

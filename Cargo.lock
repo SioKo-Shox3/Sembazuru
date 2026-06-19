@@ -3956,6 +3956,7 @@ dependencies = [
  "sembazuru-proto",
  "sembazuru-worker",
  "semver",
+ "serde",
  "tokio",
  "tonic",
  "tray-icon",

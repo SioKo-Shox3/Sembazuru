@@ -25,6 +25,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 # semver compare of the latest GitHub release tag against CARGO_PKG_VERSION.
 semver = "1"
+# Deserialize the subset of the GitHub release JSON we read (tag, notes URL, the
+# MSI asset). reqwest's `json` does the serde_json work; we only need the derive.
+serde = { version = "1", features = ["derive"] }
 # Zeroize the cluster token's GUI-side copy on drop so the plaintext credential
 # does not linger in freed heap memory (security review, M9.4a).
 zeroize = "1"
