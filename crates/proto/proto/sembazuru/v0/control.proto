@@ -78,6 +78,13 @@ message HeartbeatPing {
   // running_actions, clamped at 0.
   uint32 running_actions = 3;
   uint32 idle_slots = 4;
+  // Smoothed host idle-CPU percent (0-100), the "good neighbour" signal (ADR
+  // 0010). `optional` is load-bearing: a bare uint32 would default to 0 on the
+  // wire, which is indistinguishable from a genuine 0%-idle worker, so a pre-0010
+  // worker or one with the feature off would be read as "0% idle" and starved.
+  // Presence means "this worker reports CPU load"; absence means "no CPU signal",
+  // and the agent's effective_idle() then falls back to the legacy slot count.
+  optional uint32 idle_cpu_pct = 5;
 }
 
 message HeartbeatPong {
@@ -370,6 +377,10 @@ message WorkerStatus {
   uint32 idle_slots = 7;        // last heartbeat-reported idle slots
   uint64 last_ping_age_ms = 8;  // ms since the agent last heard from this worker
   bool healthy = 9;             // live within the dead-detection window
+  // Last heartbeat-reported smoothed idle-CPU percent (0-100), for the dashboard
+  // (ADR 0010). Absent when the worker reports no CPU signal; same presence
+  // semantics as HeartbeatPing.idle_cpu_pct.
+  optional uint32 idle_cpu_pct = 10;
 }
 
 // Action-cache state. hits/misses are counted since this daemon started; the GUI
