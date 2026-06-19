@@ -21,6 +21,21 @@ SEMBAZURU_SCRATCH_ROOT = <dir>                        # per-action hydrated inpu
 SEMBAZURU_CAS_ROOT     = <dir>                        # worker-local content cache
 ```
 
+Optional worker admission knobs (ADR 0010 / 0012); also settable persistently in
+`worker.toml`:
+
+```
+SEMBAZURU_PARTICIPATION_MODE   = adaptive   # always | adaptive (default) | off
+SEMBAZURU_IDLE_CPU_RESERVE_PCT = 10         # adaptive: idle % kept for the local user
+SEMBAZURU_IDLE_CPU_FLOOR_PCT   = 0          # adaptive: minimum % offered while participating
+```
+
+`adaptive` (default) scales the worker's contribution to its idle CPU — a "good
+neighbour" on a developer's own machine; `always` contributes full capacity
+regardless of load; `off` keeps the worker registered but out of scheduling (park a
+machine without uninstalling). `idle_cpu_hysteresis_pct` / `idle_cpu_ema_alpha_pct`
+tune the adaptive signal.
+
 The daemon enables the action cache (a 2nd identical build skips the compile)
 when `SEMBAZURU_CACHE_ROOT` is set.
 
@@ -64,5 +79,10 @@ The launcher (named via `CLToolExe`) receives the CL args, prepends
   `docs/deferred.md`); its distributed output is functionally equivalent.
 - **Local fallback always completes the build** (DESIGN.md §2): if the daemon is
   down or no worker is live, the compile runs locally.
+- **One cluster, one version (ADR 0011).** The agent admits a worker only when its
+  build version exactly matches the agent's. A mismatched worker registers but shows
+  as `version-mismatch` on the dashboard and is excluded from scheduling (its work
+  runs elsewhere or locally — the build still completes). Update every node from the
+  same release when you upgrade.
 - **Unreal Engine / UnrealBuildTool** integration (an `ActionExecutor`) is design
   observation only for now (UE is EULA; clean-room) — see ADR 0005.

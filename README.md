@@ -131,6 +131,13 @@ What works today, each backed by a CI gate (`.github/workflows/ci.yml`):
 > build paths/timestamps (`docs/deferred.md`). clang-cl stays first-class because
 > remote `cl.exe` is a Visual Studio licensing grey area.
 
+> **Cluster admission (M9.6).** A worker joins with a participation mode —
+> `adaptive` (default; scales its contribution to idle CPU so a shared machine stays
+> responsive), `always`, or `off` — and the daemon schedules only to workers whose
+> build version matches its own, keeping the cluster on one release so distributed
+> output stays byte-identical (ADR 0010/0011/0012). Updates are a manual reinstall —
+> no in-app self-update. Details in the quickstart.
+
 Step-by-step: [`docs/quickstart.md`](docs/quickstart.md). Reference env vars and
 both interception points: [`docs/integrations/README.md`](docs/integrations/README.md).
 
