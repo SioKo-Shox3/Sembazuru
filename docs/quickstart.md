@@ -76,6 +76,35 @@ target\release\sembazuru-worker.exe 127.0.0.1:50061
 > token, set `SEMBAZURU_CLUSTER_TOKEN` on the daemon **and** every worker (ADR
 > 0006). Intake is loopback-only and refuses non-loopback binds.
 
+> **Persistent config & participation modes (ADR 0012).** The env vars above are the
+> dev/CLI path; an installed worker *service* reads `%ProgramData%\Sembazuru\worker.toml`
+> (env vars still override the file). Beyond the paths above, a worker has a
+> **participation mode**: `adaptive` (default — scales its contribution to idle CPU,
+> so it stays a good neighbour on a developer's machine), `always` (full capacity
+> regardless of load), or `off` (registered but never scheduled — park a machine
+> without uninstalling).
+>
+> ```toml
+> # %ProgramData%\Sembazuru\worker.toml
+> agent                = "http://127.0.0.1:50070"
+> participation_mode   = "adaptive"   # always | adaptive | off
+> idle_cpu_reserve_pct = 10           # adaptive: idle % kept for the local user
+> idle_cpu_floor_pct   = 0            # adaptive: minimum % offered while participating
+> ```
+>
+> *Migration:* the pre-M9.6 `idle_cpu_enabled` key was replaced by `participation_mode`
+> and is now ignored — a `worker.toml` that still has it silently falls back to
+> `adaptive`. Replace `idle_cpu_enabled = true` with `participation_mode = "adaptive"`
+> and `idle_cpu_enabled = false` with `participation_mode = "always"`.
+
+> **One cluster, one version (ADR 0011).** The daemon admits a worker only when its
+> build version exactly matches the daemon's, so the cluster stays on one build and
+> distributed output stays byte-identical to local. A mismatched worker registers but
+> shows as `version-mismatch` on the dashboard and is excluded from scheduling (the
+> build still completes — locally if needed). Update every node from the same
+> installer/release when you upgrade (updates are a manual reinstall; there is no
+> in-app self-update).
+
 ## 4. Wire your build
 
 ### CMake / Ninja (compiler launcher) — the cleanest hook
