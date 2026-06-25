@@ -97,7 +97,16 @@ fn run_cli() -> Result<(), BoxError> {
             }
         });
     }
-    let config = DaemonConfig::load_effective(&DaemonConfig::path_from_env());
+    // CFG-001/SEC-001: a present-but-unreadable/invalid config must NOT silently
+    // fall back to auth-disabling defaults — refuse to start so the operator fixes
+    // it (an absent file still uses defaults, the common dev case).
+    let config = match DaemonConfig::load_effective_checked(&DaemonConfig::path_from_env()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sembazuru-daemon: {e}");
+            return Err(e.into());
+        }
+    };
     let result = runtime.block_on(run_daemon(config, shutdown));
     drop(runtime);
     result
