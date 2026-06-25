@@ -502,11 +502,40 @@ async fn build_child(
     String,
 > {
     let Some((v, cfg)) = vfs_plan else {
-        // Plain spawn (M5 scale path): provided env layered on the inherited one.
+        // Plain spawn (M5 scale path): the child inherits the worker service env
+        // (it needs OS basics like SystemRoot/PATH/ComSpec that the action's own
+        // env may not carry — a full `env_clear` here breaks bare commands such as
+        // `cmd /c ping`), with the action's `cmd.env` overlaid on top.
+        //
+        // But the worker service process holds its own secrets — above all
+        // SEMBAZURU_CLUSTER_TOKEN (config.rs reads it from the env), plus
+        // SEMBAZURU_AGENT/_CAPACITY and other SEMBAZURU_* internals — and the
+        // child's stdout/stderr are streamed straight back to the requesting agent.
+        // So strip every inherited SEMBAZURU_* var before overlaying `cmd.env`,
+        // otherwise an Execute of e.g. `cmd /c set` would exfiltrate the cluster
+        // token (SEC-002). The VFS branch below `env_clear`s instead because it
+        // runs through launcher.exe with a fully curated compiler env.
+        //
+        // LOAD-BEARING INVARIANT (else this leaks): the worker service env must
+        // carry secrets ONLY under the `SEMBAZURU_*` prefix. This is a denylist,
+        // not an allowlist — every non-`SEMBAZURU_` var (PATH, SystemRoot, …) is
+        // inherited so the bare command can run, so any non-`SEMBAZURU_` secret
+        // placed in the service env (an `AWS_*`/proxy cred, …) WOULD reach the
+        // child. The worker runs as a minimal-env service account, so today this
+        // holds; a future deployment that injects other secrets must extend this.
         let mut command = tokio::process::Command::new(&cmd.argv[0]);
         command.args(&cmd.argv[1..]);
         if !cmd.cwd.is_empty() {
             command.current_dir(&cmd.cwd);
+        }
+        for (key, _) in std::env::vars_os() {
+            if key
+                .to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("SEMBAZURU_")
+            {
+                command.env_remove(&key);
+            }
         }
         for (k, val) in &cmd.env {
             command.env(k, val);
