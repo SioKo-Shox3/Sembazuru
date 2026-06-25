@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
+use std::io;
 use std::path::Path;
 
 use crate::determinism;
@@ -331,33 +332,46 @@ pub fn input_manifest(graph: &DependencyGraph, root: &str) -> InputManifest {
 }
 
 /// Recomputes the strong-fingerprint hash by reading each manifest input's
-/// *current* content. Each entry keys per its [`InputKind`]:
+/// *current* content. Both kinds are **re-evaluated against the filesystem on
+/// every build** — neither is ever folded to a constant — so any semantic change
+/// (edit, deletion, or a previously-absent file appearing) moves the hash and the
+/// lookup misses. Each entry keys per its [`InputKind`]:
 ///   * [`InputKind::Content`] folds the current content hash. If the file has
-///     become unreadable (deleted/moved source), it folds a `<missing>` marker
-///     instead — moving the hash so the lookup *misses* and the action re-runs.
-///     A content dependency is **never** silently dropped: dropping it is what
-///     let a stale result be served (BLOCK-A).
-///   * [`InputKind::Absent`] folds an `absent` marker; if the file later
-///     appears, its hash will differ and the key moves.
+///     been deleted/moved (`NotFound`), it folds a `<missing>` marker instead —
+///     moving the hash so the lookup *misses* and the action re-runs. A content
+///     dependency is **never** silently dropped: dropping it is what let a stale
+///     result be served (BLOCK-A).
+///   * [`InputKind::Absent`] is re-checked: if the file is *still* absent it
+///     folds the stable `absent` marker (keeping the action cacheable); if it has
+///     since **appeared** it folds `appeared:<hash>`, moving the key so the stale
+///     result is no longer served (COR-002 — the previous code returned a
+///     constant `"absent"` and never noticed the file appearing).
 ///
-/// Thus a meaningful change (edited, deleted, or newly-appeared input) moves the
-/// hash (cache miss), while build noise does not.
-pub fn manifest_hash(manifest: &InputManifest) -> String {
+/// A read error other than `NotFound` (permission denied, sharing violation, the
+/// path became a directory) cannot be folded to a fixed token without risking a
+/// stale hit, so it is returned as an `Err` — callers treat that as a cache miss
+/// (re-run / decline to store), never a hit (input-side fail-closed).
+pub fn manifest_hash(manifest: &InputManifest) -> io::Result<String> {
     let mut entries: Vec<String> = Vec::new();
     for inp in &manifest.inputs {
         let token = match inp.kind {
             InputKind::Content => match std::fs::read(&inp.absolute) {
                 Ok(bytes) => determinism::sha256_hex(&bytes),
-                Err(_) => "<missing>".to_string(),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => "<missing>".to_string(),
+                Err(e) => return Err(e),
             },
-            InputKind::Absent => "absent".to_string(),
+            InputKind::Absent => match std::fs::read(&inp.absolute) {
+                Ok(bytes) => format!("appeared:{}", determinism::sha256_hex(&bytes)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => "absent".to_string(),
+                Err(e) => return Err(e),
+            },
         };
         entries.push(format!("{}\u{0}{token}", inp.logical));
     }
     entries.sort();
     entries.push("--cmd--".to_string());
     entries.extend(manifest.cmds.iter().cloned());
-    hash_components(&entries)
+    Ok(hash_components(&entries))
 }
 
 #[cfg(test)]
@@ -438,11 +452,11 @@ mod action_cache_tests {
         assert_eq!(m.inputs[0].kind, InputKind::Content);
         assert!(is_drive_absolute(&m.inputs[0].absolute));
 
-        let before = manifest_hash(&m);
+        let before = manifest_hash(&m).unwrap();
         std::fs::write(root.join("a.cpp"), b"v2-different-bytes").unwrap();
         assert_ne!(
             before,
-            manifest_hash(&m),
+            manifest_hash(&m).unwrap(),
             "an edited source MUST move the strong key (no stale hit)"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -465,15 +479,62 @@ mod action_cache_tests {
         let rs = root_str(&root);
         let g = graph_with(vec![read_access("a.cpp")]);
         let m = input_manifest(&g, &rs);
-        let present = manifest_hash(&m);
+        let present = manifest_hash(&m).unwrap();
         // The source disappears (deleted/moved). The key must MOVE (miss), not
         // stay the same by dropping the entry.
         std::fs::remove_file(root.join("a.cpp")).unwrap();
         assert_ne!(
             present,
-            manifest_hash(&m),
+            manifest_hash(&m).unwrap(),
             "a vanished content input must move the key, not be dropped"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn absent_that_later_appears_moves_the_key() {
+        // COR-002 regression: an Absent input (an include-search miss outside the
+        // build root) must be RE-CHECKED on every strong-key recompute. If the
+        // file later appears — a generated header, a newly-created optional
+        // config — the key must MOVE so the prior cached result is not served.
+        // The pre-fix code folded a constant `"absent"` and never noticed.
+        let root = tmp_dir("appears");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        // The missing header lives *outside* the build root (a real SDK-search
+        // miss) so it classifies as Absent rather than a dropped build transient.
+        let missing = std::env::temp_dir().join(format!(
+            "sbz-appears-hdr-{}-{}.h",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let missing_s = normalize_for_compare(&missing.to_string_lossy());
+        let _ = std::fs::remove_file(&missing); // ensure absent at first
+
+        let g = graph_with(vec![read_access("a.cpp"), probe_miss_access(&missing_s)]);
+        let m = input_manifest(&g, &rs);
+        assert!(m.cacheable);
+        assert!(
+            m.inputs.iter().any(|e| e.kind == InputKind::Absent),
+            "the outside-root miss must be an Absent entry"
+        );
+
+        let while_absent = manifest_hash(&m).unwrap();
+        // Still absent → stable key (an Absent input must not flap build to build).
+        assert_eq!(
+            while_absent,
+            manifest_hash(&m).unwrap(),
+            "a still-absent input keeps a stable key"
+        );
+        // The file appears. The strong key MUST move (cache miss), not stay put.
+        std::fs::write(&missing, b"#pragma once\nnow I exist").unwrap();
+        assert_ne!(
+            while_absent,
+            manifest_hash(&m).unwrap(),
+            "an absent input that APPEARS must move the strong key (no stale hit)"
+        );
+
+        let _ = std::fs::remove_file(&missing);
         let _ = std::fs::remove_dir_all(&root);
     }
 

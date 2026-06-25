@@ -98,7 +98,13 @@ impl AgentCache {
         if !manifest.cacheable {
             return Ok(CacheLookup::Miss);
         }
-        let strong = sembazuru_cas::strong_fingerprint(weak, &action_key::manifest_hash(&manifest));
+        // Recompute the strong key from the inputs' *current* content. A re-read
+        // I/O error other than a clean deletion (which `manifest_hash` folds into
+        // the key) means we cannot prove the inputs are unchanged → miss, re-run.
+        let Ok(input_hash) = action_key::manifest_hash(&manifest) else {
+            return Ok(CacheLookup::Miss);
+        };
+        let strong = sembazuru_cas::strong_fingerprint(weak, &input_hash);
         let Some(result) = self.cache.get_result(&strong)? else {
             return Ok(CacheLookup::Miss);
         };
@@ -179,7 +185,14 @@ impl AgentCache {
                 digest,
             });
         }
-        let strong = sembazuru_cas::strong_fingerprint(weak, &action_key::manifest_hash(manifest));
+        // If the strong key cannot be recomputed (an input became unreadable for
+        // a reason other than a clean deletion), decline to store a result rather
+        // than store one under an unreliable key. The manifest + already-ingested
+        // blobs are harmless without a result entry; a later resolve simply misses.
+        let Ok(input_hash) = action_key::manifest_hash(manifest) else {
+            return Ok(());
+        };
+        let strong = sembazuru_cas::strong_fingerprint(weak, &input_hash);
         self.cache.put_result(
             &strong,
             &ActionResult {
@@ -606,6 +619,67 @@ mod tests {
             cache.resolve(&weak, &tmp("miss-r2")).unwrap(),
             CacheLookup::Miss
         );
+    }
+
+    #[test]
+    fn appearing_absent_input_invalidates_the_cache() {
+        // COR-002 end-to-end: a recorded action whose manifest carries an Absent
+        // input (an include-search miss) must MISS once that file appears. The
+        // pre-fix `manifest_hash` folded a constant `"absent"`, so a generated
+        // header materializing between builds left the strong key unchanged and a
+        // stale object was served. After the fix the appearance moves the key.
+        let root = tmp("appear");
+        let build = tmp("appear-build");
+        let cache = AgentCache::open(&root).unwrap();
+
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"#include \"gen.h\"\nint main(){return 0;}").unwrap();
+        std::fs::write(build.join("a.obj"), b"OBJ-compiled-without-gen").unwrap();
+
+        // gen.h is absent at record time. It lives outside the build tree, so it
+        // is a genuine Absent dependency (not a dropped under-root transient).
+        let inc = tmp("appear-inc");
+        let gen_h = inc.join("gen.h");
+        let _ = std::fs::remove_file(&gen_h);
+
+        let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
+        let weak = cache.weak_key(&argv, &[]);
+        let manifest = InputManifest {
+            inputs: vec![
+                InputEntry {
+                    logical: "a.cpp".into(),
+                    absolute: input.to_string_lossy().into_owned(),
+                    kind: InputKind::Content,
+                },
+                InputEntry {
+                    logical: "gen.h".into(),
+                    absolute: gen_h.to_string_lossy().into_owned(),
+                    kind: InputKind::Absent,
+                },
+            ],
+            cmds: vec!["clang-cl /c a.cpp".into()],
+            cacheable: true,
+        };
+        cache
+            .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
+            .unwrap();
+
+        // Still absent → hit (nothing changed).
+        assert_eq!(
+            cache.resolve(&weak, &tmp("appear-r1")).unwrap(),
+            CacheLookup::Hit { exit_code: 0 }
+        );
+
+        // A code-gen step creates gen.h. The cached object was compiled WITHOUT
+        // it, so the result is now stale: resolve MUST miss and re-run.
+        std::fs::write(&gen_h, b"#define X 1").unwrap();
+        assert_eq!(
+            cache.resolve(&weak, &tmp("appear-r2")).unwrap(),
+            CacheLookup::Miss,
+            "an absent include that appears must invalidate the cached result (COR-002)"
+        );
+
+        let _ = std::fs::remove_file(&gen_h);
     }
 
     #[test]
