@@ -11,8 +11,14 @@
 //! end-to-end key (ADR 0003: BLAKE3); ranged `Read` is served by digest from
 //! the CAS, which is also where worker outputs and the action cache live (M4.3).
 //!
-//! Path scoping/auth is deferred to M7 — on a trusted LAN the agent presents
-//! its filesystem to the worker.
+//! **Auth + scope (M7 + ADR 0013).** The data-plane Hello is token-gated (M7,
+//! ADR 0006). Scope is agent-authoritative: when the Hello names a session the
+//! scheduler created (via the [`crate::session_registry::SessionRegistry`]), the
+//! connection binds to that session's capability and reads are scoped to the
+//! AGENT's root (not the worker-declared one), pins are per-session, and Read/Has
+//! are gated to the session's pinned digests. A worker that sends an empty/unknown
+//! session id (a pre-ADR-0013 worker or a test) falls back to the legacy per-
+//! connection scoping by the worker-declared root — the pre-0013 behaviour.
 //!
 //! A [`PathMap`] optionally remaps a requested *logical* path to a different
 //! *backing* file. Identity mapping is the real deployment; the remap exists so

@@ -39,7 +39,8 @@
 `intake.rs:159-161` で `session_id` を `action_id`(=`intake-{n}`) から分離し、**OS CSPRNG(getrandom) 128bit→32hex**。`action_id` は trace dir 名/abort key なので連番のまま。`session_id: String` は既に opaque passenger ＝**型変更なし**、mint 値だけ変更。
 
 ### (2) agent 権威 SessionRegistry（新規 `session_registry.rs`）
-session ごとに保持: `root`（agent 正規化済 input root・**worker 申告は使わない**）／`declared_outputs`／`pinned: HashMap<path, Arc<OnceCell<Digest>>>`（**per-path single-flight**＝race 解消）／`allowed_digests`（OpenRead pin で増える**共有 CAS への ACL overlay**）／`writebacks`／`dispatched_workers`（再割当てで増える集合・テレメトリ）／`created`＋`conns`。registry が **daemon 全体で1つの共有 `BlobStore`** を所有（per-server `Session.cas` を置換）。`run.rs::run_daemon` で1つ生成し intake/scheduler と fileserver の**両方**へ注入。
+session ごとに保持: `root`（agent 正規化済 input root・**worker 申告は使わない**）／`declared_outputs`／`pinned: HashMap<path, Arc<OnceCell<Digest>>>`（**per-path single-flight**＝race 解消）／`allowed_digests`（OpenRead pin で増える**共有 CAS への ACL overlay**）／`writebacks`／`created`＋`conns`。registry が **daemon 全体で1つの共有 `BlobStore`** を所有（per-server `Session.cas` を置換）。`run.rs::run_daemon` で1つ生成し intake と fileserver の**両方**へ注入。
+（`dispatched_workers` テレメトリは**当初設計に含めたが実装では見送り**：データプレーン Hello に per-worker 秘密がなく、提示された session_id の peer が dispatch 先 worker か照合できないため、記録しても比較対象がない。下記「残存」の per-session capability token と同時に入れる。）
 
 ### (3) session_id をデータプレーン Hello へ
 `worker/lib.rs execute`→`run_action`→`build_child`(VFS分岐 `:602`)→`serve_vfs_with_prefetch_ready`→`VfsState`→`FileClient::connect_with_rtt_session`→`HelloRequest` に session_id を配線。`HelloRequest`(`ops.rs:433-463`)は手書き構造体ゆえ**3つ目 field を追記＋寛容 decode**（旧2 field frame は `session_id=""`、strict trailing 検査を呼ばない）。
@@ -59,11 +60,11 @@ dispatch 直前に `registry.create`、dispatch 戻り後（cache-hit 含む）`
 
 ## 影響
 
-- 新規 `crates/agent/src/session_registry.rs`。`fileserver.rs`（handshake bind-by-session、per-op `&cap`、4ゲート、`Session` 退役、legacy fallback）。`intake.rs`（乱数 mint、create/finish）。`run.rs`（registry 生成＋両注入、idle sweeper）。`scheduler.rs`（note_dispatch）。`dataplane/src/ops.rs`（HelloRequest 3rd field＋寛容 decode）。`worker/src/{lib,vfs_pipe,fileclient}.rs`（session_id 配線）。`control.proto`＋`worker/coordination.rs`（capability flag）。`docs/protocol/v0.md`（§5 caveat を「agent 権威・session_id keyed」、WriteBack を「declared-output/root scoped」へ）。
-- 検証: SEC-004（`c:\`申告無視）UT、COR-001 二 session UT（A の編集を B が観測）、非許可 digest Read 拒否 UT、declared 外 WriteBack 拒否 UT、single-flight race UT、cross-worker isolation＋residual テレメトリ UT、旧 worker(空 id) legacy 経路で既存テスト緑、fmt/clippy/test 緑、**determinism harness 緑**。author 以外で `verifier`(opus)、データプレーン/scope に触れるので `security-reviewer`(opus)。
+- 新規 `crates/agent/src/session_registry.rs`。`fileserver.rs`（handshake bind-by-session、per-op `&cap`、4ゲート、`Session` 退役、legacy fallback）。`intake.rs`（乱数 mint、create/finish）。`run.rs`（registry 生成＋両注入、idle sweeper）。`dataplane/src/ops.rs`（HelloRequest 3rd field＋寛容 decode）。`worker/src/{lib,vfs_pipe,fileclient}.rs`（session_id 配線）。`control.proto`＋`worker/coordination.rs`（capability flag）。`docs/protocol/v0.md`（§5 caveat を「agent 権威・session_id keyed」、WriteBack を「declared-output/root scoped」へ）。
+- 検証（**実装済み・緑**）: SEC-004（`c:\`申告無視）UT＋cross-session digest isolation UT、COR-001 二 session UT（A の編集を B が観測）、single-flight race UT、absent-pin 非キャッシュ UT、declared 外 WriteBack 拒否 UT、idle sweeper UT、旧 worker(空 id) legacy 経路で既存テスト緑、fmt/clippy/test 緑（workspace 268 passed）。author 以外で `verifier`(opus)＝CONFIRMED、データプレーン/scope ゆえ `security-reviewer`(opus)＝PASS（バイパスなし）。determinism harness は本作業が supply/scope のみ＝出力バイト不変ゆえ CI ゲートに委譲。
 
 ## 残存・繰延（LAN-trusted・後続 zero-trust）
 
-- **cross-worker session theft（bounded・not closed）**: 共有トークン保持 worker が他 session_id を**捕捉**できれば（予測は 128bit 乱数で不可）その scope を読める。到達範囲は権威 root＋declared_outputs のみ（`c:\`/任意書込み不可＝現状より厳密に良い）。データプレーン Hello は共有トークン認証で per-worker 秘密がなく `dispatched_workers` はテレメトリのみ。**完全閉鎖**は per-session capability token（agent が当該 worker の `ExecuteRequest` だけに渡す第2乱数を Hello で提示・registry 照合、reserved field 11・**mTLS 不要の additive**）＝小さな後続。本 registry seam が受け皿。
+- **cross-worker session theft（bounded・not closed）**: 共有トークン保持 worker が他 session_id を**捕捉**できれば（予測は 128bit 乱数で不可）その scope を読める。到達範囲は権威 root＋declared_outputs のみ（`c:\`/任意書込み不可＝現状より厳密に良い）。データプレーン Hello は共有トークン認証で per-worker 秘密がなく、提示された id の peer が dispatch 先 worker か照合する手段がない（検知シグナルも置けない）。**完全閉鎖**は per-session capability token（agent が当該 worker の `ExecuteRequest` だけに渡す第2乱数を Hello で提示・registry 照合、reserved field 11・**mTLS 不要の additive**）＝小さな後続。本 registry seam が受け皿で、dispatch↔worker 束縛（旧 `dispatched_workers`）はこの token と同時に入れる。
 - TLS（機密性）・per-worker mTLS identity は [ADR 0006](0006-trust-and-auth.md) のまま実 2 台 LAN 判断へ繰延。
 - WriteBack の declared-output 粒度（どの output か）は content-addressed＋digest 検証で担保（誤バイト不可）。

@@ -34,9 +34,12 @@
 //! session id is the worker it was dispatched to. A token-holding worker that
 //! *captures* another session's (128-bit, unguessable) id can bind it and reach
 //! that session's scope — but only its authoritative root + declared outputs,
-//! never `c:\`/arbitrary writes. `dispatched_workers` records the dispatch for
-//! telemetry; closing the theft needs a per-session capability token (reserved
-//! proto field 11), a small additive follow-up, not mTLS.
+//! never `c:\`/arbitrary writes. Closing the theft needs proof that the peer
+//! presenting the id is the worker the action was dispatched to, which the data
+//! plane cannot do under a flat shared token; the fix is a per-session capability
+//! token (reserved proto field 11), a small additive follow-up, not mTLS. (Until
+//! that lands there is no per-worker identity to record, so no theft-detection
+//! signal is wired here — it would have nothing to compare the peer against.)
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -89,10 +92,6 @@ pub struct SessionCapability {
     allowed_digests: Mutex<HashSet<Digest>>,
     /// Output path → in-progress streamed WriteBack, per session.
     writebacks: Mutex<HashMap<String, WritebackState>>,
-    /// Worker ids dispatch *attempted* for this action (a set, because the
-    /// scheduler reassigns across workers). Telemetry only under LAN-trusted —
-    /// the data plane has no per-worker secret to enforce against (see module doc).
-    dispatched_workers: Mutex<HashSet<String>>,
     created: Instant,
     /// Live data-plane connections bound to this session (RAII via [`ConnGuard`]),
     /// so the idle sweeper never reaps a session with work in flight.
@@ -112,7 +111,6 @@ impl SessionCapability {
             pinned: Mutex::new(HashMap::new()),
             allowed_digests: Mutex::new(HashSet::new()),
             writebacks: Mutex::new(HashMap::new()),
-            dispatched_workers: Mutex::new(HashSet::new()),
             created: Instant::now(),
             conns: AtomicUsize::new(0),
             enforce,
@@ -196,21 +194,6 @@ impl SessionCapability {
     pub fn writebacks(&self) -> &Mutex<HashMap<String, WritebackState>> {
         &self.writebacks
     }
-
-    async fn note_dispatch(&self, worker_id: &str) {
-        self.dispatched_workers
-            .lock()
-            .await
-            .insert(worker_id.to_string());
-    }
-
-    /// Whether `worker_id` is one of the workers this action was dispatched to.
-    /// Used for theft *telemetry* (not enforcement): a peer presenting this id
-    /// that is not in the set is logged, but under LAN-trusted it is still served
-    /// (see module doc). Returns `true` for a legacy session (nothing to check).
-    pub async fn dispatched_to(&self, worker_id: &str) -> bool {
-        !self.enforce || self.dispatched_workers.lock().await.contains(worker_id)
-    }
 }
 
 /// RAII tracker for a live connection bound to a session, so the idle sweeper
@@ -289,14 +272,6 @@ impl SessionRegistry {
     /// entry was present.
     pub async fn finish(&self, session_id: &str) -> bool {
         self.sessions.lock().await.remove(session_id).is_some()
-    }
-
-    /// Records (telemetry) a worker the scheduler dispatched this action to. A
-    /// no-op for an unknown session.
-    pub async fn note_dispatch(&self, session_id: &str, worker_id: &str) {
-        if let Some(cap) = self.sessions.lock().await.get(session_id).cloned() {
-            cap.note_dispatch(worker_id).await;
-        }
     }
 
     /// Binds a live connection to a session, bumping its connection refcount and
@@ -527,13 +502,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn note_dispatch_is_telemetry_not_a_gate() {
+    async fn an_absent_pin_is_not_cached_so_a_later_appearance_is_seen() {
+        // `pin` must NOT cache a miss: a file absent at first touch but created
+        // later must become pinnable (the single-flight init fails WITHOUT setting
+        // the cell, so a retry re-reads). This guards the snapshot/retry contract.
         let reg = SessionRegistry::new().unwrap();
+        let dir = tmp("absent-pin");
+        let f = dir.join("late.h");
         let cap = reg.create("s".into(), None, HashSet::new()).await;
-        reg.note_dispatch("s", "worker-1").await;
-        assert!(cap.dispatched_to("worker-1").await);
-        // A worker NOT dispatched to is flagged (false) — the caller logs it but,
-        // under LAN-trusted, still serves (enforcement is the deferred cap token).
-        assert!(!cap.dispatched_to("worker-2").await);
+
+        // Absent at first touch → None, and NOT frozen.
+        assert!(cap.pin(reg.store(), "late.h", f.clone()).await.is_none());
+        // The file appears; a later pin now succeeds (the miss was not cached).
+        std::fs::write(&f, b"now here").unwrap();
+        let pinned = cap.pin(reg.store(), "late.h", f.clone()).await;
+        assert!(
+            pinned.is_some(),
+            "an absent pin must not be cached; the file appearing must be seen"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
