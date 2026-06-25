@@ -179,6 +179,58 @@ impl DaemonConfig {
         cfg
     }
 
+    /// Like [`load_from`] but distinguishes an ABSENT file (→ defaults, the common
+    /// dev case) from a PRESENT-but-unreadable/invalid one (CFG-001 / SEC-001).
+    /// A corrupt or unreadable EXISTING config must NOT silently fall back to
+    /// defaults: the defaults carry no cluster token, so doing so would silently
+    /// disable LAN auth (ADR 0006) — exactly the failure mode where a truncated
+    /// save or a tampered file quietly opens the cluster. So this returns `Err` for
+    /// a present-but-bad file; the daemon refuses to start (the operator fixes or
+    /// removes it). Env overrides are applied by [`load_effective_checked`].
+    pub fn load_or_refuse(path: &Path) -> Result<Self, String> {
+        // Lead with a confirmed-absent check so the common dev case (no file, or a
+        // missing parent dir) uses defaults — and is distinguished from a file that
+        // is genuinely PRESENT but unreadable. `try_exists() == Ok(false)` is the
+        // only "definitely not there" signal; a permission error on the file itself
+        // makes `try_exists` return `Err`, which falls through to the read+refuse.
+        if matches!(path.try_exists(), Ok(false)) {
+            return Ok(Self::default());
+        }
+        match std::fs::read(path) {
+            // Raced away between the existence check and the read → treat as absent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!(
+                "config {} exists but is unreadable ({e}); refusing to start with \
+                 auth-disabling defaults (CFG-001/SEC-001). Fix its permissions or remove it.",
+                path.display()
+            )),
+            Ok(bytes) => {
+                let s = String::from_utf8(bytes).map_err(|_| {
+                    format!(
+                        "config {} is not valid UTF-8; refusing to start.",
+                        path.display()
+                    )
+                })?;
+                toml::from_str(&s).map_err(|e| {
+                    format!(
+                        "config {} is invalid TOML ({e}); refusing to start with auth-disabling \
+                         defaults (CFG-001/SEC-001). Fix or remove it.",
+                        path.display()
+                    )
+                })
+            }
+        }
+    }
+
+    /// The daemon's effective STARTUP config: [`load_or_refuse`] then env
+    /// overrides. Returns `Err` (so the daemon exits non-zero) on a present-but-bad
+    /// config, rather than silently running with auth-disabling defaults (CFG-001).
+    pub fn load_effective_checked(path: &Path) -> Result<Self, String> {
+        let mut cfg = Self::load_or_refuse(path)?;
+        cfg.apply_env_overrides();
+        Ok(cfg)
+    }
+
     /// Writes the config to `path` as TOML, creating the parent directory. Used by
     /// the Status `SetConfig` RPC: the GUI persists settings here and they take
     /// effect on the next daemon start (no live reload, ADR 0008).
@@ -187,7 +239,25 @@ impl DaemonConfig {
             std::fs::create_dir_all(parent)?;
         }
         let s = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, s)
+        // Atomic write (CFG-001): a crash mid-write must never leave a TRUNCATED
+        // config, which would then load as auth-disabling defaults. Write a temp
+        // sibling (same volume), then rename onto the final path — a rename is
+        // atomic within a volume, so a reader always sees the old or the new file
+        // whole, never a half-written one.
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config".into());
+        let mut tmp = path.to_path_buf();
+        tmp.set_file_name(format!(".{name}.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, s)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 
     /// Builds the installer's default `daemon.toml` (M9.5d) — just the defaults. The
@@ -251,6 +321,54 @@ mod tests {
         };
         cfg.save_to(&path).unwrap();
         assert_eq!(DaemonConfig::load_from(&path), cfg);
+    }
+
+    #[test]
+    fn load_or_refuse_defaults_when_absent_but_refuses_a_corrupt_present_file() {
+        // CFG-001: an ABSENT config → defaults (common dev case, OK). A PRESENT but
+        // invalid config → Err, so the daemon refuses to start rather than silently
+        // running with auth-disabling defaults (the cluster-token-clear failure).
+        let absent = tmp_file();
+        assert_eq!(
+            DaemonConfig::load_or_refuse(&absent).unwrap(),
+            DaemonConfig::default(),
+            "an absent config loads defaults"
+        );
+
+        let path = tmp_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // A previously-tokened config that became corrupt (truncated/garbage).
+        std::fs::write(&path, "this is not valid = = toml ][").unwrap();
+        let err = DaemonConfig::load_or_refuse(&path)
+            .expect_err("a present-but-invalid config must be refused, not defaulted");
+        assert!(err.contains("invalid"), "the error explains why: {err}");
+        // And it must NOT have quietly produced an auth-disabled default.
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_sibling() {
+        // CFG-001: the save writes a temp sibling then renames (atomic), so a reader
+        // never sees a truncated config; after a successful save no `.tmp` residue
+        // remains and the result round-trips.
+        let path = tmp_file();
+        let cfg = DaemonConfig {
+            cluster_token: Some("keep-this-token".into()),
+            ..DaemonConfig::default()
+        };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(DaemonConfig::load_from(&path), cfg, "round-trips");
+        // No `.daemon.toml.tmp.*` left behind.
+        let dir = path.parent().unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".daemon.toml.tmp")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "no temp residue after an atomic save");
     }
 
     #[test]
