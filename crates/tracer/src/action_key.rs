@@ -523,6 +523,25 @@ mod action_cache_tests {
     }
 
     #[test]
+    fn load_run_from_dir_flags_an_unparseable_trace_file() {
+        // COR-003 wiring (end-to-end): a `.sbzt` file that fails to parse must
+        // surface as a cache-blocking graph warning via load_run_from_dir, not be
+        // silently swallowed — so the action it belongs to is not recorded. This
+        // exercises the real load_traces_from_dir → load_run_from_dir path (a test
+        // that only pushes a synthetic warning would not catch a dropped wiring).
+        let root = tmp_dir("badtrace");
+        std::fs::write(root.join("garbage.sbzt"), b"this is not a valid sbzt trace").unwrap();
+        let dir = root.to_string_lossy().into_owned();
+        let (graph, _cwd) = load_run_from_dir(&dir).unwrap();
+        assert!(
+            graph.warnings.iter().any(|w| w.contains("failed to parse")),
+            "an unparseable .sbzt must become a cache-blocking warning: {:?}",
+            graph.warnings
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn vanished_content_forces_a_miss_rather_than_a_drop() {
         let root = tmp_dir("vanish");
         std::fs::write(root.join("a.cpp"), b"v1").unwrap();
