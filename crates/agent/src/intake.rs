@@ -97,8 +97,14 @@ pub struct IntakeVfsContext {
 #[derive(Clone)]
 pub struct IntakeService {
     scheduler: Scheduler,
-    /// Per-daemon action counter, so each submission gets a unique action_id /
-    /// session_id without a clock or RNG (keeps the daemon reproducible).
+    /// Per-daemon action counter. It names the per-action `trace-{n}` dir and the
+    /// `action_id` (the abort key) — the *reproducible* identifiers, kept clock-
+    /// and RNG-free so the daemon's on-disk artifacts and cache keys (which key on
+    /// content/argv, never on these ids) stay stable run to run. The `session_id`
+    /// is deliberately NOT derived from this counter: it must be unpredictable
+    /// (ADR 0013 / PROTO-001), so it is minted from the OS CSPRNG instead. That is
+    /// safe for reproducibility because `session_id` names no artifact and enters
+    /// no cache key or build output — only the in-memory/wire data-plane session.
     seq: Arc<AtomicU64>,
     /// Read-VFS + cache context; `None` → plain dispatch (M6.0/tests).
     vfs: Option<Arc<IntakeVfsContext>>,
@@ -106,6 +112,18 @@ pub struct IntakeService {
     /// remote/local/fallback exec breakdown, and the in-flight gauge here. The
     /// daemon hands the same `Arc` to the Status service via [`Self::metrics`].
     metrics: Arc<Metrics>,
+}
+
+/// Mints an unpredictable 128-bit data-plane session id as 32 lowercase hex
+/// chars from the OS CSPRNG (ADR 0013 / PROTO-001). Unlike `action_id` /
+/// `trace-{n}` it is deliberately non-reproducible: guessability is exactly the
+/// threat it closes, so an attacker must capture a live session id rather than
+/// predict the next one. It names no artifact and enters no cache key or build
+/// output, so making it random does not affect the daemon's reproducibility.
+fn mint_session_id() -> String {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).expect("OS CSPRNG unavailable while minting a session id");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl IntakeService {
@@ -154,11 +172,13 @@ impl LocalIntake for IntakeService {
             return Err(Status::invalid_argument("command.argv must be non-empty"));
         }
 
-        // A unique id per submission; session_id binds the data-plane file
-        // session and `n` names the per-action trace dir.
+        // `n` names the per-action trace dir (reproducible); `action_id` is the
+        // worker's abort key. `session_id` binds the data-plane file session and
+        // is minted from the OS CSPRNG so it cannot be guessed (ADR 0013): an
+        // attacker must capture a live session id, not predict the next one.
         let n = self.seq.fetch_add(1, Ordering::Relaxed);
         let action_id = format!("intake-{n}");
-        let session_id = action_id.clone();
+        let session_id = mint_session_id();
 
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(run_submission(
@@ -517,7 +537,35 @@ pub async fn submit_to_daemon(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_loopback_intake;
+    use super::{mint_session_id, resolve_loopback_intake};
+
+    #[test]
+    fn session_id_is_unpredictable_128_bit_hex() {
+        // ADR 0013 / PROTO-001: a session id must be 32 lowercase hex chars (128
+        // random bits) and must NOT be the old guessable `intake-{n}` form. Two
+        // mints differing is a (probabilistic) proxy for "drawn from the CSPRNG,
+        // not a counter" — equality would be a 1-in-2^128 event.
+        let a = mint_session_id();
+        let b = mint_session_id();
+        assert_eq!(
+            a.len(),
+            32,
+            "session id must be 32 hex chars (128 bits): {a:?}"
+        );
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "session id must be lowercase hex: {a:?}"
+        );
+        assert!(
+            !a.starts_with("intake-"),
+            "session id must not be the guessable counter form"
+        );
+        assert_ne!(
+            a, b,
+            "two minted session ids must differ (drawn from the CSPRNG)"
+        );
+    }
 
     #[test]
     fn loopback_addresses_are_accepted() {

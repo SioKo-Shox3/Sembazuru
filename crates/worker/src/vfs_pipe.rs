@@ -62,8 +62,15 @@ struct VfsState {
     auth_token: String,
     /// The action's agent-side input root (`VfsExecution.vfs_root`), declared on
     /// the handshake so the agent scopes file supply to it (M7.1). Empty = the
-    /// agent does not scope (legacy/tests).
+    /// agent does not scope (legacy/tests). Advisory as of ADR 0013: when
+    /// `session_id` names a known session the agent uses its own authoritative
+    /// root instead (closing the worker-can-widen-scope hole, SEC-004).
     session_root: String,
+    /// The agent-minted session id (ADR 0013), presented on the data-plane
+    /// handshake so the agent binds this connection to the authoritative session
+    /// (root, per-session pin partition, allowed-digest set, declared outputs).
+    /// Empty = legacy per-connection scoping by the worker-declared `session_root`.
+    session_id: String,
     /// The session's pooled, multiplexed agent connection, dialed on first
     /// hydrate. `OnceCell::get_or_try_init` retries if the first dial fails, so a
     /// worker that starts before the agent is listening recovers on a later open.
@@ -81,6 +88,7 @@ impl VfsState {
                     self.rtt,
                     self.auth_token.clone(),
                     self.session_root.clone(),
+                    self.session_id.clone(),
                 )
             })
             .await
@@ -173,6 +181,8 @@ pub async fn serve_vfs_with_prefetch(
         predicted_paths,
         ready,
         vfs_root,
+        // Wrappers serve the legacy/test path with no agent-minted session id.
+        String::new(),
     )
     .await
 }
@@ -199,6 +209,7 @@ pub async fn serve_vfs_with_prefetch_ready(
     predicted_paths: Vec<String>,
     ready: tokio::sync::oneshot::Sender<()>,
     vfs_root: String,
+    session_id: String,
 ) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     let state = Arc::new(VfsState {
@@ -212,6 +223,8 @@ pub async fn serve_vfs_with_prefetch_ready(
         auth_token: sembazuru_proto::auth::cluster_token_from_env().unwrap_or_default(),
         // Declared input root the agent scopes file supply to (M7.1).
         session_root: vfs_root,
+        // Agent-minted session id (ADR 0013); empty on the wrapper/legacy path.
+        session_id,
         client: OnceCell::new(),
     });
 
@@ -398,6 +411,7 @@ mod tests {
                 Vec::new(),
                 tx,
                 String::new(), // unscoped (this test never dials the agent)
+                String::new(), // no agent-minted session (legacy path)
             )
             .await;
         });
@@ -445,6 +459,7 @@ mod tests {
             rtt: Duration::ZERO,
             auth_token: String::new(),   // auth-disabled harness
             session_root: String::new(), // unscoped harness
+            session_id: String::new(),   // no agent-minted session (legacy path)
             client: OnceCell::new(),
         });
 

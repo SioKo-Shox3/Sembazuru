@@ -44,6 +44,9 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# OS CSPRNG for unpredictable per-action session ids (ADR 0013 / PROTO-001): an
+# attacker must *capture* a session id, not predict the next one. Tiny, no_std.
+getrandom = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 # Windows Service support for `sembazuru-daemon --service` (M9.3b). Windows-only;

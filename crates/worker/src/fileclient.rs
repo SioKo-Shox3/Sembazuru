@@ -159,7 +159,7 @@ impl FileClient {
     /// the M3.5 latency benchmark; pass `Duration::ZERO` in production). No auth
     /// token and no declared root (unscoped) — used by tests/examples.
     pub async fn connect_with_rtt<A: ToSocketAddrs>(addr: A, rtt: Duration) -> io::Result<Self> {
-        Self::connect_with_rtt_session(addr, rtt, String::new(), String::new()).await
+        Self::connect_with_rtt_session(addr, rtt, String::new(), String::new(), String::new()).await
     }
 
     /// Connects with an explicit `token` but no declared root. Back-compat shim
@@ -169,26 +169,34 @@ impl FileClient {
         rtt: Duration,
         token: String,
     ) -> io::Result<Self> {
-        Self::connect_with_rtt_session(addr, rtt, token, String::new()).await
+        Self::connect_with_rtt_session(addr, rtt, token, String::new(), String::new()).await
     }
 
     /// Connects and performs the session-open handshake (M7.0 auth + M7.1 path
     /// scoping) before any op: it writes a single `Hello` frame carrying the
-    /// shared `token` (may be empty when auth is off) and the declared session
-    /// `root` (may be empty for no scoping), then waits for the agent's verdict —
-    /// failing the connect if the agent rejects it (bad token). The handshake
-    /// runs on the raw stream *before* the multiplexing reader task starts, so it
-    /// cannot race ordinary ops.
+    /// shared `token` (may be empty when auth is off), the declared session `root`
+    /// (may be empty for no scoping), and the agent-minted `session_id` (ADR 0013;
+    /// empty for the legacy/unscoped path), then waits for the agent's verdict —
+    /// failing the connect if the agent rejects it (bad token). When `session_id`
+    /// names a known session the agent ignores `root` and uses its own
+    /// authoritative root for that session. The handshake runs on the raw stream
+    /// *before* the multiplexing reader task starts, so it cannot race ops.
     pub async fn connect_with_rtt_session<A: ToSocketAddrs>(
         addr: A,
         rtt: Duration,
         token: String,
         root: String,
+        session_id: String,
     ) -> io::Result<Self> {
         use tokio::io::AsyncWriteExt;
 
         let mut stream = TcpStream::connect(addr).await?;
-        let payload = sembazuru_dataplane::ops::HelloRequest { token, root }.encode();
+        let payload = sembazuru_dataplane::ops::HelloRequest {
+            token,
+            root,
+            session_id,
+        }
+        .encode();
         write_frame(
             &mut stream,
             FrameHeader {
