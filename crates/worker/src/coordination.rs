@@ -46,6 +46,12 @@ pub fn local_capabilities(capacity: u32, mode: ParticipationMode) -> Capabilitie
         // scheduling when this is "off", and an "always" worker reports no CPU
         // signal (full static capacity) while "adaptive" rides idle CPU (ADR 0010).
         participation_mode: mode.as_str().to_string(),
+        // This build presents the agent-minted session_id on the data-plane Hello
+        // so the agent binds file supply to the authoritative session (ADR 0013).
+        // Advertised for visibility; the operative signal is the non-empty
+        // session_id the worker forwards — an agent tolerates old workers that
+        // send none (legacy per-connection scoping).
+        supports_session_capability: true,
     }
 }
 

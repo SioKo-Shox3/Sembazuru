@@ -61,6 +61,16 @@ message Capabilities {
   // treated as participating (not "off"); the version gate (worker_version) already
   // excludes such an old worker. Generalizes ADR 0010's idle-cpu on/off toggle.
   string participation_mode = 9;
+  // Capability flag (§6): the worker presents the agent-minted, unpredictable
+  // session_id on the data-plane Hello so the agent binds file supply to the
+  // authoritative session — its own scope root (not the worker-declared one),
+  // a per-session pin partition, an allowed-digest set, and the declared output
+  // set (ADR 0013, closing COR-001/SEC-003/SEC-004/PROTO-001-predictability).
+  // A worker that does not advertise this sends an empty session_id and the agent
+  // falls back to the legacy per-connection, worker-declared-root scoping — so a
+  // mixed cluster keeps working. Gating is by capability flag, not version
+  // sniffing (§6); the operative runtime signal is the non-empty session_id.
+  bool supports_session_capability = 10;
 }
 
 message RegisterRequest {

@@ -413,6 +413,7 @@ async fn declared_root_scopes_file_supply() {
         Duration::ZERO,
         String::new(),                      // auth off
         root.path.to_string_lossy().into(), // declared root
+        String::new(),                      // no agent-minted session (legacy scoping)
     )
     .await
     .unwrap();

@@ -435,7 +435,18 @@ pub struct HelloRequest {
     pub token: String,
     /// Agent-side logical root the worker will read under (its `vfs_root`).
     /// The agent refuses to supply paths outside it. Empty = unscoped.
+    ///
+    /// As of ADR 0013 this field is **advisory**: when `session_id` names a known
+    /// agent-minted session, the agent uses *its own* authoritative root for that
+    /// session and ignores this one (closing the worker-can-widen-scope hole,
+    /// SEC-004). It is still sent for the legacy/unscoped path (empty session_id).
     pub root: String,
+    /// The agent-minted, unpredictable data-plane session id (ADR 0013). When it
+    /// names a known session, the agent binds this connection to that session's
+    /// authoritative root, per-session pin partition, allowed-digest set, and
+    /// declared outputs. Empty = a pre-ADR-0013 worker (or a test) → the legacy
+    /// per-connection, worker-declared-root path.
+    pub session_id: String,
 }
 
 /// The agent's verdict on the handshake. `ok == false` means the agent will
@@ -451,14 +462,24 @@ impl HelloRequest {
         let mut w = Writer::new();
         w.str(&self.token);
         w.str(&self.root);
+        w.str(&self.session_id);
         w.into_bytes()
     }
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(buf);
         let token = r.str()?;
         let root = r.str()?;
+        // Tolerate an old 2-field frame (a pre-ADR-0013 worker sends no
+        // session_id): `Reader::take` does not advance on EOF, so a read past the
+        // end leaves the cursor put and yields the empty (legacy/unscoped) id.
+        // `finish` still rejects genuinely trailing/partial bytes.
+        let session_id = r.str().unwrap_or_default();
         r.finish()?;
-        Ok(HelloRequest { token, root })
+        Ok(HelloRequest {
+            token,
+            root,
+            session_id,
+        })
     }
 }
 
@@ -481,6 +502,41 @@ impl HelloResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_round_trips_and_tolerates_a_legacy_two_field_frame() {
+        // ADR 0013: the 3-field Hello (token, root, session_id) round-trips.
+        let h = HelloRequest {
+            token: "s3cret".into(),
+            root: "c:\\proj".into(),
+            session_id: "0123456789abcdef0123456789abcdef".into(),
+        };
+        assert_eq!(HelloRequest::decode(&h.encode()).unwrap(), h);
+
+        // A pre-ADR-0013 worker sends only token+root; decode must tolerate that
+        // and yield an empty session_id (→ the legacy per-connection scoping path),
+        // because `Reader::take` does not advance the cursor on an EOF read.
+        let mut w = Writer::new();
+        w.str("tok");
+        w.str("c:\\legacy");
+        let legacy = w.into_bytes();
+        let decoded = HelloRequest::decode(&legacy).unwrap();
+        assert_eq!(decoded.token, "tok");
+        assert_eq!(decoded.root, "c:\\legacy");
+        assert_eq!(
+            decoded.session_id, "",
+            "an old 2-field Hello must decode to an empty session id"
+        );
+
+        // Genuinely trailing bytes after a valid frame are still rejected — the
+        // tolerant 3rd read does not turn `finish`'s trailing-junk guard off.
+        let mut bad = h.encode();
+        bad.push(0xff);
+        assert!(
+            HelloRequest::decode(&bad).is_err(),
+            "trailing junk after a Hello must be rejected, not silently eaten"
+        );
+    }
 
     #[test]
     fn stat_round_trips_including_negative_results() {

@@ -276,6 +276,9 @@ where
 async fn run_action(
     cmd: Command,
     action_id: String,
+    // The agent-minted data-plane session id (ADR 0013), forwarded onto the VFS
+    // handshake so the agent binds file supply to the authoritative session.
+    session_id: String,
     vfs_req: Option<VfsExecution>,
     predicted_paths: Vec<String>,
     vfs_cfg: Option<Arc<WorkerVfsConfig>>,
@@ -346,7 +349,7 @@ async fn run_action(
     // input tree to remove after the run (deferred #8 / M9.2). All are cleaned up
     // after the child exits.
     let (mut child, pipe_task, job, unvirt_marker, scratch_dir) =
-        match build_child(&cmd, vfs_plan, predicted_paths).await {
+        match build_child(&cmd, vfs_plan, predicted_paths, session_id).await {
             Ok(parts) => parts,
             Err(detail) => {
                 let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
@@ -487,6 +490,9 @@ async fn build_child(
     cmd: &Command,
     vfs_plan: Option<(VfsExecution, Arc<WorkerVfsConfig>)>,
     predicted_paths: Vec<String>,
+    // The agent-minted session id (ADR 0013); moved onto the VFS data-plane
+    // handshake. Empty/unused on the plain path (it has no data plane).
+    session_id: String,
 ) -> Result<
     (
         tokio::process::Child,
@@ -610,6 +616,7 @@ async fn build_child(
             predicted_paths,
             ready_tx,
             vfs_root,
+            session_id,
         )
         .await
     });
@@ -713,6 +720,10 @@ impl Execution for WorkerService {
         // M6.1: VFS config and prefetch hint ride the request; the worker's own
         // install config decides whether VFS mode is even possible.
         let action_id = req.action_id;
+        // ADR 0013: the agent-minted data-plane session id. Previously decoded
+        // and dropped here; now forwarded onto the VFS handshake so the agent can
+        // bind file supply to the authoritative session (root/pins/outputs).
+        let session_id = req.session_id;
         let vfs_req = req.vfs;
         let predicted_paths = req.predicted_paths;
         let vfs_cfg = self.vfs.clone();
@@ -740,6 +751,7 @@ impl Execution for WorkerService {
         tokio::spawn(run_action(
             cmd,
             action_id,
+            session_id,
             vfs_req,
             predicted_paths,
             vfs_cfg,

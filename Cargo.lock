@@ -3688,6 +3688,7 @@ checksum = "b12e76d157a900eb52e81bc6e9f3069344290341720e9178cde2407113ac8d89"
 name = "sembazuru-agent"
 version = "0.0.1"
 dependencies = [
+ "getrandom 0.3.4",
  "sembazuru-cas",
  "sembazuru-dataplane",
  "sembazuru-proto",
