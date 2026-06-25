@@ -19,7 +19,6 @@
 //! a single-machine test can serve bytes that differ from whatever happens to
 //! sit at the logical path locally (proving content provenance).
 
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,6 +45,7 @@ impl ServerStats {
     }
 }
 
+use crate::session_registry::{SessionCapability, SessionRegistry, WritebackState};
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
@@ -58,9 +58,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 const INLINE_CHUNK: usize = 64 * 1024;
-
-/// Disambiguates per-server agent CAS directories within a process.
-static CAS_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Resolves a requested (agent-side logical) path to the actual file to read.
 #[derive(Clone)]
@@ -96,78 +93,6 @@ impl PathMap {
     }
 }
 
-/// In-progress streamed WriteBack for one output path: the temp file being
-/// appended to, how many bytes have landed (the next expected offset), and the
-/// running digest so the whole output is verified without buffering it.
-struct WritebackState {
-    tmp: PathBuf,
-    written: u64,
-    hasher: DigestHasher,
-}
-
-/// The per-session file-supply state: the agent's content store, the first-touch
-/// pin map that gives snapshot consistency, and any in-progress streamed outputs.
-struct Session {
-    cas: BlobStore,
-    /// Where `cas` lives, so the session scrubs it on drop (M5.3). NOTE: today
-    /// one `Session` lives for the whole agent process (the serve loop holds it),
-    /// so this fires at process exit and stops the per-run temp tree from leaking
-    /// across runs. True mid-life per-session eviction in a long-lived multi-
-    /// session agent (deferred #8) needs the daemon's session lifecycle (M5.5).
-    cas_root: PathBuf,
-    /// Requested logical path → the digest pinned at its first OpenRead. Once a
-    /// path is here, its content is frozen for the session.
-    pinned: Mutex<HashMap<String, Digest>>,
-    /// Output path → in-progress streamed WriteBack.
-    writebacks: Mutex<HashMap<String, WritebackState>>,
-    stats: Arc<ServerStats>,
-}
-
-impl Session {
-    fn new(stats: Arc<ServerStats>) -> io::Result<Session> {
-        let seq = CAS_SEQ.fetch_add(1, Ordering::Relaxed);
-        let cas_root =
-            std::env::temp_dir().join(format!("sbz-agent-cas.{}.{seq}", std::process::id()));
-        Ok(Session {
-            cas: BlobStore::open(&cas_root)?,
-            cas_root,
-            pinned: Mutex::new(HashMap::new()),
-            writebacks: Mutex::new(HashMap::new()),
-            stats,
-        })
-    }
-
-    /// Returns the pinned `(digest, size)` for `requested`, ingesting its bytes
-    /// into the CAS on first touch. `None` if the file does not exist. A later
-    /// call for the same path returns the *same* digest even if the on-disk
-    /// file has since changed (snapshot consistency).
-    async fn ingest(&self, requested: &str, actual: PathBuf) -> Option<(Digest, u64)> {
-        if let Some(d) = self.pinned.lock().await.get(requested).cloned() {
-            // Already pinned: serve the frozen blob's size from the CAS.
-            let size = self.cas.get(&d).ok().flatten().map(|b| b.len() as u64)?;
-            return Some((d, size));
-        }
-        let bytes = tokio::fs::read(&actual).await.ok()?;
-        let size = bytes.len() as u64;
-        let digest = self.cas.put(&bytes).ok()?;
-        self.pinned
-            .lock()
-            .await
-            .entry(requested.to_string())
-            .or_insert_with(|| digest.clone());
-        Some((digest, size))
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        // Scrub the session's temp CAS tree. Best-effort: a leaked temp dir is
-        // not a correctness problem, so a failure here is ignored rather than
-        // surfaced from a destructor.
-        let _ = std::fs::remove_dir_all(&self.cas_root);
-    }
-}
-
 /// Serves the file session identity-mapped on an already-bound listener. Auth
 /// **disabled** (for tests/harnesses); the daemon uses
 /// [`serve_files_with_stats_token`] with the env-configured token (ADR 0006).
@@ -177,6 +102,7 @@ pub async fn serve_files(listener: TcpListener) -> io::Result<()> {
         PathMap::Identity,
         Arc::new(ServerStats::default()),
         None,
+        Arc::new(SessionRegistry::new()?),
     )
     .await
 }
@@ -188,18 +114,29 @@ pub async fn serve_files_with_stats(
     listener: TcpListener,
     stats: Arc<ServerStats>,
 ) -> io::Result<()> {
-    serve_with_map(listener, PathMap::Identity, stats, None).await
+    serve_with_map(
+        listener,
+        PathMap::Identity,
+        stats,
+        None,
+        Arc::new(SessionRegistry::new()?),
+    )
+    .await
 }
 
 /// Like [`serve_files_with_stats`] but requires the shared cluster token on the
-/// data-plane handshake (M7, ADR 0006). `expected_token == None` disables auth.
-/// The daemon calls this with [`sembazuru_proto::auth::cluster_token_from_env`].
+/// data-plane handshake (M7, ADR 0006) and uses the daemon's shared
+/// [`SessionRegistry`] (ADR 0013), so a worker's Hello session id binds to the
+/// agent-authoritative session the scheduler created. `expected_token == None`
+/// disables auth. The daemon calls this with the env-configured token and the
+/// one registry it also hands to intake.
 pub async fn serve_files_with_stats_token(
     listener: TcpListener,
     stats: Arc<ServerStats>,
     expected_token: Option<String>,
+    registry: Arc<SessionRegistry>,
 ) -> io::Result<()> {
-    serve_with_map(listener, PathMap::Identity, stats, expected_token).await
+    serve_with_map(listener, PathMap::Identity, stats, expected_token, registry).await
 }
 
 /// Serves with paths under `logical_root` remapped to `backing_root`. For tests
@@ -213,7 +150,14 @@ pub async fn serve_files_remap(
         logical_root: logical_root.replace('/', "\\").to_lowercase(),
         backing_root,
     };
-    serve_with_map(listener, map, Arc::new(ServerStats::default()), None).await
+    serve_with_map(
+        listener,
+        map,
+        Arc::new(ServerStats::default()),
+        None,
+        Arc::new(SessionRegistry::new()?),
+    )
+    .await
 }
 
 async fn serve_with_map(
@@ -221,25 +165,27 @@ async fn serve_with_map(
     map: PathMap,
     stats: Arc<ServerStats>,
     expected_token: Option<String>,
+    registry: Arc<SessionRegistry>,
 ) -> io::Result<()> {
-    let session = Arc::new(Session::new(stats)?);
     let map = Arc::new(map);
     let expected_token = Arc::new(expected_token);
     loop {
         let (sock, _peer) = listener.accept().await?;
-        let s = session.clone();
+        let reg = registry.clone();
         let m = map.clone();
+        let st = stats.clone();
         let tok = expected_token.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(sock, s, m, tok).await;
+            let _ = handle_conn(sock, reg, m, st, tok).await;
         });
     }
 }
 
 async fn handle_conn(
     sock: TcpStream,
-    session: Arc<Session>,
+    registry: Arc<SessionRegistry>,
     map: Arc<PathMap>,
+    stats: Arc<ServerStats>,
     expected_token: Arc<Option<String>>,
 ) -> io::Result<()> {
     // Pipelining (M5.3): read requests off the connection and dispatch each on
@@ -249,16 +195,30 @@ async fn handle_conn(
     // mutex-shared because a frame must be written whole.
     let (mut rd, mut wr) = sock.into_split();
 
-    // Session-open handshake (M7.0 auth + M7.1 path scoping). ALWAYS the first
-    // frame: the peer must open the session with a Hello before any op. The agent
-    // validates the shared token (closing the unauthenticated file-supply path)
-    // and records the declared input root, then refuses to supply any path
-    // outside it (closing the arbitrary-absolute-path read). An empty root means
-    // unscoped (legacy/tests); an empty configured token means auth off.
-    let scope_root = match handshake(&mut rd, &mut wr, expected_token.as_deref()).await? {
-        HandshakeResult::Reject => return Ok(()), // rejected; connection closed
-        HandshakeResult::Accept(root) => Arc::new(root),
+    // Session-open handshake (M7.0 auth + ADR 0013 session binding). ALWAYS the
+    // first frame: the agent validates the shared token, then reads the Hello's
+    // agent-minted session id. When the id names a session the scheduler created,
+    // bind this connection to the agent's OWN authoritative capability — its scope
+    // root, per-session pin partition, allowed-digest set, and output scope —
+    // **ignoring the worker-declared root** (closing the worker-can-widen-scope
+    // hole, SEC-004). An empty/unknown id (a pre-ADR-0013 worker or a test) gets a
+    // legacy per-connection capability that uses the worker-declared root — the
+    // old behaviour, so a mixed cluster and the existing tests keep working.
+    let (session_id, worker_root) =
+        match handshake(&mut rd, &mut wr, expected_token.as_deref()).await? {
+            HandshakeResult::Reject => return Ok(()), // rejected; connection closed
+            HandshakeResult::Accept {
+                session_id,
+                worker_root,
+            } => (session_id, worker_root),
+        };
+    let cap = match registry.get(&session_id).await {
+        Some(c) => c,
+        None => SessionRegistry::legacy_capability(worker_root),
     };
+    // Hold a connection guard for the connection's whole life so the idle sweeper
+    // never reaps a session that still has a live data-plane connection.
+    let _conn = SessionRegistry::bind(cap.clone());
 
     let wr = Arc::new(Mutex::new(wr));
     loop {
@@ -267,12 +227,14 @@ async fn handle_conn(
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        let session = session.clone();
+        let registry = registry.clone();
+        let cap = cap.clone();
         let map = map.clone();
+        let stats = stats.clone();
         let wr = wr.clone();
-        let root = scope_root.clone();
         tokio::spawn(async move {
-            let resp_payload = dispatch(header.op, &payload, &session, &map, &root).await;
+            let resp_payload =
+                dispatch(header.op, &payload, &cap, registry.store(), &map, &stats).await;
             let resp_header = FrameHeader {
                 request_id: header.request_id,
                 op: header.op,
@@ -288,14 +250,21 @@ async fn handle_conn(
 enum HandshakeResult {
     /// Bad token (or malformed/absent Hello): a rejection was sent; close.
     Reject,
-    /// Accepted; the declared input root to scope file supply to (`None` =
-    /// unscoped, the legacy/test case).
-    Accept(Option<String>),
+    /// Accepted: the agent-minted `session_id` from the Hello (empty = a
+    /// pre-ADR-0013 worker), and the worker-declared root normalized for the
+    /// legacy fallback (`None` = unscoped). A bound session ignores `worker_root`
+    /// and uses its own authoritative root.
+    Accept {
+        session_id: String,
+        worker_root: Option<String>,
+    },
 }
 
 /// Normalizes a declared root for prefix comparison: lowercased, `/`→`\`, no
-/// trailing separator. Empty in → `None` (unscoped).
-fn normalize_root(root: &str) -> Option<String> {
+/// trailing separator. Empty in → `None` (unscoped). Exposed (ADR 0013) so the
+/// scheduler/intake can derive a session's authoritative root in the SAME form
+/// `path_in_scope` compares against.
+pub fn normalize_root(root: &str) -> Option<String> {
     let r = root.replace('/', "\\").to_lowercase();
     let r = r.trim_end_matches('\\');
     if r.is_empty() {
@@ -349,14 +318,14 @@ fn normalize_requested(path: &str) -> Option<String> {
 /// match a sibling `…\project` and `…\proj\..\secret` does not escape. A path
 /// that will not normalize (non-absolute, UNC, `\\?\`, drive-escaping) is OUT of
 /// scope (fail closed).
-fn path_in_scope(requested: &str, root: &Option<String>) -> bool {
+fn path_in_scope(requested: &str, root: Option<&str>) -> bool {
     let Some(root) = root else {
         return true;
     };
     let Some(norm) = normalize_requested(requested) else {
         return false;
     };
-    norm == root.as_str() || norm.starts_with(&format!("{root}\\"))
+    norm == root || norm.starts_with(&format!("{root}\\"))
 }
 
 /// Server side of the session-open handshake (M7.0 auth + M7.1 scoping). The
@@ -385,11 +354,12 @@ async fn handshake(
         Ok(Err(e)) => return Err(e),
         Err(_) => return Ok(HandshakeResult::Reject),
     };
-    // Validate the token; on success carry the declared root out.
-    let decision: Result<Option<String>, &'static str> = if header.op == OpCode::Hello {
+    // Validate the token; on success carry the agent-minted session id and the
+    // worker-declared root (the latter only used for the legacy fallback) out.
+    let decision: Result<(String, Option<String>), &'static str> = if header.op == OpCode::Hello {
         match HelloRequest::decode(&payload) {
             Ok(h) => match sembazuru_proto::auth::check(expected, &h.token) {
-                Ok(()) => Ok(normalize_root(&h.root)),
+                Ok(()) => Ok((h.session_id, normalize_root(&h.root))),
                 Err(reason) => Err(reason),
             },
             Err(_) => Err("malformed handshake"),
@@ -414,7 +384,10 @@ async fn handshake(
     .await?;
     wr.flush().await?;
     Ok(match decision {
-        Ok(root) => HandshakeResult::Accept(root),
+        Ok((session_id, worker_root)) => HandshakeResult::Accept {
+            session_id,
+            worker_root,
+        },
         Err(_) => HandshakeResult::Reject,
     })
 }
@@ -422,25 +395,26 @@ async fn handshake(
 async fn dispatch(
     op: OpCode,
     payload: &[u8],
-    session: &Arc<Session>,
+    cap: &SessionCapability,
+    store: &BlobStore,
     map: &PathMap,
-    root: &Option<String>,
+    stats: &ServerStats,
 ) -> Vec<u8> {
     match op {
         OpCode::StatBatch => match StatRequest::decode(payload) {
-            Ok(req) => stat_batch(req, map, root).await.encode(),
+            Ok(req) => stat_batch(req, map, cap.root()).await.encode(),
             Err(_) => StatResponse { entries: vec![] }.encode(),
         },
         OpCode::OpenRead => match OpenReadRequest::decode(payload) {
-            Ok(req) => open_read(req, session, map, root).await.encode(),
+            Ok(req) => open_read(req, cap, store, map, stats).await.encode(),
             Err(_) => not_found_open().encode(),
         },
         OpCode::Read => match ReadRequest::decode(payload) {
-            Ok(req) => read_range(req, session).await.encode(),
+            Ok(req) => read_range(req, cap, store, stats).await.encode(),
             Err(_) => ReadResponse { bytes: vec![] }.encode(),
         },
         OpCode::DirList => match DirListRequest::decode(payload) {
-            Ok(req) => dir_list(req, map, root).await.encode(),
+            Ok(req) => dir_list(req, map, cap.root()).await.encode(),
             Err(_) => DirListResponse {
                 exists: false,
                 entries: vec![],
@@ -448,13 +422,13 @@ async fn dispatch(
             .encode(),
         },
         OpCode::Has => match HasRequest::decode(payload) {
-            Ok(req) => has(req, session).await.encode(),
+            Ok(req) => has(req, cap, store).await.encode(),
             // A malformed probe answers "present for none" — safe (the peer
             // will then transfer, never skip a blob the agent lacks).
             Err(_) => HasResponse { present: vec![] }.encode(),
         },
         OpCode::WriteBack => match WriteBackRequest::decode(payload) {
-            Ok(req) => write_back(req, session).await.encode(),
+            Ok(req) => write_back(req, cap).await.encode(),
             Err(_) => WriteBackResponse {
                 ok: false,
                 detail: "malformed WriteBack request".to_string(),
@@ -502,13 +476,32 @@ fn tmp_sibling(final_path: &std::path::Path) -> PathBuf {
 /// appended to a temp sibling and hashed incrementally; the final chunk verifies
 /// the whole output against `digest_hex` and atomically renames the temp onto
 /// the final name, so the build never sees a torn output (§3.2) and a large
-/// `.pdb`/`.exe` is never buffered whole in memory (M4.4). WriteBack is NOT
-/// remapped — the agent publishes where it wants the artifact.
-async fn write_back(req: WriteBackRequest, session: &Session) -> WriteBackResponse {
+/// `.pdb`/`.exe` is never buffered whole in memory (M4.4).
+///
+/// **Output scope (SEC-003, ADR 0013).** A bound session may only write to its
+/// declared outputs (or, when none were declared, to within its authoritative
+/// root) — closing the hole where a worker named any absolute agent-side path. A
+/// legacy/unscoped session keeps the pre-ADR-0013 any-path behaviour. The target
+/// is otherwise NOT remapped — the agent publishes where the action's output goes.
+async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBackResponse {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
+    // Gate the target BEFORE creating any directory or temp: a bound session's
+    // output must normalize to a drive-absolute path that is declared (or within
+    // its root). A non-normalizable form (UNC/relative/drive-escaping) is refused.
+    if cap.enforces() {
+        let within_root = path_in_scope(&req.path, cap.root());
+        let allowed = match normalize_requested(&req.path) {
+            Some(norm) => cap.output_allowed(&norm, within_root),
+            None => false,
+        };
+        if !allowed {
+            return wb_err("WriteBack target is outside the session's output scope".into());
+        }
+    }
+
     let final_path = PathBuf::from(&req.path);
-    let mut wbs = session.writebacks.lock().await;
+    let mut wbs = cap.writebacks().lock().await;
 
     // offset 0 (re)starts the stream: ensure the dir, create a fresh temp.
     if req.offset == 0 {
@@ -602,7 +595,7 @@ fn not_found_open() -> OpenReadResponse {
 /// Existence + attributes only (no digest): header resolution probes many
 /// non-existent paths, so this stays cheap and ingests nothing. Digest/content
 /// come from OpenRead (which is also where snapshot pinning happens).
-async fn stat_batch(req: StatRequest, map: &PathMap, root: &Option<String>) -> StatResponse {
+async fn stat_batch(req: StatRequest, map: &PathMap, root: Option<&str>) -> StatResponse {
     let mut entries = Vec::with_capacity(req.paths.len());
     for p in &req.paths {
         // Out-of-scope paths report "does not exist" — same as a real negative
@@ -639,31 +632,34 @@ async fn stat_batch(req: StatRequest, map: &PathMap, root: &Option<String>) -> S
 
 async fn open_read(
     req: OpenReadRequest,
-    session: &Session,
+    cap: &SessionCapability,
+    store: &BlobStore,
     map: &PathMap,
-    root: &Option<String>,
+    stats: &ServerStats,
 ) -> OpenReadResponse {
     // Out-of-scope open reports "not found" (existence-hiding) and ingests
-    // nothing, so no out-of-root content ever enters the session CAS (M7.1).
-    if !path_in_scope(&req.path, root) {
+    // nothing, so no out-of-root content ever enters the store. The scope is the
+    // session's AUTHORITATIVE root (the agent's, not the worker's) — SEC-004.
+    if !path_in_scope(&req.path, cap.root()) {
         return not_found_open();
     }
     let actual = map.resolve(&req.path);
-    let Some((digest, size)) = session.ingest(&req.path, actual).await else {
+    // Pin (single-flight) into the session's partition; this also records the
+    // digest in the session's allowed-digest ACL so the later Read/Has succeeds.
+    let Some((digest, size)) = cap.pin(store, &req.path, actual).await else {
         return not_found_open();
     };
     // Inline the first chunk only if asked. A worker-local-cache client sends
     // `want_inline = false` so a cache hit transfers no content at all.
     let first_chunk = if req.want_inline {
-        match session.cas.get(&digest) {
+        match store.get(&digest) {
             Ok(Some(bytes)) => bytes[..bytes.len().min(INLINE_CHUNK)].to_vec(),
             _ => vec![],
         }
     } else {
         vec![]
     };
-    session
-        .stats
+    stats
         .inline_bytes
         .fetch_add(first_chunk.len() as u64, Ordering::Relaxed);
     OpenReadResponse {
@@ -674,43 +670,55 @@ async fn open_read(
     }
 }
 
-/// Serves a ranged read from the *pinned* blob in the CAS (not a fresh disk
+/// Serves a ranged read from the *pinned* blob in the store (not a fresh disk
 /// read), so content is consistent for the whole session.
-async fn read_range(req: ReadRequest, session: &Session) -> ReadResponse {
+async fn read_range(
+    req: ReadRequest,
+    cap: &SessionCapability,
+    store: &BlobStore,
+    stats: &ServerStats,
+) -> ReadResponse {
     let Ok(digest) = Digest::parse(&req.digest_hex) else {
         return ReadResponse { bytes: vec![] };
     };
-    let bytes = match session.cas.get(&digest) {
+    // ADR 0013: a bound session may only read digests it has itself pinned, so a
+    // digest learned out-of-band (e.g. from another session) cannot be fetched
+    // here. A legacy/unscoped session reads any present digest (old behaviour).
+    if !cap.digest_visible(&digest).await {
+        return ReadResponse { bytes: vec![] };
+    }
+    let bytes = match store.get(&digest) {
         Ok(Some(b)) => b,
         _ => return ReadResponse { bytes: vec![] }, // unknown/absent digest
     };
     let start = (req.offset as usize).min(bytes.len());
     let end = start.saturating_add(req.len as usize).min(bytes.len());
     let out = bytes[start..end].to_vec();
-    session.stats.read_ops.fetch_add(1, Ordering::Relaxed);
-    session
-        .stats
+    stats.read_ops.fetch_add(1, Ordering::Relaxed);
+    stats
         .read_bytes
         .fetch_add(out.len() as u64, Ordering::Relaxed);
     ReadResponse { bytes: out }
 }
 
-/// Answers which of the probed digests the agent's CAS already holds (§4.3).
-async fn has(req: HasRequest, session: &Session) -> HasResponse {
-    let present = req
-        .digests
-        .iter()
-        .map(|s| match Digest::parse(s) {
-            Ok(d) => session.cas.has(&d),
+/// Answers which of the probed digests the agent's store already holds (§4.3),
+/// gated by the session's allowed-digest ACL so a bound session cannot probe
+/// another session's digest (ADR 0013).
+async fn has(req: HasRequest, cap: &SessionCapability, store: &BlobStore) -> HasResponse {
+    let mut present = Vec::with_capacity(req.digests.len());
+    for s in &req.digests {
+        let ok = match Digest::parse(s) {
+            Ok(d) => cap.digest_visible(&d).await && store.has(&d),
             Err(_) => false,
-        })
-        .collect();
+        };
+        present.push(ok);
+    }
     HasResponse { present }
 }
 
 /// Lists a directory's immediate children (depth is reserved for deeper
 /// prefetch; M3.2 serves one level, which covers the include-dir snapshot case).
-async fn dir_list(req: DirListRequest, map: &PathMap, root: &Option<String>) -> DirListResponse {
+async fn dir_list(req: DirListRequest, map: &PathMap, root: Option<&str>) -> DirListResponse {
     // Out-of-scope directory reports "does not exist" (existence-hiding, M7.1).
     if !path_in_scope(&req.path, root) {
         return DirListResponse {
@@ -800,20 +808,21 @@ mod tests {
     #[test]
     fn path_in_scope_enforces_root_with_a_boundary() {
         let root = normalize_root("C:\\work\\proj");
+        let root = root.as_deref();
         // In root: the root itself and anything under it (any case/separator).
-        assert!(path_in_scope("C:\\work\\proj", &root));
-        assert!(path_in_scope("C:\\work\\proj\\src\\a.cpp", &root));
-        assert!(path_in_scope("c:/WORK/proj/inc/h.h", &root));
+        assert!(path_in_scope("C:\\work\\proj", root));
+        assert!(path_in_scope("C:\\work\\proj\\src\\a.cpp", root));
+        assert!(path_in_scope("c:/WORK/proj/inc/h.h", root));
         // A sibling that merely shares the prefix string is NOT in scope.
-        assert!(!path_in_scope("C:\\work\\project\\x", &root));
+        assert!(!path_in_scope("C:\\work\\project\\x", root));
         // Outside the root entirely.
         assert!(!path_in_scope(
             "C:\\windows\\system32\\drivers\\etc\\hosts",
-            &root
+            root
         ));
-        assert!(!path_in_scope("C:\\users\\dev\\.ssh\\id_rsa", &root));
+        assert!(!path_in_scope("C:\\users\\dev\\.ssh\\id_rsa", root));
         // No root = unscoped: everything is allowed (legacy/tests).
-        assert!(path_in_scope("C:\\anything\\at\\all", &None));
+        assert!(path_in_scope("C:\\anything\\at\\all", None));
     }
 
     #[test]
@@ -821,16 +830,17 @@ mod tests {
         // security M7.1 BLOCK-1: a `..` request that string-prefix-matches the
         // root but resolves OUTSIDE it must be rejected.
         let root = normalize_root("C:\\work\\proj");
+        let root = root.as_deref();
         assert!(!path_in_scope(
             "C:\\work\\proj\\..\\..\\users\\dev\\.ssh\\id_rsa",
-            &root
+            root
         ));
-        assert!(!path_in_scope("C:\\work\\proj\\..\\secret.txt", &root));
-        assert!(!path_in_scope("c:/work/proj/../../etc/hosts", &root));
+        assert!(!path_in_scope("C:\\work\\proj\\..\\secret.txt", root));
+        assert!(!path_in_scope("c:/work/proj/../../etc/hosts", root));
         // Interior `..` that stays inside the root is fine (collapses in-root).
-        assert!(path_in_scope("C:\\work\\proj\\src\\..\\inc\\h.h", &root));
+        assert!(path_in_scope("C:\\work\\proj\\src\\..\\inc\\h.h", root));
         // `.` components are harmless.
-        assert!(path_in_scope("C:\\work\\proj\\.\\a.cpp", &root));
+        assert!(path_in_scope("C:\\work\\proj\\.\\a.cpp", root));
     }
 
     #[test]
@@ -848,20 +858,11 @@ mod tests {
         );
         // None of these forms are in scope (fail closed).
         let root = normalize_root("C:\\work\\proj");
-        assert!(!path_in_scope("c:foo", &root));
-        assert!(!path_in_scope("\\\\host\\share\\work\\proj\\x", &root));
-        assert!(!path_in_scope("\\\\?\\c:\\work\\proj\\x", &root));
+        let root = root.as_deref();
+        assert!(!path_in_scope("c:foo", root));
+        assert!(!path_in_scope("\\\\host\\share\\work\\proj\\x", root));
+        assert!(!path_in_scope("\\\\?\\c:\\work\\proj\\x", root));
     }
-
-    #[test]
-    fn dropping_a_session_scrubs_its_temp_cas() {
-        let session = Session::new(Arc::new(ServerStats::default())).unwrap();
-        let root = session.cas_root.clone();
-        assert!(root.exists(), "Session::new creates the CAS dir");
-        drop(session);
-        assert!(
-            !root.exists(),
-            "dropping the session removes its temp CAS tree (M5.3 cleanup)"
-        );
-    }
+    // (The temp content-store scrub-on-drop is now `SessionRegistry`'s; it is
+    // covered by the session_registry module's own tests, ADR 0013.)
 }

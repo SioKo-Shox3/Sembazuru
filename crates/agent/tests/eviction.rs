@@ -51,6 +51,7 @@ async fn trace_dir_is_removed_after_a_submission() {
         agent_fileserver: "127.0.0.1:1".to_string(),
         cache: Some(cache),
         scratch_root: scratch_root.clone(),
+        registry: Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap()),
     };
     let intake = IntakeService::with_vfs(
         Scheduler::new(WorkerTable::new(Duration::from_secs(60))),
