@@ -38,6 +38,18 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **mspdbsrv.exe の扱い未決。** PDB 書き込みは別プロセス＋共有メモリ。注入/監視/無視の
   いずれにするか未決定（PDB は M2/M3 scope 外だが CI 影響あり）。出所: 実測2
   (m3-prestudy §1 Open questions)。
+- **temp ディレクトリ分類が `temp_dirs` 捕捉に依存（COR-006 残差）。** `graph.rs::is_intermediate`
+  の over-broad な `contains("\\temp\\")` fallback は除去済み（`C:\temp\proj` 等の実ソースを
+  中間物として誤除外し stale hit を招く本体バグを解消、本回コミット）。ただし fallback は
+  `\appdata\local\temp\` のみに縮小したため、**`temp_dirs` が空（CRT が block-read env や
+  `GetTempPathW` で temp を解決し per-variable 値が trace に出ない）かつ TEMP が
+  `appdata\local\temp` 配下でない（例 `TEMP=C:\Temp`）場合**、そこの run-varying compiler temp が
+  read-back 残存すると input 集合に漏れる。correctness は fail-safe（ビルドルート外＝action cache
+  は恒久 miss で誤結果なし）だが、run-varying 名が **M2 input-hash を flap させうる**。正攻法は
+  `temp_dirs` を確実に埋めること（`GetTempPathW`/`GetTempFileNameW` をフック、または block-read env
+  から TMP/TEMP を surface）で substring 推測自体を不要化する。実運用の CI/ローカルは TEMP が
+  `appdata\local\temp` 配下のため現状は非発火。出所: code-review COR-006 ＋ verifier(opus, 本回)、
+  `docs/Sembazuru_code_review_action_guide.md`。
 
 ## M4（CAS とキャッシュ）— 本バックログの主対象
 

@@ -230,11 +230,34 @@ fn collapse_separators(p: &str) -> String {
 /// root process's environment reads when available; falls back to common temp
 /// markers.
 fn is_intermediate(norm_path: &str, temp_dirs: &BTreeSet<String>) -> bool {
+    // Authoritative signal: the run's real %TMP%/%TEMP%, captured from the root
+    // process's env reads. A path *under* one of those directories is a build
+    // transient. Used whenever available.
     if temp_dirs.iter().any(|t| norm_path.starts_with(t.as_str())) {
         return true;
     }
-    // Fallback markers for when the env block wasn't captured.
-    norm_path.contains("\\temp\\") || norm_path.contains("\\appdata\\local\\temp\\")
+    // Fallback for when the env block wasn't captured: only the canonical Windows
+    // per-user temp (`...\appdata\local\temp\...`), which is specific enough not
+    // to misclassify a real source tree.
+    //
+    // A bare `\temp\` substring is deliberately NOT a marker: a legitimate project
+    // can live under `C:\temp\proj` or `D:\work\temp\fixtures`, and dropping its
+    // sources here would silently exclude real inputs from the dependency graph —
+    // an edit to such a source would then not move the action key and a stale
+    // cached result would be served (COR-006).
+    //
+    // This is a *best-effort* fallback, not a complete one, and it cuts both ways:
+    // when `temp_dirs` is empty (the CRT located temp via a whole-block env read
+    // or `GetTempPathW`, neither of which yields a per-variable value today) AND
+    // temp is *not* under `appdata\local\temp` (e.g. `TEMP=C:\Temp`), a genuine
+    // run-varying compiler transient there is no longer excluded. Such a transient
+    // is fail-safe for correctness — outside the build root it perpetually misses
+    // the action cache rather than serving a wrong result — but its run-varying
+    // name can destabilise the M2 input-hash. The real fix is to populate
+    // `temp_dirs` reliably (hook `GetTempPathW`/`GetTempFileNameW`, or surface
+    // TMP/TEMP from the block-read env) so this substring guess becomes moot; see
+    // `docs/deferred.md` (COR-006 residual).
+    norm_path.contains("\\appdata\\local\\temp\\")
 }
 
 /// Which comparison set a file access folds into.
@@ -688,6 +711,48 @@ mod tests {
                 .iter()
                 .any(|d| d.path == "c:\\work\\a-915f50da.obj.tmp"),
             "the renamed-away temp is recorded as a (non-surviving) deletion"
+        );
+    }
+
+    #[test]
+    fn temp_fallback_keeps_real_sources_but_drops_appdata_temp() {
+        // COR-006: with no captured %TEMP% (the env block was never read), the
+        // fallback must NOT drop a real source merely because its path contains a
+        // `\temp\` segment (a project under C:\temp\proj, fixtures under
+        // D:\work\temp\...), while still excluding the canonical per-user temp
+        // (`...\appdata\local\temp\...`) where compiler transients actually live.
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        // No env Read event → temp_dirs is empty → only the fallback applies.
+        t.events.push(file_event(
+            FileOp::OpenRead,
+            "C:\\temp\\proj\\src\\a.cpp",
+            0,
+        ));
+        t.events.push(file_event(
+            FileOp::OpenRead,
+            "D:\\work\\temp\\fixtures\\input.dat",
+            0,
+        ));
+        t.events.push(file_event(
+            FileOp::OpenWrite,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\_cl_abc.tmp",
+            0,
+        ));
+        let g = build_graph(&[t]);
+
+        let inputs: Vec<&str> = g.inputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            inputs.contains(&"c:\\temp\\proj\\src\\a.cpp"),
+            "a source under C:\\temp must stay an input (COR-006): {inputs:?}"
+        );
+        assert!(
+            inputs.contains(&"d:\\work\\temp\\fixtures\\input.dat"),
+            "a source under a \\temp\\ segment must stay an input (COR-006): {inputs:?}"
+        );
+        assert!(
+            g.outputs.is_empty(),
+            "the transient under \\appdata\\local\\temp\\ must still be excluded: {:?}",
+            g.outputs.iter().map(|p| &p.path).collect::<Vec<_>>()
         );
     }
 
