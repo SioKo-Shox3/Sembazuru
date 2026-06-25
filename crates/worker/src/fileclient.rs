@@ -36,6 +36,11 @@ use tokio::sync::{Mutex, oneshot};
 /// How much to request per Read after the inlined first chunk.
 const READ_CHUNK: u32 = 256 * 1024;
 
+/// Per-op deadline for a data-plane response (RES-001). Generous (a single op —
+/// Stat/OpenRead/a bounded Read chunk — is fast on a LAN), but finite: a peer that
+/// accepts the frame and then never answers must not hang a hydrate forever.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// WriteBack chunk size for streaming outputs (ADR 0003: large files stream in
 /// fixed chunks). A small output fits in a single chunk.
 const WRITEBACK_CHUNK: usize = 1024 * 1024;
@@ -129,9 +134,26 @@ impl Mux {
             self.pending.lock().await.remove(&id);
             return Err(e);
         }
-        let (header, resp) = rx.await.map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "data-plane connection closed")
-        })?;
+        let (header, resp) = match tokio::time::timeout(CALL_TIMEOUT, rx).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "data-plane connection closed",
+                ));
+            }
+            // The server accepted our frame but never answered within the deadline.
+            // Remove our pending waiter (don't leak it) and fail the op, so a
+            // hydrate cannot hang forever on an accept-but-never-respond peer
+            // (RES-001). The connection itself is left to the reader task / next op.
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "data-plane op timed out waiting for a response",
+                ));
+            }
+        };
         if header.request_id != id || !header.is_response || header.op != op {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
