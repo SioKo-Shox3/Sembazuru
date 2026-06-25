@@ -24,6 +24,7 @@ use crate::intake::{
     serve_intake_service,
 };
 use crate::scheduler::Scheduler;
+use crate::session_registry::SessionRegistry;
 use crate::status::{StatusState, evict_cache_to_cap, serve_status_service};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -59,6 +60,13 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     let table = WorkerTable::new(DEFAULT_DEAD_TIMEOUT);
     let scheduler = Scheduler::new(table.clone());
 
+    // The data-plane session registry (ADR 0013): one shared instance threaded
+    // into BOTH the file server (which binds a worker's Hello session id to the
+    // agent's authoritative capability) and intake (which creates a session right
+    // before dispatch and finishes it after). This is the object the two planes
+    // used to lack — the seam that makes the agent, not the worker, the authority.
+    let registry = Arc::new(SessionRegistry::new()?);
+
     // Coordination: workers register + heartbeat in. Spawned; the table it fills
     // is shared with the scheduler.
     let coord_listener = tokio::net::TcpListener::bind(&config.coord_addr).await?;
@@ -92,8 +100,9 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     {
         let stats = server_stats.clone();
         let tok = cluster_token.clone();
+        let reg = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_files_with_stats_token(file_listener, stats, tok).await {
+            if let Err(e) = serve_files_with_stats_token(file_listener, stats, tok, reg).await {
                 eprintln!("sembazuru-daemon: file server exited: {e}");
             }
         });
@@ -131,6 +140,7 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             agent_fileserver: fileserver_addr.to_string(),
             cache: cache.clone(),
             scratch_root: std::path::PathBuf::from(trace_root),
+            registry: registry.clone(),
         },
     );
 
@@ -173,6 +183,28 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
                     ),
                     Ok(_) => {}
                     Err(e) => eprintln!("sembazuru-daemon: cache eviction failed: {e}"),
+                }
+            }
+        });
+    }
+
+    // Backstop reaper for the session registry (ADR 0013): the common path is the
+    // explicit `finish` intake runs after dispatch, but an intake task that
+    // panicked before that would leak its session. Periodically reap sessions with
+    // NO live connection that are older than a generous TTL (far longer than any
+    // action runs, and a live connection holds a ConnGuard regardless), mirroring
+    // the WorkerTable opportunistic reaper.
+    {
+        const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(900);
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+            loop {
+                tick.tick().await;
+                let reaped = reg.sweep_idle(SESSION_TTL).await;
+                if reaped > 0 {
+                    eprintln!("sembazuru-daemon: reaped {reaped} stale data-plane session(s)");
                 }
             }
         });

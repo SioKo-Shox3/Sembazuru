@@ -361,11 +361,17 @@ async fn start_server_with_token(token: &str) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
     let token = token.to_string();
     tokio::spawn(async move {
-        let _ =
-            sembazuru_agent::fileserver::serve_files_with_stats_token(listener, stats, Some(token))
-                .await;
+        let _ = sembazuru_agent::fileserver::serve_files_with_stats_token(
+            listener,
+            stats,
+            Some(token),
+            registry,
+        )
+        .await;
     });
     addr
 }
@@ -485,4 +491,169 @@ async fn handshake_missing_token_against_authed_server_is_refused() {
             );
         }
     }
+}
+
+// --- ADR 0013: agent-authoritative session-capability enforcement ----------
+
+/// Starts the agent file server sharing `registry`, so a test can pre-create a
+/// bound session and then connect a client carrying that session id (ADR 0013).
+async fn start_server_with_registry(
+    registry: std::sync::Arc<sembazuru_agent::session_registry::SessionRegistry>,
+) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
+    tokio::spawn(async move {
+        let _ = sembazuru_agent::fileserver::serve_files_with_stats_token(
+            listener, stats, None, registry,
+        )
+        .await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn bound_session_uses_agent_root_not_worker_declared() {
+    // SEC-004: when the Hello names a session the agent created, the file server
+    // scopes supply to the AGENT'S authoritative root, IGNORING the root the
+    // worker declares — so a worker that declares a wider root cannot widen scope.
+    use sembazuru_agent::session_registry::SessionRegistry;
+    let parent = TempDir::new("authroot");
+    let proj = parent.path.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let inside = parent.write("proj\\in.h", b"inside the agent root");
+    let outside = parent.write("sibling\\secret.txt", b"must never be supplied");
+
+    let registry = std::sync::Arc::new(SessionRegistry::new().unwrap());
+    let agent_root = sembazuru_agent::fileserver::normalize_root(&proj.to_string_lossy());
+    registry
+        .create("sess".into(), agent_root, Default::default())
+        .await;
+    let addr = start_server_with_registry(registry.clone()).await;
+
+    // The worker binds the session id but DECLARES the wider `parent` root (trying
+    // to widen its scope); the agent must ignore that and use `proj`.
+    let client = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        parent.path.to_string_lossy().into(), // worker claims the wider root...
+        "sess".into(),                        // ...but binds to the agent session
+    )
+    .await
+    .unwrap();
+
+    let got = client
+        .fetch(&inside)
+        .await
+        .unwrap()
+        .expect("in-root file served");
+    assert_eq!(got.0, b"inside the agent root");
+    assert!(
+        client.fetch(&outside).await.unwrap().is_none(),
+        "the agent must scope to its OWN root, not the worker-declared wider one (SEC-004)"
+    );
+}
+
+#[tokio::test]
+async fn each_session_has_its_own_pin_so_no_stale_across_actions() {
+    // COR-001: action A's pin is frozen for A, but a LATER action B (a different
+    // session) gets its own partition and observes the CURRENT bytes — the old
+    // process-wide pin map served A's frozen v1 to B forever.
+    use sembazuru_agent::session_registry::SessionRegistry;
+    let dir = TempDir::new("perssesspin");
+    let src = dir.write("a.cpp", b"v1-original");
+
+    let registry = std::sync::Arc::new(SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create("A".into(), root.clone(), Default::default())
+        .await;
+    registry.create("B".into(), root, Default::default()).await;
+    let addr = start_server_with_registry(registry.clone()).await;
+
+    let a = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "A".into(),
+    )
+    .await
+    .unwrap();
+    let a_v1 = a.fetch(&src).await.unwrap().expect("A reads v1");
+    assert_eq!(a_v1.0, b"v1-original");
+
+    // The source is edited on disk.
+    std::fs::write(&src, b"v2-edited").unwrap();
+
+    // A re-reads: still v1 — its pin is frozen (snapshot consistency within A).
+    let a_again = a.fetch(&src).await.unwrap().expect("A re-reads");
+    assert_eq!(a_again.0, b"v1-original", "A's pin stays frozen (snapshot)");
+
+    // Session B (a different action) reads the NEW v2, not A's frozen v1.
+    let b = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "B".into(),
+    )
+    .await
+    .unwrap();
+    let b_v2 = b.fetch(&src).await.unwrap().expect("B reads");
+    assert_eq!(
+        b_v2.0, b"v2-edited",
+        "a later session must see current bytes, not a stale cross-session pin (COR-001)"
+    );
+}
+
+#[tokio::test]
+async fn bound_session_cannot_read_another_sessions_digest() {
+    // SEC-004 (digest oracle): a bound session may only Read a digest it pinned.
+    // A digest learned out-of-band (here, A's digest handed to B directly) is
+    // refused for B even though the shared store physically holds the blob.
+    use sembazuru_agent::session_registry::SessionRegistry;
+    let dir = TempDir::new("digestacl");
+    let f = dir.write("h.h", b"some header contents that are non-empty");
+
+    let registry = std::sync::Arc::new(SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create("A".into(), root.clone(), Default::default())
+        .await;
+    registry.create("B".into(), root, Default::default()).await;
+    let addr = start_server_with_registry(registry.clone()).await;
+
+    let a = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "A".into(),
+    )
+    .await
+    .unwrap();
+    let (bytes, digest) = a.fetch(&f).await.unwrap().expect("A pins the file");
+    let size = bytes.len() as u64;
+
+    // A can Read the digest it pinned.
+    assert!(a.fetch_by_digest(&digest, size).await.is_ok());
+
+    // B never opened that path, so the digest is not in B's allowed set — Read is
+    // refused (the agent returns no bytes), even though the blob exists in the
+    // shared store.
+    let b = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "B".into(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        b.fetch_by_digest(&digest, size).await.is_err(),
+        "a bound session must not read another session's digest (SEC-004)"
+    );
 }

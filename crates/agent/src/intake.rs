@@ -29,6 +29,7 @@ use tonic::{Request, Response, Status};
 
 use crate::action_cache::{AgentCache, CacheLookup};
 use crate::scheduler::Scheduler;
+use crate::session_registry::SessionRegistry;
 use crate::status::Metrics;
 use crate::{ExecOptions, ExecuteError, Execution};
 
@@ -89,6 +90,12 @@ pub struct IntakeVfsContext {
     pub cache: Option<Arc<AgentCache>>,
     /// Where per-action trace dirs are created (only used when `cache` is set).
     pub scratch_root: PathBuf,
+    /// The daemon's session registry (ADR 0013). Intake `create`s a session right
+    /// before dispatching a VFS action — binding the agent-authoritative scope
+    /// root the file server will enforce against the worker's Hello session id —
+    /// and `finish`es it when the action returns. Shared (`Arc`) with the file
+    /// server so both planes see the same sessions.
+    pub registry: Arc<SessionRegistry>,
 }
 
 /// The LocalIntake gRPC service. Wraps the daemon's [`Scheduler`]; every
@@ -318,29 +325,46 @@ async fn run_submission(
         String::new()
     };
 
+    // The declared input root scopes the worker's reads (M8.3); empty = cwd, the
+    // compiler default (the project tree is the cwd). An arbitrary process may
+    // read above its cwd, so the integration can declare a broader root. Single-
+    // machine: anything outside resolves to the same local bytes (fail-open);
+    // strict mode + a too-narrow root would fail-close those reads, which is why
+    // the root is declarable. As of ADR 0013 this same value is the AGENT-
+    // AUTHORITATIVE scope root registered for the session, so the file server
+    // scopes supply to the agent's value, NOT whatever the worker declares.
+    let vfs_root = if input_root.is_empty() {
+        command.cwd.clone()
+    } else {
+        input_root.clone()
+    };
+
     let opts = ExecOptions {
         predicted_paths,
         vfs: Some(VfsExecution {
             agent_fileserver: ctx.agent_fileserver.clone(),
-            // The declared input root scopes the worker's reads (M8.3); empty =
-            // cwd, the compiler default (the project tree is the cwd). An
-            // arbitrary process may read above its cwd, so the integration can
-            // declare a broader root. Single-machine: anything outside resolves
-            // to the same local bytes (fail-open); strict mode + a too-narrow
-            // root would fail-close those reads, which is why the root is
-            // declarable.
-            vfs_root: if input_root.is_empty() {
-                command.cwd.clone()
-            } else {
-                input_root.clone()
-            },
+            vfs_root: vfs_root.clone(),
             trace_dir: trace_dir.clone(),
             strict: strict_vfs,
         }),
     };
 
+    // Open the agent-authoritative session BEFORE dispatch (ADR 0013), so the
+    // worker's Hello — carrying this session_id — finds it and binds to the
+    // agent's scope root + per-session pin partition + allowed-digest ACL.
+    // Declared outputs are not yet wired into the capability (deferred with
+    // 2-machine WriteBack); the file server's within-root output scoping is still
+    // strictly tighter than the pre-0013 any-path behaviour.
+    ctx.registry
+        .create(
+            session_id.clone(),
+            crate::fileserver::normalize_root(&vfs_root),
+            Default::default(),
+        )
+        .await;
+
     let outcome = scheduler
-        .dispatch(command, action_id, session_id, opts)
+        .dispatch(command, action_id, session_id.clone(), opts)
         .await;
 
     // Record a successful remote run so the next identical build hits. Needs the
@@ -395,6 +419,12 @@ async fn run_submission(
 
     metrics.record_outcome(&outcome);
     emit_outcome(&tx, outcome).await;
+
+    // The action is done: drop the agent-authoritative session (ADR 0013) — its
+    // pin partition, allowed-digest ACL, and writeback table. A worker connection
+    // that lingers briefly holds a ConnGuard, so the entry's capability stays
+    // alive until that closes; the idle sweeper is only a backstop for a crash.
+    ctx.registry.finish(&session_id).await;
 }
 
 /// Mirrors a dispatch outcome as the terminal events. dispatch always completes
