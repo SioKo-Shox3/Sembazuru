@@ -73,6 +73,14 @@ fn default_capacity() -> u32 {
 /// waiting backlog so the worker cannot be memory-flooded).
 const QUEUE_FACTOR: u32 = 8;
 
+/// Upper bound on a worker's admission capacity (RES-001). No real host has
+/// hundreds of cores, and — crucially — `capacity * QUEUE_FACTOR` must not
+/// overflow `u32` (a misconfigured `u32::MAX` would otherwise panic in debug /
+/// wrap in release when sizing the accept-backlog semaphore). Matches the agent's
+/// `MAX_TRUSTED_CPU` clamp, so a worker over-reporting capacity is bounded on both
+/// sides.
+const MAX_CAPACITY: u32 = 256;
+
 /// Marker the injected DLL drops in the per-action scratch dir when, under strict
 /// VFS (ADR 0007 §a②), a read-only open under `vfs_root` could not be supplied by
 /// the agent and was therefore failed instead of opened locally. Its presence
@@ -135,7 +143,10 @@ impl WorkerService {
     /// `QUEUE_FACTOR × capacity` more may queue (reported as `QUEUED`), beyond
     /// which `Execute` is rejected with `RESOURCE_EXHAUSTED`. `capacity` ≥ 1.
     pub fn with_capacity(capacity: u32) -> Self {
-        let capacity = capacity.max(1);
+        // Clamp to [1, MAX_CAPACITY]: a 0 would admit nothing, and a misconfigured
+        // huge value (e.g. u32::MAX) would overflow `capacity * QUEUE_FACTOR` below
+        // (panic in debug / wrap in release) — RES-001.
+        let capacity = capacity.clamp(1, MAX_CAPACITY);
         Self {
             running: Arc::new(AtomicU32::new(0)),
             served: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -815,4 +826,25 @@ pub async fn serve_on_listener_with(
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_capacity_clamps_and_does_not_overflow() {
+        // RES-001: a misconfigured huge capacity must not panic — pre-fix
+        // `capacity * QUEUE_FACTOR` overflowed u32 (panic in debug) for u32::MAX —
+        // and must clamp to the safe maximum.
+        let w = WorkerService::with_capacity(u32::MAX);
+        assert_eq!(
+            w.capacity(),
+            MAX_CAPACITY,
+            "a huge capacity clamps to the safe max"
+        );
+        // Zero clamps up to 1 (admit at least one action); a normal value passes.
+        assert_eq!(WorkerService::with_capacity(0).capacity(), 1);
+        assert_eq!(WorkerService::with_capacity(4).capacity(), 4);
+    }
 }
