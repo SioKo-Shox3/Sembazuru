@@ -22,6 +22,7 @@ pub mod run;
 pub mod scheduler;
 #[cfg(windows)]
 pub mod service;
+pub mod session_registry;
 pub mod status;
 
 /// Per-action execution extras carried alongside the command into `Execute`
