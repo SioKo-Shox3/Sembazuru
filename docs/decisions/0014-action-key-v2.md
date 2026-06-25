@@ -1,7 +1,17 @@
 # 0014 — action key v2（弱/強キーの実行 identity 被覆と観測 vector の取り込み）
 
-- ステータス: **起案（PROPOSED）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
+- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
   出所: コードレビュー（COR-005／COR-004 残）。[ADR 0007](0007-arbitrary-process-distribution.md) §c の拡張。
+  **実装済み（determinism-safe な部分集合＝key を「細かくする」だけ・false hit 不可・rebuild-hit ゲート不変）**:
+  (1) のうち **cwd を weak key に追加**（COR-005 問題B＝cwd 埋込み false hit を閉鎖）、**weak-key schema
+  version**（`WEAK_KEY_SCHEMA`＝key の意味が変わるたび bump で全 entry を一度 miss させる安全な migration
+  レバー）、(4) **ActionResult codec に magic+version**（問題4＝format drift を明示的に miss 化）。テスト:
+  `weak_fingerprint_changes_with_meaningful_inputs`（cwd 追加）・`action_result_decode_gates_on_magic_and_version`。
+  **未実装（determinism gate 連動・別環境/harness 要）**: (1) 解決済み exe 絶対パス＋content digest＋worker
+  再検証／build-commit id（launcher 改修・build script）、(2) env profile 制（`VOLATILE_ENV` 見直しは出力影響
+  env を取りこぼすと **false hit** になりうるため determinism harness で実証必須）、(3) registry/enumerate/RMW
+  前状態の key 取り込み or uncacheable 化。これらは cl/clang-cl＋hooks の **determinism harness を回せる環境**
+  での専用作業。
 - 決めること: action cache キーが**実行 identity と観測入力をどこまで被覆するか**。**(1) weak key の identity 拡張**、
   **(2) env policy（profile 制）**、**(3) 観測済み非 key vector の扱い**、**(4) codec 版管理**。
 - 判定基準: 非交渉（**正しさ>速度**＝誤った cache hit を出さない／出力バイト不変／**determinism harness 緑**）。

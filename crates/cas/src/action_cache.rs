@@ -51,17 +51,41 @@ fn is_volatile(name: &str) -> bool {
         || VOLATILE_ENV.iter().any(|v| *v == upper)
 }
 
+/// Weak-key schema version (ADR 0014). Folded into every weak fingerprint, so
+/// bumping it invalidates ALL existing cache entries at once (they miss and
+/// re-run, producing byte-identical output — safe). Bump this whenever the weak
+/// key's *meaning* changes (a new keyed dimension, a changed normalization), so a
+/// mixed on-disk cache can never serve an entry computed under different rules.
+const WEAK_KEY_SCHEMA: u32 = 2;
+
 /// The weak fingerprint: everything statically known about an action before it
-/// runs. `argv` in order, the non-volatile environment sorted by name, and the
-/// toolchain binary's content digest (so a compiler upgrade invalidates the
-/// cache automatically — sccache's approach).
-pub fn weak_fingerprint(argv: &[String], env: &[(String, String)], toolchain: &Digest) -> Digest {
+/// runs. A schema tag, `argv` in order, the action's working directory, the
+/// non-volatile environment sorted by name, and the toolchain binary's content
+/// digest (so a compiler upgrade invalidates the cache automatically — sccache's
+/// approach).
+///
+/// `cwd` is folded (ADR 0014 / COR-005 problem B): the same argv+env run in a
+/// different directory can embed that directory in its output (e.g. a process
+/// that records its own `getcwd()`), so two such runs must not share a key. It is
+/// case/separator-normalized (Windows paths are case-insensitive) so incidental
+/// spelling does not cause spurious misses; folding it can only *refine* the key
+/// (more misses), never widen it (no false hit).
+pub fn weak_fingerprint(
+    argv: &[String],
+    env: &[(String, String)],
+    cwd: &str,
+    toolchain: &Digest,
+) -> Digest {
     let mut blob = Vec::new();
-    blob.extend_from_slice(b"argv\0");
+    blob.extend_from_slice(b"sbz-weak\0");
+    blob.extend_from_slice(&WEAK_KEY_SCHEMA.to_le_bytes());
+    blob.extend_from_slice(b"\0argv\0");
     for a in argv {
         blob.extend_from_slice(a.as_bytes());
         blob.push(0);
     }
+    blob.extend_from_slice(b"\0cwd\0");
+    blob.extend_from_slice(cwd.replace('/', "\\").to_ascii_lowercase().as_bytes());
     let mut kept: Vec<(String, &str)> = env
         .iter()
         .filter(|(k, _)| !is_volatile(k))
@@ -148,9 +172,18 @@ fn get_opt_digest(buf: &[u8], pos: &mut usize) -> Result<Option<Digest>, CacheCo
 #[derive(Debug)]
 pub struct CacheCodecError;
 
+/// Magic + version for the on-disk ActionResult codec (ADR 0014). An
+/// unrecognized magic/version decodes to an error → a cache miss, so a format
+/// change can never be silently misread as a valid result (COR-005 "codec に
+/// version なし"). Bump `RESULT_CODEC_VERSION` whenever the layout below changes.
+const RESULT_CODEC_MAGIC: &[u8; 4] = b"SBZR";
+const RESULT_CODEC_VERSION: u8 = 1;
+
 impl ActionResult {
     fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
+        buf.extend_from_slice(RESULT_CODEC_MAGIC);
+        buf.push(RESULT_CODEC_VERSION);
         buf.extend_from_slice(&self.exit_code.to_le_bytes());
         buf.extend_from_slice(&(self.outputs.len() as u32).to_le_bytes());
         for o in &self.outputs {
@@ -177,7 +210,15 @@ impl ActionResult {
     }
 
     fn decode(buf: &[u8]) -> Result<ActionResult, CacheCodecError> {
-        let mut pos = 0;
+        // Magic + version gate: a mismatch (old/foreign/corrupt format) is a
+        // decode error → cache miss, never a misread result.
+        if buf.get(0..4) != Some(RESULT_CODEC_MAGIC.as_slice()) {
+            return Err(CacheCodecError);
+        }
+        if buf.get(4) != Some(&RESULT_CODEC_VERSION) {
+            return Err(CacheCodecError);
+        }
+        let mut pos = 5;
         let exit_code = {
             let end = pos + 4;
             let slice = buf.get(pos..end).ok_or(CacheCodecError)?;
@@ -301,6 +342,7 @@ mod tests {
                 ("INCLUDE".into(), "c:\\sdk".into()),
                 ("TEMP".into(), "c:\\users\\a\\tmp".into()),
             ],
+            "c:\\proj",
             &tool,
         );
         let b = weak_fingerprint(
@@ -311,29 +353,31 @@ mod tests {
                 ("PATH".into(), "c:\\two".into()),
                 ("TEMP".into(), "d:\\other".into()),
             ],
+            "C:/Proj", // same dir, different case/separators — must not change the key
             &tool,
         );
         assert_eq!(
             a, b,
-            "volatile env and name case/order must not affect the key"
+            "volatile env, name case/order, and cwd spelling must not affect the key"
         );
     }
 
     #[test]
     fn weak_fingerprint_changes_with_meaningful_inputs() {
         let tool = Digest::of(b"clang-cl v18");
-        let base = weak_fingerprint(&argv(&["clang-cl", "/c", "a.cpp"]), &[], &tool);
-        // A different arg, a different non-volatile env var, and a different
-        // toolchain each move the key.
+        let base = weak_fingerprint(&argv(&["clang-cl", "/c", "a.cpp"]), &[], "c:\\proj", &tool);
+        // A different arg, a different non-volatile env var, a different toolchain,
+        // and a different working directory each move the key.
         assert_ne!(
             base,
-            weak_fingerprint(&argv(&["clang-cl", "/c", "b.cpp"]), &[], &tool)
+            weak_fingerprint(&argv(&["clang-cl", "/c", "b.cpp"]), &[], "c:\\proj", &tool)
         );
         assert_ne!(
             base,
             weak_fingerprint(
                 &argv(&["clang-cl", "/c", "a.cpp"]),
                 &[("INCLUDE".into(), "c:\\sdk".into())],
+                "c:\\proj",
                 &tool
             )
         );
@@ -342,15 +386,23 @@ mod tests {
             weak_fingerprint(
                 &argv(&["clang-cl", "/c", "a.cpp"]),
                 &[],
+                "c:\\proj",
                 &Digest::of(b"clang-cl v19")
             )
+        );
+        // ADR 0014 / COR-005 problem B: a different working directory moves the key
+        // (a process can embed its cwd in its output), so they must not share one.
+        assert_ne!(
+            base,
+            weak_fingerprint(&argv(&["clang-cl", "/c", "a.cpp"]), &[], "c:\\other", &tool),
+            "cwd must be part of the weak key"
         );
     }
 
     #[test]
     fn strong_fingerprint_binds_weak_and_input_hash() {
         let tool = Digest::of(b"t");
-        let weak = weak_fingerprint(&argv(&["cc"]), &[], &tool);
+        let weak = weak_fingerprint(&argv(&["cc"]), &[], "c:\\proj", &tool);
         let s1 = strong_fingerprint(&weak, "inputhash-AAA");
         let s2 = strong_fingerprint(&weak, "inputhash-BBB");
         assert_ne!(s1, s2, "different input content → different strong key");
@@ -381,6 +433,43 @@ mod tests {
         cache.put_result(&strong, &result).unwrap();
         assert_eq!(cache.get_result(&strong).unwrap().as_ref(), Some(&result));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn action_result_decode_gates_on_magic_and_version() {
+        // ADR 0014: the codec magic+version makes a foreign/old/corrupt format a
+        // decode error → cache miss, never a misread result.
+        let r = ActionResult {
+            exit_code: 7,
+            outputs: vec![],
+            stdout: None,
+            stderr: None,
+        };
+        let good = r.encode();
+        assert_eq!(
+            ActionResult::decode(&good).unwrap(),
+            r,
+            "good blob round-trips"
+        );
+        // An old pre-magic blob (the body without the 5-byte magic+version header)
+        // is rejected, not parsed as a valid result.
+        assert!(
+            ActionResult::decode(&good[5..]).is_err(),
+            "missing magic → miss"
+        );
+        // Wrong magic / wrong version → rejected.
+        let mut wrong_magic = good.clone();
+        wrong_magic[0] = b'X';
+        assert!(
+            ActionResult::decode(&wrong_magic).is_err(),
+            "wrong magic → miss"
+        );
+        let mut wrong_ver = good.clone();
+        wrong_ver[4] = 0xff;
+        assert!(
+            ActionResult::decode(&wrong_ver).is_err(),
+            "wrong version → miss"
+        );
     }
 
     #[test]

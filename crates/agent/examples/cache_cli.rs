@@ -80,7 +80,7 @@ fn main() -> ExitCode {
         }
     };
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let weak = agent.weak_key(&argv, &env);
+    let weak = agent.weak_key(&argv, &env, "");
     let build_root = PathBuf::from(build_root);
 
     match mode {

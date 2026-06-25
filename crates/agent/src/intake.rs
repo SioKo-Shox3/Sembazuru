@@ -266,13 +266,14 @@ async fn run_submission(
         Some(cache) => {
             let cache = cache.clone();
             let argv = command.argv.clone();
+            let cwd = command.cwd.clone();
             let mut env: Vec<(String, String)> = command
                 .env
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             env.sort();
-            tokio::task::spawn_blocking(move || cache.weak_key(&argv, &env))
+            tokio::task::spawn_blocking(move || cache.weak_key(&argv, &env, &cwd))
                 .await
                 .ok()
         }

@@ -74,13 +74,14 @@ impl AgentCache {
         self.store.evict_to(max_bytes)
     }
 
-    /// The weak fingerprint of an action: argv + non-volatile env + the
-    /// toolchain binary's content digest. `argv[0]` is hashed by content when it
-    /// is a readable file (so a compiler upgrade invalidates the cache), else by
-    /// its name as a fallback.
-    pub fn weak_key(&self, argv: &[String], env: &[(String, String)]) -> Digest {
+    /// The weak fingerprint of an action: argv + `cwd` + non-volatile env + the
+    /// toolchain binary's content digest (ADR 0014). `cwd` is folded so two runs
+    /// with the same argv/env in different directories don't share a key (COR-005
+    /// problem B). `argv[0]` is hashed by content when it is a readable file (so a
+    /// compiler upgrade invalidates the cache), else by its name as a fallback.
+    pub fn weak_key(&self, argv: &[String], env: &[(String, String)], cwd: &str) -> Digest {
         let toolchain = toolchain_digest(argv.first().map(String::as_str).unwrap_or(""));
-        sembazuru_cas::weak_fingerprint(argv, env, &toolchain)
+        sembazuru_cas::weak_fingerprint(argv, env, cwd, &toolchain)
     }
 
     /// Phase 1: try to resolve an action from cache. On a hit the cached outputs
@@ -576,7 +577,7 @@ mod tests {
 
         let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
         let env: Vec<(String, String)> = vec![];
-        let weak = cache.weak_key(&argv, &env);
+        let weak = cache.weak_key(&argv, &env, "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
 
         // Phase 2: record the first build.
@@ -617,7 +618,7 @@ mod tests {
         std::fs::write(build.join(out_logical), out_bytes).unwrap();
 
         let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
-        let weak = cache.weak_key(&argv, &[]);
+        let weak = cache.weak_key(&argv, &[], "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
         cache
             .record(&weak, &manifest, &build, &[out_logical.to_string()], 0)
@@ -676,7 +677,7 @@ mod tests {
         std::fs::write(build.join("a.obj"), b"OBJ-v1").unwrap();
 
         let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
-        let weak = cache.weak_key(&argv, &[]);
+        let weak = cache.weak_key(&argv, &[], "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
         cache
             .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
@@ -717,7 +718,7 @@ mod tests {
         let _ = std::fs::remove_file(&gen_h);
 
         let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
-        let weak = cache.weak_key(&argv, &[]);
+        let weak = cache.weak_key(&argv, &[], "");
         let manifest = InputManifest {
             inputs: vec![
                 InputEntry {
@@ -769,7 +770,7 @@ mod tests {
         std::fs::write(build.join("a.obj"), b"OBJ-1-bytes").unwrap();
         std::fs::write(build.join("b.obj"), b"OBJ-2-bytes").unwrap();
 
-        let weak = cache.weak_key(&["cc".to_string()], &[]);
+        let weak = cache.weak_key(&["cc".to_string()], &[], "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
         cache
             .record(
@@ -814,7 +815,7 @@ mod tests {
         std::fs::write(&input, b"src").unwrap();
         std::fs::write(build.join("a.obj"), b"GOOD-OBJECT-BYTES").unwrap();
 
-        let weak = cache.weak_key(&["cc".to_string()], &[]);
+        let weak = cache.weak_key(&["cc".to_string()], &[], "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
         cache
             .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
@@ -853,7 +854,7 @@ mod tests {
     fn unknown_weak_key_misses() {
         let root = tmp("unknown");
         let cache = AgentCache::open(&root).unwrap();
-        let weak = cache.weak_key(&["never-seen".to_string()], &[]);
+        let weak = cache.weak_key(&["never-seen".to_string()], &[], "");
         assert_eq!(
             cache.resolve(&weak, &tmp("u-b")).unwrap(),
             CacheLookup::Miss
@@ -870,7 +871,7 @@ mod tests {
         std::fs::write(build.join("a.obj"), b"obj").unwrap();
 
         let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
-        let weak = cache.weak_key(&argv, &[]);
+        let weak = cache.weak_key(&argv, &[], "");
 
         // No manifest yet → nothing to predict (a first build skips prefetch).
         assert!(cache.predicted_paths(&weak).unwrap().is_empty());
@@ -888,7 +889,7 @@ mod tests {
         assert_eq!(predicted, vec!["a.cpp".to_string(), "h.h".to_string()]);
 
         // An unknown action still predicts nothing.
-        let other = cache.weak_key(&["other".to_string()], &[]);
+        let other = cache.weak_key(&["other".to_string()], &[], "");
         assert!(cache.predicted_paths(&other).unwrap().is_empty());
     }
 }
