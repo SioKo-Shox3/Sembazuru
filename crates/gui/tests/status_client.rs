@@ -38,6 +38,7 @@ async fn start_status(table: WorkerTable, config_path: std::path::PathBuf) -> St
         metrics: Arc::new(Metrics::default()),
         auth_enabled: false,
         config_path,
+        admin_enabled: true, // the GUI round-trip test exercises SetConfig (ADR 0016)
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

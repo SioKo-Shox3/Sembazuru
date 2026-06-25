@@ -24,6 +24,10 @@ fn tmp_config() -> std::path::PathBuf {
 }
 
 async fn start_status_with_config(config_path: std::path::PathBuf) -> String {
+    start_status_with_config_admin(config_path, true).await
+}
+
+async fn start_status_with_config_admin(config_path: std::path::PathBuf, admin: bool) -> String {
     let state = StatusState {
         table: WorkerTable::new(Duration::from_secs(60)),
         server_stats: Arc::new(ServerStats::default()),
@@ -32,6 +36,7 @@ async fn start_status_with_config(config_path: std::path::PathBuf) -> String {
         metrics: Arc::new(Metrics::default()),
         auth_enabled: false,
         config_path,
+        admin_enabled: admin, // ADR 0016: mutating Status RPCs are opt-in
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -172,4 +177,41 @@ async fn set_config_token_semantics_unchanged_then_cleared() {
         .unwrap()
         .into_inner();
     assert!(!g.cluster_token_set, "GetConfig reflects the cleared token");
+}
+
+#[tokio::test]
+async fn mutating_status_rpcs_are_denied_without_admin_optin() {
+    // SEC-001 interim (ADR 0016): with admin disabled (the DEFAULT), the mutating
+    // Status RPCs are refused, so a low-privilege local user cannot clear the
+    // cluster token / rewrite addresses over the unauthenticated loopback plane.
+    // Read RPCs stay open.
+    let path = tmp_config();
+    let endpoint = start_status_with_config_admin(path.clone(), false).await;
+    let mut client = StatusClient::connect(endpoint).await.unwrap();
+
+    // Read still works.
+    assert!(client.get_config(GetConfigRequest {}).await.is_ok());
+
+    // SetConfig (here trying to clear the token = disable auth) is refused.
+    let err = client
+        .set_config(SetConfigRequest {
+            cluster_token: Some(String::new()),
+            ..blank_set()
+        })
+        .await
+        .expect_err("SetConfig must be denied without admin opt-in");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // TriggerEviction is likewise refused.
+    let err = client
+        .trigger_eviction(sembazuru_proto::v0::TriggerEvictionRequest {})
+        .await
+        .expect_err("TriggerEviction must be denied without admin opt-in");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // The denied SetConfig wrote nothing.
+    assert!(
+        !path.exists(),
+        "a denied SetConfig must not persist the config file"
+    );
 }

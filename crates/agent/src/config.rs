@@ -53,6 +53,14 @@ pub struct DaemonConfig {
     /// CAS size cap in bytes (M9.2); `None` = uncapped.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_max_bytes: Option<u64>,
+    /// Whether the mutating Status RPCs (`SetConfig`/`TriggerEviction`) are
+    /// allowed (SEC-001 interim, ADR 0016). Default **false**: the loopback Status
+    /// plane has no caller authentication, so config-mutation (which can clear the
+    /// cluster token and disable LAN auth) is opt-in until the named-pipe +
+    /// caller-SID transport lands. `#[serde(default)]` so an existing config that
+    /// predates this field still loads (as `false`).
+    #[serde(default)]
+    pub status_admin: bool,
 }
 
 impl Default for DaemonConfig {
@@ -66,6 +74,7 @@ impl Default for DaemonConfig {
             trace_root: None,
             cluster_token: None,
             cache_max_bytes: None,
+            status_admin: false,
         }
     }
 }
@@ -152,6 +161,13 @@ impl DaemonConfig {
             // A non-numeric or zero value disables the cap (matches the daemon's
             // historical parse). Present-but-invalid still overrides the file.
             self.cache_max_bytes = v.trim().parse::<u64>().ok().filter(|&n| n > 0);
+        }
+        if let Some(v) = std::env::var_os("SEMBAZURU_STATUS_ADMIN") {
+            // Opt-in for the mutating Status RPCs (SEC-001 / ADR 0016). Truthy =
+            // `1`/`true` (case-insensitive); anything else (incl. empty) is false.
+            let v = v.to_string_lossy();
+            let t = v.trim();
+            self.status_admin = t == "1" || t.eq_ignore_ascii_case("true");
         }
     }
 
