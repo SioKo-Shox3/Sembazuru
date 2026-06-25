@@ -1,7 +1,15 @@
 # 0015 — cache result v2（出力公開の action 単位 atomic・blob 再検証・stdio 復元）
 
-- ステータス: **起案（PROPOSED）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
+- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
   出所: コードレビュー（COR-007）。module 局所の publish path 再設計。
+  **実装済み (1)-(4)**: `resolve` を **2-pass set-atomic publish** に再設計（全 output を堅牢 temp
+  sibling に `get_verified` 付きで stage→全 commit）。固定 temp 名 `.sbz-cache-tmp` を **O_EXCL の
+  pid+seq sibling** に置換（同時 resolve 衝突・preplaced symlink 追従を解消）、republish を
+  **`store.get_verified`** に（破損 blob は公開せず miss＝再実行）、全量 memory 展開をやめ **1 blob ずつ**
+  staging（大 output で OOM しない）。回帰テスト `corrupt_output_blob_misses_instead_of_serving_wrong_bytes`
+  ＋既存 `missing_output_blob_misses_without_partial_publish`。
+  **未実装 (5)**: stdout/stderr の捕捉・cache-hit replay（`record`/`resolve`/`intake` の emit 経路に跨る
+  cross-cutting＝別 PR の follow-up。型/codec の stdout/stderr digest は既存対応）。
 - 決めること: cache hit の出力公開を**どう正しく/atomic に行うか**。**(1) action 単位 atomic 公開**、
   **(2) 堅牢 temp**、**(3) republish 再検証**、**(4) memory 上限/streaming**、**(5) stdout/stderr 捕捉・replay**。
 - 判定基準: 非交渉（**正しさ>速度**＝部分公開・破損 blob・誤 stdio を出さない／出力バイト不変）。

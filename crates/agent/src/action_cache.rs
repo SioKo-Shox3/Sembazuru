@@ -23,7 +23,8 @@
 //! strong key, so a stale result is never served.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sembazuru_cas::{ActionCache, ActionResult, BlobStore, Digest, OutputFile};
 use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest};
@@ -108,16 +109,25 @@ impl AgentCache {
         let Some(result) = self.cache.get_result(&strong)? else {
             return Ok(CacheLookup::Miss);
         };
-        // Fetch every output blob FIRST, before writing any. If a blob is
-        // missing from the CAS (e.g. evicted), fail the lookup as a miss without
-        // touching the build tree — otherwise an early write followed by a late
-        // miss would leave a partial result for the re-run to clean up.
-        let mut fetched = Vec::with_capacity(result.outputs.len());
+        // Two-pass set-atomic publish (COR-007). Pass 1 fetches + VERIFIES each
+        // output blob and stages it to a robust temp SIBLING of its final path;
+        // pass 2 renames the staged temps onto their finals. All staging happens
+        // before any rename, so a missing/corrupt blob aborts with NOTHING
+        // published (present-all-or-miss); only one blob is resident in memory at a
+        // time (bounded — no whole-set buffering, so a multi-GB output set is fine);
+        // and a corrupt-on-disk blob is a miss (re-run) rather than served verbatim.
+        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(result.outputs.len());
+        let unstage = |staged: &[(PathBuf, PathBuf)]| {
+            for (tmp, _) in staged {
+                let _ = std::fs::remove_file(tmp);
+            }
+        };
         for out in &result.outputs {
             // Scope guard (BLOCK-B): never publish a stored output outside the
             // build root. A stored logical that fails the guard means a corrupt
-            // or tampered entry — fail closed (hard error), do not publish any.
+            // or tampered entry — fail closed (hard error), publish nothing.
             if !action_key::is_under_build_root(&out.logical_path) {
+                unstage(&staged);
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     format!(
@@ -126,16 +136,35 @@ impl AgentCache {
                     ),
                 ));
             }
-            let Some(bytes) = self.store.get(&out.digest)? else {
-                return Ok(CacheLookup::Miss);
+            // get_VERIFIED, not get: a blob whose on-disk bytes no longer hash to
+            // its digest (corruption/tamper) must NOT be published — treat it as a
+            // miss so the action re-runs and produces a correct output (cache
+            // corruption → miss, never a wrong byte). An evicted/absent blob is
+            // likewise a miss; both abort before any final rename.
+            let bytes = match self.store.get_verified(&out.digest) {
+                Ok(Some(b)) => b,
+                Ok(None) | Err(_) => {
+                    unstage(&staged);
+                    return Ok(CacheLookup::Miss);
+                }
             };
-            fetched.push((&out.logical_path, bytes));
+            let final_path = build_root.join(&out.logical_path);
+            match stage_sibling(&final_path, &bytes) {
+                Ok(tmp) => staged.push((tmp, final_path)),
+                Err(e) => {
+                    unstage(&staged);
+                    return Err(e);
+                }
+            }
         }
-        // All present: now publish atomically. (A mid-publish I/O error can
-        // still leave some files, but that is a hard failure surfaced to the
-        // caller, not a silent partial hit.)
-        for (logical, bytes) in fetched {
-            publish_atomically(&build_root.join(logical), &bytes)?;
+        // Pass 2: commit. The renames are the only non-atomic window; a mid-commit
+        // I/O failure is surfaced as a hard error (not a silent partial hit), and
+        // any temps not yet committed are cleaned up.
+        for (i, (tmp, final_path)) in staged.iter().enumerate() {
+            if let Err(e) = commit_staged(tmp, final_path) {
+                unstage(&staged[i + 1..]);
+                return Err(e);
+            }
         }
         Ok(CacheLookup::Hit {
             exit_code: result.exit_code,
@@ -298,24 +327,58 @@ fn toolchain_digest(argv0: &str) -> Digest {
     }
 }
 
-/// Publishes `bytes` at `final_path` atomically (temp sibling + rename), so a
-/// build never observes a half-written cached output.
-fn publish_atomically(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = final_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut tmp = final_path.to_path_buf();
-    let mut name = final_path
+/// Per-process sequence for unique staging temp names, so two concurrent
+/// resolves of the same output never collide on a fixed temp name (COR-007).
+static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Stages `bytes` to a uniquely-named temp SIBLING of `final_path` (same volume,
+/// so the later rename is atomic) and returns the temp path. Created with
+/// `create_new` (O_EXCL / CREATE_NEW), NOT a plain write: the name is otherwise
+/// predictable and a plain write would truncate — and follow — a symlink a
+/// co-located actor might pre-plant to redirect the cached bytes. `create_new`
+/// refuses an existing path, so a planted target makes us retry with the next seq
+/// rather than write through it (the same discipline as `cas::store::write_atomic`).
+/// The caller renames the temp onto `final_path` with [`commit_staged`] only after
+/// ALL of an action's outputs have staged, so a missing/corrupt blob leaves NO
+/// output published (set-atomic publish).
+fn stage_sibling(final_path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let stem = final_path
         .file_name()
-        .map(|n| n.to_os_string())
+        .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    name.push(".sbz-cache-tmp");
-    tmp.set_file_name(name);
-    std::fs::write(&tmp, bytes)?;
-    match std::fs::rename(&tmp, final_path) {
+    loop {
+        let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            ".sbz-cache.{}.{seq}.{stem}.tmp",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(bytes)?;
+                return Ok(tmp);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Renames a staged temp onto its final path (atomic within a volume), removing
+/// the temp on failure so a failed commit leaves no `.sbz-cache.*.tmp` residue.
+fn commit_staged(tmp: &Path, final_path: &Path) -> io::Result<()> {
+    match std::fs::rename(tmp, final_path) {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_file(tmp);
             Err(e)
         }
     }
@@ -724,6 +787,55 @@ mod tests {
             "must not partially publish a.obj"
         );
         assert!(!fresh.join("b.obj").exists());
+    }
+
+    #[test]
+    fn corrupt_output_blob_misses_instead_of_serving_wrong_bytes() {
+        // COR-007: a cached output blob corrupted on disk (its bytes no longer hash
+        // to its digest) must NOT be published — `resolve` re-verifies and treats it
+        // as a miss so the action re-runs, never serving a wrong byte. Pre-fix the
+        // republish used the non-verifying `store.get` and would have served it.
+        let root = tmp("corrupt");
+        let build = tmp("corrupt-build");
+        let cache = AgentCache::open(&root).unwrap();
+
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"src").unwrap();
+        std::fs::write(build.join("a.obj"), b"GOOD-OBJECT-BYTES").unwrap();
+
+        let weak = cache.weak_key(&["cc".to_string()], &[]);
+        let manifest = manifest_for(&[("a.cpp", &input)]);
+        cache
+            .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
+            .unwrap();
+
+        // First resolve hits (good blob).
+        assert_eq!(
+            cache.resolve(&weak, &tmp("corrupt-r1")).unwrap(),
+            CacheLookup::Hit { exit_code: 0 }
+        );
+
+        // Corrupt the output blob on disk (white-box: digest→path), keeping the
+        // file at the same path so it is "present but wrong".
+        let d = Digest::of(b"GOOD-OBJECT-BYTES");
+        let blob = root
+            .join("cas")
+            .join("blake3")
+            .join(&d.hex()[0..2])
+            .join(d.hex());
+        std::fs::write(&blob, b"TAMPERED-DIFFERENT-BYTES!!").unwrap();
+
+        // Now resolve must MISS and publish nothing — the corrupt blob is rejected.
+        let fresh = tmp("corrupt-r2");
+        assert_eq!(
+            cache.resolve(&weak, &fresh).unwrap(),
+            CacheLookup::Miss,
+            "a corrupt cached blob must miss, never serve wrong bytes (COR-007)"
+        );
+        assert!(
+            !fresh.join("a.obj").exists(),
+            "nothing is published when a cached blob is corrupt"
+        );
     }
 
     #[test]
