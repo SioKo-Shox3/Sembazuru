@@ -137,9 +137,36 @@ pub struct StatusState {
     /// Path of the persisted daemon config the GetConfig/SetConfig RPCs read and
     /// write (M9.3a). The GUI edits this file; the daemon applies it on next start.
     pub config_path: PathBuf,
+    /// Whether the **mutating** Status RPCs (`SetConfig`, `TriggerEviction`) are
+    /// allowed (SEC-001 interim, ADR 0016). Default **false**: the Status plane is
+    /// loopback-TCP with no caller authentication, so a low-privilege local user
+    /// could otherwise call `SetConfig` to clear the cluster token (disabling LAN
+    /// auth) or rewrite listen addresses. Read-only RPCs (`GetStatus`/`GetConfig`)
+    /// stay open. An operator opts in via `SEMBAZURU_STATUS_ADMIN=1` /
+    /// `status_admin = true` until the named-pipe + caller-SID transport lands (the
+    /// full SEC-001 fix). The read/admin pipe split is the durable replacement.
+    pub admin_enabled: bool,
 }
 
 impl StatusState {
+    /// Gate for the mutating Status RPCs (SEC-001 interim, ADR 0016). The Status
+    /// plane is loopback-TCP with no caller authentication, so `SetConfig`
+    /// (which can clear the cluster token / rewrite listen addresses) and
+    /// `TriggerEviction` are refused unless an operator explicitly opts in. Until
+    /// the named-pipe + caller-SID transport lands, this is the cheap interim that
+    /// closes the "a local low-priv user disables LAN auth via SetConfig" path.
+    fn require_admin(&self) -> Result<(), Status> {
+        if self.admin_enabled {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(
+                "Status admin RPCs are disabled; set SEMBAZURU_STATUS_ADMIN=1 (or \
+                 status_admin = true) to enable. The loopback Status plane has no \
+                 caller authentication, so config-mutation is opt-in (SEC-001 / ADR 0016).",
+            ))
+        }
+    }
+
     /// Builds the response from the live state. `cas_size_bytes` is passed in (the
     /// CAS scan is a blocking disk walk, run off the async runtime by the caller).
     fn snapshot(&self, cas_size_bytes: u64) -> GetStatusResponse {
@@ -220,6 +247,7 @@ impl StatusRpc for StatusState {
         &self,
         _request: Request<TriggerEvictionRequest>,
     ) -> Result<Response<TriggerEvictionResponse>, Status> {
+        self.require_admin()?;
         match (&self.cache, self.cache_max_bytes) {
             (Some(cache), Some(max)) => {
                 let (freed, after) = evict_cache_to_cap(Arc::clone(cache), max)
@@ -283,6 +311,7 @@ impl StatusRpc for StatusState {
         &self,
         request: Request<SetConfigRequest>,
     ) -> Result<Response<SetConfigResponse>, Status> {
+        self.require_admin()?;
         let path = self.config_path.clone();
         let req = request.into_inner();
         let written_path = tokio::task::spawn_blocking(move || {

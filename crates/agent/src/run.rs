@@ -161,6 +161,9 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             metrics: intake.metrics(),
             auth_enabled: cluster_token.is_some(),
             config_path: DaemonConfig::path_from_env(),
+            // SEC-001 interim (ADR 0016): the mutating Status RPCs are opt-in
+            // (default off) because the loopback Status plane has no caller auth.
+            admin_enabled: config.status_admin,
         };
         tokio::spawn(async move {
             if let Err(e) = serve_status_service(status_listener, state).await {

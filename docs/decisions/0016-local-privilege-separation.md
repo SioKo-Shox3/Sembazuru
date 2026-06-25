@@ -1,7 +1,13 @@
 # 0016 — local 特権分離（named pipe＋impersonation・read/admin 分離・非 LocalSystem 既定）
 
-- ステータス: **起案（PROPOSED）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
+- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
   出所: コードレビュー（SEC-001・最も危険な P0＝local EoP→SYSTEM）。
+  **実装済み**: (1) 暫定緩和のうち **Status 書込み RPC のゲート**（`set_config`/`trigger_eviction`
+  を `status_admin`/`SEMBAZURU_STATUS_ADMIN` の opt-in・既定 deny。無認証 loopback から cluster
+  token をクリアして LAN auth を無効化する経路を閉鎖。`config_rpc.rs` で deny を実証）。
+  **未実装（本格策・lead/実機ゲート）**: LocalIntake→`run_local`→SYSTEM の主経路（= (2)named-pipe
+  transport＋DACL／(3)caller impersonation／(5)非 LocalSystem 既定＋installer ACL）。これらは Windows
+  サービス/2 ユーザー/SID assertion の実機検証（M9.5/M10）が要るため当環境では未着手。
 - 決めること: local IPC を**どの境界で守るか**。**(1) 暫定緩和（先行）**、**(2) named-pipe transport＋DACL**、
   **(3) caller impersonation で local fallback**、**(4) Status の read/admin 分離**、**(5) 非 LocalSystem 既定**。
 - 判定基準: 非交渉（**正しさ>速度**／**ローカルフォールバック常時**）。署名/EDR は [ADR 0009 撤回](0009-app-self-update-github-releases.md)で任意降格だが、
