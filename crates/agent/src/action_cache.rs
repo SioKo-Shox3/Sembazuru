@@ -26,7 +26,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sembazuru_cas::{ActionCache, ActionResult, BlobStore, Digest, OutputFile};
+use sembazuru_cas::{ActionCache, ActionResult, BlobStore, CasError, Digest, OutputFile};
 use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest};
 use sembazuru_tracer::normalize_for_compare;
 
@@ -143,6 +143,17 @@ impl AgentCache {
             // likewise a miss; both abort before any final rename.
             let bytes = match self.store.get_verified(&out.digest) {
                 Ok(Some(b)) => b,
+                // A genuine I/O error reading the CAS (disk fault, sharing
+                // violation) is NOT a normal miss: surface it as a hard error (the
+                // pre-rewrite behaviour) so a failing cache is visible instead of
+                // self-healing into endless silent re-runs.
+                Err(CasError::Io(e)) => {
+                    unstage(&staged);
+                    return Err(e);
+                }
+                // Evicted/absent blob, a corrupt-on-disk blob, or any other
+                // CAS-layer error → miss + re-run (correctness-safe; the action
+                // re-runs and produces a correct output, never a wrong byte).
                 Ok(None) | Err(_) => {
                     unstage(&staged);
                     return Ok(CacheLookup::Miss);
