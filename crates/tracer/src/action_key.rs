@@ -30,8 +30,14 @@ use crate::{DependencyGraph, Trace, build_graph, format, normalize_for_compare};
 /// to relativize logical paths). Parse failures on individual files are skipped
 /// with a warning; a `read_dir` error is fatal.
 pub fn load_run_from_dir(dir: &str) -> Result<(DependencyGraph, String), String> {
-    let traces = load_traces_from_dir(dir)?;
-    let graph = build_graph(&traces);
+    let (traces, skipped) = load_traces_from_dir(dir)?;
+    let mut graph = build_graph(&traces);
+    // A trace file that could not be read or parsed means a process's observed I/O
+    // is missing from the run — its inputs are absent from the graph, so a later
+    // edit to one of them would not move the strong key (a stale hit). Surface it
+    // as a (cache-blocking) graph warning so `input_manifest` declines to cache the
+    // action (COR-003).
+    graph.warnings.extend(skipped);
     let cwd = traces
         .iter()
         .find(|t| t.pid == graph.root_pid)
@@ -40,11 +46,16 @@ pub fn load_run_from_dir(dir: &str) -> Result<(DependencyGraph, String), String>
     Ok((graph, cwd))
 }
 
-fn load_traces_from_dir(dir: &str) -> Result<Vec<Trace>, String> {
+/// Loads every `*.sbzt` trace in `dir`. Returns the parsed traces and a list of
+/// human-readable warnings for files that could not be read or parsed (each a
+/// dropped process trace — cache-blocking, see [`load_run_from_dir`]). A
+/// `read_dir` error is fatal.
+fn load_traces_from_dir(dir: &str) -> Result<(Vec<Trace>, Vec<String>), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read directory '{dir}': {e}"))?;
 
     let mut traces = Vec::new();
+    let mut skipped = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| format!("error iterating '{dir}': {e}"))?;
         let path = entry.path();
@@ -54,16 +65,22 @@ fn load_traces_from_dir(dir: &str) -> Result<Vec<Trace>, String> {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("warning: could not read '{}': {e}", path.display());
+                skipped.push(format!(
+                    "trace file unreadable, dropped from the run: {} ({e})",
+                    path.display()
+                ));
                 continue;
             }
         };
         match format::parse(&bytes) {
             Ok(t) => traces.push(t),
-            Err(e) => eprintln!("warning: skipping '{}': {e}", path.display()),
+            Err(e) => skipped.push(format!(
+                "trace file failed to parse, dropped from the run: {} ({e})",
+                path.display()
+            )),
         }
     }
-    Ok(traces)
+    Ok((traces, skipped))
 }
 
 /// Returns `true` if `path` has a `.sbzt` extension (case-insensitive).
@@ -283,7 +300,16 @@ pub struct InputManifest {
 pub fn input_manifest(graph: &DependencyGraph, root: &str) -> InputManifest {
     let outputs = logical_outputs(graph, root);
     let mut inputs = Vec::new();
-    let mut cacheable = true;
+    // COR-003: an INCOMPLETE or ambiguous trace makes the whole action uncacheable
+    // (input-side fail-closed). If a per-process trace was truncated, a spawned
+    // child's injection failed so its I/O went unobserved, a trace file would not
+    // parse, there were no traces, or the root was ambiguous, then some inputs are
+    // missing from the graph — a later edit to one would NOT move the strong key,
+    // serving a stale result. Every warning `build_graph`/`load_run_from_dir` emits
+    // signals exactly such an untrustworthy input set, so any warning blocks
+    // caching. (A future *benign* warning class would have to be excluded here.)
+    // The action still distributes and runs; it is only not RECORDED (ADR 0007 §c).
+    let mut cacheable = graph.warnings.is_empty();
     for inp in &graph.inputs {
         let logical = determinism::relativize(&inp.path, root);
         if outputs.contains(&logical) {
@@ -470,6 +496,30 @@ mod action_cache_tests {
         let g = graph_with(vec![read_access("a.cpp")]);
         let m = input_manifest(&g, ""); // build root unknown → cannot anchor
         assert!(!m.cacheable, "an uncoverable source must fail closed");
+    }
+
+    #[test]
+    fn an_incomplete_trace_is_uncacheable() {
+        // COR-003: a graph carrying ANY warning (a truncated trace, a child whose
+        // injection failed so its I/O is unobserved, a trace file that would not
+        // parse, no traces, or an ambiguous root) means inputs are missing — a
+        // later edit to one would not move the strong key. Such an action must be
+        // distributed but NEVER recorded (no stale hit), so its manifest is
+        // uncacheable regardless of how cleanly its observed inputs anchor.
+        let root = tmp_dir("incomplete");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp")]);
+        // With a clean trace this exact action IS cacheable...
+        assert!(input_manifest(&g, &rs).cacheable);
+        // ...but a single warning (here: a simulated child-injection gap) blocks it.
+        g.warnings
+            .push("pid 10 spawned child 99 but no trace file exists".into());
+        assert!(
+            !input_manifest(&g, &rs).cacheable,
+            "an incomplete/ambiguous trace must be uncacheable (COR-003)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
