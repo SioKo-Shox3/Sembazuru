@@ -1,0 +1,539 @@
+//! Agent-authoritative per-action session registry (ADR 0013).
+//!
+//! The data-plane file server (`fileserver.rs`) used to keep a **single,
+//! process-wide** `Session`: one content store, one pin map, one writeback table
+//! shared by every connection for the daemon's whole life. That conflated four
+//! concerns the review flagged:
+//!   * **COR-001** — a path pinned by action A was served, frozen, to action B
+//!     forever (a stale input across unrelated builds);
+//!   * **SEC-004** — the supply scope was whatever *root* the worker declared on
+//!     its Hello, so a token-holding worker could widen it to `c:\`;
+//!   * **SEC-003** — WriteBack wrote any worker-named absolute path;
+//!   * **PROTO-001** — the session id was a guessable `intake-{n}` counter.
+//!
+//! This registry makes the agent the authority. The scheduler/intake mints an
+//! unpredictable `session_id` (see `intake::mint_session_id`) and `create`s a
+//! [`SessionCapability`] holding the agent's *own* normalized input root, the
+//! action's declared output set, a **per-session** pin partition (with per-path
+//! single-flight so two concurrent first-touches cannot pin different bytes), and
+//! an allowed-digest ACL grown as the session pins inputs. The worker forwards the
+//! id on its data-plane Hello; the file server looks the session up and enforces
+//! the capability, dropping the whole partition when the action finishes.
+//!
+//! **One shared content store, per-session ACL overlay.** The registry owns a
+//! single [`BlobStore`] for the daemon, so a blob a session pins is physically
+//! available to others (cross-session dedup/prefetch keep working). Isolation is
+//! the per-session `allowed_digests` *capability list*, not a byte copy: a session
+//! can only `Read`/`Has` a digest it actually pinned (by opening that path), so a
+//! guessed/sniffed digest from another session gets nothing. This store is the
+//! *ephemeral file-supply* CAS — distinct from the persistent action cache
+//! (`AgentCache`), whose M9.2 eviction never touches sessions.
+//!
+//! **Residual (LAN-trusted, ADR 0013):** the data-plane Hello authenticates with
+//! the *shared* cluster token, so the agent cannot prove the peer presenting a
+//! session id is the worker it was dispatched to. A token-holding worker that
+//! *captures* another session's (128-bit, unguessable) id can bind it and reach
+//! that session's scope — but only its authoritative root + declared outputs,
+//! never `c:\`/arbitrary writes. `dispatched_workers` records the dispatch for
+//! telemetry; closing the theft needs a per-session capability token (reserved
+//! proto field 11), a small additive follow-up, not mTLS.
+
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use sembazuru_cas::{BlobStore, Digest, DigestHasher};
+use tokio::sync::{Mutex, OnceCell};
+
+/// Disambiguates the registry's temp content-store directory within a process.
+static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The single-flight cell for one pinned path: yields the `(digest, size)` frozen
+/// at first touch. `Arc` so concurrent racers of the same path share one cell.
+type PinCell = Arc<OnceCell<(Digest, u64)>>;
+
+/// In-progress streamed WriteBack for one output path: the temp file being
+/// appended to, how many bytes have landed (the next expected offset), and the
+/// running digest so the whole output is verified without buffering it. Lives
+/// per session now (was a field of the process-wide `Session`).
+pub struct WritebackState {
+    pub tmp: PathBuf,
+    pub written: u64,
+    pub hasher: DigestHasher,
+}
+
+/// The agent's authority over one action's data-plane session: the scope root it
+/// dispatched, the action's declared outputs, the per-session pin partition (with
+/// per-path single-flight), the allowed-digest ACL, and the in-progress streamed
+/// outputs. Shared (`Arc`) across every data-plane connection that opens with this
+/// session's id; dropped — partition and all — when the action finishes.
+pub struct SessionCapability {
+    /// The agent-authoritative normalized scope root (`None` = unscoped). This is
+    /// the value the agent dispatched, NOT the worker-declared Hello root, so a
+    /// worker cannot widen its own scope (SEC-004).
+    root: Option<String>,
+    /// The action's declared output set (normalized). WriteBack targets are
+    /// restricted to this (or, when empty, to within `root`) — SEC-003.
+    declared_outputs: HashSet<String>,
+    /// Requested logical path → a single-flight cell yielding the `(digest, size)`
+    /// pinned at first touch. The `OnceCell` makes exactly one task read the file
+    /// and ingest it; concurrent racers await it and observe the SAME frozen
+    /// digest, closing the drop-the-lock-then-read race the old `ingest` had.
+    pinned: Mutex<HashMap<String, PinCell>>,
+    /// Digests this session has legitimately pinned. For a bound session, `Read`
+    /// and `Has` are gated to this set, so a digest learned out-of-band (e.g. from
+    /// another session) cannot be fetched/probed here.
+    allowed_digests: Mutex<HashSet<Digest>>,
+    /// Output path → in-progress streamed WriteBack, per session.
+    writebacks: Mutex<HashMap<String, WritebackState>>,
+    /// Worker ids dispatch *attempted* for this action (a set, because the
+    /// scheduler reassigns across workers). Telemetry only under LAN-trusted —
+    /// the data plane has no per-worker secret to enforce against (see module doc).
+    dispatched_workers: Mutex<HashSet<String>>,
+    created: Instant,
+    /// Live data-plane connections bound to this session (RAII via [`ConnGuard`]),
+    /// so the idle sweeper never reaps a session with work in flight.
+    conns: AtomicUsize,
+    /// `true` for a registry-bound session (enforce authoritative root + digest
+    /// ACL + output scope). `false` for the legacy/unscoped capability an old
+    /// worker (empty session id) or a test gets — it preserves the pre-ADR-0013
+    /// behaviour (worker-declared root, any CAS digest readable, any output path).
+    enforce: bool,
+}
+
+impl SessionCapability {
+    fn new(root: Option<String>, declared_outputs: HashSet<String>, enforce: bool) -> Self {
+        SessionCapability {
+            root,
+            declared_outputs,
+            pinned: Mutex::new(HashMap::new()),
+            allowed_digests: Mutex::new(HashSet::new()),
+            writebacks: Mutex::new(HashMap::new()),
+            dispatched_workers: Mutex::new(HashSet::new()),
+            created: Instant::now(),
+            conns: AtomicUsize::new(0),
+            enforce,
+        }
+    }
+
+    /// The agent-authoritative scope root (`None` = unscoped). The file server
+    /// scopes Stat/OpenRead/DirList against THIS, ignoring the worker's Hello root.
+    pub fn root(&self) -> Option<&str> {
+        self.root.as_deref()
+    }
+
+    /// Whether this is a bound (enforcing) session vs a legacy/unscoped one.
+    pub fn enforces(&self) -> bool {
+        self.enforce
+    }
+
+    /// Pins `requested`'s current bytes into `store` on first touch and returns
+    /// the frozen `(digest, size)`; a later call for the same path returns the
+    /// SAME digest even if the on-disk file has since changed (snapshot
+    /// consistency, v0 §4.1). `None` if the file is absent/unreadable — that is
+    /// NOT cached, so a later open can still succeed if the file appears. The
+    /// digest is recorded in the allowed-digest ACL so the session may later
+    /// `Read`/`Has` it.
+    ///
+    /// Single-flight: two concurrent first-touches of one path share one cell, so
+    /// only one disk read + ingest runs and both observe the identical digest —
+    /// closing the race where the old `ingest` dropped its lock between the
+    /// pin-check and the read and could pin different bytes under a mid-build edit.
+    pub async fn pin(
+        &self,
+        store: &BlobStore,
+        requested: &str,
+        actual: PathBuf,
+    ) -> Option<(Digest, u64)> {
+        let cell = {
+            let mut pinned = self.pinned.lock().await;
+            pinned
+                .entry(requested.to_string())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let res: Result<&(Digest, u64), ()> = cell
+            .get_or_try_init(|| async {
+                let bytes = tokio::fs::read(&actual).await.map_err(|_| ())?;
+                let size = bytes.len() as u64;
+                let digest = store.put(&bytes).map_err(|_| ())?;
+                self.allowed_digests.lock().await.insert(digest.clone());
+                Ok((digest, size))
+            })
+            .await;
+        res.ok().map(|(d, s)| (d.clone(), *s))
+    }
+
+    /// Whether `digest` may be served/probed on this session. A legacy session
+    /// allows any digest in the shared store (pre-ADR-0013 behaviour); a bound
+    /// session allows only digests it has itself pinned (closing the cross-session
+    /// digest oracle — SEC-004 / PROTO-001).
+    pub async fn digest_visible(&self, digest: &Digest) -> bool {
+        !self.enforce || self.allowed_digests.lock().await.contains(digest)
+    }
+
+    /// Whether a (already-normalized) output path may be written for this session
+    /// (SEC-003). A legacy session allows any path. A bound session restricts to
+    /// its declared outputs; when none were declared, it falls back to
+    /// `within_root` (computed by the caller against [`root`](Self::root)), which
+    /// is strictly tighter than the old "any absolute path".
+    pub fn output_allowed(&self, normalized_output: &str, within_root: bool) -> bool {
+        if !self.enforce {
+            return true;
+        }
+        if self.declared_outputs.is_empty() {
+            within_root
+        } else {
+            self.declared_outputs.contains(normalized_output)
+        }
+    }
+
+    /// The in-progress streamed-output table for this session (the file server's
+    /// `write_back` locks it per chunk).
+    pub fn writebacks(&self) -> &Mutex<HashMap<String, WritebackState>> {
+        &self.writebacks
+    }
+
+    async fn note_dispatch(&self, worker_id: &str) {
+        self.dispatched_workers
+            .lock()
+            .await
+            .insert(worker_id.to_string());
+    }
+
+    /// Whether `worker_id` is one of the workers this action was dispatched to.
+    /// Used for theft *telemetry* (not enforcement): a peer presenting this id
+    /// that is not in the set is logged, but under LAN-trusted it is still served
+    /// (see module doc). Returns `true` for a legacy session (nothing to check).
+    pub async fn dispatched_to(&self, worker_id: &str) -> bool {
+        !self.enforce || self.dispatched_workers.lock().await.contains(worker_id)
+    }
+}
+
+/// RAII tracker for a live connection bound to a session, so the idle sweeper
+/// never reaps a session that still has a data-plane connection open.
+pub struct ConnGuard(Arc<SessionCapability>);
+
+impl ConnGuard {
+    /// The capability this guard keeps alive.
+    pub fn capability(&self) -> &Arc<SessionCapability> {
+        &self.0
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.conns.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The daemon's authority over all live data-plane sessions: one shared content
+/// store plus a `session_id → capability` map. Built once in `run_daemon` and
+/// shared (`Arc`) into both the intake/scheduler (which `create`/`finish`) and the
+/// file server (which `get`s by the Hello's session id).
+pub struct SessionRegistry {
+    store: BlobStore,
+    store_root: PathBuf,
+    sessions: Mutex<HashMap<String, Arc<SessionCapability>>>,
+}
+
+impl SessionRegistry {
+    /// Opens the registry with a fresh temp content store (scrubbed on drop).
+    pub fn new() -> io::Result<SessionRegistry> {
+        let seq = STORE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let store_root =
+            std::env::temp_dir().join(format!("sbz-agent-cas.{}.{seq}", std::process::id()));
+        Ok(SessionRegistry {
+            store: BlobStore::open(&store_root)?,
+            store_root,
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The shared file-supply content store (the file server pins into and reads
+    /// from this).
+    pub fn store(&self) -> &BlobStore {
+        &self.store
+    }
+
+    /// Mints a bound session: the scheduler/intake calls this right after minting
+    /// the (unpredictable) `session_id`, with the agent's OWN normalized input
+    /// root and the action's declared outputs. Returns the capability (also stored
+    /// in the map so the data-plane Hello can find it).
+    pub async fn create(
+        &self,
+        session_id: String,
+        root: Option<String>,
+        declared_outputs: HashSet<String>,
+    ) -> Arc<SessionCapability> {
+        let cap = Arc::new(SessionCapability::new(root, declared_outputs, true));
+        self.sessions.lock().await.insert(session_id, cap.clone());
+        cap
+    }
+
+    /// Looks up a session by the id the worker presented on its Hello. `None` for
+    /// an empty/unknown id → the file server uses a legacy/unscoped capability.
+    pub async fn get(&self, session_id: &str) -> Option<Arc<SessionCapability>> {
+        if session_id.is_empty() {
+            return None;
+        }
+        self.sessions.lock().await.get(session_id).cloned()
+    }
+
+    /// Destroys a session when its action finishes (any outcome), dropping the
+    /// pin partition, allowed-digest ACL, and writeback table. The shared store's
+    /// blobs are NOT deleted (other sessions may share them). Returns whether an
+    /// entry was present.
+    pub async fn finish(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.remove(session_id).is_some()
+    }
+
+    /// Records (telemetry) a worker the scheduler dispatched this action to. A
+    /// no-op for an unknown session.
+    pub async fn note_dispatch(&self, session_id: &str, worker_id: &str) {
+        if let Some(cap) = self.sessions.lock().await.get(session_id).cloned() {
+            cap.note_dispatch(worker_id).await;
+        }
+    }
+
+    /// Binds a live connection to a session, bumping its connection refcount and
+    /// returning a guard that decrements it on drop. The file server holds this for
+    /// the connection's lifetime so a lingering connection cannot be reaped.
+    pub fn bind(cap: Arc<SessionCapability>) -> ConnGuard {
+        cap.conns.fetch_add(1, Ordering::SeqCst);
+        ConnGuard(cap)
+    }
+
+    /// A legacy/unscoped, NON-registered capability for the pre-ADR-0013 path: an
+    /// old worker (empty session id) or a test. It uses the worker-declared `root`,
+    /// reads any digest in the shared store, and allows any WriteBack path — i.e.
+    /// the exact behaviour before this change. Each connection gets its own (its
+    /// pins are connection-local), which is at worst tighter than the old shared
+    /// pin map and never staler.
+    pub fn legacy_capability(root: Option<String>) -> Arc<SessionCapability> {
+        Arc::new(SessionCapability::new(root, HashSet::new(), false))
+    }
+
+    /// Reaps bound sessions older than `ttl` that have no live connection — a
+    /// backstop for an intake task that died before calling [`finish`]. Returns
+    /// the number reaped. Mirrors the `WorkerTable` opportunistic reaper.
+    pub async fn sweep_idle(&self, ttl: Duration) -> usize {
+        let mut sessions = self.sessions.lock().await;
+        let before = sessions.len();
+        sessions
+            .retain(|_, cap| cap.conns.load(Ordering::SeqCst) > 0 || cap.created.elapsed() < ttl);
+        before - sessions.len()
+    }
+
+    /// Number of live sessions (for the status dashboard / tests).
+    pub async fn session_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+}
+
+impl Drop for SessionRegistry {
+    fn drop(&mut self) {
+        // Scrub the shared temp content store. Best-effort: a leaked temp dir is
+        // not a correctness problem, so a failure here is ignored (this is a
+        // destructor), matching the old per-server `Session` drop.
+        let _ = std::fs::remove_dir_all(&self.store_root);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::AtomicU64;
+
+    static T: AtomicU64 = AtomicU64::new(0);
+    fn tmp(tag: &str) -> PathBuf {
+        let seq = T.fetch_add(1, Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("sbz-sessreg-{}-{tag}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+    fn root_str(p: &Path) -> Option<String> {
+        Some(p.to_string_lossy().to_lowercase().replace('/', "\\"))
+    }
+
+    #[tokio::test]
+    async fn create_get_finish_lifecycle() {
+        let reg = SessionRegistry::new().unwrap();
+        assert_eq!(reg.session_count().await, 0);
+
+        let cap = reg
+            .create(
+                "sess-A".into(),
+                root_str(Path::new("c:\\proj")),
+                HashSet::new(),
+            )
+            .await;
+        assert!(cap.enforces());
+        assert_eq!(cap.root(), Some("c:\\proj"));
+        assert!(reg.get("sess-A").await.is_some());
+        assert!(
+            reg.get("").await.is_none(),
+            "an empty id never names a session"
+        );
+        assert!(reg.get("unknown").await.is_none());
+        assert_eq!(reg.session_count().await, 1);
+
+        assert!(reg.finish("sess-A").await);
+        assert!(!reg.finish("sess-A").await, "second finish is a no-op");
+        assert!(reg.get("sess-A").await.is_none());
+        assert_eq!(reg.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn single_flight_pin_freezes_one_digest_under_concurrency() {
+        // Two concurrent first-touches of the SAME path must observe the SAME
+        // frozen digest even if the file changes between them — the race the old
+        // lock-drop `ingest` had. After pinning, an edit must NOT change what the
+        // session serves (snapshot consistency).
+        let reg = SessionRegistry::new().unwrap();
+        let dir = tmp("pin");
+        let f = dir.join("a.cpp");
+        std::fs::write(&f, b"v1-original").unwrap();
+        let cap = reg.create("s".into(), None, HashSet::new()).await;
+
+        let (r1, r2) = tokio::join!(
+            cap.pin(reg.store(), "a.cpp", f.clone()),
+            cap.pin(reg.store(), "a.cpp", f.clone()),
+        );
+        let (d1, _) = r1.expect("pin 1");
+        let (d2, _) = r2.expect("pin 2");
+        assert_eq!(
+            d1, d2,
+            "concurrent first-touch must pin one identical digest"
+        );
+        assert!(
+            cap.digest_visible(&d1).await,
+            "a pinned digest is allowed to read"
+        );
+
+        // Edit the file: the pin is frozen, so a later pin returns the SAME digest.
+        std::fs::write(&f, b"v2-edited-different-length").unwrap();
+        let (d3, _) = cap
+            .pin(reg.store(), "a.cpp", f.clone())
+            .await
+            .expect("re-pin");
+        assert_eq!(
+            d1, d3,
+            "a pinned path stays frozen for the session (snapshot)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bound_session_gates_digests_legacy_does_not() {
+        // A bound session may only read/probe digests it pinned; a foreign digest
+        // (pinned by another session) is invisible even though the shared store
+        // physically holds it. A legacy session sees any digest.
+        let reg = SessionRegistry::new().unwrap();
+        let dir = tmp("acl");
+        let mine = dir.join("mine.h");
+        let theirs = dir.join("theirs.h");
+        std::fs::write(&mine, b"mine").unwrap();
+        std::fs::write(&theirs, b"theirs").unwrap();
+
+        let a = reg.create("A".into(), None, HashSet::new()).await;
+        let b = reg.create("B".into(), None, HashSet::new()).await;
+        let (d_mine, _) = a.pin(reg.store(), "mine.h", mine.clone()).await.unwrap();
+        let (d_theirs, _) = b
+            .pin(reg.store(), "theirs.h", theirs.clone())
+            .await
+            .unwrap();
+
+        // The blob B pinned is physically in the shared store...
+        assert!(reg.store().has(&d_theirs));
+        // ...but session A may NOT read it (it never pinned that path).
+        assert!(a.digest_visible(&d_mine).await);
+        assert!(
+            !a.digest_visible(&d_theirs).await,
+            "a bound session must not read another session's digest (SEC-004)"
+        );
+
+        // A legacy session has no ACL: any present digest is visible.
+        let legacy = SessionRegistry::legacy_capability(None);
+        assert!(legacy.digest_visible(&d_theirs).await);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn writeback_scope_restricts_bound_sessions_only() {
+        // declared outputs gate WriteBack for a bound session; with none declared
+        // it falls back to within-root; a legacy session allows anything.
+        let mut outs = HashSet::new();
+        outs.insert("c:\\proj\\obj\\a.obj".to_string());
+        let bound = SessionCapability::new(root_str(Path::new("c:\\proj")), outs, true);
+        assert!(
+            bound.output_allowed("c:\\proj\\obj\\a.obj", true),
+            "declared output allowed"
+        );
+        assert!(
+            !bound.output_allowed("c:\\proj\\obj\\evil.obj", true),
+            "an undeclared output is refused even within root"
+        );
+
+        // No declared outputs → within-root fallback (caller computes within_root).
+        let bound_no_decl =
+            SessionCapability::new(root_str(Path::new("c:\\proj")), HashSet::new(), true);
+        assert!(bound_no_decl.output_allowed("c:\\proj\\bin\\x.exe", true));
+        assert!(
+            !bound_no_decl.output_allowed("c:\\windows\\system32\\evil.dll", false),
+            "an out-of-root output is refused when nothing is declared (SEC-003)"
+        );
+
+        // Legacy: any path (pre-ADR-0013 behaviour).
+        let legacy = SessionRegistry::legacy_capability(None);
+        assert!(legacy.output_allowed("c:\\anywhere\\at\\all", false));
+    }
+
+    #[tokio::test]
+    async fn idle_sweeper_reaps_only_old_unconnected_sessions() {
+        let reg = SessionRegistry::new().unwrap();
+        let old = reg.create("old".into(), None, HashSet::new()).await;
+        let _young = reg.create("young".into(), None, HashSet::new()).await;
+
+        // A connection on `old` protects it from the sweeper even though it is old.
+        let guard = SessionRegistry::bind(old.clone());
+        // ttl = 0: everything is "old enough", but a bound connection is spared.
+        assert_eq!(
+            reg.sweep_idle(Duration::ZERO).await,
+            1,
+            "only the unconnected one reaps"
+        );
+        assert!(
+            reg.get("old").await.is_some(),
+            "a connected session is never reaped"
+        );
+        assert!(reg.get("young").await.is_none());
+
+        drop(guard);
+        assert_eq!(
+            reg.sweep_idle(Duration::ZERO).await,
+            1,
+            "now the unconnected old one reaps"
+        );
+        assert_eq!(reg.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn note_dispatch_is_telemetry_not_a_gate() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg.create("s".into(), None, HashSet::new()).await;
+        reg.note_dispatch("s", "worker-1").await;
+        assert!(cap.dispatched_to("worker-1").await);
+        // A worker NOT dispatched to is flagged (false) — the caller logs it but,
+        // under LAN-trusted, still serves (enforcement is the deferred cap token).
+        assert!(!cap.dispatched_to("worker-2").await);
+    }
+}
