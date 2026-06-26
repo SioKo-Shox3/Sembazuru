@@ -348,6 +348,22 @@ pub fn input_manifest(graph: &DependencyGraph, root: &str) -> InputManifest {
                     kind: InputKind::Content,
                 }),
                 Err(_) => {
+                    // A directory the toolchain probed for existence (an include-
+                    // search path — clang-cl and cl `stat`/open every candidate
+                    // directory) is NOT a content dependency: the headers resolved
+                    // *within* it are tracked as their own Content/Absent inputs, so
+                    // a header appearing is still caught (COR-002). Recording the
+                    // directory as `Absent` would break every resolve — `std::fs::read`
+                    // on a directory errors with PermissionDenied (not NotFound), so
+                    // `manifest_hash` re-reads it, hits the non-NotFound arm, and
+                    // returns `Err`, which `resolve` treats as a permanent miss (the
+                    // clang-cl M4-gate regression). Drop it.
+                    if std::fs::metadata(&absolute)
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
                     if is_under_build_root(&logical) {
                         continue; // build transient with a run-varying name
                     }
@@ -571,6 +587,46 @@ mod action_cache_tests {
             !input_manifest(&g, &rs).cacheable,
             "a truncated trace still blocks even with a benign root warning present"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_probed_directory_is_dropped_from_the_inputs() {
+        // clang-cl/cl probe include-search DIRECTORIES for existence. A directory is
+        // not a content dependency (headers within it are tracked as their own
+        // inputs), and `std::fs::read` on a directory errors with PermissionDenied
+        // (not NotFound) — recording it as an `Absent` input made `manifest_hash`
+        // return `Err` on every resolve, a PERMANENT cache miss (the clang-cl M4
+        // regression). The directory must be dropped, the action stay cacheable, and
+        // the strong hash be stable (re-readable) across resolves.
+        let root = tmp_dir("dirinput");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        std::fs::create_dir_all(root.join("incdir")).unwrap();
+        let rs = root_str(&root);
+        // A real file read + a probe of an existing directory.
+        let g = graph_with(vec![read_access("a.cpp"), read_access("incdir")]);
+        let m = input_manifest(&g, &rs);
+        assert!(
+            m.cacheable,
+            "a directory probe must not make the action uncacheable"
+        );
+        assert!(
+            m.inputs
+                .iter()
+                .all(|e| !e.absolute.to_ascii_lowercase().contains("incdir")),
+            "the probed directory must be dropped from the inputs: {:?}",
+            m.inputs.iter().map(|e| &e.absolute).collect::<Vec<_>>()
+        );
+        assert!(
+            m.inputs
+                .iter()
+                .any(|e| e.absolute.to_ascii_lowercase().contains("a.cpp")),
+            "the real file input must remain"
+        );
+        // The strong hash must recompute without an Err (the bug) and be stable.
+        let h1 = manifest_hash(&m).expect("manifest_hash must not Err on a dir-free manifest");
+        let h2 = manifest_hash(&m).expect("stable");
+        assert_eq!(h1, h2, "strong hash must be stable across resolves");
         let _ = std::fs::remove_dir_all(&root);
     }
 
