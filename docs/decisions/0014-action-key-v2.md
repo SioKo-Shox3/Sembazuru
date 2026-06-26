@@ -5,13 +5,22 @@
   **実装済み（determinism-safe な部分集合＝key を「細かくする」だけ・false hit 不可・rebuild-hit ゲート不変）**:
   (1) のうち **cwd を weak key に追加**（COR-005 問題B＝cwd 埋込み false hit を閉鎖）、**weak-key schema
   version**（`WEAK_KEY_SCHEMA`＝key の意味が変わるたび bump で全 entry を一度 miss させる安全な migration
-  レバー）、(4) **ActionResult codec に magic+version**（問題4＝format drift を明示的に miss 化）。テスト:
-  `weak_fingerprint_changes_with_meaningful_inputs`（cwd 追加）・`action_result_decode_gates_on_magic_and_version`。
-  **未実装（determinism gate 連動・別環境/harness 要）**: (1) 解決済み exe 絶対パス＋content digest＋worker
-  再検証／build-commit id（launcher 改修・build script）、(2) env profile 制（`VOLATILE_ENV` 見直しは出力影響
-  env を取りこぼすと **false hit** になりうるため determinism harness で実証必須）、(3) registry/enumerate/RMW
-  前状態の key 取り込み or uncacheable 化。これらは cl/clang-cl＋hooks の **determinism harness を回せる環境**
-  での専用作業。
+  レバー）、(1) **argv0 を agent 側で PATH 解決し解決先 binary の content digest を weak key に畳む**
+  （`toolchain_digest`／`resolve_program`／memo `digest_file_memoized`。bare な cl/clang-cl の**同名更新**が
+  従来は定数退化で stale hit していたのを invalidation 化。解決/読取不能は従来の name 定数へ **byte 不変 fallback**。
+  per-TU 再ハッシュ回避に `(path,mtime,len)` memo＋**TTL 再ハッシュ安全網**＝mtime 保存・同一長 swap の stale を
+  TTL 窓に bound）、(4) **ActionResult codec に magic+version**（問題4＝format drift を明示的に miss 化）。テスト:
+  `weak_fingerprint_changes_with_meaningful_inputs`・`action_result_decode_gates_on_magic_and_version`・
+  `record_and_resolve_agree_for_same_resolved_toolchain`・`toolchain_digest_hashes_resolved_binary_and_tracks_content`・
+  `memo_rehashes_after_ttl_...`。`verifier`(opus) で反証検証済み。M4 gate（cache_cli→weak_key）が agent 側解決を自動検証。
+  **未実装（determinism gate 連動・別環境/harness 要）**: (1) のうち **worker 再検証**（launcher が解決パス＋digest を
+  request に載せ worker が実際に起動する binary を再 digest 照合＝heterogeneous クラスタで agent≠worker の別 cl を
+  閉じる。proto field＋launcher＋worker 改修要）／build-commit id（build script）、(2) env profile 制（`VOLATILE_ENV`
+  見直しは出力影響 env を取りこぼすと **false hit** になりうるため determinism harness で実証必須）、(3)
+  registry/enumerate/RMW 前状態の key 取り込み or uncacheable 化。
+  **受容残存**: agent 側解決は agent 上の binary を digest する＝heterogeneous で worker が別 cl を走らせる場合は
+  今日の定数同様に衝突しうる（**不悪化**・worker 再検証で閉鎖）／memo の TTL 窓（mtime 保存＋同一長＋TTL 内）は
+  ≤TTL の transient stale（永続化せず self-heal）。
 - 決めること: action cache キーが**実行 identity と観測入力をどこまで被覆するか**。**(1) weak key の identity 拡張**、
   **(2) env policy（profile 制）**、**(3) 観測済み非 key vector の扱い**、**(4) codec 版管理**。
 - 判定基準: 非交渉（**正しさ>速度**＝誤った cache hit を出さない／出力バイト不変／**determinism harness 緑**）。
