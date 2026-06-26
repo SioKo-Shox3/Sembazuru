@@ -99,7 +99,9 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match agent.record(&weak, &manifest, &build_root, &outputs, exit_code) {
+            // No captured console output here (cache_cli records from a trace dir,
+            // not a live run) → empty stdout/stderr.
+            match agent.record(&weak, &manifest, &build_root, &outputs, exit_code, &[], &[]) {
                 Ok(()) => {
                     println!(
                         "RECORDED inputs={} outputs={}",
@@ -115,7 +117,10 @@ fn main() -> ExitCode {
             }
         }
         "resolve" => match agent.resolve(&weak, &build_root) {
-            Ok(CacheLookup::Hit { exit_code }) => {
+            Ok(CacheLookup::Hit { exit_code, .. }) => {
+                // The replayed stdout/stderr are ignored here: the M4 gate parses this
+                // tool's stdout for `^HIT`, so emitting them would perturb it. The
+                // production replay path is the daemon's intake (SubmitAction stream).
                 println!("HIT {exit_code}");
                 ExitCode::SUCCESS
             }
