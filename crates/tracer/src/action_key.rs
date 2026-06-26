@@ -275,6 +275,23 @@ pub struct InputManifest {
     pub cacheable: bool,
 }
 
+/// Whether a `build_graph` / `load_run_from_dir` warning means a process's reads
+/// were genuinely **unobserved** — so the input set is incomplete and the action
+/// must not be cached (COR-003). Lost-input signals block: a truncated per-process
+/// trace, a spawned child with no trace (an injection gap), an unreadable or
+/// unparseable trace file, and "no traces" at all.
+///
+/// A `"N root processes found"` warning does NOT block. It is a root-ATTRIBUTION
+/// ambiguity, not lost I/O — every process's reads are still in the graph — and it
+/// legitimately occurs for a multi-process toolchain like clang-cl (driver →
+/// `-cc1` frontend), whose input set the M2 determinism gate confirms is complete.
+/// Blocking on it would wrongly make every such build uncacheable (the M4 gate
+/// regression that surfaced this). Match on the stable substring the warning
+/// carries (see `graph.rs`).
+fn is_cache_blocking_warning(w: &str) -> bool {
+    !w.contains("root processes found")
+}
+
 /// Extracts the manifest from a traced run: every input that is not a generated
 /// output, anchored to a re-readable absolute path under `root`, plus the
 /// relativized command lines.
@@ -300,16 +317,24 @@ pub struct InputManifest {
 pub fn input_manifest(graph: &DependencyGraph, root: &str) -> InputManifest {
     let outputs = logical_outputs(graph, root);
     let mut inputs = Vec::new();
-    // COR-003: an INCOMPLETE or ambiguous trace makes the whole action uncacheable
-    // (input-side fail-closed). If a per-process trace was truncated, a spawned
-    // child's injection failed so its I/O went unobserved, a trace file would not
-    // parse, there were no traces, or the root was ambiguous, then some inputs are
-    // missing from the graph — a later edit to one would NOT move the strong key,
-    // serving a stale result. Every warning `build_graph`/`load_run_from_dir` emits
-    // signals exactly such an untrustworthy input set, so any warning blocks
-    // caching. (A future *benign* warning class would have to be excluded here.)
-    // The action still distributes and runs; it is only not RECORDED (ADR 0007 §c).
-    let mut cacheable = graph.warnings.is_empty();
+    // COR-003: a trace that failed to OBSERVE some process's reads makes the whole
+    // action uncacheable (input-side fail-closed) — a later edit to an unobserved
+    // input would not move the strong key, serving a stale result. The action still
+    // distributes and runs; it is only not RECORDED (ADR 0007 §c). Only *lost-input*
+    // warnings block (see [`is_cache_blocking_warning`]); a benign one — e.g. a
+    // root-attribution ambiguity for a multi-process toolchain like clang-cl, whose
+    // input set the determinism gate confirms is complete — must NOT, or it would
+    // wrongly make those actions uncacheable.
+    let blocking: Vec<&str> = graph
+        .warnings
+        .iter()
+        .map(String::as_str)
+        .filter(|w| is_cache_blocking_warning(w))
+        .collect();
+    let mut cacheable = blocking.is_empty();
+    if !cacheable {
+        eprintln!("sembazuru: action not cached — incomplete trace: {blocking:?}");
+    }
     for inp in &graph.inputs {
         let logical = determinism::relativize(&inp.path, root);
         if outputs.contains(&logical) {
@@ -500,24 +525,51 @@ mod action_cache_tests {
 
     #[test]
     fn an_incomplete_trace_is_uncacheable() {
-        // COR-003: a graph carrying ANY warning (a truncated trace, a child whose
-        // injection failed so its I/O is unobserved, a trace file that would not
-        // parse, no traces, or an ambiguous root) means inputs are missing — a
-        // later edit to one would not move the strong key. Such an action must be
-        // distributed but NEVER recorded (no stale hit), so its manifest is
-        // uncacheable regardless of how cleanly its observed inputs anchor.
+        // COR-003: a graph carrying a LOST-INPUT warning (a truncated trace, a
+        // child whose injection failed so its I/O is unobserved, a trace file that
+        // would not parse, or no traces) means inputs are missing — a later edit to
+        // one would not move the strong key. Such an action must be distributed but
+        // NEVER recorded (no stale hit), so its manifest is uncacheable regardless
+        // of how cleanly its observed inputs anchor.
         let root = tmp_dir("incomplete");
         std::fs::write(root.join("a.cpp"), b"src").unwrap();
         let rs = root_str(&root);
         let mut g = graph_with(vec![read_access("a.cpp")]);
         // With a clean trace this exact action IS cacheable...
         assert!(input_manifest(&g, &rs).cacheable);
-        // ...but a single warning (here: a simulated child-injection gap) blocks it.
+        // ...but a single lost-input warning (here: a child-injection gap) blocks it.
         g.warnings
             .push("pid 10 spawned child 99 but no trace file exists".into());
         assert!(
             !input_manifest(&g, &rs).cacheable,
-            "an incomplete/ambiguous trace must be uncacheable (COR-003)"
+            "an incomplete trace (lost input) must be uncacheable (COR-003)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_root_attribution_warning_does_not_block_caching() {
+        // COR-003 refinement: a "N root processes found" warning is a root-
+        // ATTRIBUTION ambiguity, not lost I/O (the clang-cl driver→frontend case,
+        // which the M4 cache gate caches and the M2 determinism gate proves
+        // complete). It must NOT make the action uncacheable — only genuinely
+        // lost-input warnings do. (This is the regression that failed CI.)
+        let root = tmp_dir("multiroot");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp")]);
+        g.warnings
+            .push("2 root processes found; using earliest-started pid 10 as root".into());
+        assert!(
+            input_manifest(&g, &rs).cacheable,
+            "a root-attribution warning must not block caching (clang-cl)"
+        );
+        // ...but a real lost-input warning alongside it still does.
+        g.warnings
+            .push("trace for pid 10 is truncated (process killed mid-write?)".into());
+        assert!(
+            !input_manifest(&g, &rs).cacheable,
+            "a truncated trace still blocks even with a benign root warning present"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
