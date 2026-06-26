@@ -120,6 +120,12 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Ok(CacheLookup::Miss) => {
+                // Diagnostic to stderr (the gate parses stdout for `MISS`/`HIT`, so
+                // this does not perturb it): pinpoint *why* the second build missed.
+                eprintln!(
+                    "--- cache miss diagnostic ---\n{}",
+                    agent.explain_miss(&weak)
+                );
                 println!("MISS");
                 ExitCode::from(3)
             }

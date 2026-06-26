@@ -183,6 +183,87 @@ impl AgentCache {
         })
     }
 
+    /// Diagnostic (gate/test only, NOT on the hot path): explain stage-by-stage why
+    /// [`resolve`] hits or misses for `weak` — a weak-key miss, an uncacheable
+    /// manifest, which stored input's *current* re-read moved the strong key, or a
+    /// strong-key (result) miss. Re-reads inputs exactly as [`manifest_hash`] does.
+    /// `cache_cli` prints this on a miss so a CI gate can pinpoint a cache
+    /// regression without re-running the compiler.
+    pub fn explain_miss(&self, weak: &Digest) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let manifest_bytes = match self.cache.get_manifest(weak) {
+            Ok(Some(b)) => b,
+            Ok(None) => return "weak MISS: no manifest stored for this weak key".into(),
+            Err(e) => return format!("weak lookup error: {e}"),
+        };
+        let Some(manifest) = decode_manifest(&manifest_bytes) else {
+            return "manifest decode FAILED (corrupt)".into();
+        };
+        let _ = writeln!(
+            out,
+            "weak HIT: stored manifest has {} inputs, cacheable={}",
+            manifest.inputs.len(),
+            manifest.cacheable
+        );
+        if !manifest.cacheable {
+            let _ = writeln!(out, "=> UNCACHEABLE manifest -> miss");
+            return out;
+        }
+        let mut changed = 0usize;
+        for inp in &manifest.inputs {
+            let (token, flag) = match inp.kind {
+                InputKind::Content => match std::fs::read(&inp.absolute) {
+                    Ok(b) => (format!("content({} bytes)", b.len()), ""),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => (
+                        "<missing>".to_string(),
+                        "  <-- CHANGED: was content, now MISSING",
+                    ),
+                    Err(e) => (format!("<ioerr:{:?}>", e.kind()), "  <-- IO ERROR"),
+                },
+                InputKind::Absent => match std::fs::read(&inp.absolute) {
+                    Ok(_) => (
+                        "appeared".to_string(),
+                        "  <-- CHANGED: was absent, now APPEARED",
+                    ),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => ("absent".to_string(), ""),
+                    Err(e) => (format!("<ioerr:{:?}>", e.kind()), "  <-- IO ERROR"),
+                },
+            };
+            if !flag.is_empty() {
+                changed += 1;
+            }
+            let _ = writeln!(
+                out,
+                "  [{:?}] {} = {}{}",
+                inp.kind, inp.absolute, token, flag
+            );
+        }
+        match action_key::manifest_hash(&manifest) {
+            Ok(input_hash) => {
+                let strong = sembazuru_cas::strong_fingerprint(weak, &input_hash);
+                match self.cache.get_result(&strong) {
+                    Ok(Some(_)) => {
+                        let _ = writeln!(out, "=> strong HIT (resolve would hit)");
+                    }
+                    Ok(None) => {
+                        let _ = writeln!(
+                            out,
+                            "=> strong MISS: {changed} input(s) changed since record"
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "=> result lookup error: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(out, "=> manifest_hash IO error: {:?} -> miss", e.kind());
+            }
+        }
+        out
+    }
+
     /// Phase 2: record a just-run action. `manifest` is its observed inputs (from
     /// [`AgentCache::manifest_from_trace_dir`]); `output_logical_paths` are the
     /// produced outputs relative to `build_root`. Their bytes are ingested into
