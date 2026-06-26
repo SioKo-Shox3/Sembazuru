@@ -340,12 +340,63 @@ impl WorkerConfig {
         }
     }
 
-    /// Loads from `path` then applies the env overrides — the worker's effective
-    /// startup config.
+    /// Loads from `path` then applies the env overrides. The **lenient** variant: a
+    /// present-but-invalid file silently falls back to defaults (used off the startup
+    /// path, e.g. tooling). Startup must use [`load_effective_checked`] instead.
     pub fn load_effective(path: &Path) -> Self {
         let mut cfg = Self::load_from(path);
         cfg.apply_env_overrides();
         cfg
+    }
+
+    /// Loads from `path`, distinguishing an ABSENT file (→ defaults, the common dev
+    /// case) from one that is PRESENT but unreadable / not UTF-8 / invalid TOML (→
+    /// `Err`). Mirrors the daemon's CFG-001 `load_or_refuse`: a present-but-bad worker
+    /// config must NOT silently fall back to defaults, because the defaults carry no
+    /// `agent`, no `cluster_token`, and no VFS paths — the worker would then silently
+    /// fail to register, present no auth token, and disable read-VFS while the
+    /// operator believes their file took effect. Refuse instead so the
+    /// misconfiguration is loud. Env overrides are applied by [`load_effective_checked`].
+    pub fn load_or_refuse(path: &Path) -> Result<Self, String> {
+        // `try_exists() == Ok(false)` is the only "definitely not there" signal; a
+        // permission error on the file itself returns `Err`, which falls through to
+        // the read+refuse below (a present-but-unreadable file must not be defaulted).
+        if matches!(path.try_exists(), Ok(false)) {
+            return Ok(Self::default());
+        }
+        match std::fs::read(path) {
+            // Raced away between the existence check and the read → treat as absent.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!(
+                "worker config {} exists but is unreadable ({e}); refusing to start on \
+                 defaults (no agent/token/VFS). Fix its permissions or remove it.",
+                path.display()
+            )),
+            Ok(bytes) => {
+                let s = String::from_utf8(bytes).map_err(|_| {
+                    format!(
+                        "worker config {} is not valid UTF-8; refusing to start.",
+                        path.display()
+                    )
+                })?;
+                toml::from_str(&s).map_err(|e| {
+                    format!(
+                        "worker config {} is invalid TOML ({e}); refusing to start on \
+                         defaults (no agent/token/VFS). Fix or remove it.",
+                        path.display()
+                    )
+                })
+            }
+        }
+    }
+
+    /// The worker's effective STARTUP config: [`load_or_refuse`] then env overrides.
+    /// Returns `Err` (so the CLI exits non-zero / the service reports Stopped) on a
+    /// present-but-bad config rather than silently running on defaults (CFG-001).
+    pub fn load_effective_checked(path: &Path) -> Result<Self, String> {
+        let mut cfg = Self::load_or_refuse(path)?;
+        cfg.apply_env_overrides();
+        Ok(cfg)
     }
 
     /// Writes the config to `path` as TOML, creating the parent directory. The MSI
@@ -356,7 +407,26 @@ impl WorkerConfig {
             std::fs::create_dir_all(parent)?;
         }
         let s = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, s)
+        // Atomic write (CFG-001, mirroring the daemon): a crash mid-write must never
+        // leave a TRUNCATED config — under [`load_effective_checked`] that truncation
+        // would refuse the worker's start, and under the lenient [`load_from`] it
+        // would silently load as defaults. Write a temp sibling on the same volume,
+        // then rename onto the final path; a rename is atomic within a volume, so a
+        // reader always sees the old or the new file whole, never a half-written one.
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "worker.toml".into());
+        let mut tmp = path.to_path_buf();
+        tmp.set_file_name(format!(".{name}.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, s)?;
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 
     /// The resolved idle-CPU tuning (ADR 0010): the optional knobs with their
@@ -508,10 +578,68 @@ mod tests {
 
     #[test]
     fn invalid_file_falls_back_to_defaults() {
+        // The LENIENT loader (`load_from`) still defaults on a corrupt file — used off
+        // the startup path. Startup uses the checked loader (see the CFG-001 test).
         let path = tmp_file();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "this is = = not valid toml [[[").unwrap();
         assert_eq!(WorkerConfig::load_from(&path), WorkerConfig::default());
+    }
+
+    #[test]
+    fn load_or_refuse_defaults_when_absent_but_refuses_a_corrupt_present_file() {
+        // CFG-001 (worker mirror): an ABSENT config → defaults (common dev case, OK).
+        // A PRESENT but invalid config → Err, so the worker refuses to start rather
+        // than silently running on defaults (no agent/token/VFS) while the operator
+        // believes their wired file took effect.
+        let absent = tmp_file();
+        assert_eq!(
+            WorkerConfig::load_or_refuse(&absent).unwrap(),
+            WorkerConfig::default(),
+            "an absent config loads defaults"
+        );
+
+        let path = tmp_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "this is = = not valid toml ][").unwrap();
+        let err = WorkerConfig::load_or_refuse(&path)
+            .expect_err("a present-but-invalid config must be refused, not defaulted");
+        assert!(err.contains("invalid"), "the error explains why: {err}");
+
+        // A present-but-non-UTF-8 file is also refused (not silently defaulted) — the
+        // arm the daemon's tests leave uncovered.
+        let bin_path = tmp_file();
+        std::fs::create_dir_all(bin_path.parent().unwrap()).unwrap();
+        std::fs::write(&bin_path, [0xff, 0xfe, 0x00, 0x80, 0x81]).unwrap();
+        let err = WorkerConfig::load_or_refuse(&bin_path)
+            .expect_err("a present-but-non-UTF-8 config must be refused");
+        assert!(err.contains("UTF-8"), "the error names the cause: {err}");
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_sibling() {
+        // CFG-001 (worker mirror): the save writes a temp sibling then renames
+        // (atomic), so a reader never sees a truncated config; after a successful save
+        // no `.worker.toml.tmp.*` residue remains and the result round-trips.
+        let path = tmp_file();
+        let cfg = WorkerConfig {
+            agent: Some("http://10.0.0.1:50070".into()),
+            cluster_token: Some("keep-this-token".into()),
+            ..WorkerConfig::default()
+        };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(WorkerConfig::load_from(&path), cfg, "round-trips");
+        let dir = path.parent().unwrap();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".worker.toml.tmp")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "no temp residue after an atomic save");
     }
 
     #[test]
