@@ -39,9 +39,17 @@ pub struct AgentCache {
 /// The outcome of a cache lookup.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CacheLookup {
-    /// The action was cached: its outputs were republished and it exited with
-    /// this code. The action must NOT be executed.
-    Hit { exit_code: i32 },
+    /// The action was cached: its outputs were republished and it exited with this
+    /// code. `stdout`/`stderr` are the recorded console output to replay (COR-007)
+    /// so a cached build shows the same diagnostics a fresh run did; empty when the
+    /// recorded run produced none or its blob was evicted/corrupt (console output is
+    /// advisory, so a missing replay blob never demotes the hit). The action must
+    /// NOT be executed.
+    Hit {
+        exit_code: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
     /// Not cached (or its inputs changed): the caller must run the action.
     Miss,
 }
@@ -178,8 +186,25 @@ impl AgentCache {
                 return Err(e);
             }
         }
+        // Replay the recorded console output on a hit (COR-007). Best-effort and
+        // VERIFIED (`get_verified`): a missing or corrupt stdout/stderr blob degrades
+        // to empty rather than forcing a re-run — the hit already served the correct
+        // output files + exit code, and console output is advisory, not a correctness
+        // boundary, so replaying nothing is safer than replaying corrupt bytes.
+        let stdout = result
+            .stdout
+            .as_ref()
+            .and_then(|d| self.store.get_verified(d).ok().flatten())
+            .unwrap_or_default();
+        let stderr = result
+            .stderr
+            .as_ref()
+            .and_then(|d| self.store.get_verified(d).ok().flatten())
+            .unwrap_or_default();
         Ok(CacheLookup::Hit {
             exit_code: result.exit_code,
+            stdout,
+            stderr,
         })
     }
 
@@ -268,6 +293,14 @@ impl AgentCache {
     /// [`AgentCache::manifest_from_trace_dir`]); `output_logical_paths` are the
     /// produced outputs relative to `build_root`. Their bytes are ingested into
     /// the CAS and the manifest + result stored so the next identical build hits.
+    /// `stdout`/`stderr` are the run's captured console output (COR-007): they are
+    /// ingested into the CAS and replayed by [`resolve`](Self::resolve) on a hit, so
+    /// a cached build shows the same diagnostics a fresh run did. Pass empty slices
+    /// when there is nothing to capture (e.g. an inherited-stdio run).
+    // The params are the cohesive set describing one action's recording (keys,
+    // outputs, exit, console output); bundling them would not aid clarity, so the
+    // arity lint is allowed.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         weak: &Digest,
@@ -275,6 +308,8 @@ impl AgentCache {
         build_root: &Path,
         output_logical_paths: &[String],
         exit_code: i32,
+        stdout: &[u8],
+        stderr: &[u8],
     ) -> io::Result<()> {
         // Input-side fail-closed (ADR 0007 §b.3): if the strong key cannot be
         // guaranteed to cover a real content read, decline the action rather
@@ -315,13 +350,26 @@ impl AgentCache {
             return Ok(());
         };
         let strong = sembazuru_cas::strong_fingerprint(weak, &input_hash);
+        // Ingest the run's console output (COR-007) so a later hit replays the same
+        // diagnostics. Empty → None (nothing stored, the common case for a tool that
+        // printed no warnings). Shadows the byte-slice params with their digests.
+        let stdout = if stdout.is_empty() {
+            None
+        } else {
+            Some(self.store.put(stdout)?)
+        };
+        let stderr = if stderr.is_empty() {
+            None
+        } else {
+            Some(self.store.put(stderr)?)
+        };
         self.cache.put_result(
             &strong,
             &ActionResult {
                 exit_code,
                 outputs,
-                stdout: None,
-                stderr: None,
+                stdout,
+                stderr,
             },
         )
     }
@@ -663,7 +711,15 @@ mod tests {
 
         // Phase 2: record the first build.
         cache
-            .record(&weak, &manifest, &build, &[out_logical.to_string()], 0)
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &[out_logical.to_string()],
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
 
         // Simulate a clean rebuild dir: the output is gone, the input unchanged.
@@ -672,7 +728,14 @@ mod tests {
         // The manifest's absolute path points at the original input (unchanged),
         // so the strong key matches.
         let lookup = cache.resolve(&weak, &build2).unwrap();
-        assert_eq!(lookup, CacheLookup::Hit { exit_code: 0 });
+        assert_eq!(
+            lookup,
+            CacheLookup::Hit {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new()
+            }
+        );
         // The cached output was republished into build2.
         assert_eq!(
             std::fs::read(build2.join(out_logical)).unwrap(),
@@ -702,7 +765,15 @@ mod tests {
         let weak = cache.weak_key(&argv, &[], "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
         cache
-            .record(&weak, &manifest, &build, &[out_logical.to_string()], 0)
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &[out_logical.to_string()],
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
 
         // The output blob is in the CAS and a fresh build hits.
@@ -712,7 +783,11 @@ mod tests {
         );
         assert_eq!(
             cache.resolve(&weak, &tmp("evict-r1")).unwrap(),
-            CacheLookup::Hit { exit_code: 0 }
+            CacheLookup::Hit {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new()
+            }
         );
 
         // (a) Evict everything (cap 0): the CAS shrinks to empty. The action-cache
@@ -733,12 +808,24 @@ mod tests {
         // re-records, and the next resolve republishes the byte-identical bytes.
         std::fs::write(build.join(out_logical), out_bytes).unwrap();
         cache
-            .record(&weak, &manifest, &build, &[out_logical.to_string()], 0)
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &[out_logical.to_string()],
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
         let r3 = tmp("evict-r3");
         assert_eq!(
             cache.resolve(&weak, &r3).unwrap(),
-            CacheLookup::Hit { exit_code: 0 }
+            CacheLookup::Hit {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new()
+            }
         );
         assert_eq!(
             std::fs::read(r3.join(out_logical)).unwrap(),
@@ -761,13 +848,25 @@ mod tests {
         let weak = cache.weak_key(&argv, &[], "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
         cache
-            .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["a.obj".to_string()],
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
 
         // First resolve hits.
         assert_eq!(
             cache.resolve(&weak, &tmp("miss-r1")).unwrap(),
-            CacheLookup::Hit { exit_code: 0 }
+            CacheLookup::Hit {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new()
+            }
         );
         // Edit the input: the strong key moves → miss (must re-run).
         std::fs::write(&input, b"version TWO is different").unwrap();
@@ -817,13 +916,25 @@ mod tests {
             cacheable: true,
         };
         cache
-            .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["a.obj".to_string()],
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
 
         // Still absent → hit (nothing changed).
         assert_eq!(
             cache.resolve(&weak, &tmp("appear-r1")).unwrap(),
-            CacheLookup::Hit { exit_code: 0 }
+            CacheLookup::Hit {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new()
+            }
         );
 
         // A code-gen step creates gen.h. The cached object was compiled WITHOUT
@@ -836,6 +947,109 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&gen_h);
+    }
+
+    #[test]
+    fn recorded_stdout_stderr_replay_on_a_hit() {
+        // COR-007: a cached action replays the recorded console output, so a hit shows
+        // the same compiler diagnostics a fresh run did. The blob is content-addressed,
+        // so a second resolve replays it again (not consumed).
+        let root = tmp("stdio");
+        let build = root.join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        let src = build.join("a.cpp");
+        std::fs::write(&src, b"int main(){}").unwrap();
+        let out = build.join("a.obj");
+        std::fs::write(&out, b"OBJ").unwrap();
+
+        let cache = AgentCache::open(&root).unwrap();
+        let weak = Digest::of(b"weak-stdio");
+        let manifest = manifest_for(&[("a.cpp", &src)]);
+        let warn = b"a.cpp(1): warning C4101: unused variable\n".to_vec();
+        let errs = b"a.cpp(2): error C2065: 'x': undeclared identifier\n".to_vec();
+        cache
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["a.obj".to_string()],
+                0,
+                &warn,
+                &errs,
+            )
+            .unwrap();
+
+        std::fs::remove_file(&out).unwrap();
+        match cache.resolve(&weak, &build).unwrap() {
+            CacheLookup::Hit {
+                exit_code,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(exit_code, 0);
+                assert_eq!(stdout, warn, "the recorded stdout is replayed verbatim");
+                assert_eq!(stderr, errs, "the recorded stderr is replayed verbatim");
+            }
+            CacheLookup::Miss => panic!("expected a hit"),
+        }
+        // A second hit replays the same bytes (content-addressed, not consumed).
+        std::fs::remove_file(&out).unwrap();
+        match cache.resolve(&weak, &build).unwrap() {
+            CacheLookup::Hit { stdout, .. } => assert_eq!(stdout, warn, "replayable again"),
+            CacheLookup::Miss => panic!("expected a second hit"),
+        }
+    }
+
+    #[test]
+    fn an_evicted_stdout_blob_degrades_to_empty_without_demoting_the_hit() {
+        // COR-007 best-effort replay: console output is advisory, so if its CAS blob
+        // is evicted/corrupt the hit is STILL served (correct output files + exit
+        // code) with an empty replay — never demoted to a miss like an output blob is.
+        let root = tmp("stdio-evict");
+        let build = tmp("stdio-evict-build");
+        let cache = AgentCache::open(&root).unwrap();
+        let src = build.join("a.cpp");
+        std::fs::write(&src, b"src").unwrap();
+        std::fs::write(build.join("a.obj"), b"OBJ").unwrap();
+
+        let weak = cache.weak_key(&["cc".to_string()], &[], "");
+        let manifest = manifest_for(&[("a.cpp", &src)]);
+        let warn = b"a warning to lose\n".to_vec();
+        cache
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["a.obj".to_string()],
+                0,
+                &warn,
+                b"",
+            )
+            .unwrap();
+
+        // Evict the stdout blob (white-box: digest→path), leaving the output blob.
+        let d = Digest::of(&warn);
+        let blob = root
+            .join("cas")
+            .join("blake3")
+            .join(&d.hex()[0..2])
+            .join(d.hex());
+        std::fs::remove_file(&blob).unwrap();
+
+        let fresh = tmp("stdio-evict-r");
+        match cache.resolve(&weak, &fresh).unwrap() {
+            CacheLookup::Hit {
+                exit_code, stdout, ..
+            } => {
+                assert_eq!(exit_code, 0, "the hit is still served");
+                assert!(stdout.is_empty(), "the missing stdout blob replays empty");
+                assert!(
+                    fresh.join("a.obj").exists(),
+                    "the output file is still published"
+                );
+            }
+            CacheLookup::Miss => panic!("an evicted *stdout* blob must NOT demote the hit"),
+        }
     }
 
     #[test]
@@ -860,6 +1074,8 @@ mod tests {
                 &build,
                 &["a.obj".into(), "b.obj".into()],
                 0,
+                &[],
+                &[],
             )
             .unwrap();
 
@@ -899,13 +1115,25 @@ mod tests {
         let weak = cache.weak_key(&["cc".to_string()], &[], "");
         let manifest = manifest_for(&[("a.cpp", &input)]);
         cache
-            .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["a.obj".to_string()],
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
 
         // First resolve hits (good blob).
         assert_eq!(
             cache.resolve(&weak, &tmp("corrupt-r1")).unwrap(),
-            CacheLookup::Hit { exit_code: 0 }
+            CacheLookup::Hit {
+                exit_code: 0,
+                stdout: Vec::new(),
+                stderr: Vec::new()
+            }
         );
 
         // Corrupt the output blob on disk (white-box: digest→path), keeping the
@@ -962,7 +1190,15 @@ mod tests {
         std::fs::write(&header, b"#pragma once").unwrap();
         let manifest = manifest_for(&[("a.cpp", &input), ("h.h", &header)]);
         cache
-            .record(&weak, &manifest, &build, &["a.obj".to_string()], 0)
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["a.obj".to_string()],
+                0,
+                &[],
+                &[],
+            )
             .unwrap();
 
         let mut predicted = cache.predicted_paths(&weak).unwrap();

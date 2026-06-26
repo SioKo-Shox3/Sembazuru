@@ -286,11 +286,24 @@ async fn run_submission(
         let weak = weak.clone();
         let br = build_root.clone();
         match tokio::task::spawn_blocking(move || cache.resolve(&weak, &br)).await {
-            Ok(Ok(CacheLookup::Hit { exit_code })) => {
+            Ok(Ok(CacheLookup::Hit {
+                exit_code,
+                stdout,
+                stderr,
+            })) => {
                 metrics.record_cache_hit();
                 let _ = tx
                     .send(Ok(state_ev(ActionState::Completed, "cache hit")))
                     .await;
+                // Replay the recorded compiler console output before exiting, so a
+                // cached build shows the same diagnostics (warnings, notes) a fresh
+                // run did — exactly as the remote run path forwards them (COR-007).
+                if !stdout.is_empty() {
+                    let _ = tx.send(Ok(stdio_ev(false, stdout))).await;
+                }
+                if !stderr.is_empty() {
+                    let _ = tx.send(Ok(stdio_ev(true, stderr))).await;
+                }
                 let _ = tx.send(Ok(exit_ev(exit_code, 0))).await;
                 return;
             }
@@ -377,7 +390,8 @@ async fn run_submission(
     // Without a trace or any discoverable output, recording is skipped (the build
     // is still correct, just uncached).
     if let (Some(cache), Some(weak)) = (&ctx.cache, &weak)
-        && matches!(&outcome, Execution::Remote(o) if o.exit_code == Some(0))
+        && let Execution::Remote(o) = &outcome
+        && o.exit_code == Some(0)
         && !trace_dir.is_empty()
         && !non_deterministic
     {
@@ -387,6 +401,10 @@ async fn run_submission(
         let declared = declared_outputs.clone();
         let td = trace_dir.clone();
         let rd = root_decl.clone();
+        // The remote run's console output, captured so a later hit replays the same
+        // diagnostics (COR-007). Cloned (not moved) — `outcome` is still emitted below.
+        let rec_stdout = o.stdout.clone();
+        let rec_stderr = o.stderr.clone();
         let _ = tokio::task::spawn_blocking(move || {
             let root = rd.as_deref();
             let outs: Vec<String> = if !declared.is_empty() {
@@ -401,7 +419,7 @@ async fn run_submission(
             if !outs.is_empty()
                 && let Ok(manifest) = cache.manifest_from_trace_dir(&td, root)
             {
-                let _ = cache.record(&weak, &manifest, &br, &outs, 0);
+                let _ = cache.record(&weak, &manifest, &br, &outs, 0, &rec_stdout, &rec_stderr);
             }
         })
         .await;
