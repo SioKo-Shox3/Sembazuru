@@ -107,7 +107,9 @@ fn parse_account(args: &[String]) -> sembazuru_worker::service::ServiceAccount {
 /// the worker's capacity, run the worker, and stop it gracefully on Ctrl-C. Dropping
 /// the runtime stops the Execution server.
 fn run_cli() -> Result<(), BoxError> {
-    let mut config = WorkerConfig::load_effective(&WorkerConfig::path_from_env());
+    // Refuse to start on a present-but-corrupt config (CFG-001): silently defaulting
+    // would drop the operator's agent/token/VFS settings. An absent file is fine.
+    let mut config = WorkerConfig::load_effective_checked(&WorkerConfig::path_from_env())?;
     // A positional CLI arg overrides the configured listen address (dev convenience;
     // the service has no argv and uses the file/env value).
     if let Some(addr) = std::env::args().nth(1) {

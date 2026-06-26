@@ -98,7 +98,21 @@ fn run_service() -> windows_service::Result<()> {
 
     // A service has no per-shell env, so config comes from the file (+ any env),
     // M9.3c. Load it first because the runtime is sized to the worker's capacity.
-    let config = WorkerConfig::load_effective(&WorkerConfig::path_from_env());
+    // Refuse to run on a present-but-corrupt config (CFG-001): a service silently
+    // defaulting (no agent/token/VFS) is the scariest variant — it has no shell to
+    // notice the warning. Report Stopped to the SCM so the failure is visible.
+    let config = match WorkerConfig::load_effective_checked(&WorkerConfig::path_from_env()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sembazuru-worker: {e}");
+            set(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                Duration::default(),
+            )?;
+            return Ok(());
+        }
+    };
     let worker_threads = config.capacity.unwrap_or(2).clamp(2, 64) as usize;
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
