@@ -10,7 +10,7 @@ jobs:
     name: Rust (fmt, clippy, test)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,7 +30,7 @@ jobs:
         os: [windows-2022, windows-2025]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
       - uses: dtolnay/rust-toolchain@stable
       - run: cmake -S hooks -B hooks/build -A x64
       - run: cmake --build hooks/build --config Release
@@ -42,7 +42,7 @@ jobs:
       - name: Stage 32-bit interceptor next to the 64-bit one
         run: Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
       - run: cargo build -p sembazuru-tracer --release
-      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1 (TEST-001: SHA-pinned)
       # Ninja for the M6.3 CMake/Ninja gate (the COMPILER_LAUNCHER path). GitHub's
       # Windows images do not put ninja on PATH by default, and the hooks build
       # above uses the VS generator; choco (preinstalled on the runner, no new
@@ -170,7 +170,7 @@ jobs:
     # == WiX ProductVersion.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
       - uses: dtolnay/rust-toolchain@stable
       # Release-hygiene gate: a Cargo/WiX version mismatch would ship an MSI whose
       # ProductVersion disagrees with the binaries' reported version (version-gated
@@ -197,7 +197,7 @@ jobs:
       - name: Build MSI (unsigned)
         run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64
       - name: Upload MSI artifact (unsigned)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
         with:
           name: Sembazuru-msi-unsigned
           path: installer/bin/x64/Release/Sembazuru.msi

@@ -41,7 +41,7 @@ jobs:
       # signing steps and the draft-vs-published decision below.
       HAS_SIGNING_CERT: ${{ secrets.SBZ_SIGNING_PFX_BASE64 != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
       - uses: dtolnay/rust-toolchain@stable
       - name: Enable long paths
         run: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
@@ -135,7 +135,7 @@ jobs:
         run: Copy-Item installer/bin/x64/Release/Sembazuru.msi "Sembazuru-${{ steps.ver.outputs.version }}-x64.msi" -Force
 
       - name: Upload MSI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
         with:
           name: Sembazuru-${{ steps.ver.outputs.version }}-msi
           path: Sembazuru-${{ steps.ver.outputs.version }}-x64.msi
