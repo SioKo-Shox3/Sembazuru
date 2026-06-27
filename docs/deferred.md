@@ -10,6 +10,39 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 
 ---
 
+## コードレビュー指摘（`Sembazuru_code_review_action_guide.md`）最終ステータス（2026-06-27）
+
+外部静的レビュー全 20 指摘の最終状態。**CLOSED**＝コード実装済み（main マージ済み or 本ブランチ commit）。
+**DEFERRED-ACCEPTED**＝現脅威モデル（LAN-trusted＋共有トークン, ADR 0006）で意図的に受容。
+**DEFERRED-blocked**＝実装したいが当環境（Rust/CI のみ・実 Windows サービス/2 ユーザー/秘密鍵なし）で安全に実装・検証不能＝lead/実機（M9.5/M10）。各 verifier(opus) 反証検証済み。
+
+| ID | 区分 | 状態 | 要点 / blocker |
+|---|---|---|---|
+| COR-001 | P0 | **CLOSED** | agent 権威 per-action session capability＋single-flight pin（PR#1 38079a6） |
+| COR-002 | P0 | **CLOSED** | Absent 入力 re-read＋ディレクトリ入力除外（PR#1/#2） |
+| COR-003 | P0 | **CLOSED** | 不完全 trace を uncacheable（lost-input warning のみ・root 帰属曖昧は除外, PR#1） |
+| COR-004 | P0 | **PARTIAL→繰延** | key 不足の determinism-safe 分は閉鎖済み（cwd=COR-005／stdout-stderr=COR-007／injection-gap=COR-003／不完全 trace=COR-003）。残り＝**「未知 exe は既定 cache off／verified profile のみ cache」へ既定反転**（registry値・dir列挙・RMW 前状態など未観測 vector の被覆）。これは ADR 0007 §c の方針決定＋determinism harness 実証を要し、既定 allow→deny の反転は全ツール挙動・ゲートに影響＝**決定者判断の繰延設計**（ADR 0014 (2)(3)）。 |
+| COR-005 | P0 | **CLOSED** | weak key に cwd・schema version＋**解決済みコンパイラ binary の content digest**（同名更新で invalidation, PR#1/#2）。heterogeneous で agent≠worker の別 cl を閉じる **worker 再検証**は B-big 繰延（↓） |
+| COR-006 | P1 | **CLOSED** | temp 中間物 heuristic を厳格化（`\temp\` 広域 fallback 除去, PR#1） |
+| COR-007 | P0 | **CLOSED** | 出力公開を set-atomic＋get_verified＋有界 memory／stdout-stderr の CAS 記録＆hit 時 replay（PR#1/#2） |
+| SEC-001 | P0 | **PARTIAL→繰延(B-machine)** | 暫定: 無認証 Status 書込み RPC を default-deny opt-in 化済み（PR#1）。本道＝**named-pipe transport＋`ImpersonateNamedPipeClient`＋非 LocalSystem 既定**で local EoP→SYSTEM を閉じる。実 Windows サービス＋2 ユーザー SID＋DACL＋EDR 申請を要し当環境で実装・検証不能＝M9.5/M10・lead（`docs/handoff/lead-actions.md` §3） |
+| SEC-002 | P0 | **CLOSED** | worker plain-spawn が継承 env の `SEMBAZURU_*` を除去（PR#1） |
+| SEC-003 | P1 | **CLOSED** | WriteBack を within-root に scope（agent 権威, PR#1） |
+| SEC-004 | P1 | **CLOSED** | fileserver が worker 申告 root を無視し agent 権威 root を使用（PR#1） |
+| SEC-005 | P2 | **DEFERRED-ACCEPTED** | `normalize_requested`（字句正規化）＋`path_in_scope`＋fail-closed で `..`/境界を処理済み。完全な handle ベース（`GetFinalPathNameByHandle`）検証は LAN-trusted で受容繰延 |
+| PROTO-001 | P1 | **CLOSED** | session_id を 128-bit CSPRNG 化（予測不可, PR#1） |
+| REL-001 | P2 | **DEFERRED-ACCEPTED** | remote 失敗時の自動 local fallback は hermetic（compiler staging）アクション前提の at-least-once。at-most-once は副作用宣言を要する将来方針 |
+| REL-002 | P2 | **DEFERRED-ACCEPTED(minor)** | JoinSet supervisor は実装済み。graceful drain の精緻化は M10（実 2 台）で |
+| RES-001 | P1 | **CLOSED** | worker capacity clamp＋FileClient per-op timeout＋agent console バッファ 8 MiB 上限（PR#1/#2）。prefetch 件数/per-op 件数の上限は LAN-trusted で低優先（必要なら同パターンで追加可） |
+| CFG-001 | P1 | **CLOSED** | daemon＋worker とも破損 config を起動拒否（load_or_refuse）＋atomic save（PR#1/#2） |
+| MAINT-001 | P3 | **PARTIAL** | local fallback 理由を typed `LocalFallbackReason` 化（脆い `starts_with("route-away")` 契約を除去, commit c657c0f）。codec の magic/version は COR-005/007 で付与済み。残る大物（C++ hook の 4 ファイル分割・winsvc 共通 crate・action lifecycle state machine・ActionContext 引数束ね）は欠陥でなく意図的リファクタ＝計画的に実施 |
+| TEST-001 | P2 | **PARTIAL** | cache 正当性ゲートの大半はユニットテスト済み（absent→present/under-temp/truncated/concurrent-first-touch/cwd/PATH-resolved/multi-output-partial/stdout）＋codec 決定的 fuzz（commit c6cb607）。残り＝security 非 admin 系（B-machine）・fuzzing harness・supply-chain CI（cargo-audit/deny・SHA pin・CodeQL・SBOM）＝CI/実機バックログ |
+| DOC-001 | P3 | **CLOSED** | 本ステータス表が指摘状態を同期（doc とコードの整合） |
+
+**未クローズで実装が残るのは設計判断/実機/CI-infra に依存する 4 件のみ**: COR-004 本道（cache 既定方針反転・要決定者＋determinism harness）、SEC-001 本道（named-pipe+impersonation・要実機 M9.5/M10）、COR-005 の heterogeneous worker 再検証（proto+launcher+worker の B-big）、TEST-001 残ゲート（非 admin/CI-infra）。いずれも当環境で安全に完了不能＝lead/後続マイルストーン。それ以外は全て CLOSED または現脅威モデルで受容（DEFERRED-ACCEPTED）。
+
+---
+
 ## M3.x（近接の正しさ。M4 と並行 or 直前に片付ける候補）
 
 - **未仮想化アクセスの検知→フォールバック機構が未実装。** M3.4 は「安全側」
