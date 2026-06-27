@@ -217,6 +217,31 @@ pub async fn execute_on_channel_with(
     .await
 }
 
+/// Max console bytes buffered per stream (stdout/stderr) per action — a RES-001 DoS
+/// cap. The agent buffers the worker's streamed console output whole (to replay it,
+/// M6.1, and to record it, COR-007); a runaway or hostile worker streaming endless
+/// `OutputChunk`s would otherwise grow this buffer without bound and OOM the agent
+/// (and bloat the CAS). 8 MiB dwarfs any real compiler's per-TU diagnostics; beyond
+/// it, further bytes are dropped with a one-time in-band notice.
+const MAX_CONSOLE_BYTES: usize = 8 * 1024 * 1024;
+const CONSOLE_TRUNCATION_NOTICE: &[u8] = b"\n[sembazuru: console output capped at 8 MiB]\n";
+
+/// Appends `data` to `buf` but never grows `buf` past [`MAX_CONSOLE_BYTES`] (plus the
+/// one-time [`CONSOLE_TRUNCATION_NOTICE`] emitted on the chunk that first overflows).
+/// Bounds the agent's per-action console buffer regardless of how much the worker
+/// streams (RES-001).
+fn append_console_capped(buf: &mut Vec<u8>, data: &[u8]) {
+    if buf.len() >= MAX_CONSOLE_BYTES {
+        return; // already capped (the notice was appended on the overflowing chunk)
+    }
+    let room = MAX_CONSOLE_BYTES - buf.len();
+    let take = data.len().min(room);
+    buf.extend_from_slice(&data[..take]);
+    if take < data.len() {
+        buf.extend_from_slice(CONSOLE_TRUNCATION_NOTICE);
+    }
+}
+
 /// Sends the `ExecuteRequest` and folds its event stream into an [`ActionOutcome`].
 async fn drive_execute(
     mut client: ExecutionClient<tonic::transport::Channel>,
@@ -244,13 +269,16 @@ async fn drive_execute(
                 outcome.wall_time_us = e.wall_time_us;
             }
             Some(Event::Stdio(c)) => {
-                // Collect the compiler's console output to replay to the
-                // developer (M6.1). Buffered here, re-streamed to the launcher.
-                if c.is_stderr {
-                    outcome.stderr.extend_from_slice(&c.data);
+                // Collect the compiler's console output to replay to the developer
+                // (M6.1) and record it (COR-007). Buffered here, re-streamed to the
+                // launcher. CAPPED (RES-001): a runaway/hostile worker streaming
+                // endless chunks cannot grow this buffer without bound.
+                let buf = if c.is_stderr {
+                    &mut outcome.stderr
                 } else {
-                    outcome.stdout.extend_from_slice(&c.data);
-                }
+                    &mut outcome.stdout
+                };
+                append_console_capped(buf, &c.data);
             }
             Some(Event::Output(_)) => { /* write-back is M3.3 */ }
             None => {}
@@ -310,4 +338,41 @@ pub async fn execute_with_fallback(
     };
     let exit_code = run_local(&command).await.unwrap_or(-1);
     Execution::LocalFallback { exit_code, reason }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_buffer_is_capped_at_the_limit() {
+        // RES-001: a flood far exceeding the cap is bounded (no unbounded growth),
+        // and a one-time truncation notice is appended.
+        let mut buf = Vec::new();
+        let flood = vec![b'x'; MAX_CONSOLE_BYTES * 2];
+        append_console_capped(&mut buf, &flood);
+        assert!(
+            buf.len() <= MAX_CONSOLE_BYTES + CONSOLE_TRUNCATION_NOTICE.len(),
+            "buffer is bounded by the cap (+ the notice): {}",
+            buf.len()
+        );
+        assert!(
+            buf.ends_with(CONSOLE_TRUNCATION_NOTICE),
+            "an overflowing chunk appends the truncation notice"
+        );
+        // An already-capped buffer never grows further (further chunks dropped).
+        let after_cap = buf.len();
+        append_console_capped(&mut buf, b"more output");
+        assert_eq!(buf.len(), after_cap, "a capped buffer does not grow");
+    }
+
+    #[test]
+    fn console_buffer_keeps_small_output_verbatim() {
+        // Normal-sized output is kept exactly, with no notice (the common case).
+        let mut buf = Vec::new();
+        append_console_capped(&mut buf, b"a.cpp(1): warning C4101\n");
+        append_console_capped(&mut buf, b"a.cpp(2): note\n");
+        assert_eq!(buf, b"a.cpp(1): warning C4101\na.cpp(2): note\n");
+        assert!(!buf.ends_with(CONSOLE_TRUNCATION_NOTICE));
+    }
 }
