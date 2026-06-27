@@ -206,6 +206,35 @@ impl LocalIntake for IntakeService {
     }
 }
 
+/// COR-004: the toolchain basenames whose byte-reproducibility the M2 determinism
+/// harness proves (ADR 0007 §c) — the verified-deterministic cache profile. Only
+/// these (plus any operator opt-ins) are RECORDED to the action cache by default; an
+/// arbitrary tool is distributed but never cached, because its output can depend on
+/// vectors the action key does not cover (registry values, directory enumeration,
+/// read-modify-write pre-state, system time/locale/codepage, …). Caching those by
+/// default would risk a stale hit.
+const VERIFIED_TOOLS: &[&str] = &["cl", "clang-cl", "clang", "clang++", "dxc"];
+
+/// Whether `argv0`'s toolchain is in the verified-deterministic cache profile
+/// ([`VERIFIED_TOOLS`], matched on the case-insensitive, extension-stripped
+/// basename) or opted in by the operator via the comma-separated
+/// `SEMBAZURU_VERIFIED_TOOLS` env var. A bare `cl`, an absolute `C:\…\clang-cl.exe`,
+/// and `clang-cl` all match `clang-cl`/`cl`.
+fn is_verified_tool(argv0: &str) -> bool {
+    if argv0.is_empty() {
+        return false;
+    }
+    let base = std::path::Path::new(argv0)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(argv0)
+        .to_ascii_lowercase();
+    VERIFIED_TOOLS.contains(&base.as_str())
+        || std::env::var("SEMBAZURU_VERIFIED_TOOLS")
+            .ok()
+            .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(&base)))
+}
+
 /// Drives one submission to completion and mirrors its terminal events. Without
 /// a VFS context this is a plain dispatch (M6.0). With one, the compile runs
 /// under the read-VFS; with a cache it is resolved first (a hit skips the worker)
@@ -259,6 +288,15 @@ async fn run_submission(
         Some(r) => PathBuf::from(r),
         None => PathBuf::from(&command.cwd),
     };
+
+    // COR-004: only a VERIFIED-deterministic toolchain — one whose byte-reproducibility
+    // the M2 determinism harness proves (ADR 0007 §c) — is cacheable BY DEFAULT. An
+    // unknown/arbitrary tool is still DISTRIBUTED (correctness via local fallback is
+    // unaffected) but NEVER RECORDED: its output can depend on vectors the action key
+    // does not cover (registry values, directory enumeration, read-modify-write
+    // pre-state, system time/locale, …, see COR-004), so caching it by default risks a
+    // stale hit. An operator opts a known-good tool in via `SEMBAZURU_VERIFIED_TOOLS`.
+    let tool_verified = is_verified_tool(command.argv.first().map(String::as_str).unwrap_or(""));
 
     // The weak key keys resolve, predicted_paths, and record. Computed off the
     // async runtime: weak_key hashes the toolchain binary from disk.
@@ -384,9 +422,11 @@ async fn run_submission(
     // Record a successful remote run so the next identical build hits. Needs the
     // trace (from the DLL); the outputs come from the launcher's declaration when
     // it had one, else they are discovered from the trace itself (ADR 0007 §b —
-    // the compiler-independent path, so dxc and other non-clang-cl tools cache
-    // too). A non-deterministic action is distributed but never recorded (ADR
-    // 0007 §c): a later byte-identical-input hit would serve a stale result.
+    // the compiler-independent path, so dxc and other verified non-clang-cl tools
+    // cache too). Recording is gated on: the action declared deterministic
+    // (`!non_deterministic`, ADR 0007 §c — else a later byte-identical-input hit
+    // would serve a stale result) AND its toolchain is a VERIFIED profile
+    // (`tool_verified`, COR-004 — an arbitrary tool is distributed but not cached).
     // Without a trace or any discoverable output, recording is skipped (the build
     // is still correct, just uncached).
     if let (Some(cache), Some(weak)) = (&ctx.cache, &weak)
@@ -394,6 +434,7 @@ async fn run_submission(
         && o.exit_code == Some(0)
         && !trace_dir.is_empty()
         && !non_deterministic
+        && tool_verified
     {
         let cache = cache.clone();
         let weak = weak.clone();
@@ -586,7 +627,46 @@ pub async fn submit_to_daemon(
 
 #[cfg(test)]
 mod tests {
-    use super::{mint_session_id, resolve_loopback_intake};
+    use super::{is_verified_tool, mint_session_id, resolve_loopback_intake};
+
+    #[test]
+    fn verified_tool_profile_matches_compilers_only() {
+        // COR-004: bare / absolute / extension / case forms of the verified-
+        // deterministic compilers match; an arbitrary tool does NOT (→ distributed
+        // but never recorded, so its un-keyed vectors can't serve a stale hit).
+        assert!(is_verified_tool("cl"));
+        assert!(is_verified_tool("clang-cl"));
+        assert!(is_verified_tool("dxc"));
+        assert!(is_verified_tool(
+            "C:\\Program Files\\LLVM\\bin\\clang-cl.exe"
+        ));
+        assert!(is_verified_tool("CLANG++"), "case-insensitive");
+        assert!(
+            !is_verified_tool("python"),
+            "arbitrary tool is not verified"
+        );
+        assert!(!is_verified_tool("my-custom-codegen.exe"));
+        assert!(!is_verified_tool(""));
+    }
+
+    #[test]
+    fn verified_tool_honors_operator_opt_in() {
+        // An operator verifies their own known-good tool via the env var (COR-004).
+        let key = "SEMBAZURU_VERIFIED_TOOLS";
+        assert!(!is_verified_tool("my-codegen"));
+        // SAFETY: a uniquely-named var not touched by other tests; set, assert, clear.
+        unsafe { std::env::set_var(key, "my-codegen, other-tool") };
+        let opted = is_verified_tool("my-codegen") && is_verified_tool("C:\\x\\OTHER-TOOL.exe");
+        unsafe { std::env::remove_var(key) };
+        assert!(
+            opted,
+            "SEMBAZURU_VERIFIED_TOOLS opts a tool into the cache profile"
+        );
+        assert!(
+            !is_verified_tool("my-codegen"),
+            "removed → no longer verified"
+        );
+    }
 
     #[test]
     fn session_id_is_unpredictable_128_bit_hex() {
