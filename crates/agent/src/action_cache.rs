@@ -838,6 +838,56 @@ mod tests {
     }
 
     #[test]
+    fn manifest_codec_rejects_malformed_input_without_panicking() {
+        // TEST-001 (action-cache codec robustness, deterministic fuzz): a corrupt,
+        // truncated, or adversarial manifest must decode to None (→ a cache miss /
+        // re-run), NEVER panic and NEVER half-decode. The codec is bounds-checked end
+        // to end and caps the inputs/cmds pre-allocation, so a huge length prefix
+        // cannot OOM either.
+        let valid = encode_manifest(&InputManifest {
+            inputs: vec![InputEntry {
+                logical: "a.cpp".into(),
+                absolute: "c:\\w\\a.cpp".into(),
+                kind: InputKind::Content,
+            }],
+            cmds: vec!["cc /c a.cpp".into()],
+            cacheable: true,
+        });
+        // Every strict prefix of a valid encoding is incomplete → None, no panic.
+        for n in 0..valid.len() {
+            assert_eq!(
+                decode_manifest(&valid[..n]),
+                None,
+                "truncated at {n} must miss"
+            );
+        }
+        // A sweep of hand-crafted malformed buffers (oversized length prefixes,
+        // garbage) plus a byte-flip at every position. The contract is NO PANIC; a
+        // buffer that still decodes must round-trip consistently (never half-decode).
+        let mut cases: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![1],                                     // cacheable byte only
+            vec![1, 0xff, 0xff, 0xff, 0xff],             // huge n_inputs
+            vec![0xff; 64],                              // garbage
+            vec![1, 1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff], // 1 input, huge logical len
+        ];
+        for i in 0..valid.len() {
+            let mut b = valid.clone();
+            b[i] ^= 0xff;
+            cases.push(b);
+        }
+        for (j, b) in cases.iter().enumerate() {
+            if let Some(m) = decode_manifest(b) {
+                assert_eq!(
+                    decode_manifest(&encode_manifest(&m)),
+                    Some(m),
+                    "case {j} decoded, so it must round-trip (no half-decode)"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn second_identical_build_hits_and_republishes_output() {
         let root = tmp("hit");
         let build = tmp("hit-build");
