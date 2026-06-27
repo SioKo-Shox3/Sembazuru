@@ -295,7 +295,52 @@ pub enum Execution {
     /// The remote path failed (or didn't complete) and the agent ran it locally.
     /// Local fallback is the hard requirement of `docs/DESIGN.md` §2 — a build
     /// must complete even if the network or a worker dies.
-    LocalFallback { exit_code: i32, reason: String },
+    LocalFallback {
+        exit_code: i32,
+        reason: LocalFallbackReason,
+    },
+}
+
+/// Why an action ran locally instead of remotely (MAINT-001). A typed reason
+/// replaces the previous `reason: String`, whose `"route-away"` prefix had become
+/// the implementation contract for the status breakdown (`status::record_outcome`
+/// matched `reason.starts_with("route-away")`). [`Display`](std::fmt::Display)
+/// reproduces the previous human-readable strings for telemetry; [`is_route_away`]
+/// is the typed replacement for that prefix match.
+///
+/// [`is_route_away`]: LocalFallbackReason::is_route_away
+#[derive(Debug, Clone)]
+pub enum LocalFallbackReason {
+    /// The process bypasses the user-mode hooks (msys2/Cygwin direct NT syscalls, or
+    /// on the denylist) so it cannot be virtualized — it ran locally from the START.
+    /// A DELIBERATE, correct local run by policy (ADR 0007 §a①), NOT a remote
+    /// failure, so the status breakdown counts it as a local (not fallback) run.
+    /// Carries the human-readable trigger.
+    RouteAway(String),
+    /// No live worker was available to attempt the action.
+    NoWorker,
+    /// Every worker tried was exhausted (unreachable / failed / did-not-complete /
+    /// over the latency budget) — carries the last attempt's detail.
+    RemoteExhausted(String),
+}
+
+impl LocalFallbackReason {
+    /// Whether this was a deliberate policy route-away (a correct local run), as
+    /// opposed to a remote-failure fallback — the distinction the status breakdown
+    /// draws. Replaces the fragile `reason.starts_with("route-away")`.
+    pub fn is_route_away(&self) -> bool {
+        matches!(self, LocalFallbackReason::RouteAway(_))
+    }
+}
+
+impl std::fmt::Display for LocalFallbackReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocalFallbackReason::RouteAway(why) => write!(f, "route-away ({why})"),
+            LocalFallbackReason::NoWorker => f.write_str("no live workers"),
+            LocalFallbackReason::RemoteExhausted(detail) => f.write_str(detail),
+        }
+    }
 }
 
 /// Runs `command` on the local machine, returning its exit code. This is the
@@ -333,8 +378,10 @@ pub async fn execute_with_fallback(
 ) -> Execution {
     let reason = match execute_remote(endpoint, command.clone(), action_id, session_id).await {
         Ok(outcome) if outcome.exit_code.is_some() => return Execution::Remote(outcome),
-        Ok(_) => "remote action did not complete (no exit status)".to_string(),
-        Err(e) => format!("remote execution failed: {e}"),
+        Ok(_) => LocalFallbackReason::RemoteExhausted(
+            "remote action did not complete (no exit status)".to_string(),
+        ),
+        Err(e) => LocalFallbackReason::RemoteExhausted(format!("remote execution failed: {e}")),
     };
     let exit_code = run_local(&command).await.unwrap_or(-1);
     Execution::LocalFallback { exit_code, reason }

@@ -75,16 +75,15 @@ impl Metrics {
 
     /// Classifies a completed dispatch into the remote/local/fallback breakdown.
     /// A `LocalFallback` whose reason is a route-away is a *deliberate* local run
-    /// (policy, ADR 0007 §a①), not a failure fallback; the reason string is the
-    /// only place that distinction survives a dispatch, so it is matched here.
-    /// Kept in sync with `scheduler::dispatch`, which prefixes every route-away
-    /// reason with the literal "route-away".
+    /// (policy, ADR 0007 §a①), not a failure fallback. The distinction is carried by
+    /// the typed [`LocalFallbackReason`] (MAINT-001 — previously a fragile
+    /// `reason.starts_with("route-away")` string contract).
+    ///
+    /// [`LocalFallbackReason`]: crate::LocalFallbackReason
     pub fn record_outcome(&self, outcome: &Execution) {
         match outcome {
             Execution::Remote(_) => &self.exec_remote,
-            Execution::LocalFallback { reason, .. } if reason.starts_with("route-away") => {
-                &self.exec_local
-            }
+            Execution::LocalFallback { reason, .. } if reason.is_route_away() => &self.exec_local,
             Execution::LocalFallback { .. } => &self.exec_fallback,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -404,15 +403,17 @@ mod tests {
         m.record_outcome(&Execution::Remote(ActionOutcome::default()));
         m.record_outcome(&Execution::LocalFallback {
             exit_code: 0,
-            reason: "route-away (cygwin1.dll)".into(),
+            reason: crate::LocalFallbackReason::RouteAway("cygwin1.dll".into()),
         });
         m.record_outcome(&Execution::LocalFallback {
             exit_code: 0,
-            reason: "no live workers".into(),
+            reason: crate::LocalFallbackReason::NoWorker,
         });
         m.record_outcome(&Execution::LocalFallback {
             exit_code: 0,
-            reason: "worker w1 exceeded latency budget".into(),
+            reason: crate::LocalFallbackReason::RemoteExhausted(
+                "worker w1 exceeded latency budget".into(),
+            ),
         });
 
         assert_eq!(

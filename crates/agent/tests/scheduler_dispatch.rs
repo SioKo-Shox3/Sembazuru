@@ -349,7 +349,7 @@ async fn dispatch_falls_back_to_local_with_no_workers() {
     match exec {
         Execution::LocalFallback { exit_code, reason } => {
             assert_eq!(exit_code, 2);
-            assert_eq!(reason, "no live workers");
+            assert_eq!(reason.to_string(), "no live workers");
         }
         other => panic!("expected local fallback with no workers, got {other:?}"),
     }

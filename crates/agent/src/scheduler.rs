@@ -26,7 +26,9 @@ use std::time::Duration;
 use sembazuru_proto::v0::Command;
 
 use crate::coordination::{WorkerEntry, WorkerTable};
-use crate::{ExecOptions, ExecuteError, Execution, execute_on_channel_with, run_local};
+use crate::{
+    ExecOptions, ExecuteError, Execution, LocalFallbackReason, execute_on_channel_with, run_local,
+};
 
 /// Upper bound on a worker's self-reported `cpu_count` when used for load
 /// math. A worker is untrusted until M7 (ADR 0004 §6); clamping stops a single
@@ -412,13 +414,13 @@ impl Scheduler {
             let exit_code = run_local(&command).await.unwrap_or(-1);
             return Execution::LocalFallback {
                 exit_code,
-                reason: format!("route-away ({why})"),
+                reason: LocalFallbackReason::RouteAway(why),
             };
         }
 
         let key = affinity_key(&command.argv);
         let mut tried: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut reason = "no live workers".to_string();
+        let mut reason = LocalFallbackReason::NoWorker;
 
         // Try workers one at a time (reassignment), reserving each atomically so
         // concurrent dispatchers balance. The guard holds the reservation for the
@@ -428,7 +430,10 @@ impl Scheduler {
             let channel = match self.channel_for(&w.execution_endpoint) {
                 Ok(c) => c,
                 Err(e) => {
-                    reason = format!("worker {} unreachable: {e}", w.worker_id);
+                    reason = LocalFallbackReason::RemoteExhausted(format!(
+                        "worker {} unreachable: {e}",
+                        w.worker_id
+                    ));
                     drop(guard);
                     continue;
                 }
@@ -449,13 +454,22 @@ impl Scheduler {
                     return Execution::Remote(outcome);
                 }
                 Ok(Ok(_)) => {
-                    reason = format!("worker {} did not complete the action", w.worker_id);
+                    reason = LocalFallbackReason::RemoteExhausted(format!(
+                        "worker {} did not complete the action",
+                        w.worker_id
+                    ));
                 }
                 Ok(Err(e)) => {
-                    reason = format!("worker {} failed: {e}", w.worker_id);
+                    reason = LocalFallbackReason::RemoteExhausted(format!(
+                        "worker {} failed: {e}",
+                        w.worker_id
+                    ));
                 }
                 Err(_) => {
-                    reason = format!("worker {} exceeded latency budget", w.worker_id);
+                    reason = LocalFallbackReason::RemoteExhausted(format!(
+                        "worker {} exceeded latency budget",
+                        w.worker_id
+                    ));
                 }
             }
             drop(guard); // release the reservation before trying the next worker
