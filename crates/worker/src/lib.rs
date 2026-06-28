@@ -229,13 +229,45 @@ fn setup_err(category: &'static str, detail: impl std::fmt::Display) -> String {
     category.to_string()
 }
 
-fn exit_event(code: i32, wall_us: u64) -> Result<ExecuteEvent, Status> {
+fn resolved_tool_digest(cmd: &Command) -> String {
+    // Extract PATH the SAME way the agent does for the weak key, so the two sides
+    // can never resolve a different binary from an equivalent env and spuriously
+    // mismatch (COR-005 symmetry; a mismatch is always safe — a lost cache record,
+    // never a false hit). The agent sorts the env before reading PATH
+    // (`intake.rs` → `weak_key_and_tool`); a proto `map` can carry distinct
+    // case-variant keys ("PATH" vs "Path") with different values, so without the
+    // sort the worker would pick by HashMap iteration order. Sorting makes both
+    // sides deterministic and identical.
+    let mut env: Vec<(String, String)> = cmd
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.sort();
+    let path_env = env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .map(|(_, v)| v.as_str());
+    sembazuru_cas::toolchain::toolchain_digest(
+        cmd.argv.first().map(String::as_str).unwrap_or(""),
+        path_env,
+        &cmd.cwd,
+    )
+    .to_string()
+}
+
+fn exit_event(
+    code: i32,
+    wall_us: u64,
+    resolved_tool_digest: String,
+) -> Result<ExecuteEvent, Status> {
     Ok(ExecuteEvent {
         event: Some(Event::Exit(ExitStatus {
             exit_code: code,
             wall_time_us: wall_us,
             user_time_us: 0,
             kernel_time_us: 0,
+            resolved_tool_digest,
         })),
     })
 }
@@ -433,7 +465,8 @@ async fn run_action(
                     // accounting later, where the values are not bounded by a wall
                     // clock.
                     let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    let _ = tx.send(exit_event(code, wall)).await;
+                    let tool_digest = resolved_tool_digest(&cmd);
+                    let _ = tx.send(exit_event(code, wall, tool_digest)).await;
                     let _ = tx.send(state_event(ActionState::Completed, "")).await;
                 }
             }
@@ -846,5 +879,21 @@ mod tests {
         // Zero clamps up to 1 (admit at least one action); a normal value passes.
         assert_eq!(WorkerService::with_capacity(0).capacity(), 1);
         assert_eq!(WorkerService::with_capacity(4).capacity(), 4);
+    }
+
+    #[test]
+    fn resolved_tool_digest_wiring_reports_non_empty_digest() {
+        let current_exe = std::env::current_exe().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let cmd = Command {
+            argv: vec![current_exe.to_string_lossy().into_owned()],
+            env: Default::default(),
+            cwd: cwd.to_string_lossy().into_owned(),
+        };
+
+        assert!(
+            !resolved_tool_digest(&cmd).is_empty(),
+            "worker tool digest wiring should report a non-empty digest"
+        );
     }
 }

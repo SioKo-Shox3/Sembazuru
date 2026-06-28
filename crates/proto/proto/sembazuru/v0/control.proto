@@ -216,6 +216,12 @@ message ExitStatus {
   uint64 wall_time_us = 2;      // worker-measured wall clock
   uint64 user_time_us = 3;
   uint64 kernel_time_us = 4;
+  // COR-005 worker re-verification: hex content digest of the toolchain binary the
+  // worker actually resolved+launched for argv[0]. The agent compares it to the
+  // digest it folded into the weak key and SKIPS recording on a mismatch (a
+  // heterogeneous agent != worker compiler), so a different binary's result is
+  // never recorded under this key. Empty = not reported. Additive proto3 field.
+  string resolved_tool_digest = 5;
 }
 
 // A chunk of the process's console output (M6.1). The compiler's diagnostics run

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use sembazuru_cas::Digest;
 use sembazuru_proto::v0::{
     ActionState, Command, ExitStatus, OutputChunk, StateChange, SubmitActionEvent,
     SubmitActionRequest, VfsExecution, local_intake_client::LocalIntakeClient,
@@ -66,6 +67,7 @@ fn exit_ev(code: i32, wall_us: u64) -> SubmitActionEvent {
             wall_time_us: wall_us,
             user_time_us: 0,
             kernel_time_us: 0,
+            resolved_tool_digest: String::new(),
         })),
     }
 }
@@ -247,6 +249,10 @@ fn is_verified_tool(argv0: &str) -> bool {
             .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(&base)))
 }
 
+fn worker_tool_matches(reported: &str, expected: &Digest) -> bool {
+    !reported.is_empty() && reported == expected.to_string()
+}
+
 /// Drives one submission to completion and mirrors its terminal events. Without
 /// a VFS context this is a plain dispatch (M6.0). With one, the compile runs
 /// under the read-VFS; with a cache it is resolved first (a hit skips the worker)
@@ -308,11 +314,12 @@ async fn run_submission(
     // does not cover (registry values, directory enumeration, read-modify-write
     // pre-state, system time/locale, …, see COR-004), so caching it by default risks a
     // stale hit. An operator opts a known-good tool in via `SEMBAZURU_VERIFIED_TOOLS`.
-    let tool_verified = is_verified_tool(command.argv.first().map(String::as_str).unwrap_or(""));
+    let argv0 = command.argv.first().cloned().unwrap_or_default();
+    let tool_verified = is_verified_tool(&argv0);
 
     // The weak key keys resolve, predicted_paths, and record. Computed off the
-    // async runtime: weak_key hashes the toolchain binary from disk.
-    let weak = match &ctx.cache {
+    // async runtime: weak_key_and_tool hashes the toolchain binary from disk.
+    let (weak, agent_tool_digest) = match &ctx.cache {
         Some(cache) => {
             let cache = cache.clone();
             let argv = command.argv.clone();
@@ -323,11 +330,14 @@ async fn run_submission(
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
             env.sort();
-            tokio::task::spawn_blocking(move || cache.weak_key(&argv, &env, &cwd))
+            match tokio::task::spawn_blocking(move || cache.weak_key_and_tool(&argv, &env, &cwd))
                 .await
-                .ok()
+            {
+                Ok((weak, tool_digest)) => (Some(weak), Some(tool_digest)),
+                Err(_) => (None, None),
+            }
         }
-        None => None,
+        None => (None, None),
     };
 
     // Cache resolve: a hit republishes the outputs and skips the worker entirely.
@@ -441,41 +451,50 @@ async fn run_submission(
     // (`tool_verified`, COR-004 — an arbitrary tool is distributed but not cached).
     // Without a trace or any discoverable output, recording is skipped (the build
     // is still correct, just uncached).
-    if let (Some(cache), Some(weak)) = (&ctx.cache, &weak)
+    if let (Some(cache), Some(weak), Some(atd)) = (&ctx.cache, &weak, &agent_tool_digest)
         && let Execution::Remote(o) = &outcome
         && o.exit_code == Some(0)
         && !trace_dir.is_empty()
         && !non_deterministic
         && tool_verified
     {
-        let cache = cache.clone();
-        let weak = weak.clone();
-        let br = build_root.clone();
-        let declared = declared_outputs.clone();
-        let td = trace_dir.clone();
-        let rd = root_decl.clone();
-        // The remote run's console output, captured so a later hit replays the same
-        // diagnostics (COR-007). Cloned (not moved) — `outcome` is still emitted below.
-        let rec_stdout = o.stdout.clone();
-        let rec_stderr = o.stderr.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let root = rd.as_deref();
-            let outs: Vec<String> = if !declared.is_empty() {
-                declared
-            } else {
-                cache.outputs_from_trace_dir(&td, root).unwrap_or_default()
-            };
-            // record() self-gates on manifest.cacheable (input-side fail-closed)
-            // and on each output staying under the build root, so a manifest that
-            // could not cover a real source, or an out-of-scope output, simply
-            // does not get stored — the build stays correct, just uncached.
-            if !outs.is_empty()
-                && let Ok(manifest) = cache.manifest_from_trace_dir(&td, root)
-            {
-                let _ = cache.record(&weak, &manifest, &br, &outs, 0, &rec_stdout, &rec_stderr);
-            }
-        })
-        .await;
+        if worker_tool_matches(&o.resolved_tool_digest, atd) {
+            let cache = cache.clone();
+            let weak = weak.clone();
+            let br = build_root.clone();
+            let declared = declared_outputs.clone();
+            let td = trace_dir.clone();
+            let rd = root_decl.clone();
+            // The remote run's console output, captured so a later hit replays the same
+            // diagnostics (COR-007). Cloned (not moved) — `outcome` is still emitted below.
+            let rec_stdout = o.stdout.clone();
+            let rec_stderr = o.stderr.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let root = rd.as_deref();
+                let outs: Vec<String> = if !declared.is_empty() {
+                    declared
+                } else {
+                    cache.outputs_from_trace_dir(&td, root).unwrap_or_default()
+                };
+                // record() self-gates on manifest.cacheable (input-side fail-closed)
+                // and on each output staying under the build root, so a manifest that
+                // could not cover a real source, or an out-of-scope output, simply
+                // does not get stored — the build stays correct, just uncached.
+                if !outs.is_empty()
+                    && let Ok(manifest) = cache.manifest_from_trace_dir(&td, root)
+                {
+                    let _ = cache.record(&weak, &manifest, &br, &outs, 0, &rec_stdout, &rec_stderr);
+                }
+            })
+            .await;
+        } else {
+            eprintln!(
+                "sembazuru-agent: heterogeneous toolchain digest mismatch for argv[0]={:?}; \
+                 worker reported {:?}, agent expected {}; skipping cache record",
+                argv0, o.resolved_tool_digest, atd
+            );
+            metrics.record_compiler_digest_mismatch();
+        }
     }
 
     // Remove this action's trace dir now that the manifest has been ingested
@@ -639,7 +658,10 @@ pub async fn submit_to_daemon(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_verified_tool, mint_session_id, resolve_loopback_intake};
+    use std::sync::atomic::Ordering;
+
+    use super::{is_verified_tool, mint_session_id, resolve_loopback_intake, worker_tool_matches};
+    use crate::status::Metrics;
 
     #[test]
     fn verified_tool_profile_matches_compilers_only() {
@@ -678,6 +700,23 @@ mod tests {
             !is_verified_tool("my-codegen"),
             "removed → no longer verified"
         );
+    }
+
+    #[test]
+    fn worker_tool_match_requires_reported_digest() {
+        let expected = sembazuru_cas::Digest::of(b"agent-tool");
+        assert!(worker_tool_matches(&expected.to_string(), &expected));
+        assert!(!worker_tool_matches(
+            &sembazuru_cas::Digest::of(b"worker-tool").to_string(),
+            &expected
+        ));
+        assert!(!worker_tool_matches("", &expected));
+
+        let metrics = Metrics::default();
+        if !worker_tool_matches("", &expected) {
+            metrics.record_compiler_digest_mismatch();
+        }
+        assert_eq!(metrics.compiler_digest_mismatch.load(Ordering::Relaxed), 1);
     }
 
     #[test]

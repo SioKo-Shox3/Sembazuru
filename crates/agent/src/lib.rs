@@ -45,6 +45,7 @@ pub struct ActionOutcome {
     pub states: Vec<i32>,
     pub exit_code: Option<i32>,
     pub wall_time_us: u64,
+    pub resolved_tool_digest: String,
     /// The remote process's console output, collected for replay to the
     /// developer (M6.1): the compiler ran on the worker, so its diagnostics must
     /// be streamed back or they are invisible.
@@ -267,6 +268,7 @@ async fn drive_execute(
             Some(Event::Exit(e)) => {
                 outcome.exit_code = Some(e.exit_code);
                 outcome.wall_time_us = e.wall_time_us;
+                outcome.resolved_tool_digest = e.resolved_tool_digest;
             }
             Some(Event::Stdio(c)) => {
                 // Collect the compiler's console output to replay to the developer

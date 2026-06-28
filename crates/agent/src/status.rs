@@ -58,6 +58,9 @@ pub struct Metrics {
     /// Actions that wanted a worker but fell back to local (every remote attempt
     /// failed, or no worker was live).
     pub exec_fallback: AtomicU64,
+    /// Successful remote runs skipped for cache record because the worker-resolved
+    /// compiler digest did not match the agent-side weak-key digest.
+    pub compiler_digest_mismatch: AtomicU64,
     /// Actions submitted but not yet terminal (gauge, moved by [`InFlightGuard`]).
     in_flight: AtomicU64,
 }
@@ -71,6 +74,12 @@ impl Metrics {
     /// Counts one action-cache miss (the cache was consulted and did not serve).
     pub fn record_cache_miss(&self) {
         self.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one worker/agent compiler digest mismatch at the cache record gate.
+    pub fn record_compiler_digest_mismatch(&self) {
+        self.compiler_digest_mismatch
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Classifies a completed dispatch into the remote/local/fallback breakdown.

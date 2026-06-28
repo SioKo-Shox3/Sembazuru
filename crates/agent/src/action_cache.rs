@@ -90,6 +90,16 @@ impl AgentCache {
     /// (cl.exe v1→v2) moves the key and invalidates the cache instead of serving a
     /// stale hit; an argv0 that cannot be resolved/read falls back to its name.
     pub fn weak_key(&self, argv: &[String], env: &[(String, String)], cwd: &str) -> Digest {
+        self.weak_key_and_tool(argv, env, cwd).0
+    }
+
+    /// Returns the weak fingerprint and the toolchain digest folded into it.
+    pub fn weak_key_and_tool(
+        &self,
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: &str,
+    ) -> (Digest, Digest) {
         // PATH is excluded from the KEY (volatile), but is read here to resolve a
         // bare argv0 to the actual binary, whose content digest IS the identity.
         let path_env = env
@@ -101,7 +111,10 @@ impl AgentCache {
             path_env,
             cwd,
         );
-        sembazuru_cas::weak_fingerprint(argv, env, cwd, &toolchain)
+        (
+            sembazuru_cas::weak_fingerprint(argv, env, cwd, &toolchain),
+            toolchain,
+        )
     }
 
     /// Phase 1: try to resolve an action from cache. On a hit the cached outputs

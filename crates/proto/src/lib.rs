@@ -137,3 +137,26 @@ pub mod auth {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use crate::v0::ExitStatus;
+
+    #[test]
+    fn exit_status_preserves_resolved_tool_digest() {
+        let status = ExitStatus {
+            exit_code: 0,
+            wall_time_us: 1,
+            user_time_us: 2,
+            kernel_time_us: 3,
+            resolved_tool_digest: "abcdef".to_string(),
+        };
+        let mut encoded = Vec::new();
+        status.encode(&mut encoded).unwrap();
+
+        let decoded = ExitStatus::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.resolved_tool_digest, "abcdef");
+    }
+}
