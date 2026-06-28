@@ -21,7 +21,7 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 | COR-001 | P0 | **CLOSED** | agent 権威 per-action session capability＋single-flight pin（PR#1 38079a6） |
 | COR-002 | P0 | **CLOSED** | Absent 入力 re-read＋ディレクトリ入力除外（PR#1/#2） |
 | COR-003 | P0 | **CLOSED** | 不完全 trace を uncacheable（lost-input warning のみ・root 帰属曖昧は除外, PR#1） |
-| COR-004 | P0 | **PARTIAL→繰延** | key 不足の determinism-safe 分は閉鎖済み（cwd=COR-005／stdout-stderr=COR-007／injection-gap=COR-003／不完全 trace=COR-003）。残り＝**「未知 exe は既定 cache off／verified profile のみ cache」へ既定反転**（registry値・dir列挙・RMW 前状態など未観測 vector の被覆）。これは ADR 0007 §c の方針決定＋determinism harness 実証を要し、既定 allow→deny の反転は全ツール挙動・ゲートに影響＝**決定者判断の繰延設計**（ADR 0014 (2)(3)）。 |
+| COR-004 | P0 | **CLOSED** | 「未知 exe は既定 cache off／verified-deterministic profile（cl/clang-cl/clang/clang++/dxc＋`SEMBAZURU_VERIFIED_TOOLS` opt-in）のみ記録」へ既定反転を実装（9c56295）。記録ポリシー厳格化に伴い `WEAK_KEY_SCHEMA` v3 で旧ポリシー entry を一掃（hardening 34895dc）。決定者承認 2026-06-29（ADR 0014 (2)、Codex/verifier(opus) 二重レビュー＋CI hooks: M8.5 distributed-but-not-cached／M8.4・M4・M6 cache-hit 緑）。残存は別件継続: heterogeneous worker≠agent identity 閉鎖＝**COR-005 worker 再検証**、registry/enumerate/RMW の key 被覆＝**ADR 0014 (3)**。 |
 | COR-005 | P0 | **CLOSED** | weak key に cwd・schema version＋**解決済みコンパイラ binary の content digest**（同名更新で invalidation, PR#1/#2）。heterogeneous で agent≠worker の別 cl を閉じる **worker 再検証**は B-big 繰延（↓） |
 | COR-006 | P1 | **CLOSED** | temp 中間物 heuristic を厳格化（`\temp\` 広域 fallback 除去, PR#1） |
 | COR-007 | P0 | **CLOSED** | 出力公開を set-atomic＋get_verified＋有界 memory／stdout-stderr の CAS 記録＆hit 時 replay（PR#1/#2） |
@@ -39,7 +39,7 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 | TEST-001 | P2 | **PARTIAL** | cache 正当性ゲートの大半はユニットテスト済み（absent→present/under-temp/truncated/concurrent-first-touch/cwd/PATH-resolved/multi-output-partial/stdout）＋codec 決定的 fuzz（commit c6cb607）。残り＝security 非 admin 系（B-machine）・fuzzing harness・supply-chain CI（cargo-audit/deny・SHA pin・CodeQL・SBOM）＝CI/実機バックログ |
 | DOC-001 | P3 | **CLOSED** | 本ステータス表が指摘状態を同期（doc とコードの整合） |
 
-**未クローズで実装が残るのは設計判断/実機/CI-infra に依存する 4 件のみ**: COR-004 本道（cache 既定方針反転・要決定者＋determinism harness）、SEC-001 本道（named-pipe+impersonation・要実機 M9.5/M10）、COR-005 の heterogeneous worker 再検証（proto+launcher+worker の B-big）、TEST-001 残ゲート（非 admin/CI-infra）。いずれも当環境で安全に完了不能＝lead/後続マイルストーン。それ以外は全て CLOSED または現脅威モデルで受容（DEFERRED-ACCEPTED）。
+**未クローズで実装が残るのは設計判断/実機/CI-infra に依存する 3 件のみ**: SEC-001 本道（named-pipe+impersonation・要実機 M9.5/M10）、COR-005 の heterogeneous worker 再検証（proto+launcher+worker の B-big）、TEST-001 残ゲート（非 admin/CI-infra）。いずれも当環境で安全に完了不能＝lead/後続マイルストーン。それ以外は全て CLOSED または現脅威モデルで受容（DEFERRED-ACCEPTED）。COR-004 本道（既定 cache off／verified-only）は 2026-06-29 にクローズ（9c56295＋hardening 34895dc、決定者承認＋CI 緑）。
 
 ---
 

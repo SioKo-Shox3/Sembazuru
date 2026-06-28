@@ -1,6 +1,6 @@
 # 0014 — action key v2（弱/強キーの実行 identity 被覆と観測 vector の取り込み）
 
-- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
+- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: **(2) の既定 `off`／verified-only 記録ポリシーは ACCEPTED（プロジェクトリード、2026-06-29。根拠＝実装 9c56295＋hardening 34895dc の `WEAK_KEY_SCHEMA` v3＋Codex/verifier(opus) 二重レビュー＋CI hooks M8.5/M8.4/M4/M6 緑）。(1) worker 再検証・(3) registry/enumerate 被覆は未実装で承認継続。**
   出所: コードレビュー（COR-005／COR-004 残）。[ADR 0007](0007-arbitrary-process-distribution.md) §c の拡張。
   **実装済み（determinism-safe な部分集合＝key を「細かくする」だけ・false hit 不可・rebuild-hit ゲート不変）**:
   (1) のうち **cwd を weak key に追加**（COR-005 問題B＝cwd 埋込み false hit を閉鎖）、**weak-key schema
