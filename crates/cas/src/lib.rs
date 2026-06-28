@@ -12,6 +12,7 @@
 
 mod action_cache;
 mod store;
+pub mod toolchain;
 
 pub use action_cache::{
     ActionCache, ActionResult, OutputFile, strong_fingerprint, weak_fingerprint,
