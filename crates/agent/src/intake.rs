@@ -220,6 +220,18 @@ const VERIFIED_TOOLS: &[&str] = &["cl", "clang-cl", "clang", "clang++", "dxc"];
 /// basename) or opted in by the operator via the comma-separated
 /// `SEMBAZURU_VERIFIED_TOOLS` env var. A bare `cl`, an absolute `C:\…\clang-cl.exe`,
 /// and `clang-cl` all match `clang-cl`/`cl`.
+/// This check matches tool NAME (basename) only, not a verified binary identity
+/// from M2 byte-reproducibility. It is sound in homogeneous/LAN-trusted
+/// environments because, whenever `argv0` resolves to a real file — the normal
+/// case, including a real `cl.exe` *or* a `cl.bat`/`cl.cmd` shim, since resolution
+/// is extension-agnostic (`candidate_with_exe` checks `is_file()` before adding
+/// `.exe`) — the weak_key folds that file's content digest: a same-named tool with
+/// different bytes yields a different key and cannot pollute existing entries or be
+/// served stale. The residual is an `argv0` that resolves to NO real file (e.g. a
+/// bare name absent from PATH): `toolchain_digest` then falls back to a content-blind
+/// name-constant, so a name-verified-but-unresolvable tool would be keyed by name
+/// alone. Heterogeneous worker != agent identity closure is deferred to COR-005
+/// worker re-verification.
 fn is_verified_tool(argv0: &str) -> bool {
     if argv0.is_empty() {
         return false;

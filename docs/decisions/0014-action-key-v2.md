@@ -51,6 +51,8 @@ weak key に **解決済み exe 絶対パス＋content digest**（launcher が C
 ### (2) env policy ＝ profile 制
 `cache_policy: off | verified | unsafe` を導入（任意プロセスの既定 `off`）。`verified` profile（clang-cl/MSVC/dxc）は許可 exe digest・許可 side effect・required trace coverage・env key policy・determinism flag を定義（[ADR 0007 §c](0007-arbitrary-process-distribution.md) の決定性ゲートと接続）。**profile 未指定アクションは全 env を key に含めるか uncacheable（fail-closed）**。`VOLATILE_ENV` の固定除外は verified profile 内に限定。
 
+**実装メモ（9c56295 / COR-004）**: 既定 `off`／verified-only の記録ゲートは実装済み（`crates/agent/src/intake.rs` の record ゲート `&& tool_verified`）。ただし現実装の verified 判定は toolchain の **basename 一致**（`is_verified_tool`、`file_stem`・大小無視・`SEMBAZURU_VERIFIED_TOOLS` opt-in）であり「M2 で実証済みのバイナリ identity」そのものではない。homogeneous／LAN-trusted では健全: `.exe` の identity は weak_key の content digest（`crates/cas/src/action_cache.rs` `weak_fingerprint`）で固定され、中身の異なる同名 `cl.exe` は別キー化して既存 entry を汚染しない。残存（threat model 周辺）: argv0 が**実在ファイルに解決しない**場合（PATH 不在の素名等）、`toolchain_digest` は content-blind な name-constant に退化するため、name-verified だが未解決のツールは名前だけでキー化され得る（解決する場合は実在 `.bat`/`.cmd` を含め当該ファイルの content digest が weak_key に畳まれ安全＝`candidate_with_exe` は `.exe` 付与前に `is_file()` を拡張子非依存で判定）。heterogeneous の worker≠agent identity 閉鎖は **COR-005 worker 再検証**に委ねる。記録ポリシー厳格化（任意ツールを既定 non-record 化）に伴い `WEAK_KEY_SCHEMA` を v3 に bump し、旧ポリシー下で記録された任意ツール entry を一掃した。
+
 ### (3) 観測済み非 key vector
 registry 値・enumerate membership・RMW 前内容を strong key に**畳む**か、それらに触れるアクションを **uncacheable**（fail-closed）。`is_content_read` を拡張し、enumerate/registry を「key 化できなければ無キャッシュ」に倒す（[ADR 0007 §b.3](0007-arbitrary-process-distribution.md) を入力側へ拡張）。
 

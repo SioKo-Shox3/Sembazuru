@@ -56,7 +56,13 @@ fn is_volatile(name: &str) -> bool {
 /// re-run, producing byte-identical output — safe). Bump this whenever the weak
 /// key's *meaning* changes (a new keyed dimension, a changed normalization), so a
 /// mixed on-disk cache can never serve an entry computed under different rules.
-const WEAK_KEY_SCHEMA: u32 = 2;
+/// v3 (COR-004): the record policy tightened to a verified-deterministic tool
+/// profile (arbitrary tools are now distributed but never recorded). The key
+/// meaning is unchanged, but a cache populated under the prior looser policy
+/// could still hold an entry for an arbitrary tool whose output depends on
+/// un-keyed vectors; bumping the schema retires those entries so the tightened
+/// policy applies retroactively.
+const WEAK_KEY_SCHEMA: u32 = 3;
 
 /// The weak fingerprint: everything statically known about an action before it
 /// runs. A schema tag, `argv` in order, the action's working directory, the
