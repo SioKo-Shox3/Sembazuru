@@ -15,5 +15,8 @@ publish.workspace = true
 [dependencies]
 tokio = { version = "1", features = ["io-util"], optional = true }
 
+[dev-dependencies]
+proptest = "1"
+
 [features]
 tokio = ["dep:tokio"]

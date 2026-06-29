@@ -502,6 +502,74 @@ impl HelloResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    mod fuzz {
+        use super::*;
+
+        macro_rules! decode_all_ops {
+            ($buf:expr; $($ty:ty),+ $(,)?) => {
+                $(
+                    let _ = <$ty>::decode($buf);
+                )+
+            };
+        }
+
+        proptest! {
+            #[test]
+            fn op_decoders_never_panic(buf in any::<Vec<u8>>()) {
+                decode_all_ops!(
+                    &buf;
+                    HelloRequest,
+                    HelloResponse,
+                    StatRequest,
+                    StatResponse,
+                    OpenReadRequest,
+                    OpenReadResponse,
+                    ReadRequest,
+                    ReadResponse,
+                    DirListRequest,
+                    DirListResponse,
+                    WriteBackRequest,
+                    WriteBackResponse,
+                    HasRequest,
+                    HasResponse,
+                );
+            }
+
+            #[test]
+            fn read_request_round_trips(
+                digest_hex in any::<String>(),
+                offset in any::<u64>(),
+                len in any::<u32>(),
+            ) {
+                let req = ReadRequest {
+                    digest_hex,
+                    offset,
+                    len,
+                };
+                prop_assert_eq!(ReadRequest::decode(&req.encode()).unwrap(), req);
+            }
+
+            #[test]
+            fn write_back_request_round_trips(
+                path in any::<String>(),
+                digest_hex in any::<String>(),
+                offset in any::<u64>(),
+                bytes in any::<Vec<u8>>(),
+                last in any::<bool>(),
+            ) {
+                let req = WriteBackRequest {
+                    path,
+                    digest_hex,
+                    offset,
+                    bytes,
+                    last,
+                };
+                prop_assert_eq!(WriteBackRequest::decode(&req.encode()).unwrap(), req);
+            }
+        }
+    }
 
     #[test]
     fn hello_round_trips_and_tolerates_a_legacy_two_field_frame() {

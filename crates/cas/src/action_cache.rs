@@ -323,8 +323,20 @@ impl From<DigestError> for CacheCodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::process;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    mod fuzz {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn action_result_decode_never_panics(bytes in any::<Vec<u8>>()) {
+                let _ = ActionResult::decode(&bytes);
+            }
+        }
+    }
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
     fn tmp_root() -> PathBuf {

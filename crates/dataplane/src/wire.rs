@@ -237,6 +237,33 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    mod fuzz {
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn decode_frame_body_never_panics(bytes in any::<Vec<u8>>()) {
+                let _ = decode_frame_body(&bytes);
+            }
+
+            #[test]
+            fn decode_frame_never_panics(bytes in any::<Vec<u8>>()) {
+                let _ = decode_frame(&bytes);
+            }
+
+            #[test]
+            fn decode_frame_with_explicit_length_prefix_never_panics(
+                len in any::<u32>(),
+                body in any::<Vec<u8>>(),
+            ) {
+                let mut bytes = len.to_le_bytes().to_vec();
+                bytes.extend_from_slice(&body);
+                let _ = decode_frame(&bytes);
+            }
+        }
+    }
 
     #[test]
     fn frame_round_trips_with_length_prefix() {
