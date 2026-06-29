@@ -1,0 +1,42 @@
+# CodeQL static analysis (TEST-001 supply-chain / security).
+#
+# Scans the C++ hook layer — the security-sensitive code: DLL injection, inline
+# API hooks, and the named-pipe VFS client. This is exactly where a memory-safety
+# defect (or a pattern an EDR flags as malware-like) would hide, and it is the one
+# layer not already covered by Rust's safety guarantees + `clippy -D warnings`.
+# The repo is public, so CodeQL runs at no cost (no GitHub Advanced Security needed).
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly, so a newly-published CodeQL query catches a latent issue even with no
+    # code change (Mondays 05:30 UTC).
+    - cron: "30 5 * * 1"
+
+jobs:
+  analyze:
+    name: CodeQL (C++ hooks)
+    # MSVC toolchain — the hooks build with the VS generator, same as the `hooks`
+    # job in ci.yml. Pin to windows-2022 (CodeQL must trace the real MSVC build).
+    runs-on: windows-2022
+    permissions:
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3 (TEST-001: SHA-pinned)
+        with:
+          languages: c-cpp
+      # Build the hook DLL + interceptor the way ci.yml does, so CodeQL traces the
+      # real compilation (autobuild can miss a bespoke CMake layout).
+      - run: cmake -S hooks -B hooks/build -A x64
+      - run: cmake --build hooks/build --config Release
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3 (TEST-001: SHA-pinned)
+        with:
+          category: "/language:c-cpp"

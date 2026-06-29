@@ -18,6 +18,34 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  supply-chain:
+    name: Supply chain (cargo-deny)
+    # OS-agnostic dependency-graph check (no compilation): cargo-deny resolves the
+    # full cross-platform graph via `cargo metadata`, so ubuntu covers the Windows
+    # deps too and is faster. Config + rationale in deny.toml. TEST-001.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
+      # RustSec security advisories (vulnerabilities/unsound = error) + permissive
+      # license allow-list + crates.io-only sources + wildcard ban. A vulnerability or
+      # a disallowed license fails the build.
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20 (TEST-001: SHA-pinned)
+        with:
+          command: check advisories bans licenses sources
+      # A CycloneDX SBOM of the resolved dependency graph, published as an audit
+      # artifact (TEST-001 supply-chain). Informational provenance for releases — not
+      # a gate (no `if-no-files-found: error`), so it never blocks the build.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate CycloneDX SBOM
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --all --format json
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
+        with:
+          name: sbom-cyclonedx
+          path: "**/*.cdx.json"
+
   hooks:
     name: C++ hooks + tracer (MSVC)
     # M7.3 Windows-version matrix: run the hook/Detours + determinism + injection

@@ -1,0 +1,76 @@
+# cargo-deny configuration — supply-chain gate (TEST-001).
+#
+# Run by the `supply-chain` CI job (and locally via `cargo deny check`). It fails
+# the build on: a RustSec security advisory in the dependency graph, a crate whose
+# license is not on the permissive allow-list below, a yanked crate, a wildcard
+# version requirement, or a dependency pulled from a registry/git source other than
+# crates.io. The threat model (ADR 0006, LAN-trusted) does not relax supply-chain
+# hygiene: a compromised or copyleft-encumbered dependency is a correctness/legal
+# risk regardless of the runtime trust boundary.
+#
+# Schema: cargo-deny v2 (advisories/licenses). Keep the action's cargo-deny version
+# pinned in ci.yml so this schema can't drift out from under the config.
+
+[advisories]
+version = 2
+# Fail on a dependency that has been yanked from crates.io (a strong signal the
+# author pulled it — often a security or correctness defect).
+yanked = "deny"
+# "Unmaintained" advisories are flagged only for crates we DIRECTLY depend on (which
+# we can act on), not for transitive deps deep under the GUI stack: egui/eframe +
+# tray-icon pull in unmaintained gtk-rs GTK3 bindings (RUSTSEC-2024-0412..0420, Linux
+# tray, never compiled on our Windows target) and proc-macro-error (RUSTSEC-2024-0370)
+# that we don't control and that our direct deps will update. Security VULNERABILITIES
+# and unsound advisories remain hard errors regardless of this setting.
+unmaintained = "workspace"
+# Add an advisory ID here ONLY with a written justification (why it does not affect us
+# / why it cannot yet be upgraded) — never to silence the gate casually.
+ignore = []
+
+[licenses]
+version = 2
+# Every license that appears in the resolved graph (enumerated from `cargo metadata`,
+# 2026-06-29). All are permissive or weak/file-level copyleft (MPL-2.0) or font
+# licenses (OFL-1.1 / Ubuntu-font-1.0, from the bundled GUI font). No strong copyleft
+# (GPL/AGPL/LGPL) is REQUIRED — those appear only as OR-alternatives where a
+# permissive option is also offered, which cargo-deny satisfies with the permissive
+# side. A new dependency that needs a license not listed here fails the gate on
+# purpose: add it deliberately (with the rationale) rather than by accident.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "0BSD",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Zlib",
+    "Unlicense",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+# Duplicate versions of the same crate are common in a large graph and not a defect —
+# warn so they are visible, but do not block the build.
+multiple-versions = "warn"
+# A wildcard (`*`) version requirement on a published crate is a supply-chain hazard
+# (any future release is silently accepted). Workspace-internal path deps that use a
+# wildcard are exempt (`allow-wildcard-paths`) — they resolve to the in-tree crate,
+# not the registry.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io. An unknown registry or a git dependency would pull code from
+# outside the vetted supply chain (the Detours fork is vendored C++ in `hooks/`, not
+# a Cargo source, so no git sources are expected here).
+unknown-registry = "deny"
+unknown-git = "deny"
