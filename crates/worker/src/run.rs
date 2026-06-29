@@ -32,6 +32,24 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// (file + env).
 pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Result<(), BoxError> {
     let addr: std::net::SocketAddr = config.listen_addr.parse()?;
+    if !addr.ip().is_loopback() && !config.unsafe_allow_insecure_execution_lan {
+        return Err(format!(
+            "refusing to bind the unauthenticated Worker Execution RPC to non-loopback \
+             address {addr}: this exposes remote code execution to the network. Bind a \
+             loopback address (127.0.0.1:<port>), or set \
+             SEMBAZURU_UNSAFE_ALLOW_INSECURE_EXECUTION_LAN=1 \
+             (worker.toml unsafe_allow_insecure_execution_lan=true) to override — never \
+             in production."
+        )
+        .into());
+    }
+    if !addr.ip().is_loopback() && config.unsafe_allow_insecure_execution_lan {
+        eprintln!(
+            "sembazuru-worker: WARNING: UNSAFE non-loopback Worker Execution bind enabled \
+             at {addr}; the Execution RPC is unauthenticated and exposes remote code \
+             execution to the network — never in production."
+        );
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     eprintln!("sembazuru-worker: Execution service on {local}");
@@ -131,6 +149,92 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn worker_accepts_loopback() {
+        let config = WorkerConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            unsafe_allow_insecure_execution_lan: false,
+            ..WorkerConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_worker(config, shutdown.clone()));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        shutdown.cancel();
+
+        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run_worker did not return within 5s of shutdown")
+            .expect("run_worker task panicked");
+        assert!(res.is_ok(), "run_worker returned an error: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn worker_refuses_0_0_0_0_without_unsafe_flag() {
+        let config = WorkerConfig {
+            listen_addr: "0.0.0.0:0".into(),
+            unsafe_allow_insecure_execution_lan: false,
+            ..WorkerConfig::default()
+        };
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_worker(config, CancellationToken::new()),
+        )
+        .await
+        .expect("run_worker did not refuse within 5s");
+        let err = res.expect_err("run_worker must refuse 0.0.0.0 without the unsafe flag");
+        assert!(
+            err.to_string().contains("non-loopback"),
+            "error should mention non-loopback: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_refuses_lan_ip_without_unsafe_flag() {
+        let config = WorkerConfig {
+            listen_addr: "192.0.2.1:0".into(),
+            unsafe_allow_insecure_execution_lan: false,
+            ..WorkerConfig::default()
+        };
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_worker(config, CancellationToken::new()),
+        )
+        .await
+        .expect("run_worker did not refuse within 5s");
+        assert!(
+            res.is_err(),
+            "run_worker must refuse a LAN IP without the unsafe flag"
+        );
+        let err = res.expect_err("checked above");
+        assert!(
+            err.to_string().contains("non-loopback"),
+            "error should mention non-loopback: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_allows_lan_only_with_unsafe_flag() {
+        let config = WorkerConfig {
+            listen_addr: "0.0.0.0:0".into(),
+            unsafe_allow_insecure_execution_lan: true,
+            ..WorkerConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_worker(config, shutdown.clone()));
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        shutdown.cancel();
+
+        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run_worker did not return within 5s of shutdown")
+            .expect("run_worker task panicked");
+        assert!(res.is_ok(), "run_worker returned an error: {res:?}");
+    }
 
     /// `run_worker` must return promptly when the shutdown token is cancelled — the
     /// property the Windows Service Stop handler and Ctrl-C both rely on. Uses an

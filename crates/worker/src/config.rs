@@ -135,6 +135,12 @@ pub struct WorkerConfig {
     /// Shared cluster auth token (ADR 0006); `None` disables auth (presented empty).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_token: Option<String>,
+    /// Allows binding the UNAUTHENTICATED Worker Execution RPC to a non-loopback
+    /// (LAN-reachable) address; the Execution RPC has no caller auth yet, so a
+    /// non-loopback bind exposes unauthenticated remote code execution; MUST NEVER
+    /// be enabled in production; default false (loopback-only).
+    #[serde(default)]
+    pub unsafe_allow_insecure_execution_lan: bool,
     /// Admission capacity (max concurrent actions); `None` = machine parallelism.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capacity: Option<u32>,
@@ -182,6 +188,7 @@ impl Default for WorkerConfig {
             agent: None,
             advertise: None,
             cluster_token: None,
+            unsafe_allow_insecure_execution_lan: false,
             capacity: None,
             action_timeout_secs: None,
             launcher: None,
@@ -206,6 +213,12 @@ impl Default for WorkerConfig {
 /// from under the operator.
 fn empty_to_none(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+fn env_truthy(value: std::ffi::OsString) -> bool {
+    let value = value.to_string_lossy();
+    let trimmed = value.trim();
+    trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
 }
 
 /// Parses `SEMBAZURU_PARTICIPATION_MODE` (case-insensitive): `always` / `adaptive` /
@@ -276,6 +289,9 @@ impl WorkerConfig {
         }
         if let Some(v) = std::env::var_os("SEMBAZURU_CLUSTER_TOKEN") {
             self.cluster_token = empty_to_none(v.to_string_lossy().into_owned());
+        }
+        if let Some(v) = std::env::var_os("SEMBAZURU_UNSAFE_ALLOW_INSECURE_EXECUTION_LAN") {
+            self.unsafe_allow_insecure_execution_lan = env_truthy(v);
         }
         if let Ok(v) = std::env::var("SEMBAZURU_CAPACITY") {
             // Present-but-invalid (or zero) clears it → machine parallelism, matching
@@ -548,6 +564,7 @@ mod tests {
             agent: Some("http://10.0.0.1:50070".into()),
             advertise: Some("http://10.0.0.2:50061".into()),
             cluster_token: Some("s3cret".into()),
+            unsafe_allow_insecure_execution_lan: false,
             capacity: Some(8),
             action_timeout_secs: Some(1800),
             launcher: Some("C:\\sbz\\launcher.exe".into()),
@@ -745,6 +762,39 @@ mod tests {
             cfg.cluster_token.as_deref(),
             Some("  pad  "),
             "the cluster token is taken verbatim (no trim), matching the daemon's reader"
+        );
+    }
+
+    #[test]
+    fn unsafe_allow_insecure_execution_lan_defaults_off_and_env_opts_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let absent = tmp_file();
+
+        unsafe {
+            std::env::remove_var("SEMBAZURU_UNSAFE_ALLOW_INSECURE_EXECUTION_LAN");
+        }
+        assert_eq!(
+            WorkerConfig::load_effective(&absent),
+            WorkerConfig::default()
+        );
+
+        // SAFETY: serialized by ENV_LOCK; set, load, then clear.
+        unsafe {
+            std::env::set_var("SEMBAZURU_UNSAFE_ALLOW_INSECURE_EXECUTION_LAN", "1");
+        }
+        let cfg = WorkerConfig::load_effective(&absent);
+        unsafe {
+            std::env::remove_var("SEMBAZURU_UNSAFE_ALLOW_INSECURE_EXECUTION_LAN");
+        }
+        assert!(
+            cfg.unsafe_allow_insecure_execution_lan,
+            "SEMBAZURU_UNSAFE_ALLOW_INSECURE_EXECUTION_LAN=1 opts in"
+        );
+
+        let cfg = WorkerConfig::load_effective(&absent);
+        assert!(
+            !cfg.unsafe_allow_insecure_execution_lan,
+            "removing the env var restores the default-off setting"
         );
     }
 
