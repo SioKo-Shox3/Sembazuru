@@ -1,6 +1,6 @@
 # 0014 — action key v2（弱/強キーの実行 identity 被覆と観測 vector の取り込み）
 
-- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: **(2) の既定 `off`／verified-only 記録ポリシーは ACCEPTED（プロジェクトリード、2026-06-29。根拠＝実装 9c56295＋hardening 34895dc の `WEAK_KEY_SCHEMA` v3＋Codex/verifier(opus) 二重レビュー＋CI hooks M8.5/M8.4/M4/M6 緑）。(1) worker 再検証・(3) registry/enumerate 被覆は未実装で承認継続。**
+- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: **(2) の既定 `off`／verified-only 記録ポリシーは ACCEPTED（プロジェクトリード、2026-06-29。根拠＝実装 9c56295＋hardening 34895dc の `WEAK_KEY_SCHEMA` v3＋Codex/verifier(opus) 二重レビュー＋CI hooks M8.5/M8.4/M4/M6 緑）。(1) の worker 再検証は実装済み（cd7b8dc、CI hooks M4/M6 緑）。build-commit id・(3) registry/enumerate 被覆は未実装で承認継続。**
   出所: コードレビュー（COR-005／COR-004 残）。[ADR 0007](0007-arbitrary-process-distribution.md) §c の拡張。
   **実装済み（determinism-safe な部分集合＝key を「細かくする」だけ・false hit 不可・rebuild-hit ゲート不変）**:
   (1) のうち **cwd を weak key に追加**（COR-005 問題B＝cwd 埋込み false hit を閉鎖）、**weak-key schema
@@ -13,13 +13,16 @@
   `weak_fingerprint_changes_with_meaningful_inputs`・`action_result_decode_gates_on_magic_and_version`・
   `record_and_resolve_agree_for_same_resolved_toolchain`・`toolchain_digest_hashes_resolved_binary_and_tracks_content`・
   `memo_rehashes_after_ttl_...`。`verifier`(opus) で反証検証済み。M4 gate（cache_cli→weak_key）が agent 側解決を自動検証。
-  **未実装（determinism gate 連動・別環境/harness 要）**: (1) のうち **worker 再検証**（launcher が解決パス＋digest を
-  request に載せ worker が実際に起動する binary を再 digest 照合＝heterogeneous クラスタで agent≠worker の別 cl を
-  閉じる。proto field＋launcher＋worker 改修要）／build-commit id（build script）、(2) env profile 制（`VOLATILE_ENV`
+  **(1) worker 再検証は実装済み（2026-06-29、cd7b8dc）**: worker が起動した binary を自機 digest し
+  `ExitStatus.resolved_tool_digest`（proto field 5・additive）で報告、agent が weak key の toolchain digest と record
+  ゲートで照合し不一致/未報告は非記録（Codex+verifier(opus) 二重レビュー、CI hooks M4/M6 で homogeneous 命中継続を確認。
+  `toolchain_digest` は agent/worker 共有 `crates/cas/src/toolchain.rs`）。当初案の「launcher が request に digest を載せる」
+  ではなく、worker が `ExitStatus`（control.proto・既存 v0 プレーン）で報告する additive 設計に修正（実コードに ExecuteResponse は無い）。
+  **未実装（determinism gate 連動・別環境/harness 要）**: (1) のうち build-commit id（build script）、(2) env profile 制（`VOLATILE_ENV`
   見直しは出力影響 env を取りこぼすと **false hit** になりうるため determinism harness で実証必須）、(3)
   registry/enumerate/RMW 前状態の key 取り込み or uncacheable 化。
   **受容残存**: agent 側解決は agent 上の binary を digest する＝heterogeneous で worker が別 cl を走らせる場合は
-  今日の定数同様に衝突しうる（**不悪化**・worker 再検証で閉鎖）／memo の TTL 窓（mtime 保存＋同一長＋TTL 内）は
+  今日の定数同様に衝突しうる（**worker 再検証で閉鎖済み**: cd7b8dc）／memo の TTL 窓（mtime 保存＋同一長＋TTL 内）は
   ≤TTL の transient stale（永続化せず self-heal）。
 - 決めること: action cache キーが**実行 identity と観測入力をどこまで被覆するか**。**(1) weak key の identity 拡張**、
   **(2) env policy（profile 制）**、**(3) 観測済み非 key vector の扱い**、**(4) codec 版管理**。
