@@ -36,10 +36,10 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 | RES-001 | P1 | **CLOSED** | worker capacity clamp＋FileClient per-op timeout＋agent console バッファ 8 MiB 上限（PR#1/#2）。prefetch 件数/per-op 件数の上限は LAN-trusted で低優先（必要なら同パターンで追加可） |
 | CFG-001 | P1 | **CLOSED** | daemon＋worker とも破損 config を起動拒否（load_or_refuse）＋atomic save（PR#1/#2） |
 | MAINT-001 | P3 | **PARTIAL** | local fallback 理由を typed `LocalFallbackReason` 化（脆い `starts_with("route-away")` 契約を除去, commit c657c0f）。codec の magic/version は COR-005/007 で付与済み。残る大物（C++ hook の 4 ファイル分割・winsvc 共通 crate・action lifecycle state machine・ActionContext 引数束ね）は欠陥でなく意図的リファクタ＝計画的に実施 |
-| TEST-001 | P2 | **PARTIAL** | cache 正当性ゲートの大半はユニットテスト済み（absent→present/under-temp/truncated/concurrent-first-touch/cwd/PATH-resolved/multi-output-partial/stdout）＋codec 決定的 fuzz（commit c6cb607）。残り＝security 非 admin 系（B-machine）・fuzzing harness・supply-chain CI（cargo-audit/deny・SHA pin・CodeQL・SBOM）＝CI/実機バックログ |
+| TEST-001 | P2 | **PARTIAL→残=非 admin のみ** | cache 正当性ゲートの大半はユニットテスト済み＋codec 決定的 fuzz（c6cb607）。**supply-chain CI 実装・CI 緑**（cargo-deny advisories/licenses/bans/sources＋`deny.toml`・CycloneDX SBOM・C++ hooks の CodeQL、SHA-pin、b480b28、CI #109＋CodeQL run success）。**property-based fuzzing harness 実装・CI 緑**（proptest で dataplane wire/ops decode＋cas ActionResult codec の no-panic＋round-trip、f159b41、workspace 303）。SHA-pin は 8584537 で済。**残り＝security 非 admin 系のみ**（2 ユーザー/admin 権限の B-machine、当環境で安全に検証不能） |
 | DOC-001 | P3 | **CLOSED** | 本ステータス表が指摘状態を同期（doc とコードの整合） |
 
-**未クローズで実装が残るのは実機/CI-infra に依存する 2 件のみ**: SEC-001 本道（named-pipe+impersonation・要実機 M9.5/M10）、TEST-001 残ゲート（非 admin/CI-infra）。いずれも当環境で安全に完了不能＝lead/後続マイルストーン。それ以外は全て CLOSED または現脅威モデルで受容（DEFERRED-ACCEPTED）。COR-004 本道（既定 cache off／verified-only）は 2026-06-29 にクローズ（9c56295＋hardening 34895dc、決定者承認＋CI 緑）。**COR-005 の heterogeneous worker 再検証**も 2026-06-29 にクローズ（worker が起動 binary を digest 報告→agent 照合・不一致は非記録、Pass A a19c125＋Pass B cd7b8dc、二重レビュー＋CI hooks M4/M6 緑）。
+**未クローズで実装が残るのは実 Windows サービス/2 ユーザー/EDR に依存する 2 件のみ**: SEC-001 本道（named-pipe transport＋`ImpersonateNamedPipeClient`＋非 LocalSystem・要実機 M9.5/M10）、TEST-001 の security 非 admin 系テスト（2 ユーザー/admin の B-machine）。いずれも当環境で安全に検証不能＝lead/後続マイルストーン（検証できない特権分離コードは非交渉 #1 により実装しない）。それ以外は全て CLOSED または現脅威モデルで受容（DEFERRED-ACCEPTED）。2026-06-29 にクローズ: **COR-004**（既定 cache off／verified-only、9c56295＋34895dc）、**COR-005** heterogeneous worker 再検証（worker digest 報告→agent 照合、a19c125＋cd7b8dc）、**TEST-001 の supply-chain CI**（cargo-deny＋SBOM＋CodeQL、b480b28）と **property-based fuzzing harness**（proptest no-panic、f159b41）。いずれも CI（#106/#107/#109＋CodeQL run）緑。
 
 ---
 
