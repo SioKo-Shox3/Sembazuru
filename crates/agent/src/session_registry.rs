@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
@@ -96,6 +96,8 @@ pub struct SessionCapability {
     /// Live data-plane connections bound to this session (RAII via [`ConnGuard`]),
     /// so the idle sweeper never reaps a session with work in flight.
     conns: AtomicUsize,
+    /// Terminal ADD-001 gate: finished sessions reject late data-plane ops.
+    closed: AtomicBool,
     /// `true` for a registry-bound session (enforce authoritative root + digest
     /// ACL + output scope). `false` for the legacy/unscoped capability an old
     /// worker (empty session id) or a test gets — it preserves the pre-ADR-0013
@@ -113,6 +115,7 @@ impl SessionCapability {
             writebacks: Mutex::new(HashMap::new()),
             created: Instant::now(),
             conns: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
             enforce,
         }
     }
@@ -126,6 +129,16 @@ impl SessionCapability {
     /// Whether this is a bound (enforcing) session vs a legacy/unscoped one.
     pub fn enforces(&self) -> bool {
         self.enforce
+    }
+
+    /// Marks this capability closed after its action session finishes.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this capability has been closed by session finish.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     /// Pins `requested`'s current bytes into `store` on first touch and returns
@@ -268,12 +281,19 @@ impl SessionRegistry {
         self.sessions.lock().await.get(session_id).cloned()
     }
 
-    /// Destroys a session when its action finishes (any outcome), dropping the
-    /// pin partition, allowed-digest ACL, and writeback table. The shared store's
+    /// Destroys a session when its action finishes (any outcome), removing the
+    /// registry entry and marking the live capability closed so a lingering
+    /// data-plane connection cannot run late ops (ADD-001). The shared store's
     /// blobs are NOT deleted (other sessions may share them). Returns whether an
     /// entry was present.
     pub async fn finish(&self, session_id: &str) -> bool {
-        self.sessions.lock().await.remove(session_id).is_some()
+        match self.sessions.lock().await.remove(session_id) {
+            Some(cap) => {
+                cap.close();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Binds a live connection to a session, bumping its connection refcount and
@@ -364,6 +384,36 @@ mod tests {
         assert!(reg.finish("sess-A").await);
         assert!(!reg.finish("sess-A").await, "second finish is a no-op");
         assert!(reg.get("sess-A").await.is_none());
+        assert_eq!(reg.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn finish_marks_live_connection_capability_closed() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg.create("sess-live".into(), None, HashSet::new()).await;
+        let held = cap.clone();
+        let _guard = SessionRegistry::bind(held.clone());
+
+        assert!(!held.is_closed());
+        assert!(reg.finish("sess-live").await);
+        assert!(
+            held.is_closed(),
+            "finish must close a still-referenced capability"
+        );
+        assert_eq!(reg.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn closed_session_cleanup_does_not_panic() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("sess-cleanup".into(), None, HashSet::new())
+            .await;
+        let guard = SessionRegistry::bind(cap);
+
+        assert!(reg.finish("sess-cleanup").await);
+        drop(guard);
+        assert_eq!(reg.sweep_idle(Duration::ZERO).await, 0);
         assert_eq!(reg.session_count().await, 0);
     }
 

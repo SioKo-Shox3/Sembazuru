@@ -568,6 +568,74 @@ async fn start_server_with_registry(
     addr
 }
 
+#[tokio::test]
+async fn late_open_read_after_finish_is_rejected() {
+    let dir = TempDir::new("late-open");
+    let path = dir.write("input.h", b"input bytes");
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create("late-open".into(), root, Default::default())
+        .await;
+    let addr = start_server_with_registry(registry.clone()).await;
+    let client = connect_bound(addr, "late-open").await;
+
+    let got = client.fetch(&path).await.unwrap().expect("live fetch");
+    assert_eq!(got.0, b"input bytes");
+    assert!(registry.finish("late-open").await);
+
+    let late = client.open_read(&path, false).await.unwrap();
+    assert!(!late.exists, "a finished session must hide late OpenRead");
+}
+
+#[tokio::test]
+async fn late_read_after_finish_is_rejected() {
+    let dir = TempDir::new("late-read");
+    let path = dir.write("input.h", b"read me after pin");
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create("late-read".into(), root, Default::default())
+        .await;
+    let addr = start_server_with_registry(registry.clone()).await;
+    let client = connect_bound(addr, "late-read").await;
+
+    let (digest, size) = client.probe_digest(&path).await.unwrap().expect("exists");
+    assert!(registry.finish("late-read").await);
+    assert!(
+        client.fetch_by_digest(&digest, size).await.is_err(),
+        "a finished session must reject late Read"
+    );
+}
+
+#[tokio::test]
+async fn late_writeback_after_finish_is_rejected() {
+    let dir = TempDir::new("late-writeback");
+    let input = dir.write("input.h", b"prove connection is live");
+    let out = dir.join("out/late.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create("late-writeback".into(), root, Default::default())
+        .await;
+    let addr = start_server_with_registry(registry.clone()).await;
+    let client = connect_bound(addr, "late-writeback").await;
+
+    assert!(client.fetch(&input).await.unwrap().is_some());
+    assert!(registry.finish("late-writeback").await);
+
+    let resp = client.write_back(&out, b"must not publish").await.unwrap();
+    assert!(!resp.ok, "late WriteBack must be a hard reject");
+    assert_eq!(resp.detail, "session is closed");
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "late WriteBack must not create the output"
+    );
+}
+
 fn assert_permission_denied_contains(result: std::io::Result<FileClient>, needle: &str) {
     match result {
         Ok(_) => panic!("connect should have been rejected"),

@@ -511,10 +511,9 @@ async fn run_submission(
     metrics.record_outcome(&outcome);
     emit_outcome(&tx, outcome).await;
 
-    // The action is done: drop the agent-authoritative session (ADR 0013) — its
-    // pin partition, allowed-digest ACL, and writeback table. A worker connection
-    // that lingers briefly holds a ConnGuard, so the entry's capability stays
-    // alive until that closes; the idle sweeper is only a backstop for a crash.
+    // The action is done: finish the agent-authoritative session (ADR 0013).
+    // finish() also closes the live capability, so a lingering ConnGuard cannot
+    // run late data-plane ops; the idle sweeper is only a backstop for a crash.
     ctx.registry.finish(&session_id).await;
 }
 

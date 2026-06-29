@@ -445,6 +445,12 @@ async fn dispatch(
     map: &PathMap,
     stats: &ServerStats,
 ) -> Vec<u8> {
+    if cap.is_closed() {
+        // ADD-001: finished sessions may leave a lingering connection; no late
+        // op may run, and WriteBack is a hard reject.
+        return closed_response(op);
+    }
+
     match op {
         OpCode::StatBatch => match StatRequest::decode(payload) {
             Ok(req) => stat_batch(req, map, cap.root()).await.encode(),
@@ -482,6 +488,30 @@ async fn dispatch(
         },
         // A Hello only belongs as the first frame (handled in `handshake`); one
         // arriving mid-stream is a protocol error, answered with a rejection.
+        OpCode::Hello => HelloResponse {
+            ok: false,
+            detail: "unexpected handshake after session open".to_string(),
+        }
+        .encode(),
+    }
+}
+
+fn closed_response(op: OpCode) -> Vec<u8> {
+    match op {
+        OpCode::StatBatch => StatResponse { entries: vec![] }.encode(),
+        OpCode::OpenRead => not_found_open().encode(),
+        OpCode::Read => ReadResponse { bytes: vec![] }.encode(),
+        OpCode::DirList => DirListResponse {
+            exists: false,
+            entries: vec![],
+        }
+        .encode(),
+        OpCode::Has => HasResponse { present: vec![] }.encode(),
+        OpCode::WriteBack => WriteBackResponse {
+            ok: false,
+            detail: "session is closed".to_string(),
+        }
+        .encode(),
         OpCode::Hello => HelloResponse {
             ok: false,
             detail: "unexpected handshake after session open".to_string(),
