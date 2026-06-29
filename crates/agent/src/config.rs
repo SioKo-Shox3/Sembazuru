@@ -67,6 +67,12 @@ pub struct DaemonConfig {
     /// false.
     #[serde(default)]
     pub unsafe_legacy_dataplane_sessions: bool,
+    /// Allows binding Coordination / the file server to a non-loopback address
+    /// while worker auth is DISABLED (no cluster token); this exposes
+    /// rogue-worker registration and agent file supply to the LAN. MUST NEVER be
+    /// enabled in production. Default false.
+    #[serde(default)]
+    pub unsafe_allow_unauthenticated_lan: bool,
 }
 
 impl Default for DaemonConfig {
@@ -82,6 +88,7 @@ impl Default for DaemonConfig {
             cache_max_bytes: None,
             status_admin: false,
             unsafe_legacy_dataplane_sessions: false,
+            unsafe_allow_unauthenticated_lan: false,
         }
     }
 }
@@ -184,6 +191,9 @@ impl DaemonConfig {
             // Explicit dangerous opt-in for transitional/test data-plane
             // compatibility. Truthy matches SEMBAZURU_STATUS_ADMIN.
             self.unsafe_legacy_dataplane_sessions = env_truthy(v);
+        }
+        if let Some(v) = std::env::var_os("SEMBAZURU_UNSAFE_ALLOW_UNAUTHENTICATED_LAN") {
+            self.unsafe_allow_unauthenticated_lan = env_truthy(v);
         }
     }
 
@@ -479,6 +489,37 @@ mod tests {
         let cfg = DaemonConfig::load_effective(&path);
         assert!(
             !cfg.unsafe_legacy_dataplane_sessions,
+            "removing the env var restores the default-off behavior"
+        );
+    }
+
+    #[test]
+    fn unsafe_allow_unauthenticated_lan_defaults_off_and_env_opts_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = tmp_file();
+
+        unsafe {
+            std::env::remove_var("SEMBAZURU_UNSAFE_ALLOW_UNAUTHENTICATED_LAN");
+        }
+        let default_cfg = DaemonConfig::load_from(&path);
+        assert_eq!(default_cfg, DaemonConfig::default());
+        assert!(!default_cfg.unsafe_allow_unauthenticated_lan);
+
+        unsafe {
+            std::env::set_var("SEMBAZURU_UNSAFE_ALLOW_UNAUTHENTICATED_LAN", "1");
+        }
+        let cfg = DaemonConfig::load_effective(&path);
+        assert!(
+            cfg.unsafe_allow_unauthenticated_lan,
+            "SEMBAZURU_UNSAFE_ALLOW_UNAUTHENTICATED_LAN=1 opts in"
+        );
+
+        unsafe {
+            std::env::remove_var("SEMBAZURU_UNSAFE_ALLOW_UNAUTHENTICATED_LAN");
+        }
+        let cfg = DaemonConfig::load_effective(&path);
+        assert!(
+            !cfg.unsafe_allow_unauthenticated_lan,
             "removing the env var restores the default-off behavior"
         );
     }

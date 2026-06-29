@@ -29,18 +29,40 @@ use crate::status::{StatusState, evict_cache_to_cap, serve_status_service};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Warns loudly when an unauthenticated daemon exposes a LAN-reachable listener:
-/// auth disabled **and** a non-loopback bind means any host on the network can
-/// register a worker or read the agent's filesystem (ADR 0006; security F1).
-/// Loopback, or auth enabled, is fine and says nothing.
-fn warn_if_exposed(role: &str, addr: std::net::SocketAddr, auth_enabled: bool) {
-    if !auth_enabled && !addr.ip().is_loopback() {
-        eprintln!(
-            "sembazuru-daemon: WARNING: {role} listens on {addr} (non-loopback) with worker auth \
-             DISABLED — any host on this network can reach it. Set a cluster token (config or \
-             SEMBAZURU_CLUSTER_TOKEN) on the daemon and every worker to require auth (ADR 0006)."
-        );
+/// Refuses unauthenticated LAN-reachable Coordination/file-server binds by
+/// default. Loopback, or auth enabled, is fine. The unsafe override exists only
+/// for explicit transitional/test deployments and must never be used in
+/// production.
+fn refuse_unauthenticated_lan(
+    role: &str,
+    addr: std::net::SocketAddr,
+    auth_enabled: bool,
+    unsafe_allow_unauthenticated_lan: bool,
+) -> Result<(), BoxError> {
+    if auth_enabled || addr.ip().is_loopback() {
+        return Ok(());
     }
+    if unsafe_allow_unauthenticated_lan {
+        eprintln!(
+            "sembazuru-daemon: WARNING: {role} listens on {addr}; unauthenticated LAN bind \
+             allowed by unsafe override; never in production."
+        );
+        return Ok(());
+    }
+
+    let risk = if role == "Coordination" {
+        "register a rogue worker"
+    } else {
+        "read agent files"
+    };
+    Err(format!(
+        "refusing to bind {role} to non-loopback address {addr} with worker auth DISABLED: any \
+         host on this network could {risk}. Set a cluster token (config cluster_token or \
+         SEMBAZURU_CLUSTER_TOKEN) on the daemon and every worker, or set \
+         SEMBAZURU_UNSAFE_ALLOW_UNAUTHENTICATED_LAN=1 \
+         (unsafe_allow_unauthenticated_lan=true) to override - never in production."
+    )
+    .into())
 }
 
 /// Runs the daemon — Coordination + file supply + Scheduler + LocalIntake + the
@@ -74,11 +96,12 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         "sembazuru-daemon: Coordination on {}",
         coord_listener.local_addr()?
     );
-    warn_if_exposed(
+    refuse_unauthenticated_lan(
         "Coordination",
         coord_listener.local_addr()?,
         cluster_token.is_some(),
-    );
+        config.unsafe_allow_unauthenticated_lan,
+    )?;
     {
         let t = table.clone();
         let tok = cluster_token.clone();
@@ -95,7 +118,12 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     let file_listener = tokio::net::TcpListener::bind(&config.fileserver_addr).await?;
     let fileserver_addr = file_listener.local_addr()?;
     eprintln!("sembazuru-daemon: file server on {fileserver_addr}");
-    warn_if_exposed("file server", fileserver_addr, cluster_token.is_some());
+    refuse_unauthenticated_lan(
+        "file server",
+        fileserver_addr,
+        cluster_token.is_some(),
+        config.unsafe_allow_unauthenticated_lan,
+    )?;
     if config.unsafe_legacy_dataplane_sessions {
         eprintln!(
             "sembazuru-daemon: WARNING: UNSAFE legacy empty-session data-plane fallback is \
@@ -280,5 +308,74 @@ mod tests {
             .expect("run_daemon did not return within 5s of shutdown")
             .expect("run_daemon task panicked");
         assert!(res.is_ok(), "run_daemon returned an error: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn daemon_refuses_coord_lan_without_token() {
+        let config = DaemonConfig {
+            coord_addr: "0.0.0.0:0".into(),
+            cluster_token: None,
+            ..DaemonConfig::default()
+        };
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_daemon(config, CancellationToken::new()),
+        )
+        .await
+        .expect("run_daemon did not return within 5s")
+        .expect_err("daemon must refuse unauthenticated Coordination LAN bind");
+        let message = err.to_string();
+        assert!(message.contains("Coordination"), "{message}");
+        assert!(message.contains("non-loopback"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn daemon_refuses_fileserver_lan_without_token() {
+        let config = DaemonConfig {
+            coord_addr: "127.0.0.1:0".into(),
+            fileserver_addr: "0.0.0.0:0".into(),
+            cluster_token: None,
+            ..DaemonConfig::default()
+        };
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_daemon(config, CancellationToken::new()),
+        )
+        .await
+        .expect("run_daemon did not return within 5s")
+        .expect_err("daemon must refuse unauthenticated file server LAN bind");
+        let message = err.to_string();
+        assert!(message.contains("file server"), "{message}");
+    }
+
+    #[test]
+    fn daemon_allows_lan_with_cluster_token() {
+        assert!(
+            refuse_unauthenticated_lan("Coordination", "0.0.0.0:1".parse().unwrap(), true, false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn daemon_allows_loopback_without_token() {
+        assert!(
+            refuse_unauthenticated_lan(
+                "Coordination",
+                "127.0.0.1:1".parse().unwrap(),
+                false,
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn unsafe_override_allows_but_warns() {
+        assert!(
+            refuse_unauthenticated_lan("file server", "0.0.0.0:1".parse().unwrap(), false, true)
+                .is_ok()
+        );
     }
 }
