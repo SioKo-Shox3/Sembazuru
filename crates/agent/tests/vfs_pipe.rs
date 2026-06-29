@@ -10,6 +10,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
 
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct TempDir {
     path: PathBuf,
 }
@@ -37,6 +39,53 @@ async fn start_file_server() -> std::net::SocketAddr {
         let _ = sembazuru_agent::fileserver::serve_files(listener).await;
     });
     addr
+}
+
+async fn start_file_server_with_token(token: &str) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let token = token.to_string();
+    tokio::spawn(async move {
+        let _ = sembazuru_agent::fileserver::serve_files_with_stats_token(
+            listener,
+            stats,
+            Some(token),
+            registry,
+            true,
+        )
+        .await;
+    });
+    addr
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 /// Sends one hydrate request over the pipe and returns (status, local_path).
@@ -122,6 +171,53 @@ async fn pipe_hydrates_file_into_scratch() {
     let missing = dir.join("nope.h").to_string_lossy().into_owned();
     let (status, _) = pipe_hydrate(&full, &missing).await;
     assert_eq!(status, 1, "missing file is reported not-found");
+}
+
+#[tokio::test]
+async fn dataplane_uses_config_token_not_env() {
+    let _guard = ENV_LOCK.lock().await;
+    let _env = EnvVarGuard::set("SEMBAZURU_CLUSTER_TOKEN", "env-wrong");
+
+    let dir = TempDir::new("cfg-token");
+    let content = b"int token_source() { return 7; }\n";
+    let logical = dir.join("proj/token.cpp");
+    std::fs::create_dir_all(logical.parent().unwrap()).unwrap();
+    std::fs::write(&logical, content).unwrap();
+    let logical_str = logical.to_string_lossy().into_owned();
+
+    let addr = start_file_server_with_token("cfg-tok").await;
+    let scratch = dir.join("scratch");
+    let pipe_name = format!("sbz-vfs-token-{}", std::process::id());
+    let full = format!(r"\\.\pipe\{pipe_name}");
+    {
+        let pn = pipe_name.clone();
+        let sc = scratch.clone();
+        let cas = dir.join("worker-cas");
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = sembazuru_worker::vfs_pipe::serve_vfs_with_prefetch_ready(
+                &pn,
+                addr,
+                sc,
+                cas,
+                Duration::ZERO,
+                Vec::new(),
+                ready_tx,
+                String::new(),
+                String::new(),
+                "cfg-tok".to_string(),
+            )
+            .await;
+        });
+        ready_rx.await.expect("VFS pipe should become ready");
+    }
+
+    let (status, local) = pipe_hydrate(&full, &logical_str).await;
+    assert_eq!(
+        status, 0,
+        "hydrate should authenticate with the config token, not the env token"
+    );
+    assert_eq!(std::fs::read(&local).unwrap(), content, "bytes must match");
 }
 
 /// M4.2 "Done when" core: a second build transfers no file content for a path

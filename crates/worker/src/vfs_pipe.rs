@@ -181,7 +181,9 @@ pub async fn serve_vfs_with_prefetch(
         predicted_paths,
         ready,
         vfs_root,
-        // Wrappers serve the legacy/test path with no agent-minted session id.
+        // Wrappers serve the legacy/test path with no agent-minted session id
+        // and no auth token.
+        String::new(),
         String::new(),
     )
     .await
@@ -210,6 +212,7 @@ pub async fn serve_vfs_with_prefetch_ready(
     ready: tokio::sync::oneshot::Sender<()>,
     vfs_root: String,
     session_id: String,
+    auth_token: String,
 ) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     let state = Arc::new(VfsState {
@@ -218,9 +221,7 @@ pub async fn serve_vfs_with_prefetch_ready(
         cas: BlobStore::open(cas_root)?,
         agent_addr,
         rtt,
-        // Production token comes from the environment (ADR 0006); empty disables
-        // auth (the agent then accepts unconditionally).
-        auth_token: sembazuru_proto::auth::cluster_token_from_env().unwrap_or_default(),
+        auth_token,
         // Declared input root the agent scopes file supply to (M7.1).
         session_root: vfs_root,
         // Agent-minted session id (ADR 0013); empty on the wrapper/legacy path.
@@ -412,6 +413,7 @@ mod tests {
                 tx,
                 String::new(), // unscoped (this test never dials the agent)
                 String::new(), // no agent-minted session (legacy path)
+                String::new(), // no auth token
             )
             .await;
         });

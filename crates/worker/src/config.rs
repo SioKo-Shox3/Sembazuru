@@ -485,6 +485,7 @@ impl WorkerConfig {
             dll: PathBuf::from(self.dll.as_ref()?),
             scratch_root: PathBuf::from(self.scratch_root.as_ref()?),
             cas_root: PathBuf::from(self.cas_root.as_ref()?),
+            cluster_token: self.cluster_token.clone(),
         })
     }
 
@@ -679,6 +680,78 @@ mod tests {
         let vfs = full.vfs().expect("all four paths set");
         assert_eq!(vfs.launcher, PathBuf::from("l"));
         assert_eq!(vfs.cas_root, PathBuf::from("c"));
+    }
+
+    #[test]
+    fn worker_file_token_used_for_register_and_dataplane() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN");
+        }
+
+        let cfg = WorkerConfig {
+            cluster_token: Some("file-tok".into()),
+            launcher: Some("launcher.exe".into()),
+            dll: Some("sbz_interceptor64.dll".into()),
+            scratch_root: Some("scratch".into()),
+            cas_root: Some("cas".into()),
+            ..WorkerConfig::default()
+        };
+
+        assert_eq!(
+            cfg.cluster_token.as_deref(),
+            Some("file-tok"),
+            "register uses the resolved worker config token"
+        );
+        assert_eq!(
+            cfg.vfs()
+                .expect("all four VFS paths set")
+                .cluster_token
+                .as_deref(),
+            Some("file-tok"),
+            "data-plane VFS config uses the same resolved token"
+        );
+    }
+
+    #[test]
+    fn env_token_overrides_file_token() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN");
+        }
+        let path = tmp_file();
+        WorkerConfig {
+            cluster_token: Some("file-tok".into()),
+            launcher: Some("launcher.exe".into()),
+            dll: Some("sbz_interceptor64.dll".into()),
+            scratch_root: Some("scratch".into()),
+            cas_root: Some("cas".into()),
+            ..WorkerConfig::default()
+        }
+        .save_to(&path)
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("SEMBAZURU_CLUSTER_TOKEN", "env-tok");
+        }
+        let cfg = WorkerConfig::load_effective(&path);
+        unsafe {
+            std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN");
+        }
+
+        assert_eq!(
+            cfg.cluster_token.as_deref(),
+            Some("env-tok"),
+            "register uses the env-overridden resolved token"
+        );
+        assert_eq!(
+            cfg.vfs()
+                .expect("all four VFS paths set")
+                .cluster_token
+                .as_deref(),
+            Some("env-tok"),
+            "data-plane VFS config uses the same env-overridden token"
+        );
     }
 
     #[test]

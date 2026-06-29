@@ -58,6 +58,10 @@ pub struct WorkerVfsConfig {
     pub scratch_root: PathBuf,
     /// Worker-local content store, persisted across builds (M4 worker cache).
     pub cas_root: PathBuf,
+    /// Shared cluster token presented on the data-plane handshake, threaded from
+    /// the resolved WorkerConfig so a token set only in worker.toml reaches the
+    /// data plane; None/empty = no auth.
+    pub cluster_token: Option<String>,
 }
 
 /// Default admission capacity when none is given: the machine's parallelism.
@@ -645,6 +649,7 @@ async fn build_child(
     // failure drops `ready_tx`, so `ready_rx.await` errors and we fail closed.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let cas = cfg.cas_root.clone();
+    let auth_token = cfg.cluster_token.clone().unwrap_or_default();
     let pipe_for_task = pipe_name.clone();
     // Declare the action's input root so the agent scopes file supply to it
     // (M7.1): the worker only legitimately reads under vfs_root (the hook
@@ -661,6 +666,7 @@ async fn build_child(
             ready_tx,
             vfs_root,
             session_id,
+            auth_token,
         )
         .await
     });
