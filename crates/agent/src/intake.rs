@@ -441,6 +441,14 @@ async fn run_submission(
         .dispatch(command, action_id, session_id.clone(), opts)
         .await;
 
+    // dispatch() returns only after the worker's terminal Execute event (after
+    // the child exits): the action is done and no legitimate data-plane op
+    // remains. Finish before cache record/publish so lingering/detached
+    // connections cannot run late post-processing ops, future 2-machine
+    // WriteBack cannot race cache record/publish, the ADD-001 closed gate
+    // rejects any late detached read, and the idle sweeper stays a crash backstop.
+    ctx.registry.finish(&session_id).await;
+
     // Record a successful remote run so the next identical build hits. Needs the
     // trace (from the DLL); the outputs come from the launcher's declaration when
     // it had one, else they are discovered from the trace itself (ADR 0007 §b —
@@ -510,11 +518,6 @@ async fn run_submission(
 
     metrics.record_outcome(&outcome);
     emit_outcome(&tx, outcome).await;
-
-    // The action is done: finish the agent-authoritative session (ADR 0013).
-    // finish() also closes the live capability, so a lingering ConnGuard cannot
-    // run late data-plane ops; the idle sweeper is only a backstop for a crash.
-    ctx.registry.finish(&session_id).await;
 }
 
 /// Mirrors a dispatch outcome as the terminal events. dispatch always completes
