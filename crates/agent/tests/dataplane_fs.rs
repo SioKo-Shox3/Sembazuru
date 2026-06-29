@@ -39,14 +39,47 @@ impl Drop for TempDir {
     }
 }
 
-/// Starts the agent file server on an ephemeral port; returns its address.
-async fn start_server() -> std::net::SocketAddr {
+/// Starts the production-mode agent file server on an ephemeral port; returns
+/// its address and a pre-created unscoped bound session id.
+async fn start_server() -> (std::net::SocketAddr, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let session_id = "authsess".to_string();
+    registry
+        .create(session_id.clone(), None, Default::default())
+        .await;
+    tokio::spawn(async move {
+        let _ = sembazuru_agent::fileserver::serve_files_with_stats_token(
+            listener, stats, None, registry, false,
+        )
+        .await;
+    });
+    (addr, session_id)
+}
+
+/// Starts the legacy no-token helper with empty-session compatibility enabled.
+async fn start_legacy_server() -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let _ = sembazuru_agent::fileserver::serve_files(listener).await;
     });
     addr
+}
+
+async fn connect_bound(addr: std::net::SocketAddr, session_id: &str) -> FileClient {
+    FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        session_id.to_string(),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -56,8 +89,8 @@ async fn fetch_returns_exact_bytes_and_verifies_digest() {
     let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
     let path = dir.write("sub/main.cpp", &big);
 
-    let addr = start_server().await;
-    let client = FileClient::connect(addr).await.unwrap();
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
 
     let (bytes, digest) = client
         .fetch(&path)
@@ -83,8 +116,8 @@ async fn snapshot_pins_content_against_midbuild_edits() {
     let v1 = b"version-ONE-content".to_vec();
     let path = dir.write("hdr.h", &v1);
 
-    let addr = start_server().await;
-    let client = FileClient::connect(addr).await.unwrap();
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
 
     // Digest-first open pins v1 in the agent's CAS.
     let (digest, size) = client
@@ -116,8 +149,8 @@ async fn has_probe_reports_agent_cas_membership() {
     let dir = TempDir::new("has");
     let path = dir.write("a.h", b"ingest me\n");
 
-    let addr = start_server().await;
-    let client = FileClient::connect(addr).await.unwrap();
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
 
     let (digest, _) = client.probe_digest(&path).await.unwrap().expect("exists");
     let absent = sembazuru_cas::Digest::of(b"never ingested").canonical();
@@ -135,8 +168,8 @@ async fn stat_batch_reports_existence_per_path() {
     let present = dir.write("a.h", b"#pragma once\n");
     let absent = dir.join("b.h").to_string_lossy().into_owned();
 
-    let addr = start_server().await;
-    let client = FileClient::connect(addr).await.unwrap();
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
 
     let resp = client.stat_batch(&[present, absent]).await.expect("rpc ok");
     assert_eq!(resp.entries.len(), 2);
@@ -147,20 +180,21 @@ async fn stat_batch_reports_existence_per_path() {
 
 #[tokio::test]
 async fn write_back_publishes_atomically_and_verifies_digest() {
-    use sembazuru_dataplane::ops::{WriteBackRequest, WriteBackResponse};
-    use sembazuru_dataplane::wire::{FrameHeader, OpCode, decode_frame, encode_frame};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use sembazuru_dataplane::async_io::{read_frame, write_frame};
+    use sembazuru_dataplane::ops::{
+        HelloRequest, HelloResponse, WriteBackRequest, WriteBackResponse,
+    };
+    use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+    use tokio::io::AsyncWriteExt;
 
     let dir = TempDir::new("wb");
     let out = dir.join("out/a.obj").to_string_lossy().into_owned();
     let bytes = b"\x00\x01OBJ-bytes\xff".to_vec();
 
-    let addr = start_server().await;
+    let (addr, session_id) = start_server().await;
 
     // A good WriteBack publishes the bytes at the requested path.
-    let client = sembazuru_worker::fileclient::FileClient::connect(addr)
-        .await
-        .unwrap();
+    let client = connect_bound(addr, &session_id).await;
     let resp = client.write_back(&out, &bytes).await.unwrap();
     assert!(resp.ok, "write-back should succeed: {}", resp.detail);
     assert_eq!(std::fs::read(&out).unwrap(), bytes, "published bytes match");
@@ -179,6 +213,29 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     // A corrupted transfer (digest does not match the bytes) is rejected, and no
     // torn output is published. Send a hand-built frame with a wrong digest.
     let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let hello_payload = HelloRequest {
+        token: String::new(),
+        root: String::new(),
+        session_id: session_id.clone(),
+    }
+    .encode();
+    write_frame(
+        &mut sock,
+        FrameHeader {
+            request_id: 0,
+            op: OpCode::Hello,
+            is_response: false,
+        },
+        &hello_payload,
+    )
+    .await
+    .unwrap();
+    sock.flush().await.unwrap();
+    let (hello_header, hello_payload) = read_frame(&mut sock).await.unwrap();
+    assert_eq!(hello_header.op, OpCode::Hello);
+    assert!(hello_header.is_response);
+    assert!(HelloResponse::decode(&hello_payload).unwrap().ok);
+
     let bad = dir.join("out/bad.obj").to_string_lossy().into_owned();
     let payload = WriteBackRequest {
         path: bad.clone(),
@@ -189,22 +246,20 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
         last: true,
     }
     .encode();
-    let framed = encode_frame(
+    write_frame(
+        &mut sock,
         FrameHeader {
             request_id: 1,
             op: OpCode::WriteBack,
             is_response: false,
         },
         &payload,
-    );
-    sock.write_all(&framed).await.unwrap();
-    let mut len = [0u8; 4];
-    sock.read_exact(&mut len).await.unwrap();
-    let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
-    sock.read_exact(&mut body).await.unwrap();
-    let full = [&len[..], &body[..]].concat();
-    let (_h, rp, _n) = decode_frame(&full).unwrap();
-    let wbr = WriteBackResponse::decode(rp).unwrap();
+    )
+    .await
+    .unwrap();
+    sock.flush().await.unwrap();
+    let (_h, rp) = read_frame(&mut sock).await.unwrap();
+    let wbr = WriteBackResponse::decode(&rp).unwrap();
     assert!(!wbr.ok, "digest mismatch must be rejected");
     assert!(
         !std::path::Path::new(&bad).exists(),
@@ -224,8 +279,8 @@ async fn write_back_streams_large_output_in_chunks() {
         .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
         .collect();
 
-    let addr = start_server().await;
-    let client = FileClient::connect(addr).await.unwrap();
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
 
     let resp = client.write_back(&out, &big).await.unwrap();
     assert!(
@@ -247,8 +302,8 @@ async fn dir_list_snapshots_a_directory() {
     dir.write("inc/stdlib.h", b"yy");
     std::fs::create_dir_all(dir.join("inc/sys")).unwrap();
 
-    let addr = start_server().await;
-    let client = FileClient::connect(addr).await.unwrap();
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
 
     let inc = dir.join("inc").to_string_lossy().into_owned();
     let resp = client.dir_list(&inc, 0).await.expect("rpc ok");
@@ -274,8 +329,8 @@ async fn one_connection_multiplexes_concurrent_ops() {
         paths.push((dir.write(&format!("tu{i}.cpp"), body.as_bytes()), body));
     }
 
-    let addr = start_server().await;
-    let client = FileClient::connect(addr).await.unwrap();
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
 
     // Fire all fetches concurrently on clones of the one connection.
     let mut handles = Vec::new();
@@ -370,6 +425,7 @@ async fn start_server_with_token(token: &str) -> std::net::SocketAddr {
             stats,
             Some(token),
             registry,
+            true,
         )
         .await;
     });
@@ -413,7 +469,7 @@ async fn declared_root_scopes_file_supply() {
     let outside = TempDir::new("scope-outside");
     let secret = outside.write("secret.txt", b"must never be supplied");
 
-    let addr = start_server().await; // agent is unscoped; scope comes from the client
+    let addr = start_legacy_server().await; // agent is unscoped; scope comes from the client
     let client = FileClient::connect_with_rtt_session(
         addr,
         Duration::ZERO,
@@ -467,7 +523,7 @@ async fn declared_root_scopes_file_supply() {
     );
     // Sanity: the same agent, unscoped, WOULD have served it (proves the file is
     // real and readable, so the scoping is what blocked it).
-    let addr2 = start_server().await;
+    let addr2 = start_legacy_server().await;
     let unscoped = FileClient::connect(addr2).await.unwrap();
     assert!(
         unscoped.fetch(&secret).await.unwrap().is_some(),
@@ -505,11 +561,156 @@ async fn start_server_with_registry(
     let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
     tokio::spawn(async move {
         let _ = sembazuru_agent::fileserver::serve_files_with_stats_token(
-            listener, stats, None, registry,
+            listener, stats, None, registry, false,
         )
         .await;
     });
     addr
+}
+
+fn assert_permission_denied_contains(result: std::io::Result<FileClient>, needle: &str) {
+    match result {
+        Ok(_) => panic!("connect should have been rejected"),
+        Err(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                e.to_string().contains(needle),
+                "expected error to contain {needle:?}, got: {e}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hello_unknown_nonempty_session_id_is_rejected() {
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let addr = start_server_with_registry(registry).await;
+
+    let result = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "nosuch".into(),
+    )
+    .await;
+    assert_permission_denied_contains(result, "unknown or expired");
+}
+
+#[tokio::test]
+async fn hello_expired_session_id_is_rejected() {
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    registry
+        .create("expired".into(), None, Default::default())
+        .await;
+    assert!(registry.finish("expired").await);
+    let addr = start_server_with_registry(registry).await;
+
+    let result = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "expired".into(),
+    )
+    .await;
+    assert_permission_denied_contains(result, "unknown or expired");
+}
+
+#[tokio::test]
+async fn hello_empty_session_id_rejected_in_production_mode() {
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let addr = start_server_with_registry(registry).await;
+
+    let result = FileClient::connect(addr).await;
+    assert_permission_denied_contains(result, "session id required");
+}
+
+#[tokio::test]
+async fn legacy_empty_session_id_allowed_only_in_test_compat_mode() {
+    let dir = TempDir::new("legacy-empty");
+    let path = dir.write("ok.h", b"legacy bytes");
+
+    let legacy_addr = start_legacy_server().await;
+    let legacy = FileClient::connect(legacy_addr)
+        .await
+        .expect("legacy helper accepts empty session id");
+    let got = legacy
+        .fetch(&path)
+        .await
+        .unwrap()
+        .expect("legacy server serves file");
+    assert_eq!(got.0, b"legacy bytes");
+
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let prod_addr = start_server_with_registry(registry).await;
+    let result = FileClient::connect(prod_addr).await;
+    assert_permission_denied_contains(result, "session id required");
+}
+
+#[tokio::test]
+async fn unknown_session_cannot_open_any_file() {
+    let dir = TempDir::new("unknown-open");
+    let path = dir.write("src.h", b"session-bound");
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    registry
+        .create("valid".into(), None, Default::default())
+        .await;
+    let addr = start_server_with_registry(registry).await;
+
+    let result = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "unknown".into(),
+    )
+    .await;
+    assert_permission_denied_contains(result, "unknown or expired");
+
+    let valid = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "valid".into(),
+    )
+    .await
+    .unwrap();
+    let got = valid
+        .fetch(&path)
+        .await
+        .unwrap()
+        .expect("valid session serves");
+    assert_eq!(got.0, b"session-bound");
+}
+
+#[tokio::test]
+async fn unknown_session_cannot_writeback_any_path() {
+    let dir = TempDir::new("unknown-wb");
+    let out = dir.join("out/evil.obj");
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let addr = start_server_with_registry(registry).await;
+
+    let result = FileClient::connect_with_rtt_session(
+        addr,
+        Duration::ZERO,
+        String::new(),
+        String::new(),
+        "unknown".into(),
+    )
+    .await;
+    assert_permission_denied_contains(result, "unknown or expired");
+    assert!(
+        !out.exists(),
+        "unknown session must not be able to publish an output"
+    );
 }
 
 #[tokio::test]

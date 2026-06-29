@@ -102,7 +102,10 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         let tok = cluster_token.clone();
         let reg = registry.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_files_with_stats_token(file_listener, stats, tok, reg).await {
+            // production rejects empty/unknown session ids (ADD-002); wired from config in a later commit.
+            if let Err(e) =
+                serve_files_with_stats_token(file_listener, stats, tok, reg, false).await
+            {
                 eprintln!("sembazuru-daemon: file server exited: {e}");
             }
         });

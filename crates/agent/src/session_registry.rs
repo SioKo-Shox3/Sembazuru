@@ -257,8 +257,10 @@ impl SessionRegistry {
         cap
     }
 
-    /// Looks up a session by the id the worker presented on its Hello. `None` for
-    /// an empty/unknown id → the file server uses a legacy/unscoped capability.
+    /// Returns the bound capability for a known session id, or `None` for an empty
+    /// or unknown/expired id; in production the file server now rejects that at the
+    /// handshake (only an explicitly-enabled legacy-compat mode treats an empty id
+    /// as the legacy/unscoped path).
     pub async fn get(&self, session_id: &str) -> Option<Arc<SessionCapability>> {
         if session_id.is_empty() {
             return None;

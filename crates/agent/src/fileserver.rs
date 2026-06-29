@@ -16,9 +16,11 @@
 //! scheduler created (via the [`crate::session_registry::SessionRegistry`]), the
 //! connection binds to that session's capability and reads are scoped to the
 //! AGENT's root (not the worker-declared one), pins are per-session, and Read/Has
-//! are gated to the session's pinned digests. A worker that sends an empty/unknown
-//! session id (a pre-ADR-0013 worker or a test) falls back to the legacy per-
-//! connection scoping by the worker-declared root — the pre-0013 behaviour.
+//! are gated to the session's pinned digests. A worker that sends an unknown or
+//! expired non-empty session id is rejected and is never downgraded to legacy
+//! scoping. An empty session id is rejected in production; only explicit
+//! test/harness compatibility mode accepts it as the legacy per-connection scope
+//! by the worker-declared root.
 //!
 //! A [`PathMap`] optionally remaps a requested *logical* path to a different
 //! *backing* file. Identity mapping is the real deployment; the remap exists so
@@ -109,6 +111,7 @@ pub async fn serve_files(listener: TcpListener) -> io::Result<()> {
         Arc::new(ServerStats::default()),
         None,
         Arc::new(SessionRegistry::new()?),
+        true,
     )
     .await
 }
@@ -126,6 +129,7 @@ pub async fn serve_files_with_stats(
         stats,
         None,
         Arc::new(SessionRegistry::new()?),
+        true,
     )
     .await
 }
@@ -141,8 +145,17 @@ pub async fn serve_files_with_stats_token(
     stats: Arc<ServerStats>,
     expected_token: Option<String>,
     registry: Arc<SessionRegistry>,
+    legacy_sessions_enabled: bool,
 ) -> io::Result<()> {
-    serve_with_map(listener, PathMap::Identity, stats, expected_token, registry).await
+    serve_with_map(
+        listener,
+        PathMap::Identity,
+        stats,
+        expected_token,
+        registry,
+        legacy_sessions_enabled,
+    )
+    .await
 }
 
 /// Serves with paths under `logical_root` remapped to `backing_root`. For tests
@@ -162,6 +175,7 @@ pub async fn serve_files_remap(
         Arc::new(ServerStats::default()),
         None,
         Arc::new(SessionRegistry::new()?),
+        true,
     )
     .await
 }
@@ -172,6 +186,7 @@ async fn serve_with_map(
     stats: Arc<ServerStats>,
     expected_token: Option<String>,
     registry: Arc<SessionRegistry>,
+    legacy_sessions_enabled: bool,
 ) -> io::Result<()> {
     let map = Arc::new(map);
     let expected_token = Arc::new(expected_token);
@@ -182,7 +197,7 @@ async fn serve_with_map(
         let st = stats.clone();
         let tok = expected_token.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(sock, reg, m, st, tok).await;
+            let _ = handle_conn(sock, reg, m, st, tok, legacy_sessions_enabled).await;
         });
     }
 }
@@ -193,6 +208,7 @@ async fn handle_conn(
     map: Arc<PathMap>,
     stats: Arc<ServerStats>,
     expected_token: Arc<Option<String>>,
+    legacy_sessions_enabled: bool,
 ) -> io::Result<()> {
     // Pipelining (M5.3): read requests off the connection and dispatch each on
     // its own task, writing responses (tagged with the request id) as they
@@ -207,20 +223,20 @@ async fn handle_conn(
     // bind this connection to the agent's OWN authoritative capability — its scope
     // root, per-session pin partition, allowed-digest set, and output scope —
     // **ignoring the worker-declared root** (closing the worker-can-widen-scope
-    // hole, SEC-004). An empty/unknown id (a pre-ADR-0013 worker or a test) gets a
-    // legacy per-connection capability that uses the worker-declared root — the
-    // old behaviour, so a mixed cluster and the existing tests keep working.
-    let (session_id, worker_root) =
-        match handshake(&mut rd, &mut wr, expected_token.as_deref()).await? {
-            HandshakeResult::Reject => return Ok(()), // rejected; connection closed
-            HandshakeResult::Accept {
-                session_id,
-                worker_root,
-            } => (session_id, worker_root),
-        };
-    let cap = match registry.get(&session_id).await {
-        Some(c) => c,
-        None => SessionRegistry::legacy_capability(worker_root),
+    // hole, SEC-004). Unknown or expired non-empty ids are rejected and never
+    // downgraded to legacy. Empty ids are rejected in production and accepted only
+    // when a test/harness explicitly enables legacy compatibility.
+    let cap = match handshake(
+        &mut rd,
+        &mut wr,
+        expected_token.as_deref(),
+        registry.as_ref(),
+        legacy_sessions_enabled,
+    )
+    .await?
+    {
+        HandshakeResult::Reject => return Ok(()), // rejected; connection closed
+        HandshakeResult::Accept { cap } => cap,
     };
     // Hold a connection guard for the connection's whole life so the idle sweeper
     // never reaps a session that still has a live data-plane connection.
@@ -256,14 +272,32 @@ async fn handle_conn(
 enum HandshakeResult {
     /// Bad token (or malformed/absent Hello): a rejection was sent; close.
     Reject,
-    /// Accepted: the agent-minted `session_id` from the Hello (empty = a
-    /// pre-ADR-0013 worker), and the worker-declared root normalized for the
-    /// legacy fallback (`None` = unscoped). A bound session ignores `worker_root`
-    /// and uses its own authoritative root.
-    Accept {
-        session_id: String,
-        worker_root: Option<String>,
-    },
+    /// Accepted: the resolved session capability. A bound session uses the
+    /// agent-authoritative root; an explicitly enabled legacy empty-id session
+    /// uses the worker-declared root.
+    Accept { cap: Arc<SessionCapability> },
+}
+
+async fn resolve_session(
+    registry: &SessionRegistry,
+    legacy_sessions_enabled: bool,
+    session_id: String,
+    worker_root: Option<String>,
+) -> Result<Arc<SessionCapability>, &'static str> {
+    // Belt-and-suspenders: registry.get also returns None for an empty id,
+    // so neither check alone is assumed to be the sole guard.
+    if session_id.is_empty() {
+        if legacy_sessions_enabled {
+            Ok(SessionRegistry::legacy_capability(worker_root))
+        } else {
+            Err("session id required")
+        }
+    } else {
+        registry
+            .get(&session_id)
+            .await
+            .ok_or("unknown or expired session id")
+    }
 }
 
 /// Normalizes a declared root for prefix comparison: lowercased, `/`→`\`, no
@@ -336,15 +370,19 @@ fn path_in_scope(requested: &str, root: Option<&str>) -> bool {
 
 /// Server side of the session-open handshake (M7.0 auth + M7.1 scoping). The
 /// peer's first frame must be a `Hello` carrying the cluster token and the
-/// declared root; this validates the token and replies with the verdict, then
-/// returns the normalized root to scope supply to. A rejection is sent before
-/// closing so the client surfaces a clean `PermissionDenied`, not a bare reset.
-/// EOF before the handshake is just a peer that connected and left. The reason
-/// is a fixed safe string (no secret, no internal path; M7 §5).
+/// declared root; this validates the token, resolves the session id, and replies
+/// with the verdict. Unknown/expired non-empty ids are rejected and never
+/// downgraded to legacy. Empty ids are rejected unless the caller explicitly
+/// enabled legacy test/harness compatibility. A rejection is sent before closing
+/// so the client surfaces a clean `PermissionDenied`, not a bare reset. EOF
+/// before the handshake is just a peer that connected and left. The reason is a
+/// fixed safe string (no secret, no internal path; M7 §5).
 async fn handshake(
     rd: &mut tokio::net::tcp::OwnedReadHalf,
     wr: &mut tokio::net::tcp::OwnedWriteHalf,
     expected: Option<&str>,
+    registry: &SessionRegistry,
+    legacy_sessions_enabled: bool,
 ) -> io::Result<HandshakeResult> {
     use tokio::io::AsyncWriteExt;
 
@@ -360,12 +398,16 @@ async fn handshake(
         Ok(Err(e)) => return Err(e),
         Err(_) => return Ok(HandshakeResult::Reject),
     };
-    // Validate the token; on success carry the agent-minted session id and the
-    // worker-declared root (the latter only used for the legacy fallback) out.
-    let decision: Result<(String, Option<String>), &'static str> = if header.op == OpCode::Hello {
+    // Validate the token; on success resolve the agent-minted session id to the
+    // capability this connection will hold for its lifetime.
+    let decision: Result<Arc<SessionCapability>, &'static str> = if header.op == OpCode::Hello {
         match HelloRequest::decode(&payload) {
             Ok(h) => match sembazuru_proto::auth::check(expected, &h.token) {
-                Ok(()) => Ok((h.session_id, normalize_root(&h.root))),
+                Ok(()) => {
+                    let worker_root = normalize_root(&h.root);
+                    resolve_session(registry, legacy_sessions_enabled, h.session_id, worker_root)
+                        .await
+                }
                 Err(reason) => Err(reason),
             },
             Err(_) => Err("malformed handshake"),
@@ -390,10 +432,7 @@ async fn handshake(
     .await?;
     wr.flush().await?;
     Ok(match decision {
-        Ok((session_id, worker_root)) => HandshakeResult::Accept {
-            session_id,
-            worker_root,
-        },
+        Ok(cap) => HandshakeResult::Accept { cap },
         Err(_) => HandshakeResult::Reject,
     })
 }
