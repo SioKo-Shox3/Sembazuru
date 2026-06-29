@@ -61,6 +61,12 @@ pub struct DaemonConfig {
     /// predates this field still loads (as `false`).
     #[serde(default)]
     pub status_admin: bool,
+    /// Enables the pre-ADR-0013 empty-session-id legacy data-plane fallback:
+    /// unscoped, any-path, worker-declared-root capability. MUST NEVER be
+    /// enabled in production; transitional/test compatibility only. Default
+    /// false.
+    #[serde(default)]
+    pub unsafe_legacy_dataplane_sessions: bool,
 }
 
 impl Default for DaemonConfig {
@@ -75,6 +81,7 @@ impl Default for DaemonConfig {
             cluster_token: None,
             cache_max_bytes: None,
             status_admin: false,
+            unsafe_legacy_dataplane_sessions: false,
         }
     }
 }
@@ -88,6 +95,12 @@ impl Default for DaemonConfig {
 /// normalized out from under the operator.
 fn empty_to_none(s: String) -> Option<String> {
     (!s.is_empty()).then_some(s)
+}
+
+fn env_truthy(value: std::ffi::OsString) -> bool {
+    let value = value.to_string_lossy();
+    let trimmed = value.trim();
+    trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
 }
 
 impl DaemonConfig {
@@ -165,9 +178,12 @@ impl DaemonConfig {
         if let Some(v) = std::env::var_os("SEMBAZURU_STATUS_ADMIN") {
             // Opt-in for the mutating Status RPCs (SEC-001 / ADR 0016). Truthy =
             // `1`/`true` (case-insensitive); anything else (incl. empty) is false.
-            let v = v.to_string_lossy();
-            let t = v.trim();
-            self.status_admin = t == "1" || t.eq_ignore_ascii_case("true");
+            self.status_admin = env_truthy(v);
+        }
+        if let Some(v) = std::env::var_os("SEMBAZURU_UNSAFE_LEGACY_DATAPLANE_SESSIONS") {
+            // Explicit dangerous opt-in for transitional/test data-plane
+            // compatibility. Truthy matches SEMBAZURU_STATUS_ADMIN.
+            self.unsafe_legacy_dataplane_sessions = env_truthy(v);
         }
     }
 
@@ -433,6 +449,37 @@ mod tests {
             cfg.cache_root.as_deref(),
             Some("C:\\from-file"),
             "a field with no env var keeps the file value"
+        );
+    }
+
+    #[test]
+    fn unsafe_legacy_dataplane_sessions_defaults_off_and_env_opts_in() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = tmp_file();
+
+        unsafe {
+            std::env::remove_var("SEMBAZURU_UNSAFE_LEGACY_DATAPLANE_SESSIONS");
+        }
+        let default_cfg = DaemonConfig::load_from(&path);
+        assert_eq!(default_cfg, DaemonConfig::default());
+        assert!(!default_cfg.unsafe_legacy_dataplane_sessions);
+
+        unsafe {
+            std::env::set_var("SEMBAZURU_UNSAFE_LEGACY_DATAPLANE_SESSIONS", "1");
+        }
+        let cfg = DaemonConfig::load_effective(&path);
+        assert!(
+            cfg.unsafe_legacy_dataplane_sessions,
+            "SEMBAZURU_UNSAFE_LEGACY_DATAPLANE_SESSIONS=1 opts in"
+        );
+
+        unsafe {
+            std::env::remove_var("SEMBAZURU_UNSAFE_LEGACY_DATAPLANE_SESSIONS");
+        }
+        let cfg = DaemonConfig::load_effective(&path);
+        assert!(
+            !cfg.unsafe_legacy_dataplane_sessions,
+            "removing the env var restores the default-off behavior"
         );
     }
 

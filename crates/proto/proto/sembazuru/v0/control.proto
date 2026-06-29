@@ -66,10 +66,13 @@ message Capabilities {
   // authoritative session — its own scope root (not the worker-declared one),
   // a per-session pin partition, an allowed-digest set, and the declared output
   // set (ADR 0013, closing COR-001/SEC-003/SEC-004/PROTO-001-predictability).
-  // A worker that does not advertise this sends an empty session_id and the agent
-  // falls back to the legacy per-connection, worker-declared-root scoping — so a
-  // mixed cluster keeps working. Gating is by capability flag, not version
-  // sniffing (§6); the operative runtime signal is the non-empty session_id.
+  // A worker that does not advertise this sends an empty session_id. As of
+  // ADD-002, production rejects an empty or unknown/expired session_id at the
+  // data-plane handshake. The legacy empty-session fallback is reachable only
+  // through the explicit unsafe `unsafe_legacy_dataplane_sessions` opt-in for
+  // transitional/test compatibility; never enable that path in production.
+  // Gating is by capability flag, not version sniffing (§6); the operative
+  // runtime signal is the non-empty session_id.
   bool supports_session_capability = 10;
 }
 

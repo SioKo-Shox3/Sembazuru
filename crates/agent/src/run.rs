@@ -96,15 +96,31 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     let fileserver_addr = file_listener.local_addr()?;
     eprintln!("sembazuru-daemon: file server on {fileserver_addr}");
     warn_if_exposed("file server", fileserver_addr, cluster_token.is_some());
+    if config.unsafe_legacy_dataplane_sessions {
+        eprintln!(
+            "sembazuru-daemon: WARNING: UNSAFE legacy empty-session data-plane fallback is \
+             ENABLED; it reopens the pre-ADR-0013 unscoped/any-path, worker-declared-root \
+             capability for empty session ids. NEVER use this in production."
+        );
+    }
     let server_stats = Arc::new(ServerStats::default());
     {
         let stats = server_stats.clone();
         let tok = cluster_token.clone();
         let reg = registry.clone();
+        let legacy_sessions_enabled = config.unsafe_legacy_dataplane_sessions;
         tokio::spawn(async move {
-            // production rejects empty/unknown session ids (ADD-002); wired from config in a later commit.
-            if let Err(e) =
-                serve_files_with_stats_token(file_listener, stats, tok, reg, false).await
+            // Empty/unknown session ids are rejected by default (ADD-002); the
+            // legacy empty-session compatibility path is wired from config and
+            // defaults off.
+            if let Err(e) = serve_files_with_stats_token(
+                file_listener,
+                stats,
+                tok,
+                reg,
+                legacy_sessions_enabled,
+            )
+            .await
             {
                 eprintln!("sembazuru-daemon: file server exited: {e}");
             }
