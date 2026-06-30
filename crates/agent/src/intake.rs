@@ -31,7 +31,7 @@ use tonic::{Request, Response, Status};
 
 use crate::action_cache::{AgentCache, CacheLookup};
 use crate::scheduler::Scheduler;
-use crate::session_registry::SessionRegistry;
+use crate::session_registry::{DEFAULT_OUTPUT_MAX_BYTES, OutputSpec, SessionRegistry};
 use crate::status::Metrics;
 use crate::{ExecOptions, ExecuteError, Execution};
 
@@ -437,17 +437,23 @@ async fn run_submission(
     // Open the agent-authoritative session BEFORE dispatch (ADR 0013), so the
     // worker's Hello — carrying this session_id — finds it and binds to the
     // agent's scope root + per-session pin partition + allowed-digest ACL +
-    // normalized declared-output authority. Trace-discovered outputs are cache
-    // record inputs only; they do not grant WriteBack authority (SEC-003).
-    let declared: std::collections::HashSet<String> = declared_outputs
+    // normalized output-id authority. Trace-discovered outputs are cache record
+    // inputs only; they do not grant WriteBack authority (SEC-003).
+    let outputs: Vec<OutputSpec> = declared_outputs
         .iter()
         .filter_map(|p| crate::fileserver::normalize_requested(p))
+        .enumerate()
+        .map(|(id, normalized)| OutputSpec {
+            id: id as u32,
+            final_path: PathBuf::from(normalized),
+            max_size: DEFAULT_OUTPUT_MAX_BYTES,
+        })
         .collect();
     ctx.registry
         .create(
             session_id.clone(),
             crate::fileserver::normalize_root(&vfs_root),
-            declared,
+            outputs,
         )
         .await;
 

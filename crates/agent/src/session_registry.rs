@@ -14,7 +14,7 @@
 //! This registry makes the agent the authority. The scheduler/intake mints an
 //! unpredictable `session_id` (see `intake::mint_session_id`) and `create`s a
 //! [`SessionCapability`] holding the agent's *own* normalized input root, the
-//! action's declared output set, a **per-session** pin partition (with per-path
+//! action's declared output specs, a **per-session** pin partition (with per-path
 //! single-flight so two concurrent first-touches cannot pin different bytes), and
 //! an allowed-digest ACL grown as the session pins inputs. The worker forwards the
 //! id on its data-plane Hello; the file server looks the session up and enforces
@@ -33,7 +33,7 @@
 //! the *shared* cluster token, so the agent cannot prove the peer presenting a
 //! session id is the worker it was dispatched to. A token-holding worker that
 //! *captures* another session's (128-bit, unguessable) id can bind it and reach
-//! that session's scope — but only its authoritative root + declared outputs,
+//! that session's scope — but only its authoritative root + output specs,
 //! never `c:\`/arbitrary writes. Closing the theft needs proof that the peer
 //! presenting the id is the worker the action was dispatched to, which the data
 //! plane cannot do under a flat shared token; the fix is a per-session capability
@@ -51,6 +51,18 @@ use std::time::{Duration, Instant};
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use tokio::sync::{Mutex, OnceCell};
 
+/// Default per-output WriteBack cap (8 GiB).
+pub const DEFAULT_OUTPUT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Agent-authoritative publish target + size cap for one declared output; worker
+/// references it by id only and never names a path.
+#[derive(Debug, Clone)]
+pub struct OutputSpec {
+    pub id: u32,
+    pub final_path: std::path::PathBuf,
+    pub max_size: u64,
+}
+
 /// Disambiguates the registry's temp content-store directory within a process.
 static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -58,7 +70,7 @@ static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// at first touch. `Arc` so concurrent racers of the same path share one cell.
 type PinCell = Arc<OnceCell<(Digest, u64)>>;
 
-/// In-progress streamed WriteBack for one output path: the temp file being
+/// In-progress streamed WriteBack for one output id: the temp file being
 /// appended to, how many bytes have landed (the next expected offset), and the
 /// running digest so the whole output is verified without buffering it. Lives
 /// per session now (was a field of the process-wide `Session`).
@@ -69,7 +81,7 @@ pub struct WritebackState {
 }
 
 /// The agent's authority over one action's data-plane session: the scope root it
-/// dispatched, the action's declared outputs, the per-session pin partition (with
+/// dispatched, the action's output specs, the per-session pin partition (with
 /// per-path single-flight), the allowed-digest ACL, and the in-progress streamed
 /// outputs. Shared (`Arc`) across every data-plane connection that opens with this
 /// session's id; dropped — partition and all — when the action finishes.
@@ -78,9 +90,9 @@ pub struct SessionCapability {
     /// the value the agent dispatched, NOT the worker-declared Hello root, so a
     /// worker cannot widen its own scope (SEC-004).
     root: Option<String>,
-    /// The action's declared output set (normalized). WriteBack targets are
-    /// restricted to this exactly — SEC-003.
-    declared_outputs: HashSet<String>,
+    /// Output id → agent-authoritative output spec. WriteBack names only the id;
+    /// the path and size cap remain controlled by the agent — SEC-003.
+    outputs: HashMap<u32, OutputSpec>,
     /// Requested logical path → a single-flight cell yielding the `(digest, size)`
     /// pinned at first touch. The `OnceCell` makes exactly one task read the file
     /// and ingest it; concurrent racers await it and observe the SAME frozen
@@ -90,8 +102,8 @@ pub struct SessionCapability {
     /// and `Has` are gated to this set, so a digest learned out-of-band (e.g. from
     /// another session) cannot be fetched/probed here.
     allowed_digests: Mutex<HashSet<Digest>>,
-    /// Output path → in-progress streamed WriteBack, per session.
-    writebacks: Mutex<HashMap<String, WritebackState>>,
+    /// Output id → in-progress streamed WriteBack, per session.
+    writebacks: Mutex<HashMap<u32, WritebackState>>,
     created: Instant,
     /// Live data-plane connections bound to this session (RAII via [`ConnGuard`]),
     /// so the idle sweeper never reaps a session with work in flight.
@@ -101,15 +113,16 @@ pub struct SessionCapability {
     /// `true` for a registry-bound session (enforce authoritative root + digest
     /// ACL + output scope). `false` for the legacy/unscoped capability an old
     /// worker (empty session id) or a test gets — it preserves the pre-ADR-0013
-    /// behaviour (worker-declared root, any CAS digest readable, any output path).
+    /// behaviour for reads (worker-declared root, any CAS digest readable). It
+    /// still has no output specs, so WriteBack ids remain unauthorized.
     enforce: bool,
 }
 
 impl SessionCapability {
-    fn new(root: Option<String>, declared_outputs: HashSet<String>, enforce: bool) -> Self {
+    fn new(root: Option<String>, outputs: HashMap<u32, OutputSpec>, enforce: bool) -> Self {
         SessionCapability {
             root,
-            declared_outputs,
+            outputs,
             pinned: Mutex::new(HashMap::new()),
             allowed_digests: Mutex::new(HashSet::new()),
             writebacks: Mutex::new(HashMap::new()),
@@ -186,19 +199,15 @@ impl SessionCapability {
         !self.enforce || self.allowed_digests.lock().await.contains(digest)
     }
 
-    /// Whether a (already-normalized) output path may be written for this session
-    /// (SEC-003). A legacy session allows any path. A bound session may write
-    /// ONLY its declared outputs; an empty declared set forbids all WriteBack.
-    pub fn output_allowed(&self, normalized_output: &str) -> bool {
-        if !self.enforce {
-            return true;
-        }
-        self.declared_outputs.contains(normalized_output)
+    /// Returns the agent-authoritative output spec for `output_id`, if this
+    /// session declared it. Unknown ids have no WriteBack authority.
+    pub fn output_spec(&self, output_id: u32) -> Option<OutputSpec> {
+        self.outputs.get(&output_id).cloned()
     }
 
     /// The in-progress streamed-output table for this session (the file server's
     /// `write_back` locks it per chunk).
-    pub fn writebacks(&self) -> &Mutex<HashMap<String, WritebackState>> {
+    pub fn writebacks(&self) -> &Mutex<HashMap<u32, WritebackState>> {
         &self.writebacks
     }
 }
@@ -251,15 +260,19 @@ impl SessionRegistry {
 
     /// Mints a bound session: the scheduler/intake calls this right after minting
     /// the (unpredictable) `session_id`, with the agent's OWN normalized input
-    /// root and the action's declared outputs. Returns the capability (also stored
+    /// root and the action's output specs. Returns the capability (also stored
     /// in the map so the data-plane Hello can find it).
     pub async fn create(
         &self,
         session_id: String,
         root: Option<String>,
-        declared_outputs: HashSet<String>,
+        outputs: Vec<OutputSpec>,
     ) -> Arc<SessionCapability> {
-        let cap = Arc::new(SessionCapability::new(root, declared_outputs, true));
+        let outputs = outputs
+            .into_iter()
+            .map(|spec| (spec.id, spec))
+            .collect::<HashMap<_, _>>();
+        let cap = Arc::new(SessionCapability::new(root, outputs, true));
         self.sessions.lock().await.insert(session_id, cap.clone());
         cap
     }
@@ -300,12 +313,12 @@ impl SessionRegistry {
 
     /// A legacy/unscoped, NON-registered capability for the pre-ADR-0013 path: an
     /// old worker (empty session id) or a test. It uses the worker-declared `root`,
-    /// reads any digest in the shared store, and allows any WriteBack path — i.e.
-    /// the exact behaviour before this change. Each connection gets its own (its
-    /// pins are connection-local), which is at worst tighter than the old shared
-    /// pin map and never staler.
+    /// reads any digest in the shared store, but has no declared output specs, so
+    /// WriteBack ids are still rejected unless a caller explicitly created a bound
+    /// session with specs. Each connection gets its own pins (connection-local),
+    /// which is at worst tighter than the old shared pin map and never staler.
     pub fn legacy_capability(root: Option<String>) -> Arc<SessionCapability> {
-        Arc::new(SessionCapability::new(root, HashSet::new(), false))
+        Arc::new(SessionCapability::new(root, HashMap::new(), false))
     }
 
     /// Reaps bound sessions older than `ttl` that have no live connection — a
@@ -362,11 +375,22 @@ mod tests {
             .create(
                 "sess-A".into(),
                 root_str(Path::new("c:\\proj")),
-                HashSet::new(),
+                vec![OutputSpec {
+                    id: 7,
+                    final_path: PathBuf::from("c:\\proj\\obj\\a.obj"),
+                    max_size: 123,
+                }],
             )
             .await;
         assert!(cap.enforces());
         assert_eq!(cap.root(), Some("c:\\proj"));
+        let spec = cap.output_spec(7).expect("declared output spec");
+        assert_eq!(spec.final_path, PathBuf::from("c:\\proj\\obj\\a.obj"));
+        assert_eq!(spec.max_size, 123);
+        assert!(
+            cap.output_spec(8).is_none(),
+            "unknown output ids have no authority"
+        );
         assert!(reg.get("sess-A").await.is_some());
         assert!(
             reg.get("").await.is_none(),
@@ -384,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn finish_marks_live_connection_capability_closed() {
         let reg = SessionRegistry::new().unwrap();
-        let cap = reg.create("sess-live".into(), None, HashSet::new()).await;
+        let cap = reg.create("sess-live".into(), None, Vec::new()).await;
         let held = cap.clone();
         let _guard = SessionRegistry::bind(held.clone());
 
@@ -400,9 +424,7 @@ mod tests {
     #[tokio::test]
     async fn closed_session_cleanup_does_not_panic() {
         let reg = SessionRegistry::new().unwrap();
-        let cap = reg
-            .create("sess-cleanup".into(), None, HashSet::new())
-            .await;
+        let cap = reg.create("sess-cleanup".into(), None, Vec::new()).await;
         let guard = SessionRegistry::bind(cap);
 
         assert!(reg.finish("sess-cleanup").await);
@@ -421,7 +443,7 @@ mod tests {
         let dir = tmp("pin");
         let f = dir.join("a.cpp");
         std::fs::write(&f, b"v1-original").unwrap();
-        let cap = reg.create("s".into(), None, HashSet::new()).await;
+        let cap = reg.create("s".into(), None, Vec::new()).await;
 
         let (r1, r2) = tokio::join!(
             cap.pin(reg.store(), "a.cpp", f.clone()),
@@ -464,8 +486,8 @@ mod tests {
         std::fs::write(&mine, b"mine").unwrap();
         std::fs::write(&theirs, b"theirs").unwrap();
 
-        let a = reg.create("A".into(), None, HashSet::new()).await;
-        let b = reg.create("B".into(), None, HashSet::new()).await;
+        let a = reg.create("A".into(), None, Vec::new()).await;
+        let b = reg.create("B".into(), None, Vec::new()).await;
         let (d_mine, _) = a.pin(reg.store(), "mine.h", mine.clone()).await.unwrap();
         let (d_theirs, _) = b
             .pin(reg.store(), "theirs.h", theirs.clone())
@@ -490,42 +512,41 @@ mod tests {
 
     #[tokio::test]
     async fn writeback_scope_restricts_to_declared_outputs() {
-        // Declared outputs gate WriteBack for a bound session; with none declared
-        // all WriteBack is refused. A legacy session allows anything.
-        let mut outs = HashSet::new();
-        outs.insert("c:\\proj\\obj\\a.obj".to_string());
+        // Declared output specs gate WriteBack for a bound session; with none
+        // declared all WriteBack ids are refused.
+        let mut outs = HashMap::new();
+        outs.insert(
+            0,
+            OutputSpec {
+                id: 0,
+                final_path: PathBuf::from("c:\\proj\\obj\\a.obj"),
+                max_size: DEFAULT_OUTPUT_MAX_BYTES,
+            },
+        );
         let bound = SessionCapability::new(root_str(Path::new("c:\\proj")), outs, true);
-        assert!(
-            bound.output_allowed("c:\\proj\\obj\\a.obj"),
-            "declared output allowed"
-        );
-        assert!(
-            !bound.output_allowed("c:\\proj\\obj\\evil.obj"),
-            "an undeclared output is refused even within root"
-        );
+        let spec = bound.output_spec(0).expect("declared output allowed");
+        assert_eq!(spec.final_path, PathBuf::from("c:\\proj\\obj\\a.obj"));
+        assert_eq!(spec.max_size, DEFAULT_OUTPUT_MAX_BYTES);
+        assert!(bound.output_spec(1).is_none(), "unknown id is refused");
 
         // No declared outputs → no WriteBack authority, even within root.
         let bound_no_decl =
-            SessionCapability::new(root_str(Path::new("c:\\proj")), HashSet::new(), true);
+            SessionCapability::new(root_str(Path::new("c:\\proj")), HashMap::new(), true);
         assert!(
-            !bound_no_decl.output_allowed("c:\\proj\\bin\\x.exe"),
-            "an in-root output is refused when nothing is declared (SEC-003)"
-        );
-        assert!(
-            !bound_no_decl.output_allowed("c:\\windows\\system32\\evil.dll"),
-            "an out-of-root output is refused when nothing is declared (SEC-003)"
+            bound_no_decl.output_spec(0).is_none(),
+            "no id is valid when nothing is declared (SEC-003)"
         );
 
-        // Legacy: any path (pre-ADR-0013 behaviour).
+        // Legacy has no output specs, so WriteBack ids are not authorized there.
         let legacy = SessionRegistry::legacy_capability(None);
-        assert!(legacy.output_allowed("c:\\anywhere\\at\\all"));
+        assert!(legacy.output_spec(0).is_none());
     }
 
     #[tokio::test]
     async fn idle_sweeper_reaps_only_old_unconnected_sessions() {
         let reg = SessionRegistry::new().unwrap();
-        let old = reg.create("old".into(), None, HashSet::new()).await;
-        let _young = reg.create("young".into(), None, HashSet::new()).await;
+        let old = reg.create("old".into(), None, Vec::new()).await;
+        let _young = reg.create("young".into(), None, Vec::new()).await;
 
         // A connection on `old` protects it from the sweeper even though it is old.
         let guard = SessionRegistry::bind(old.clone());
@@ -558,7 +579,7 @@ mod tests {
         let reg = SessionRegistry::new().unwrap();
         let dir = tmp("absent-pin");
         let f = dir.join("late.h");
-        let cap = reg.create("s".into(), None, HashSet::new()).await;
+        let cap = reg.create("s".into(), None, Vec::new()).await;
 
         // Absent at first touch → None, and NOT frozen.
         assert!(cap.pin(reg.store(), "late.h", f.clone()).await.is_none());

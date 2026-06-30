@@ -555,28 +555,19 @@ fn tmp_sibling(final_path: &std::path::Path) -> PathBuf {
 /// the final name, so the build never sees a torn output (§3.2) and a large
 /// `.pdb`/`.exe` is never buffered whole in memory (M4.4).
 ///
-/// **Output scope (SEC-003, ADR 0013).** A bound session may only write to its
-/// declared outputs — closing the hole where a worker named any absolute
-/// agent-side path. A legacy/unscoped session keeps the pre-ADR-0013 any-path
-/// behaviour. The target is otherwise NOT remapped — the agent publishes where
-/// the action's output goes.
+/// **Output scope (SEC-003, ADR 0013).** The worker names only an `output_id`.
+/// The bound session resolves that id to the agent-owned final path and
+/// per-output size cap. Unknown ids are rejected before any directory or temp
+/// file is created.
 async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBackResponse {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-    // Gate the target BEFORE creating any directory or temp: a bound session's
-    // output must normalize to a drive-absolute path that was declared. A
-    // non-normalizable form (UNC/relative/drive-escaping) is refused.
-    if cap.enforces() {
-        let allowed = match normalize_requested(&req.path) {
-            Some(norm) => cap.output_allowed(&norm),
-            None => false,
-        };
-        if !allowed {
-            return wb_err("WriteBack target is not a declared output of this session".into());
-        }
-    }
+    let spec = match cap.output_spec(req.output_id) {
+        Some(spec) => spec,
+        None => return wb_err("unknown output id".into()),
+    };
 
-    let final_path = PathBuf::from(&req.path);
+    let final_path = spec.final_path.clone();
     let mut wbs = cap.writebacks().lock().await;
 
     // offset 0 (re)starts the stream: ensure the dir, create a fresh temp.
@@ -591,7 +582,7 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
             return wb_io_err("create temp failed", e);
         }
         wbs.insert(
-            req.path.clone(),
+            req.output_id,
             WritebackState {
                 tmp,
                 written: 0,
@@ -600,9 +591,8 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         );
     }
 
-    // Append this chunk to the temp and fold it into the running digest.
-    {
-        let Some(state) = wbs.get_mut(&req.path) else {
+    let new_written = {
+        let Some(state) = wbs.get_mut(&req.output_id) else {
             return wb_err("WriteBack chunk arrived without a begin (offset 0)".into());
         };
         if req.offset != state.written {
@@ -611,6 +601,25 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
                 req.offset, state.written
             ));
         }
+        match state.written.checked_add(req.bytes.len() as u64) {
+            Some(new_written) if new_written <= spec.max_size => Ok(new_written),
+            _ => Err(state.tmp.clone()),
+        }
+    };
+    let new_written = match new_written {
+        Ok(new_written) => new_written,
+        Err(tmp) => {
+            wbs.remove(&req.output_id);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return wb_err("output exceeds max size".into());
+        }
+    };
+
+    // Append this chunk to the temp and fold it into the running digest.
+    {
+        let state = wbs
+            .get_mut(&req.output_id)
+            .expect("state present after size check");
         match tokio::fs::OpenOptions::new()
             .write(true)
             .open(&state.tmp)
@@ -627,7 +636,7 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
             Err(e) => return wb_io_err("open temp failed", e),
         }
         state.hasher.update(&req.bytes);
-        state.written += req.bytes.len() as u64;
+        state.written = new_written;
     }
 
     if !req.last {
@@ -639,7 +648,7 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
 
     // Final chunk: verify the whole output and publish atomically.
     let state = wbs
-        .remove(&req.path)
+        .remove(&req.output_id)
         .expect("state present (just appended)");
     let actual = state.hasher.finalize().canonical();
     if actual != req.digest_hex {

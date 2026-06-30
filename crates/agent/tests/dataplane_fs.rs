@@ -4,10 +4,10 @@
 //! Read with digest verification, and DirList — before the C++ hook/pipe (M3.2b)
 //! is layered on. No compiler or DLL involved.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use sembazuru_agent::session_registry::{DEFAULT_OUTPUT_MAX_BYTES, OutputSpec};
 use sembazuru_worker::fileclient::FileClient;
 
 /// A self-cleaning temp directory, so the test needs no `tempfile` dependency.
@@ -40,14 +40,23 @@ impl Drop for TempDir {
     }
 }
 
-fn declared_outputs(paths: &[&str]) -> HashSet<String> {
+fn output_specs(paths: &[(u32, &str)]) -> Vec<OutputSpec> {
     paths
         .iter()
-        .map(|p| {
-            sembazuru_agent::fileserver::normalize_requested(p)
-                .expect("test output paths must be drive-absolute")
+        .map(|(id, path)| OutputSpec {
+            id: *id,
+            final_path: PathBuf::from(path),
+            max_size: DEFAULT_OUTPUT_MAX_BYTES,
         })
         .collect()
+}
+
+fn output_spec(id: u32, path: &str, max_size: u64) -> OutputSpec {
+    OutputSpec {
+        id,
+        final_path: PathBuf::from(path),
+        max_size,
+    }
 }
 
 /// Starts the production-mode agent file server on an ephemeral port; returns
@@ -91,6 +100,64 @@ async fn connect_bound(addr: std::net::SocketAddr, session_id: &str) -> FileClie
     )
     .await
     .unwrap()
+}
+
+async fn connect_raw_bound(addr: std::net::SocketAddr, session_id: &str) -> tokio::net::TcpStream {
+    use sembazuru_dataplane::async_io::{read_frame, write_frame};
+    use sembazuru_dataplane::ops::{HelloRequest, HelloResponse};
+    use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+    use tokio::io::AsyncWriteExt;
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let hello_payload = HelloRequest {
+        token: String::new(),
+        root: String::new(),
+        session_id: session_id.to_string(),
+    }
+    .encode();
+    write_frame(
+        &mut sock,
+        FrameHeader {
+            request_id: 0,
+            op: OpCode::Hello,
+            is_response: false,
+        },
+        &hello_payload,
+    )
+    .await
+    .unwrap();
+    sock.flush().await.unwrap();
+    let (hello_header, hello_payload) = read_frame(&mut sock).await.unwrap();
+    assert_eq!(hello_header.op, OpCode::Hello);
+    assert!(hello_header.is_response);
+    assert!(HelloResponse::decode(&hello_payload).unwrap().ok);
+    sock
+}
+
+async fn send_raw_writeback(
+    sock: &mut tokio::net::TcpStream,
+    request_id: u64,
+    payload: Vec<u8>,
+) -> sembazuru_dataplane::ops::WriteBackResponse {
+    use sembazuru_dataplane::async_io::{read_frame, write_frame};
+    use sembazuru_dataplane::ops::WriteBackResponse;
+    use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+    use tokio::io::AsyncWriteExt;
+
+    write_frame(
+        sock,
+        FrameHeader {
+            request_id,
+            op: OpCode::WriteBack,
+            is_response: false,
+        },
+        &payload,
+    )
+    .await
+    .unwrap();
+    sock.flush().await.unwrap();
+    let (_h, rp) = read_frame(sock).await.unwrap();
+    WriteBackResponse::decode(&rp).unwrap()
 }
 
 #[tokio::test]
@@ -191,12 +258,7 @@ async fn stat_batch_reports_existence_per_path() {
 
 #[tokio::test]
 async fn write_back_publishes_atomically_and_verifies_digest() {
-    use sembazuru_dataplane::async_io::{read_frame, write_frame};
-    use sembazuru_dataplane::ops::{
-        HelloRequest, HelloResponse, WriteBackRequest, WriteBackResponse,
-    };
-    use sembazuru_dataplane::wire::{FrameHeader, OpCode};
-    use tokio::io::AsyncWriteExt;
+    use sembazuru_dataplane::ops::WriteBackRequest;
 
     let dir = TempDir::new("wb");
     let out = dir.join("out/a.obj").to_string_lossy().into_owned();
@@ -210,21 +272,21 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
         .create(
             session_id.clone(),
             None,
-            declared_outputs(&[out.as_str(), bad.as_str()]),
+            output_specs(&[(0, out.as_str()), (1, bad.as_str())]),
         )
         .await;
     let addr = start_server_with_registry(registry).await;
 
-    // A good WriteBack publishes the bytes at the requested path.
+    // A good WriteBack publishes the bytes at the path resolved from output id 0.
     let client = connect_bound(addr, &session_id).await;
-    let resp = client.write_back(&out, &bytes).await.unwrap();
+    let resp = client.write_back(0, &bytes).await.unwrap();
     assert!(resp.ok, "write-back should succeed: {}", resp.detail);
     assert_eq!(std::fs::read(&out).unwrap(), bytes, "published bytes match");
 
     // Re-publishing over an existing output must replace it atomically (the
     // rename-over-existing case a rebuild hits every time).
     let bytes2 = b"\x02REBUILT-obj\x03".to_vec();
-    let resp2 = client.write_back(&out, &bytes2).await.unwrap();
+    let resp2 = client.write_back(0, &bytes2).await.unwrap();
     assert!(resp2.ok, "re-publish should replace: {}", resp2.detail);
     assert_eq!(
         std::fs::read(&out).unwrap(),
@@ -233,33 +295,11 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     );
 
     // A corrupted transfer (digest does not match the bytes) is rejected, and no
-    // torn output is published. Send a hand-built frame with a wrong digest.
-    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let hello_payload = HelloRequest {
-        token: String::new(),
-        root: String::new(),
-        session_id: session_id.clone(),
-    }
-    .encode();
-    write_frame(
-        &mut sock,
-        FrameHeader {
-            request_id: 0,
-            op: OpCode::Hello,
-            is_response: false,
-        },
-        &hello_payload,
-    )
-    .await
-    .unwrap();
-    sock.flush().await.unwrap();
-    let (hello_header, hello_payload) = read_frame(&mut sock).await.unwrap();
-    assert_eq!(hello_header.op, OpCode::Hello);
-    assert!(hello_header.is_response);
-    assert!(HelloResponse::decode(&hello_payload).unwrap().ok);
-
+    // torn output is published. Send a hand-built frame with a wrong digest to
+    // output id 1.
+    let mut sock = connect_raw_bound(addr, &session_id).await;
     let payload = WriteBackRequest {
-        path: bad.clone(),
+        output_id: 1,
         digest_hex: "blake3:0000000000000000000000000000000000000000000000000000000000000000"
             .into(),
         offset: 0,
@@ -267,20 +307,7 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
         last: true,
     }
     .encode();
-    write_frame(
-        &mut sock,
-        FrameHeader {
-            request_id: 1,
-            op: OpCode::WriteBack,
-            is_response: false,
-        },
-        &payload,
-    )
-    .await
-    .unwrap();
-    sock.flush().await.unwrap();
-    let (_h, rp) = read_frame(&mut sock).await.unwrap();
-    let wbr = WriteBackResponse::decode(&rp).unwrap();
+    let wbr = send_raw_writeback(&mut sock, 1, payload).await;
     assert!(!wbr.ok, "digest mismatch must be rejected");
     assert!(
         !std::path::Path::new(&bad).exists(),
@@ -304,12 +331,12 @@ async fn write_back_streams_large_output_in_chunks() {
         std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
     let session_id = "wb-big".to_string();
     registry
-        .create(session_id.clone(), None, declared_outputs(&[out.as_str()]))
+        .create(session_id.clone(), None, output_specs(&[(0, out.as_str())]))
         .await;
     let addr = start_server_with_registry(registry).await;
     let client = connect_bound(addr, &session_id).await;
 
-    let resp = client.write_back(&out, &big).await.unwrap();
+    let resp = client.write_back(0, &big).await.unwrap();
     assert!(
         resp.ok,
         "chunked write-back should succeed: {}",
@@ -596,159 +623,176 @@ async fn start_server_with_registry(
 }
 
 #[tokio::test]
-async fn writeback_to_declared_output_succeeds() {
-    let dir = TempDir::new("wb-declared-ok");
-    let out = dir.join("out/ok.obj").to_string_lossy().into_owned();
+async fn writeback_unknown_output_id_rejected() {
+    let dir = TempDir::new("wb-unknown-output-id");
+    let out = dir.join("out/known.obj").to_string_lossy().into_owned();
     let registry =
         std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
     registry
         .create(
-            "wb-declared-ok".into(),
+            "wb-unknown-output-id".into(),
             None,
-            declared_outputs(&[out.as_str()]),
+            output_specs(&[(0, out.as_str())]),
         )
         .await;
     let addr = start_server_with_registry(registry).await;
-    let client = connect_bound(addr, "wb-declared-ok").await;
+    let client = connect_bound(addr, "wb-unknown-output-id").await;
 
-    let resp = client.write_back(&out, b"declared-output").await.unwrap();
+    let resp = client.write_back(99, b"not declared").await.unwrap();
 
+    assert!(!resp.ok, "unknown output id must be refused");
     assert!(
-        resp.ok,
-        "declared WriteBack should succeed: {}",
+        resp.detail.contains("unknown output id"),
+        "detail should mention unknown id, got: {}",
         resp.detail
-    );
-    assert_eq!(
-        std::fs::read(&out).unwrap(),
-        b"declared-output",
-        "declared output is published"
-    );
-}
-
-#[tokio::test]
-async fn writeback_to_root_but_undeclared_path_fails() {
-    let dir = TempDir::new("wb-root-undeclared");
-    let declared = dir.join("out/declared.obj").to_string_lossy().into_owned();
-    let other = dir.join("out/other.obj").to_string_lossy().into_owned();
-    let registry =
-        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
-    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
-    registry
-        .create(
-            "wb-root-undeclared".into(),
-            root,
-            declared_outputs(&[declared.as_str()]),
-        )
-        .await;
-    let addr = start_server_with_registry(registry).await;
-    let client = connect_bound(addr, "wb-root-undeclared").await;
-
-    let resp = client.write_back(&other, b"not declared").await.unwrap();
-
-    assert!(!resp.ok, "undeclared WriteBack must be refused");
-    assert_eq!(
-        resp.detail,
-        "WriteBack target is not a declared output of this session"
-    );
-    assert!(
-        !std::path::Path::new(&other).exists(),
-        "undeclared output must not be published"
-    );
-}
-
-#[tokio::test]
-async fn writeback_empty_declared_outputs_fails() {
-    let dir = TempDir::new("wb-empty-declared");
-    let out = dir.join("out/none.obj").to_string_lossy().into_owned();
-    let registry =
-        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
-    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
-    registry
-        .create("wb-empty-declared".into(), root, HashSet::new())
-        .await;
-    let addr = start_server_with_registry(registry).await;
-    let client = connect_bound(addr, "wb-empty-declared").await;
-
-    let resp = client.write_back(&out, b"no authority").await.unwrap();
-
-    assert!(!resp.ok, "empty declared outputs must refuse all WriteBack");
-    assert_eq!(
-        resp.detail,
-        "WriteBack target is not a declared output of this session"
     );
     assert!(
         !std::path::Path::new(&out).exists(),
-        "empty declared set must not publish an output"
+        "unknown id must not publish the declared output"
     );
 }
 
 #[tokio::test]
-async fn writeback_dotdot_declared_output_rejected() {
-    let dir = TempDir::new("wb-dotdot");
-    let declared = dir.join("out/good.obj").to_string_lossy().into_owned();
-    let dotdot = format!("{}\\out\\..\\escape.obj", dir.path.to_string_lossy());
-    let escaped = dir.join("escape.obj");
+async fn writeback_other_session_output_id_rejected() {
+    let dir = TempDir::new("wb-other-session-output-id");
+    let a_out = dir.join("out/a.obj").to_string_lossy().into_owned();
     let registry =
         std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
-    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
     registry
-        .create(
-            "wb-dotdot".into(),
-            root,
-            declared_outputs(&[declared.as_str()]),
-        )
+        .create("A".into(), None, output_specs(&[(0, a_out.as_str())]))
         .await;
+    registry.create("B".into(), None, Vec::new()).await;
     let addr = start_server_with_registry(registry).await;
-    let client = connect_bound(addr, "wb-dotdot").await;
+    let client_b = connect_bound(addr, "B").await;
 
-    let resp = client.write_back(&dotdot, b"dotdot").await.unwrap();
+    let resp = client_b
+        .write_back(0, b"session B cannot use A id")
+        .await
+        .unwrap();
 
-    assert!(!resp.ok, "dotdot path to an undeclared target must fail");
-    assert_eq!(
-        resp.detail,
-        "WriteBack target is not a declared output of this session"
+    assert!(!resp.ok, "another session's id must be refused");
+    assert!(
+        resp.detail.contains("unknown output id"),
+        "detail should mention unknown id, got: {}",
+        resp.detail
     );
     assert!(
-        !escaped.exists(),
-        "dotdot target must not be published when it is not declared"
+        !std::path::Path::new(&a_out).exists(),
+        "session B must not publish session A's output"
     );
 }
 
 #[tokio::test]
-async fn writeback_absolute_outside_root_rejected() {
-    let root_dir = TempDir::new("wb-outside-root");
-    let outside_dir = TempDir::new("wb-outside-other");
-    let declared = root_dir
-        .join("out/declared.obj")
-        .to_string_lossy()
-        .into_owned();
-    let outside = outside_dir
-        .join("outside.obj")
-        .to_string_lossy()
-        .into_owned();
+async fn writeback_path_field_not_accepted_in_v2() {
+    use sembazuru_dataplane::wire::Writer;
+
+    let dir = TempDir::new("wb-old-path-field");
+    let out = dir.join("out/old.obj").to_string_lossy().into_owned();
     let registry =
         std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
-    let root = sembazuru_agent::fileserver::normalize_root(&root_dir.path.to_string_lossy());
     registry
         .create(
-            "wb-outside-root".into(),
-            root,
-            declared_outputs(&[declared.as_str()]),
+            "wb-old-path-field".into(),
+            None,
+            output_specs(&[(0, out.as_str())]),
         )
         .await;
     let addr = start_server_with_registry(registry).await;
-    let client = connect_bound(addr, "wb-outside-root").await;
+    let mut sock = connect_raw_bound(addr, "wb-old-path-field").await;
 
-    let resp = client.write_back(&outside, b"outside").await.unwrap();
+    // Old v1 was path, digest, offset, bytes, last. The first u32 of that old
+    // path string is now decoded as output_id. This payload is crafted so the v2
+    // decoder succeeds and reaches the unknown-id rejection path.
+    let mut payload = Writer::new();
+    payload.str("\0\0\0\0"); // old path field, length 4 -> v2 output_id 4
+    let old_digest = String::from_utf8(vec![0, 0, 0, 0, 12, 0, 0, 0]).unwrap();
+    payload.str(&old_digest);
+    payload.u64(0);
+    payload.bytes(&[]);
+    payload.bool(true);
 
-    assert!(!resp.ok, "outside undeclared WriteBack must be refused");
-    assert_eq!(
-        resp.detail,
-        "WriteBack target is not a declared output of this session"
+    let resp = send_raw_writeback(&mut sock, 1, payload.into_bytes()).await;
+
+    assert!(!resp.ok, "old path-based WriteBack must be refused");
+    assert!(
+        resp.detail.contains("unknown output id"),
+        "detail should mention unknown id, got: {}",
+        resp.detail
     );
     assert!(
-        !std::path::Path::new(&outside).exists(),
-        "outside output must not be published"
+        !std::path::Path::new(&out).exists(),
+        "old path-based frame must not publish"
+    );
+}
+
+#[tokio::test]
+async fn writeback_size_limit_enforced() {
+    let dir = TempDir::new("wb-size-limit");
+    let out = dir.join("out/limited.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    registry
+        .create(
+            "wb-size-limit".into(),
+            None,
+            vec![output_spec(0, out.as_str(), 10)],
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let client = connect_bound(addr, "wb-size-limit").await;
+
+    let resp = client.write_back(0, &[0u8; 100]).await.unwrap();
+
+    assert!(!resp.ok, "oversized output must be refused");
+    assert!(
+        resp.detail.contains("output exceeds max size"),
+        "detail should mention size cap, got: {}",
+        resp.detail
+    );
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "oversized output must not be published"
+    );
+}
+
+#[tokio::test]
+async fn writeback_digest_mismatch_rejected() {
+    use sembazuru_dataplane::ops::WriteBackRequest;
+
+    let dir = TempDir::new("wb-digest-mismatch");
+    let out = dir.join("out/bad.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    registry
+        .create(
+            "wb-digest-mismatch".into(),
+            None,
+            output_specs(&[(0, out.as_str())]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let mut sock = connect_raw_bound(addr, "wb-digest-mismatch").await;
+
+    let payload = WriteBackRequest {
+        output_id: 0,
+        digest_hex: "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            .into(),
+        offset: 0,
+        bytes: b"these bytes do not match".to_vec(),
+        last: true,
+    }
+    .encode();
+    let resp = send_raw_writeback(&mut sock, 1, payload).await;
+
+    assert!(!resp.ok, "digest mismatch must be refused");
+    assert!(
+        resp.detail.contains("digest mismatch"),
+        "detail should mention digest mismatch, got: {}",
+        resp.detail
+    );
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "digest mismatch must not publish"
     );
 }
 
@@ -803,7 +847,11 @@ async fn late_writeback_after_finish_is_rejected() {
         std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
     let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
     registry
-        .create("late-writeback".into(), root, Default::default())
+        .create(
+            "late-writeback".into(),
+            root,
+            output_specs(&[(0, out.as_str())]),
+        )
         .await;
     let addr = start_server_with_registry(registry.clone()).await;
     let client = connect_bound(addr, "late-writeback").await;
@@ -811,7 +859,7 @@ async fn late_writeback_after_finish_is_rejected() {
     assert!(client.fetch(&input).await.unwrap().is_some());
     assert!(registry.finish("late-writeback").await);
 
-    let resp = client.write_back(&out, b"must not publish").await.unwrap();
+    let resp = client.write_back(0, b"must not publish").await.unwrap();
     assert!(!resp.ok, "late WriteBack must be a hard reject");
     assert_eq!(resp.detail, "session is closed");
     assert!(

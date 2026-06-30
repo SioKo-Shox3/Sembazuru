@@ -303,19 +303,19 @@ impl FileClient {
         Ok(HasResponse::decode(&resp).map_err(to_io)?.present)
     }
 
-    /// Returns a produced output to the agent for atomic publication at `path`,
-    /// streamed in fixed chunks so a large output is never buffered whole on
-    /// either side. The agent verifies the full digest on the final chunk, so a
-    /// corrupted transfer is rejected rather than published. A small output is a
-    /// single chunk.
-    pub async fn write_back(&self, path: &str, bytes: &[u8]) -> io::Result<WriteBackResponse> {
+    /// Returns a produced output to the agent for atomic publication at the
+    /// agent-authoritative target named by `output_id`, streamed in fixed chunks
+    /// so a large output is never buffered whole on either side. The agent
+    /// verifies the full digest on the final chunk, so a corrupted transfer is
+    /// rejected rather than published. A small output is a single chunk.
+    pub async fn write_back(&self, output_id: u32, bytes: &[u8]) -> io::Result<WriteBackResponse> {
         let digest = Digest::of(bytes).canonical();
         let mut offset = 0usize;
         loop {
             let end = (offset + WRITEBACK_CHUNK).min(bytes.len());
             let last = end == bytes.len();
             let payload = WriteBackRequest {
-                path: path.to_string(),
+                output_id,
                 digest_hex: digest.clone(),
                 offset: offset as u64,
                 bytes: bytes[offset..end].to_vec(),
