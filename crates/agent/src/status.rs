@@ -297,10 +297,11 @@ impl StatusRpc for StatusState {
         // presence bool here — never echo the secret over the wire (M9.3a).
         let (cfg, file_exists) = tokio::task::spawn_blocking(move || {
             let exists = path.exists();
-            (DaemonConfig::load_from(&path), exists)
+            DaemonConfig::load_or_refuse(&path).map(|cfg| (cfg, exists))
         })
         .await
-        .map_err(|e| Status::internal(format!("config read failed: {e}")))?;
+        .map_err(|e| Status::internal(format!("config read failed: {e}")))?
+        .map_err(Status::failed_precondition)?;
         Ok(Response::new(GetConfigResponse {
             config_path: self.config_path.to_string_lossy().into_owned(),
             file_exists,
@@ -322,11 +323,16 @@ impl StatusRpc for StatusState {
         self.require_admin()?;
         let path = self.config_path.clone();
         let req = request.into_inner();
+        enum SetConfigError {
+            Load(String),
+            Save(String),
+        }
+
         let written_path = tokio::task::spawn_blocking(move || {
             // Start from the existing persisted config so an absent optional field
             // (cluster_token unchanged) and empty addresses keep their stored
             // values — a GUI editing one knob need not re-send everything.
-            let mut cfg = DaemonConfig::load_from(&path);
+            let mut cfg = DaemonConfig::load_or_refuse(&path).map_err(SetConfigError::Load)?;
             let keep = |new: String, old: String| if new.trim().is_empty() { old } else { new };
             cfg.coord_addr = keep(req.coord_addr, cfg.coord_addr);
             cfg.intake_addr = keep(req.intake_addr, cfg.intake_addr);
@@ -340,11 +346,16 @@ impl StatusRpc for StatusState {
             if let Some(t) = req.cluster_token {
                 cfg.cluster_token = empty_to_none(t);
             }
-            cfg.save_to(&path).map(|()| path)
+            cfg.save_to(&path)
+                .map(|()| path)
+                .map_err(|e| SetConfigError::Save(e.to_string()))
         })
         .await
         .map_err(|e| Status::internal(format!("config write failed: {e}")))?
-        .map_err(|e| Status::internal(format!("config write failed: {e}")))?;
+        .map_err(|e| match e {
+            SetConfigError::Load(msg) => Status::failed_precondition(msg),
+            SetConfigError::Save(msg) => Status::internal(format!("config write failed: {msg}")),
+        })?;
         Ok(Response::new(SetConfigResponse {
             ok: true,
             detail: format!(

@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sembazuru_agent::config::DaemonConfig;
+use sembazuru_agent::config::{
+    DEFAULT_COORD, DEFAULT_FILESERVER, DEFAULT_INTAKE, DEFAULT_STATUS, DaemonConfig,
+};
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::fileserver::ServerStats;
 use sembazuru_agent::status::{Metrics, StatusState, serve_status_service};
@@ -57,6 +59,101 @@ fn blank_set() -> SetConfigRequest {
         cache_max_bytes: 0,
         cluster_token: None,
     }
+}
+
+fn write_config_bytes(path: &std::path::Path, bytes: &[u8]) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[tokio::test]
+async fn get_config_refuses_invalid_existing_config() {
+    let path = tmp_config();
+    write_config_bytes(&path, b"this is = = not valid toml [[[ \n");
+    let endpoint = start_status_with_config(path).await;
+    let mut client = StatusClient::connect(endpoint).await.unwrap();
+
+    let err = client
+        .get_config(GetConfigRequest {})
+        .await
+        .expect_err("GetConfig must refuse a present invalid config");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[tokio::test]
+async fn set_config_does_not_overwrite_invalid_existing_config() {
+    let path = tmp_config();
+    let invalid = b"this is = = not valid toml [[[ \n";
+    write_config_bytes(&path, invalid);
+    let endpoint = start_status_with_config(path.clone()).await;
+    let mut client = StatusClient::connect(endpoint).await.unwrap();
+
+    let err = client
+        .set_config(SetConfigRequest {
+            intake_addr: "127.0.0.1:6101".into(),
+            ..blank_set()
+        })
+        .await
+        .expect_err("SetConfig must refuse a present invalid config");
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        invalid,
+        "SetConfig must not overwrite a corrupt existing config"
+    );
+}
+
+#[tokio::test]
+async fn get_config_defaults_when_absent() {
+    let path = tmp_config();
+    assert!(!path.exists());
+    let endpoint = start_status_with_config(path).await;
+    let mut client = StatusClient::connect(endpoint).await.unwrap();
+
+    let cfg = client
+        .get_config(GetConfigRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert!(!cfg.file_exists);
+    assert_eq!(cfg.coord_addr, DEFAULT_COORD);
+    assert_eq!(cfg.intake_addr, DEFAULT_INTAKE);
+    assert_eq!(cfg.fileserver_addr, DEFAULT_FILESERVER);
+    assert_eq!(cfg.status_addr, DEFAULT_STATUS);
+    assert!(cfg.cache_root.is_empty());
+    assert!(cfg.trace_root.is_empty());
+    assert_eq!(cfg.cache_max_bytes, 0);
+    assert!(!cfg.cluster_token_set);
+}
+
+#[tokio::test]
+async fn set_config_preserves_valid_existing_values() {
+    let path = tmp_config();
+    DaemonConfig {
+        coord_addr: "127.0.0.1:6100".into(),
+        cluster_token: Some("known-token".into()),
+        ..DaemonConfig::default()
+    }
+    .save_to(&path)
+    .unwrap();
+    let endpoint = start_status_with_config(path.clone()).await;
+    let mut client = StatusClient::connect(endpoint).await.unwrap();
+
+    client
+        .set_config(SetConfigRequest {
+            intake_addr: "127.0.0.1:6101".into(),
+            ..blank_set()
+        })
+        .await
+        .unwrap();
+
+    let saved = DaemonConfig::load_or_refuse(&path).unwrap();
+    assert_eq!(saved.cluster_token.as_deref(), Some("known-token"));
+    assert_eq!(saved.coord_addr, "127.0.0.1:6100");
+    assert_eq!(saved.intake_addr, "127.0.0.1:6101");
 }
 
 #[tokio::test]
