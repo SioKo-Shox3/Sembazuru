@@ -130,15 +130,19 @@ The **daemon** service:
   `--service` argument selects SCM mode over the plain CLI).
 - **Account:** **LocalSystem by default** in the production MSI. The daemon READS the
   developer's *arbitrary* source tree to serve it to workers, and those roots are not
-  known at install time (they vary per build), so a least-privilege virtual account
-  would need per-build ACL grants that defeat the zero-config goal. A hardened
-  identity is still available for operators who pre-grant source-root read access:
-  `sembazuru-daemon install --account virtual` registers the daemon under
-  `NT SERVICE\SembazuruDaemon` instead. The daemon itself performs **no DLL
-  injection** (it schedules actions and serves files); injection happens only in the
-  worker's compiler children (the steady-state above). Contrast the **worker**, which
-  needs no broad read and therefore defaults to the least-privilege virtual account
-  (below).
+  known at install time (they vary per build), so the MSI keeps the zero-config
+  default. The separate `sembazuru-daemon install` self-install command defaults to
+  the least-privilege virtual account `NT SERVICE\SembazuruDaemon`; to serve a source
+  tree, grant that account READ access to the served roots, for example:
+  `icacls "C:\path\to\src" /grant "NT SERVICE\SembazuruDaemon:(OI)(CI)R" /T`. Also
+  grant read/write access on `%ProgramData%\Sembazuru` for daemon config, cache, and
+  trace data. `--account system` installs the self-installed service as LocalSystem,
+  but is discouraged because a local low-privilege caller reaching LocalIntake could
+  trigger SYSTEM-level local-fallback execution; the named-pipe + caller-token
+  hardening lands in 4.3/4.4. The daemon itself performs **no DLL injection** (it
+  schedules actions and serves files); injection happens only in the worker's compiler
+  children (the steady-state above). Contrast the **worker**, which needs no broad
+  read and therefore defaults to the least-privilege virtual account (below).
 
 The **worker** service is registered identically (added M9.3c):
 

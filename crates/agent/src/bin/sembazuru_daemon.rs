@@ -31,6 +31,9 @@ fn main() -> Result<(), BoxError> {
         Some("install") => {
             let account = parse_account(&args);
             sembazuru_agent::service::install(account)?;
+            if let Some(warning) = account.warning() {
+                eprintln!("{warning}");
+            }
             eprintln!(
                 "sembazuru-daemon: installed service '{}' ({account:?}); start it with `sc start {}`",
                 sembazuru_agent::service::SERVICE_NAME,
@@ -68,17 +71,19 @@ fn seed_config() -> Result<(), BoxError> {
     Ok(())
 }
 
-/// `--account <system|virtual|networkservice>`, default System. The daemon reads
-/// the developer's source files to serve them; LocalSystem can always do that,
-/// while a hardened account needs ACL grants (see `service::ServiceAccount`).
+/// `--account <system|virtual|networkservice>`, default Virtual. The daemon reads
+/// the developer's source files to serve them; the default virtual account needs
+/// ACL grants, while `--account system` is an explicit opt-in that prints a warning
+/// (see `service::ServiceAccount`).
 #[cfg(windows)]
 fn parse_account(args: &[String]) -> sembazuru_agent::service::ServiceAccount {
     use sembazuru_agent::service::ServiceAccount;
-    args.iter()
+    let parsed = args
+        .iter()
         .position(|a| a == "--account")
         .and_then(|i| args.get(i + 1))
-        .and_then(|s| ServiceAccount::parse(s))
-        .unwrap_or(ServiceAccount::System)
+        .and_then(|s| ServiceAccount::parse(s));
+    ServiceAccount::resolve_self_install(parsed)
 }
 
 /// Foreground/CLI mode: build a Tokio runtime, run the daemon, and stop it

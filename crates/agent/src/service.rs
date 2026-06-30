@@ -135,12 +135,13 @@ pub fn run_as_service() -> windows_service::Result<()> {
 
 /// The account the service runs under. The daemon (the agent) READS the
 /// developer's source tree to serve it to workers, so it needs read access to
-/// those files: LocalSystem can read everything; a least-privilege account
-/// (a virtual `NT SERVICE\..` account, or NetworkService) is preferable for EDR
-/// optics but must be granted read access to the served source roots
-/// (ADR 0008 §3 / edr-allowlist). The worker — which only injects into its own
-/// child compilers (unprivileged) and reads inputs over the data plane — can run
-/// least-privilege without that caveat (handled when the worker is serviced).
+/// those files. The self-install default is `Virtual` (least privilege; needs ACL
+/// grants to read the served source roots). `System` can read everything but is an
+/// explicit, security-discouraged opt-in. NetworkService is also available for
+/// operators who grant the needed source-root access (ADR 0008 §3 /
+/// edr-allowlist). The worker — which only injects into its own child compilers
+/// (unprivileged) and reads inputs over the data plane — can run least-privilege
+/// without that caveat (handled when the worker is serviced).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAccount {
     /// LocalSystem (`account_name = None`). Reads all files; most powerful.
@@ -160,6 +161,28 @@ impl ServiceAccount {
             "virtual" => Some(Self::Virtual),
             "networkservice" | "network" => Some(Self::NetworkService),
             _ => None,
+        }
+    }
+
+    /// Resolves the self-install account default. The default is the
+    /// least-privilege virtual account (`NT SERVICE\SembazuruDaemon`); LocalSystem
+    /// (`--account system`) is an explicit, discouraged opt-in.
+    pub fn resolve_self_install(parsed: Option<ServiceAccount>) -> ServiceAccount {
+        parsed.unwrap_or(ServiceAccount::Virtual)
+    }
+
+    /// Returns the service-account warning shown by self-install.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::System => Some(concat!(
+                "WARNING: installing SembazuruDaemon as LocalSystem.\n",
+                "Running the daemon as LocalSystem means a local low-privilege user who can ",
+                "reach LocalIntake could cause SYSTEM-level local-fallback command execution ",
+                "(privilege escalation).\n",
+                "Prefer the default virtual account. Never use System unless you understand ",
+                "the risk and have other mitigations."
+            )),
+            Self::Virtual | Self::NetworkService => None,
         }
     }
 
@@ -269,5 +292,28 @@ mod tests {
             ServiceAccount::NetworkService.account_name(),
             Some(OsString::from("NT AUTHORITY\\NetworkService"))
         );
+    }
+
+    #[test]
+    fn parse_account_defaults_to_virtual() {
+        assert_eq!(
+            ServiceAccount::resolve_self_install(None),
+            ServiceAccount::Virtual
+        );
+        assert_eq!(
+            ServiceAccount::resolve_self_install(ServiceAccount::parse("bogus")),
+            ServiceAccount::Virtual
+        );
+    }
+
+    #[test]
+    fn explicit_system_account_still_supported_with_warning() {
+        assert_eq!(
+            ServiceAccount::resolve_self_install(ServiceAccount::parse("system")),
+            ServiceAccount::System
+        );
+        assert!(ServiceAccount::System.warning().is_some());
+        assert!(ServiceAccount::Virtual.warning().is_none());
+        assert!(ServiceAccount::NetworkService.warning().is_none());
     }
 }
