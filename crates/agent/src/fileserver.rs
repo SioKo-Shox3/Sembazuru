@@ -53,7 +53,7 @@ impl ServerStats {
     }
 }
 
-use crate::session_registry::{SessionCapability, SessionRegistry, WritebackState};
+use crate::session_registry::{SessionCapability, SessionRegistry, WritebackState, staging_temp};
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
@@ -537,23 +537,12 @@ fn wb_io_err(category: &'static str, detail: impl std::fmt::Display) -> WriteBac
     wb_err(category.to_string())
 }
 
-/// A same-directory temp sibling, so the eventual rename is same-volume (atomic).
-fn tmp_sibling(final_path: &std::path::Path) -> PathBuf {
-    let mut tmp = final_path.to_path_buf();
-    let mut name = final_path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".sbz-writeback-tmp");
-    tmp.set_file_name(name);
-    tmp
-}
-
 /// Receives a streamed worker output (`docs/protocol/v0.md` §4.1): each chunk is
 /// appended to a temp sibling and hashed incrementally; the final chunk verifies
-/// the whole output against `digest_hex` and atomically renames the temp onto
-/// the final name, so the build never sees a torn output (§3.2) and a large
-/// `.pdb`/`.exe` is never buffered whole in memory (M4.4).
+/// the whole output against `digest_hex` and records the verified staging path.
+/// The agent's intake path publishes it only after the action succeeds (3.3), so
+/// failed/aborted/closed actions discard staging and never expose partial or late
+/// final output. A large `.pdb`/`.exe` is never buffered whole in memory (M4.4).
 ///
 /// **Output scope (SEC-003, ADR 0013).** The worker names only an `output_id`.
 /// The bound session resolves that id to the agent-owned final path and
@@ -577,11 +566,11 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         {
             return wb_io_err("create output dir failed", e);
         }
-        let tmp = tmp_sibling(&final_path);
-        if let Err(e) = tokio::fs::File::create(&tmp).await {
+        let tmp = staging_temp(&final_path);
+        if let Err(e) = tokio::fs::File::create_new(&tmp).await {
             return wb_io_err("create temp failed", e);
         }
-        wbs.insert(
+        let old = wbs.insert(
             req.output_id,
             WritebackState {
                 tmp,
@@ -589,6 +578,9 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
                 hasher: DigestHasher::new(),
             },
         );
+        if let Some(old) = old {
+            let _ = tokio::fs::remove_file(old.tmp).await;
+        }
     }
 
     let new_written = {
@@ -646,10 +638,11 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         };
     }
 
-    // Final chunk: verify the whole output and publish atomically.
+    // Final chunk: verify the whole output and stage it for intake-owned publish.
     let state = wbs
         .remove(&req.output_id)
         .expect("state present (just appended)");
+    drop(wbs);
     let actual = state.hasher.finalize().canonical();
     if actual != req.digest_hex {
         let _ = tokio::fs::remove_file(&state.tmp).await;
@@ -658,13 +651,16 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
             req.digest_hex
         ));
     }
-    if let Err(e) = tokio::fs::rename(&state.tmp, &final_path).await {
-        let _ = tokio::fs::remove_file(&state.tmp).await;
-        return wb_io_err("atomic publish failed", e);
-    }
-    WriteBackResponse {
-        ok: true,
-        detail: String::new(),
+    if cap
+        .record_staged(req.output_id, state.tmp, final_path)
+        .await
+    {
+        WriteBackResponse {
+            ok: true,
+            detail: String::new(),
+        }
+    } else {
+        wb_err("session closed during writeback".into())
     }
 }
 

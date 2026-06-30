@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use sembazuru_agent::session_registry::{DEFAULT_OUTPUT_MAX_BYTES, OutputSpec};
+use sembazuru_agent::session_registry::{DEFAULT_OUTPUT_MAX_BYTES, OutputSpec, staging_temp};
 use sembazuru_worker::fileclient::FileClient;
 
 /// A self-cleaning temp directory, so the test needs no `tempfile` dependency.
@@ -57,6 +57,23 @@ fn output_spec(id: u32, path: &str, max_size: u64) -> OutputSpec {
         final_path: PathBuf::from(path),
         max_size,
     }
+}
+
+fn staging_files(dir: &std::path::Path) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut files = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".sbz-staging-"))
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
 
 /// Starts the production-mode agent file server on an ephemeral port; returns
@@ -268,7 +285,7 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     let registry =
         std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
     let session_id = "wb-atomic".to_string();
-    registry
+    let cap = registry
         .create(
             session_id.clone(),
             None,
@@ -277,17 +294,34 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
         .await;
     let addr = start_server_with_registry(registry).await;
 
-    // A good WriteBack publishes the bytes at the path resolved from output id 0.
+    // A good WriteBack stages the bytes at the path resolved from output id 0.
     let client = connect_bound(addr, &session_id).await;
     let resp = client.write_back(0, &bytes).await.unwrap();
     assert!(resp.ok, "write-back should succeed: {}", resp.detail);
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "write-back stages only; intake publishes after action success"
+    );
+    assert_eq!(
+        staging_files(std::path::Path::new(&out).parent().unwrap()).len(),
+        1,
+        "verified output is staged"
+    );
+    cap.publish_staged().await.unwrap();
     assert_eq!(std::fs::read(&out).unwrap(), bytes, "published bytes match");
 
-    // Re-publishing over an existing output must replace it atomically (the
-    // rename-over-existing case a rebuild hits every time).
+    // Publishing over an existing output must replace it atomically (the
+    // rename-over-existing case a rebuild hits every time), but only when intake
+    // explicitly publishes the staged output.
     let bytes2 = b"\x02REBUILT-obj\x03".to_vec();
     let resp2 = client.write_back(0, &bytes2).await.unwrap();
     assert!(resp2.ok, "re-publish should replace: {}", resp2.detail);
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        bytes,
+        "existing output is unchanged until publish"
+    );
+    cap.publish_staged().await.unwrap();
     assert_eq!(
         std::fs::read(&out).unwrap(),
         bytes2,
@@ -313,6 +347,15 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
         !std::path::Path::new(&bad).exists(),
         "no torn output published"
     );
+    assert!(
+        staging_files(std::path::Path::new(&bad).parent().unwrap()).is_empty(),
+        "digest mismatch removes staging and records no staged output"
+    );
+    cap.publish_staged().await.unwrap();
+    assert!(
+        !std::path::Path::new(&bad).exists(),
+        "publish has nothing to publish after digest mismatch"
+    );
 }
 
 #[tokio::test]
@@ -330,7 +373,7 @@ async fn write_back_streams_large_output_in_chunks() {
     let registry =
         std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
     let session_id = "wb-big".to_string();
-    registry
+    let cap = registry
         .create(session_id.clone(), None, output_specs(&[(0, out.as_str())]))
         .await;
     let addr = start_server_with_registry(registry).await;
@@ -342,11 +385,218 @@ async fn write_back_streams_large_output_in_chunks() {
         "chunked write-back should succeed: {}",
         resp.detail
     );
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "large write-back stages only"
+    );
+    cap.publish_staged().await.unwrap();
     assert_eq!(
         std::fs::read(&out).unwrap(),
         big,
         "the streamed output is published byte-for-byte"
     );
+}
+
+#[tokio::test]
+async fn failed_action_does_not_publish_writeback() {
+    let dir = TempDir::new("wb-failed-action");
+    let out = dir.join("out/failed.obj").to_string_lossy().into_owned();
+    let bytes = b"verified but action fails".to_vec();
+
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let cap = registry
+        .create(
+            "wb-failed-action".into(),
+            None,
+            output_specs(&[(0, out.as_str())]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let client = connect_bound(addr, "wb-failed-action").await;
+
+    let resp = client.write_back(0, &bytes).await.unwrap();
+    assert!(resp.ok, "write-back should stage: {}", resp.detail);
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "staged write-back must not publish before action success"
+    );
+    let out_dir = std::path::Path::new(&out).parent().unwrap();
+    let staged = staging_files(out_dir);
+    assert_eq!(
+        staged.len(),
+        1,
+        "verified output should have one staging temp"
+    );
+
+    cap.discard_staged().await;
+
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "failed action must not publish staged output"
+    );
+    assert!(!staged[0].exists(), "discard removes the staging temp");
+    assert!(
+        staging_files(out_dir).is_empty(),
+        "no staging temp remains after discard"
+    );
+}
+
+#[tokio::test]
+async fn late_writeback_after_exit_rejected() {
+    let dir = TempDir::new("late-writeback-exit");
+    let out = dir.join("out/late.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let cap = registry
+        .create(
+            "late-writeback-exit".into(),
+            None,
+            output_specs(&[(0, out.as_str())]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry.clone()).await;
+    let client = connect_bound(addr, "late-writeback-exit").await;
+
+    assert!(registry.finish("late-writeback-exit").await);
+    let resp = client.write_back(0, b"too late").await.unwrap();
+
+    assert!(!resp.ok, "late WriteBack must be rejected");
+    assert_eq!(resp.detail, "session is closed");
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "late WriteBack must not publish"
+    );
+    cap.discard_staged().await;
+}
+
+#[tokio::test]
+async fn digest_mismatch_removes_staging() {
+    use sembazuru_dataplane::ops::WriteBackRequest;
+
+    let dir = TempDir::new("wb-digest-staging-cleanup");
+    let out = dir.join("out/bad.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let cap = registry
+        .create(
+            "wb-digest-staging-cleanup".into(),
+            None,
+            output_specs(&[(0, out.as_str())]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let mut sock = connect_raw_bound(addr, "wb-digest-staging-cleanup").await;
+
+    let payload = WriteBackRequest {
+        output_id: 0,
+        digest_hex: "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+            .into(),
+        offset: 0,
+        bytes: b"wrong digest bytes".to_vec(),
+        last: true,
+    }
+    .encode();
+    let resp = send_raw_writeback(&mut sock, 1, payload).await;
+
+    assert!(!resp.ok, "digest mismatch must be refused");
+    let out_dir = std::path::Path::new(&out).parent().unwrap();
+    assert!(
+        staging_files(out_dir).is_empty(),
+        "digest mismatch removes its staging temp"
+    );
+    cap.publish_staged().await.unwrap();
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "publish has nothing to publish after digest mismatch"
+    );
+}
+
+#[tokio::test]
+async fn crash_like_disconnect_leaves_no_final_output() {
+    use sembazuru_dataplane::ops::WriteBackRequest;
+
+    let dir = TempDir::new("wb-disconnect");
+    let out = dir.join("out/partial.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let cap = registry
+        .create(
+            "wb-disconnect".into(),
+            None,
+            output_specs(&[(0, out.as_str())]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let mut sock = connect_raw_bound(addr, "wb-disconnect").await;
+
+    let chunk = b"partial output chunk".to_vec();
+    let payload = WriteBackRequest {
+        output_id: 0,
+        digest_hex: sembazuru_cas::Digest::of(&chunk).canonical(),
+        offset: 0,
+        bytes: chunk,
+        last: false,
+    }
+    .encode();
+    let resp = send_raw_writeback(&mut sock, 1, payload).await;
+    assert!(resp.ok, "first chunk should be accepted: {}", resp.detail);
+    drop(sock);
+
+    cap.discard_staged().await;
+
+    let out_dir = std::path::Path::new(&out).parent().unwrap();
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "disconnect before final chunk must not publish"
+    );
+    assert!(
+        staging_files(out_dir).is_empty(),
+        "discard removes the in-progress staging temp"
+    );
+}
+
+#[test]
+fn staging_temp_is_unique_and_create_new() {
+    let dir = TempDir::new("staging-temp");
+    let final_path = dir.join("out/final.obj");
+    let a = staging_temp(&final_path);
+    let b = staging_temp(&final_path);
+
+    assert_ne!(a, b, "staging temp names should be CSPRNG-unique");
+    assert_eq!(a.parent(), final_path.parent());
+    assert_eq!(b.parent(), final_path.parent());
+    for path in [&a, &b] {
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+        let suffix = name.strip_prefix(".sbz-staging-").unwrap();
+        assert_eq!(suffix.len(), 32, "staging suffix is 32 hex chars");
+        assert!(
+            suffix
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "staging suffix must be lowercase hex: {suffix}"
+        );
+    }
+
+    std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+    let _first = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&a)
+        .unwrap();
+    let second_same = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&a);
+    assert_eq!(
+        second_same.unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    let _different = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&b)
+        .unwrap();
 }
 
 #[tokio::test]

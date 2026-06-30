@@ -268,7 +268,7 @@ fn should_record_cache(
 /// a VFS context this is a plain dispatch (M6.0). With one, the compile runs
 /// under the read-VFS; with a cache it is resolved first (a hit skips the worker)
 /// and recorded after a successful run so the next identical build hits.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::collapsible_if)]
 async fn run_submission(
     scheduler: Scheduler,
     vfs: Option<Arc<IntakeVfsContext>>,
@@ -449,7 +449,8 @@ async fn run_submission(
             max_size: DEFAULT_OUTPUT_MAX_BYTES,
         })
         .collect();
-    ctx.registry
+    let cap = ctx
+        .registry
         .create(
             session_id.clone(),
             crate::fileserver::normalize_root(&vfs_root),
@@ -468,6 +469,14 @@ async fn run_submission(
     // WriteBack cannot race cache record/publish, the ADD-001 closed gate
     // rejects any late detached read, and the idle sweeper stays a crash backstop.
     ctx.registry.finish(&session_id).await;
+    if let Execution::Remote(o) = &outcome
+        && o.exit_code == Some(0)
+    {
+        if let Err(e) = cap.publish_staged().await {
+            eprintln!("sembazuru-agent: publishing staged outputs failed: {e}");
+        }
+    }
+    cap.discard_staged().await;
 
     // Record a successful remote run so the next identical build hits. Needs the
     // trace (from the DLL); the outputs come from the launcher's declaration when

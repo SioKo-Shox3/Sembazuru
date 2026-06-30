@@ -43,7 +43,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -80,6 +80,14 @@ pub struct WritebackState {
     pub hasher: DigestHasher,
 }
 
+/// A worker-produced output that has been fully streamed and digest-verified,
+/// but is not yet published to its final path. Intake publishes these only after
+/// the remote action exits successfully.
+pub struct StagedOutput {
+    pub staging_path: PathBuf,
+    pub final_path: PathBuf,
+}
+
 /// The agent's authority over one action's data-plane session: the scope root it
 /// dispatched, the action's output specs, the per-session pin partition (with
 /// per-path single-flight), the allowed-digest ACL, and the in-progress streamed
@@ -104,6 +112,9 @@ pub struct SessionCapability {
     allowed_digests: Mutex<HashSet<Digest>>,
     /// Output id → in-progress streamed WriteBack, per session.
     writebacks: Mutex<HashMap<u32, WritebackState>>,
+    /// Output id → fully streamed and digest-verified output waiting for the
+    /// intake action-success gate to publish it.
+    staged: Mutex<HashMap<u32, StagedOutput>>,
     created: Instant,
     /// Live data-plane connections bound to this session (RAII via [`ConnGuard`]),
     /// so the idle sweeper never reaps a session with work in flight.
@@ -126,6 +137,7 @@ impl SessionCapability {
             pinned: Mutex::new(HashMap::new()),
             allowed_digests: Mutex::new(HashSet::new()),
             writebacks: Mutex::new(HashMap::new()),
+            staged: Mutex::new(HashMap::new()),
             created: Instant::now(),
             conns: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
@@ -209,6 +221,108 @@ impl SessionCapability {
     /// `write_back` locks it per chunk).
     pub fn writebacks(&self) -> &Mutex<HashMap<u32, WritebackState>> {
         &self.writebacks
+    }
+
+    /// Records a fully streamed and digest-verified output for later publish by
+    /// the agent's intake path. This does not touch the final path.
+    ///
+    /// Returns false and deletes staging_path if the session is already closed.
+    /// The closed check is performed under the same lock that discard_staged drains,
+    /// so no temp can be inserted after discard has run.
+    pub async fn record_staged(
+        &self,
+        output_id: u32,
+        staging_path: PathBuf,
+        final_path: PathBuf,
+    ) -> bool {
+        let old = {
+            let mut staged = self.staged.lock().await;
+            if self.is_closed() {
+                drop(staged);
+                let _ = tokio::fs::remove_file(&staging_path).await;
+                return false;
+            }
+            staged.insert(
+                output_id,
+                StagedOutput {
+                    staging_path,
+                    final_path,
+                },
+            )
+        };
+        if let Some(old) = old {
+            let _ = tokio::fs::remove_file(old.staging_path).await;
+        }
+        true
+    }
+
+    /// Publishes all verified staged outputs by atomically renaming each staging
+    /// sibling onto its final path. All entries are attempted; the first error is
+    /// returned after the drain completes.
+    pub async fn publish_staged(&self) -> io::Result<()> {
+        let entries = {
+            let mut staged = self.staged.lock().await;
+            staged.drain().map(|(_, staged)| staged).collect::<Vec<_>>()
+        };
+
+        let mut first_err = None;
+        for staged in entries {
+            if let Some(parent) = staged.final_path.parent()
+                && let Err(e) = tokio::fs::create_dir_all(parent).await
+            {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                continue;
+            }
+            if let Err(e) = tokio::fs::rename(&staged.staging_path, &staged.final_path).await
+                && first_err.is_none()
+            {
+                first_err = Some(e);
+            }
+        }
+
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Drops any verified-but-unpublished staged outputs and any in-progress
+    /// WriteBack temps. Used after failed/aborted/closed actions and after the
+    /// publish attempt to avoid leaving session-owned temp files behind.
+    pub async fn discard_staged(&self) {
+        let staged_paths = {
+            let mut staged = self.staged.lock().await;
+            staged
+                .drain()
+                .map(|(_, staged)| staged.staging_path)
+                .collect::<Vec<_>>()
+        };
+        let writeback_paths = {
+            let mut writebacks = self.writebacks.lock().await;
+            writebacks
+                .drain()
+                .map(|(_, state)| state.tmp)
+                .collect::<Vec<_>>()
+        };
+
+        for path in staged_paths.into_iter().chain(writeback_paths) {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+    }
+}
+
+/// A same-directory, CSPRNG-named staging sibling. Keeping staging beside the
+/// final path makes the publish rename same-volume and therefore atomic.
+pub fn staging_temp(final_path: &Path) -> PathBuf {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).expect("OS CSPRNG unavailable while naming a staging output");
+    let hex = buf.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let name = format!(".sbz-staging-{hex}");
+    match final_path.parent() {
+        Some(parent) => parent.join(name),
+        None => PathBuf::from(name),
     }
 }
 
@@ -325,11 +439,23 @@ impl SessionRegistry {
     /// backstop for an intake task that died before calling [`finish`]. Returns
     /// the number reaped. Mirrors the `WorkerTable` opportunistic reaper.
     pub async fn sweep_idle(&self, ttl: Duration) -> usize {
-        let mut sessions = self.sessions.lock().await;
-        let before = sessions.len();
-        sessions
-            .retain(|_, cap| cap.conns.load(Ordering::SeqCst) > 0 || cap.created.elapsed() < ttl);
-        before - sessions.len()
+        let reaped = {
+            let mut sessions = self.sessions.lock().await;
+            let mut reaped = Vec::new();
+            sessions.retain(|_, cap| {
+                let keep = cap.conns.load(Ordering::SeqCst) > 0 || cap.created.elapsed() < ttl;
+                if !keep {
+                    reaped.push(Arc::clone(cap));
+                }
+                keep
+            });
+            reaped
+        };
+
+        for cap in &reaped {
+            cap.discard_staged().await;
+        }
+        reaped.len()
     }
 
     /// Number of live sessions (for the status dashboard / tests).
@@ -431,6 +557,46 @@ mod tests {
         drop(guard);
         assert_eq!(reg.sweep_idle(Duration::ZERO).await, 0);
         assert_eq!(reg.session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn record_staged_on_closed_session_discards_and_does_not_stage() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg.create("sess-closed".into(), None, Vec::new()).await;
+        let dir = tmp("closed-stage");
+        let staging_path = dir.join("staged.tmp");
+        let final_path = dir.join("out.bin");
+        std::fs::write(&staging_path, b"verified bytes").unwrap();
+
+        assert!(reg.finish("sess-closed").await);
+        let staged = cap
+            .record_staged(0, staging_path.clone(), final_path.clone())
+            .await;
+
+        assert!(!staged);
+        assert!(!staging_path.exists());
+        cap.publish_staged().await.unwrap();
+        assert!(!final_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sweep_idle_discards_staging_of_reaped_sessions() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg.create("sess-reaped".into(), None, Vec::new()).await;
+        let dir = tmp("sweep-stage");
+        let staging_path = dir.join("staged.tmp");
+        let final_path = dir.join("out.bin");
+        std::fs::write(&staging_path, b"verified bytes").unwrap();
+        assert!(cap.record_staged(0, staging_path.clone(), final_path).await);
+
+        let reaped = reg.sweep_idle(Duration::ZERO).await;
+
+        assert!(reaped >= 1);
+        assert!(!staging_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
