@@ -19,10 +19,7 @@ use crate::action_cache::AgentCache;
 use crate::config::DaemonConfig;
 use crate::coordination::{DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination_with_token};
 use crate::fileserver::{ServerStats, serve_files_with_stats_token};
-use crate::intake::{
-    IntakeService, IntakeVfsContext, require_loopback, resolve_loopback_intake,
-    serve_intake_service,
-};
+use crate::intake::{IntakeService, IntakeVfsContext, LocalIntakeTransport, require_loopback};
 use crate::scheduler::Scheduler;
 use crate::session_registry::SessionRegistry;
 use crate::status::{StatusState, evict_cache_to_cap, serve_status_service};
@@ -263,14 +260,14 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     // LocalIntake: the build front door (loopback-only). This is the blocking
     // server; the daemon runs until the LocalIntake server exits OR `shutdown` is
     // cancelled (Ctrl-C in CLI mode, SCM Stop in service mode).
-    let intake_sockaddr = resolve_loopback_intake(&config.intake_addr)?;
-    let intake_listener = tokio::net::TcpListener::bind(intake_sockaddr).await?;
-    eprintln!(
-        "sembazuru-daemon: LocalIntake on {}",
-        intake_listener.local_addr()?
-    );
+    let intake_transport = LocalIntakeTransport::loopback_tcp(&config.intake_addr)?;
+    match &intake_transport {
+        LocalIntakeTransport::LoopbackTcp(addr) => {
+            eprintln!("sembazuru-daemon: LocalIntake on {addr}");
+        }
+    }
     tokio::select! {
-        r = serve_intake_service(intake_listener, intake) => r?,
+        r = intake_transport.serve(intake) => r?,
         _ = shutdown.cancelled() => {
             eprintln!("sembazuru-daemon: shutdown requested; stopping");
         }

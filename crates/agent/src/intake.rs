@@ -12,6 +12,7 @@
 //! root) is safe here precisely because it never leaves the machine — the
 //! launcher already has the command on its argv.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,6 +28,7 @@ use sembazuru_proto::v0::{
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use crate::action_cache::{AgentCache, CacheLookup};
@@ -618,6 +620,57 @@ pub fn resolve_loopback_intake(addr: &str) -> Result<std::net::SocketAddr, Strin
     require_loopback(addr, "LocalIntake")
 }
 
+/// LocalIntake transport.
+///
+/// A Windows named-pipe variant with a caller-SID DACL lands in 4.3; this
+/// preparatory abstraction keeps the M6 default TCP behavior unchanged.
+#[derive(Clone, Debug)]
+pub enum LocalIntakeTransport {
+    /// Loopback TCP (the M6 default).
+    LoopbackTcp(SocketAddr),
+}
+
+impl LocalIntakeTransport {
+    /// Server-side loopback TCP transport from config such as `127.0.0.1:50071`.
+    pub fn loopback_tcp(addr: &str) -> Result<Self, String> {
+        Ok(Self::LoopbackTcp(require_loopback(addr, "LocalIntake")?))
+    }
+
+    /// Client-side LocalIntake transport from the launcher's endpoint string.
+    pub fn from_endpoint(endpoint: &str) -> Result<Self, String> {
+        let addr = endpoint.strip_prefix("http://").unwrap_or(endpoint);
+        Ok(Self::LoopbackTcp(require_loopback(addr, "LocalIntake")?))
+    }
+
+    /// Serve LocalIntake over this transport.
+    pub async fn serve(
+        self,
+        service: IntakeService,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::LoopbackTcp(addr) => {
+                let listener = TcpListener::bind(addr).await?;
+                serve_intake_service(listener, service).await
+            }
+        }
+    }
+
+    /// Connect a launcher-side LocalIntake client over this transport.
+    pub async fn connect(&self) -> Result<LocalIntakeClient<Channel>, ExecuteError> {
+        match self {
+            Self::LoopbackTcp(addr) => {
+                let channel = Endpoint::from_shared(format!("http://{addr}"))
+                    .map_err(ExecuteError::Transport)?
+                    .connect_timeout(Duration::from_millis(500))
+                    .connect()
+                    .await
+                    .map_err(ExecuteError::Transport)?;
+                Ok(LocalIntakeClient::new(channel))
+            }
+        }
+    }
+}
+
 /// Serves a plain LocalIntake (no VFS, no cache) on an already-bound listener.
 /// The daemon binds an explicit loopback port; tests bind an ephemeral one and
 /// learn it before serving.
@@ -655,12 +708,9 @@ pub async fn submit_to_daemon(
     command: Command,
     opts: SubmitOptions,
 ) -> Result<(i32, String), ExecuteError> {
-    let channel = tonic::transport::Endpoint::from_shared(endpoint)
-        .map_err(ExecuteError::Transport)?
-        .connect_timeout(Duration::from_millis(500))
-        .connect()
-        .await?;
-    let mut client = LocalIntakeClient::new(channel);
+    let transport = LocalIntakeTransport::from_endpoint(&endpoint)
+        .map_err(|e| ExecuteError::Rpc(Status::invalid_argument(e)))?;
+    let mut client = transport.connect().await?;
     let request = SubmitActionRequest {
         command: Some(command),
         declared_outputs: opts.declared_outputs,
@@ -698,13 +748,18 @@ pub async fn submit_to_daemon(
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     use super::{
-        is_verified_tool, mint_session_id, resolve_loopback_intake, should_record_cache,
-        worker_tool_matches,
+        IntakeService, LocalIntakeTransport, SubmitOptions, is_verified_tool, mint_session_id,
+        resolve_loopback_intake, should_record_cache, submit_to_daemon, worker_tool_matches,
     };
+    use crate::coordination::WorkerTable;
+    use crate::scheduler::Scheduler;
     use crate::status::Metrics;
     use sembazuru_cas::toolchain::ToolchainIdentity;
+    use sembazuru_proto::v0::Command;
+    use tokio::net::TcpListener;
 
     #[test]
     fn verified_tool_profile_matches_compilers_only() {
@@ -863,5 +918,63 @@ mod tests {
         assert!(resolve_loopback_intake("[::]:50071").is_err());
         // A specific routable address is also refused.
         assert!(resolve_loopback_intake("10.0.0.5:50071").is_err());
+    }
+
+    #[test]
+    fn transport_from_endpoint_parses_loopback() {
+        for endpoint in ["http://127.0.0.1:50071", "127.0.0.1:50071"] {
+            let transport = LocalIntakeTransport::from_endpoint(endpoint)
+                .expect("loopback endpoint should parse");
+            match transport {
+                LocalIntakeTransport::LoopbackTcp(addr) => {
+                    assert_eq!(addr, "127.0.0.1:50071".parse().unwrap());
+                }
+            }
+        }
+
+        assert!(LocalIntakeTransport::from_endpoint("http://10.0.0.5:50071").is_err());
+        assert!(LocalIntakeTransport::loopback_tcp("127.0.0.1:0").is_ok());
+    }
+
+    #[tokio::test]
+    async fn transport_serve_and_connect_round_trips() {
+        let reserved = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+
+        let transport = LocalIntakeTransport::loopback_tcp(&addr.to_string()).unwrap();
+        let scheduler = Scheduler::new(WorkerTable::new(Duration::from_secs(60)));
+        let service = IntakeService::new(scheduler);
+        let server_transport = transport.clone();
+        let server = tokio::spawn(async move {
+            server_transport.serve(service).await.unwrap();
+        });
+
+        let command = Command {
+            argv: vec!["cmd".into(), "/c".into(), "exit".into(), "0".into()],
+            env: Default::default(),
+            cwd: String::new(),
+        };
+        let endpoint = format!("http://{addr}");
+        let mut result = None;
+        for _ in 0..20 {
+            match submit_to_daemon(endpoint.clone(), command.clone(), SubmitOptions::default())
+                .await
+            {
+                Ok(ok) => {
+                    result = Some(ok);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+        server.abort();
+
+        let (code, note) = result.expect("transport-backed intake should accept a submission");
+        assert_eq!(code, 0);
+        assert!(
+            note.starts_with("local fallback:"),
+            "empty worker table should dispatch via local fallback, got {note:?}"
+        );
     }
 }
