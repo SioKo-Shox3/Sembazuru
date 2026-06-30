@@ -4,10 +4,20 @@
 //! Given the set of per-process traces from one run, this links them into a
 //! process tree and folds their events into normalized input/output sets,
 //! registry reads, and environment reads. Normalization rules (case folding,
-//! relative-path resolution, intermediate/telemetry tagging) live here and
-//! nowhere else.
+//! relative-path resolution, telemetry tagging) live here and nowhere else.
+//!
+//! Transients are detected from event sequences, never from path location. A
+//! path is non-surviving only when one trace shows it was created in that
+//! process and then deleted, or written and then renamed away by that same
+//! process. Reads are kept as inputs even when they live under %TMP%/%TEMP% or
+//! a directory named `temp`; dropping a real read by location could omit it from
+//! the action key and allow a stale cache hit. Cross-process deletes are
+//! conservatively not applied to another process's outputs: this keeps a real
+//! delete-then-write survivor, at the cost of rare write-then-delete false
+//! outputs. False outputs can cause misses, but not stale hits or incomplete
+//! republishes.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::model::{AccessKind, EnvOp, EventKind, FileOp, RegistryOp, Trace};
 
@@ -62,11 +72,16 @@ pub struct DependencyGraph {
     /// Files the build produced and left behind (write opens, move
     /// destinations, created directories). These survive the build, so they
     /// are the outputs that matter for reproducibility and distribution.
+    /// Surviving outputs are not filtered by temp-looking directories: a temp
+    /// file that remains on disk is conservative output evidence.
     pub outputs: Vec<PathAccess>,
-    /// Files the build deleted or removed without otherwise producing them —
-    /// transients (compiler temp files, stale-output cleanup). Dependency
-    /// information, but not surviving outputs, so kept separate: a transient
-    /// with a run-varying name must not break output-set comparison.
+    /// Files the build deleted or renamed away. Delete removes only an output
+    /// produced earlier by the same trace from the surviving output set but
+    /// leaves any prior input intact, so a read of a pre-existing file remains
+    /// an input even when the file is later deleted. Cross-process deletes do
+    /// not remove another trace's output. This survival-based model replaces
+    /// the old temp-path substring heuristic and is cache-correct because it
+    /// never drops a read merely because of where the file lived.
     pub deletions: Vec<PathAccess>,
     pub registry: Vec<RegistryAccess>,
     pub env: Vec<EnvAccess>,
@@ -225,41 +240,6 @@ fn collapse_separators(p: &str) -> String {
     out
 }
 
-/// Is this path under the session temp area, i.e. an intermediate artifact to
-/// exclude from run-to-run comparison? Uses %TMP%/%TEMP% captured from the
-/// root process's environment reads when available; falls back to common temp
-/// markers.
-fn is_intermediate(norm_path: &str, temp_dirs: &BTreeSet<String>) -> bool {
-    // Authoritative signal: the run's real %TMP%/%TEMP%, captured from the root
-    // process's env reads. A path *under* one of those directories is a build
-    // transient. Used whenever available.
-    if temp_dirs.iter().any(|t| norm_path.starts_with(t.as_str())) {
-        return true;
-    }
-    // Fallback for when the env block wasn't captured: only the canonical Windows
-    // per-user temp (`...\appdata\local\temp\...`), which is specific enough not
-    // to misclassify a real source tree.
-    //
-    // A bare `\temp\` substring is deliberately NOT a marker: a legitimate project
-    // can live under `C:\temp\proj` or `D:\work\temp\fixtures`, and dropping its
-    // sources here would silently exclude real inputs from the dependency graph —
-    // an edit to such a source would then not move the action key and a stale
-    // cached result would be served (COR-006).
-    //
-    // This is a *best-effort* fallback, not a complete one, and it cuts both ways:
-    // when `temp_dirs` is empty (the CRT located temp via a whole-block env read
-    // or `GetTempPathW`, neither of which yields a per-variable value today) AND
-    // temp is *not* under `appdata\local\temp` (e.g. `TEMP=C:\Temp`), a genuine
-    // run-varying compiler transient there is no longer excluded. Such a transient
-    // is fail-safe for correctness — outside the build root it perpetually misses
-    // the action cache rather than serving a wrong result — but its run-varying
-    // name can destabilise the M2 input-hash. The real fix is to populate
-    // `temp_dirs` reliably (hook `GetTempPathW`/`GetTempFileNameW`, or surface
-    // TMP/TEMP from the block-read env) so this substring guess becomes moot; see
-    // `docs/deferred.md` (COR-006 residual).
-    norm_path.contains("\\appdata\\local\\temp\\")
-}
-
 /// Which comparison set a file access folds into.
 #[derive(Clone, Copy)]
 enum Bucket {
@@ -301,6 +281,24 @@ impl Accumulator {
         entry.kinds.insert(kind);
         entry.pids.insert(pid);
     }
+
+    fn remove_path_for_pid(&mut self, bucket: Bucket, norm: &str, pid: u32) {
+        let map = match bucket {
+            Bucket::Input => &mut self.inputs,
+            Bucket::Output => &mut self.outputs,
+            Bucket::Deletion => &mut self.deletions,
+        };
+        let should_remove = map
+            .get_mut(norm)
+            .map(|entry| {
+                entry.pids.remove(&pid);
+                entry.pids.is_empty()
+            })
+            .unwrap_or(false);
+        if should_remove {
+            map.remove(norm);
+        }
+    }
 }
 
 /// Device/pipe paths (`\\.\pipe\...`, `\\.\PhysicalDrive0`, console handles)
@@ -310,27 +308,6 @@ impl Accumulator {
 /// catch here.
 fn is_device(norm: &str) -> bool {
     norm.starts_with("\\\\.\\") || norm.contains("\\pipe\\")
-}
-
-/// Collects %TMP%/%TEMP% values seen in env reads, normalized, so intermediate
-/// detection can use the run's real temp dirs.
-fn collect_temp_dirs(traces: &[Trace]) -> BTreeSet<String> {
-    let mut dirs = BTreeSet::new();
-    for t in traces {
-        for ev in &t.events {
-            if let EventKind::Env { op: EnvOp::Read } = ev.kind {
-                let name = ev.path.to_ascii_uppercase();
-                if (name == "TMP" || name == "TEMP") && !ev.aux.is_empty() {
-                    let mut d = normalize_path(&ev.aux, &t.cwd);
-                    if !d.ends_with('\\') {
-                        d.push('\\');
-                    }
-                    dirs.insert(d);
-                }
-            }
-        }
-    }
-    dirs
 }
 
 /// Builds the dependency graph from a set of traces gathered in one run.
@@ -346,7 +323,6 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
     }
 
     let pids: BTreeSet<u32> = traces.iter().map(|t| t.pid).collect();
-    let temp_dirs = collect_temp_dirs(traces);
 
     // --- Process tree -----------------------------------------------------
     let mut nodes: BTreeMap<u32, ProcessNode> = BTreeMap::new();
@@ -435,10 +411,11 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
         if TELEMETRY_EXES.contains(&t.exe_name().as_str()) {
             continue;
         }
+        let mut produced: HashSet<String> = HashSet::new();
         for ev in &t.events {
             match &ev.kind {
                 EventKind::File { op, .. } => {
-                    fold_file(&mut acc, t.pid, *op, ev, &temp_dirs, &t.cwd);
+                    fold_file(&mut acc, t.pid, *op, ev, &t.cwd, &mut produced);
                 }
                 EventKind::Registry {
                     op: RegistryOp::QueryValue,
@@ -492,20 +469,31 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
     graph
 }
 
+/// Folds one file event into the graph's comparison buckets.
+///
+/// Transient classification here is survival-based rather than location-based:
+/// a successful delete removes only a same-process output from the surviving
+/// output set, while preserving any prior input read; a successful move removes
+/// the renamed-away source from input/output buckets only when this trace
+/// produced that source, then records the destination as an output when it is a
+/// real file path. Cross-process deletes never drop another process's output,
+/// so trace fold order cannot turn a real delete-then-write survivor into a
+/// missing republished output. The intentionally conservative opposite case, a
+/// cross-process write-then-delete, may leave a false output and cause a miss.
+/// A failed delete or rename leaves any surviving output in place. No
+/// temp-directory or substring heuristic is consulted, so a content read under
+/// %TMP%/%TEMP% remains an input and is not dropped by location.
 fn fold_file(
     acc: &mut Accumulator,
     pid: u32,
     op: FileOp,
     ev: &crate::model::Event,
-    temp_dirs: &BTreeSet<String>,
     cwd: &str,
+    produced: &mut HashSet<String>,
 ) {
     let norm = normalize_path(&ev.path, cwd);
     if is_device(&norm) {
         return; // named pipe / device, not a file
-    }
-    if is_intermediate(&norm, temp_dirs) {
-        return; // intermediate artifact, excluded from comparison sets
     }
     let ok = ev.succeeded();
     match op {
@@ -523,9 +511,11 @@ fn fold_file(
         FileOp::OpenReadWrite => {
             acc.add_path(Bucket::Input, &norm, AccessKind::Read, pid);
             acc.add_path(Bucket::Output, &norm, AccessKind::Write, pid);
+            produced.insert(norm.clone());
         }
         FileOp::OpenWrite => {
             acc.add_path(Bucket::Output, &norm, AccessKind::Write, pid);
+            produced.insert(norm.clone());
         }
         FileOp::Probe => {
             let kind = if ok {
@@ -539,13 +529,27 @@ fn fold_file(
             acc.add_path(Bucket::Input, &norm, AccessKind::Enumerate, pid);
         }
         FileOp::Delete => {
-            // A deleted file does not survive the build: a transient, not a
-            // surviving output. Kept in the separate deletions set.
+            // Only a SUCCESSFUL delete proves the path did not survive the
+            // build. A failed delete (sharing violation, EDR/AV lock,
+            // incremental-link lock) leaves a genuinely-produced output in
+            // place; the hook still emits the event with a non-zero status, so
+            // an unconditional removal would drop a real output -> a later
+            // cache hit would republish an incomplete result. Keep the deletion
+            // record unconditional (matches prior behavior; the deletions set
+            // is informational).
+            if ok && produced.contains(&norm) {
+                acc.remove_path_for_pid(Bucket::Output, &norm, pid);
+            }
             acc.add_path(Bucket::Deletion, &norm, AccessKind::Delete, pid);
         }
         FileOp::Move => {
-            // The source is renamed away: it does not survive the build. If a
-            // prior write in this run produced it — the compiler's
+            // Only a SUCCESSFUL rename removes the source and produces the
+            // destination. A failed rename leaves the source surviving (do not
+            // drop it from outputs) and produces no destination (do not invent
+            // a phantom output). Same survival rule as Delete.
+            //
+            // After a successful rename, the source does not survive the build.
+            // If a prior write in this process produced it — the compiler's
             // write-temp-then-rename-onto-the-final-name pattern, e.g. lld via
             // NtSetInformationFile(FileRenameInformation) — drop it from the
             // outputs so a run-varying temp name cannot break output-set
@@ -557,20 +561,41 @@ fn fold_file(
             // also added to INPUTS by the read side of that open — drop it from
             // both sets, not just outputs, or the run-varying name pollutes the
             // input hash whenever the temp lives outside the build root.
-            acc.outputs.remove(&norm);
-            acc.inputs.remove(&norm);
+            if ok && produced.contains(&norm) {
+                // A successful rename removes the source. Drop it from outputs
+                // (it does not survive under its temp name). Only drop it from
+                // INPUTS if it was this-process-PRODUCED -- i.e. a prior write
+                // in this trace created it (lld
+                // OpenReadWrite's its temp and memory-maps the output buffer,
+                // so its read side is reading our own output, not a real
+                // dependency). A move of a PRE-EXISTING file that was only READ
+                // is a real input and MUST stay in the cache key, or a later
+                // content change would stale-hit.
+                acc.remove_path_for_pid(Bucket::Output, &norm, pid);
+                acc.remove_path_for_pid(Bucket::Input, &norm, pid);
+            }
             acc.add_path(Bucket::Deletion, &norm, AccessKind::Move, pid);
-            if !ev.aux.is_empty() {
+            if ok && !ev.aux.is_empty() {
                 let dst = normalize_path(&ev.aux, cwd);
-                if !is_device(&dst) && !is_intermediate(&dst, temp_dirs) {
+                if !is_device(&dst) {
                     acc.add_path(Bucket::Output, &dst, AccessKind::Write, pid);
+                    produced.insert(dst);
                 }
             }
         }
         FileOp::CreateDir => {
             acc.add_path(Bucket::Output, &norm, AccessKind::Write, pid);
+            produced.insert(norm.clone());
         }
         FileOp::RemoveDir => {
+            // A directory created and then removed by the same process did not
+            // survive -- drop it from outputs, mirroring the Delete arm. A
+            // FAILED RemoveDir (non-zero status) leaves the directory in place,
+            // so gate the removal on success. Deletion record stays
+            // unconditional.
+            if ok && produced.contains(&norm) {
+                acc.remove_path_for_pid(Bucket::Output, &norm, pid);
+            }
             acc.add_path(Bucket::Deletion, &norm, AccessKind::Delete, pid);
         }
     }
@@ -623,6 +648,33 @@ mod tests {
     }
 
     #[test]
+    fn cross_process_delete_then_write_keeps_the_output() {
+        let mut driver = trace(10, 1, "C:\\driver.exe");
+        driver
+            .events
+            .push(file_event(FileOp::Delete, "C:\\proj\\bin\\out.dll", 0));
+
+        let mut linker = trace(20, 1, "C:\\link.exe");
+        linker
+            .events
+            .push(file_event(FileOp::OpenWrite, "C:\\proj\\bin\\out.dll", 0));
+
+        let g = build_graph(&[driver.clone(), linker.clone()]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            outs.contains(&"c:\\proj\\bin\\out.dll"),
+            "delete-then-write survivor must remain an output: {outs:?}"
+        );
+
+        let g = build_graph(&[linker, driver]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            outs.contains(&"c:\\proj\\bin\\out.dll"),
+            "trace order must not drop the surviving output: {outs:?}"
+        );
+    }
+
+    #[test]
     fn failed_probe_is_kept_as_probe_miss() {
         let mut t = trace(10, 1, "C:\\cl.exe");
         // include search miss: the build depends on this file being absent
@@ -663,14 +715,130 @@ mod tests {
 
     #[test]
     fn deleted_file_is_a_transient_not_an_output() {
-        // A compiler temp file: deleted, never produced as a surviving output.
+        // A compiler temp file created and deleted in the same run never
+        // survives as an output.
         let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events
+            .push(file_event(FileOp::OpenWrite, "C:\\build\\_cl_12345.tmp", 0));
         t.events
             .push(file_event(FileOp::Delete, "C:\\build\\_cl_12345.tmp", 0));
         let g = build_graph(&[t]);
         assert!(g.outputs.is_empty(), "transient must not be an output");
         assert_eq!(g.deletions.len(), 1);
         assert_eq!(g.deletions[0].path, "c:\\build\\_cl_12345.tmp");
+
+        // A pre-existing file read before deletion is still a real input. If
+        // this were removed from inputs, a later content change could stale-hit.
+        let mut t = trace(20, 1, "C:\\cl.exe");
+        t.events
+            .push(file_event(FileOp::OpenRead, "C:\\src\\config.h", 0));
+        t.events
+            .push(file_event(FileOp::Delete, "C:\\src\\config.h", 0));
+        let g = build_graph(&[t]);
+        let inputs: Vec<&str> = g.inputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            inputs.contains(&"c:\\src\\config.h"),
+            "read-then-delete must stay an input: {inputs:?}"
+        );
+        assert!(
+            g.deletions.iter().any(|d| d.path == "c:\\src\\config.h"),
+            "read-then-delete must also record the deletion"
+        );
+    }
+
+    #[test]
+    fn failed_delete_keeps_a_surviving_output() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events
+            .push(file_event(FileOp::OpenWrite, "C:\\proj\\out.o", 0));
+        t.events
+            .push(file_event(FileOp::Delete, "C:\\proj\\out.o", 5));
+
+        let g = build_graph(&[t]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            outs.contains(&"c:\\proj\\out.o"),
+            "stale-hit regression: failed delete must not drop a surviving output: {outs:?}"
+        );
+    }
+
+    #[test]
+    fn created_then_removed_dir_is_not_a_surviving_output() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events
+            .push(file_event(FileOp::CreateDir, "C:\\build\\objs", 0));
+        t.events
+            .push(file_event(FileOp::RemoveDir, "C:\\build\\objs", 0));
+
+        let g = build_graph(&[t]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            !outs.contains(&"c:\\build\\objs"),
+            "created-then-removed directory must not survive as an output: {outs:?}"
+        );
+        assert!(
+            g.deletions.iter().any(|d| d.path == "c:\\build\\objs"),
+            "removed directory must be recorded as a deletion"
+        );
+    }
+
+    #[test]
+    fn failed_removedir_keeps_the_directory_output() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events
+            .push(file_event(FileOp::CreateDir, "C:\\build\\objs", 0));
+        t.events
+            .push(file_event(FileOp::RemoveDir, "C:\\build\\objs", 5));
+
+        let g = build_graph(&[t]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            outs.contains(&"c:\\build\\objs"),
+            "failed RemoveDir must keep the surviving directory output: {outs:?}"
+        );
+    }
+
+    #[test]
+    fn failed_move_keeps_source_and_adds_no_phantom_output() {
+        let mut t = trace(10, 1, "C:\\link.exe");
+        t.events
+            .push(file_event(FileOp::OpenWrite, "C:\\work\\a.obj", 0));
+        let mut rename = file_event(FileOp::Move, "C:\\work\\a.obj", 5);
+        rename.aux = "C:\\work\\final.obj".to_string();
+        t.events.push(rename);
+
+        let g = build_graph(&[t]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            outs.contains(&"c:\\work\\a.obj"),
+            "failed move must keep the surviving source output: {outs:?}"
+        );
+        assert!(
+            !outs.contains(&"c:\\work\\final.obj"),
+            "failed move must not invent a phantom destination output: {outs:?}"
+        );
+    }
+
+    #[test]
+    fn read_then_move_of_preexisting_file_keeps_the_input() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events
+            .push(file_event(FileOp::OpenRead, "C:\\src\\config.h", 0));
+        let mut rename = file_event(FileOp::Move, "C:\\src\\config.h", 0);
+        rename.aux = "C:\\archive\\config.h".to_string();
+        t.events.push(rename);
+
+        let g = build_graph(&[t]);
+        let inputs: Vec<&str> = g.inputs.iter().map(|p| p.path.as_str()).collect();
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            inputs.contains(&"c:\\src\\config.h"),
+            "read-then-move of a pre-existing file must stay an input: {inputs:?}"
+        );
+        assert!(
+            outs.contains(&"c:\\archive\\config.h"),
+            "successful move must record the destination output: {outs:?}"
+        );
     }
 
     #[test]
@@ -715,14 +883,11 @@ mod tests {
     }
 
     #[test]
-    fn temp_fallback_keeps_real_sources_but_drops_appdata_temp() {
-        // COR-006: with no captured %TEMP% (the env block was never read), the
-        // fallback must NOT drop a real source merely because its path contains a
-        // `\temp\` segment (a project under C:\temp\proj, fixtures under
-        // D:\work\temp\...), while still excluding the canonical per-user temp
-        // (`...\appdata\local\temp\...`) where compiler transients actually live.
+    fn temp_located_reads_are_inputs_transients_are_dropped_by_event_sequence() {
+        // COR-006: temp-looking locations are not transients by themselves. A
+        // read from any of these locations is a real input; only a create then
+        // delete event sequence proves a non-surviving compiler temp.
         let mut t = trace(10, 1, "C:\\cl.exe");
-        // No env Read event → temp_dirs is empty → only the fallback applies.
         t.events.push(file_event(
             FileOp::OpenRead,
             "C:\\temp\\proj\\src\\a.cpp",
@@ -734,7 +899,17 @@ mod tests {
             0,
         ));
         t.events.push(file_event(
+            FileOp::OpenRead,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\real_input.h",
+            0,
+        ));
+        t.events.push(file_event(
             FileOp::OpenWrite,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\_cl_abc.tmp",
+            0,
+        ));
+        t.events.push(file_event(
+            FileOp::Delete,
             "C:\\Users\\dev\\AppData\\Local\\Temp\\_cl_abc.tmp",
             0,
         ));
@@ -750,9 +925,114 @@ mod tests {
             "a source under a \\temp\\ segment must stay an input (COR-006): {inputs:?}"
         );
         assert!(
+            inputs.contains(&"c:\\users\\dev\\appdata\\local\\temp\\real_input.h"),
+            "a read under the real temp dir must stay an input: {inputs:?}"
+        );
+        assert!(
             g.outputs.is_empty(),
-            "the transient under \\appdata\\local\\temp\\ must still be excluded: {:?}",
+            "created-then-deleted temp must not be a surviving output: {:?}",
             g.outputs.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn project_root_under_c_temp_is_an_input() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events.push(file_event(
+            FileOp::OpenRead,
+            "C:\\temp\\project\\src\\main.cpp",
+            0,
+        ));
+        let g = build_graph(&[t]);
+        let inputs: Vec<&str> = g.inputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            inputs.contains(&"c:\\temp\\project\\src\\main.cpp"),
+            "project source under C:\\temp must be an input: {inputs:?}"
+        );
+    }
+
+    #[test]
+    fn source_read_under_percent_temp_is_an_input() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events.push(file_event(
+            FileOp::OpenRead,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\src\\main.cpp",
+            0,
+        ));
+        let g = build_graph(&[t]);
+        let inputs: Vec<&str> = g.inputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            inputs.contains(&"c:\\users\\dev\\appdata\\local\\temp\\src\\main.cpp"),
+            "source read under %TEMP% must be an input: {inputs:?}"
+        );
+    }
+
+    #[test]
+    fn compiler_temp_create_write_delete_is_a_transient() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events.push(file_event(
+            FileOp::OpenWrite,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\_cl_abc.tmp",
+            0,
+        ));
+        t.events.push(file_event(
+            FileOp::Delete,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\_cl_abc.tmp",
+            0,
+        ));
+        let g = build_graph(&[t]);
+        assert!(
+            g.outputs.is_empty(),
+            "created-then-deleted temp must not be an output: {:?}",
+            g.outputs.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+        assert!(
+            g.deletions
+                .iter()
+                .any(|d| d.path == "c:\\users\\dev\\appdata\\local\\temp\\_cl_abc.tmp"),
+            "created-then-deleted temp must be recorded as a deletion"
+        );
+    }
+
+    #[test]
+    fn compiler_temp_create_write_rename_is_a_transient() {
+        let mut t = trace(10, 1, "C:\\clang-cl.exe");
+        t.events.push(file_event(
+            FileOp::OpenReadWrite,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\a-915f50da.obj.tmp",
+            0,
+        ));
+        let mut rename = file_event(
+            FileOp::Move,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\a-915f50da.obj.tmp",
+            0,
+        );
+        rename.aux = "C:\\work\\a.obj".to_string();
+        t.events.push(rename);
+
+        let g = build_graph(&[t]);
+        let outs: Vec<&str> = g.outputs.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(outs, vec!["c:\\work\\a.obj"], "only final output survives");
+        assert!(
+            g.inputs.is_empty(),
+            "renamed-away temp must not remain an input: {:?}",
+            g.inputs.iter().map(|p| &p.path).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn read_temp_file_is_included_as_input() {
+        let mut t = trace(10, 1, "C:\\cl.exe");
+        t.events.push(file_event(
+            FileOp::OpenRead,
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\settings.props",
+            0,
+        ));
+        let g = build_graph(&[t]);
+        let inputs: Vec<&str> = g.inputs.iter().map(|p| p.path.as_str()).collect();
+        assert!(
+            inputs.contains(&"c:\\users\\dev\\appdata\\local\\temp\\settings.props"),
+            "read-only temp-located file must be an input: {inputs:?}"
         );
     }
 

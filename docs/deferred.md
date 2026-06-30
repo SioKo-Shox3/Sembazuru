@@ -71,18 +71,25 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 - **mspdbsrv.exe の扱い未決。** PDB 書き込みは別プロセス＋共有メモリ。注入/監視/無視の
   いずれにするか未決定（PDB は M2/M3 scope 外だが CI 影響あり）。出所: 実測2
   (m3-prestudy §1 Open questions)。
-- **temp ディレクトリ分類が `temp_dirs` 捕捉に依存（COR-006 残差）。** `graph.rs::is_intermediate`
-  の over-broad な `contains("\\temp\\")` fallback は除去済み（`C:\temp\proj` 等の実ソースを
-  中間物として誤除外し stale hit を招く本体バグを解消、本回コミット）。ただし fallback は
-  `\appdata\local\temp\` のみに縮小したため、**`temp_dirs` が空（CRT が block-read env や
-  `GetTempPathW` で temp を解決し per-variable 値が trace に出ない）かつ TEMP が
-  `appdata\local\temp` 配下でない（例 `TEMP=C:\Temp`）場合**、そこの run-varying compiler temp が
-  read-back 残存すると input 集合に漏れる。correctness は fail-safe（ビルドルート外＝action cache
-  は恒久 miss で誤結果なし）だが、run-varying 名が **M2 input-hash を flap させうる**。正攻法は
-  `temp_dirs` を確実に埋めること（`GetTempPathW`/`GetTempFileNameW` をフック、または block-read env
-  から TMP/TEMP を surface）で substring 推測自体を不要化する。実運用の CI/ローカルは TEMP が
-  `appdata\local\temp` 配下のため現状は非発火。出所: code-review COR-006 ＋ verifier(opus, 本回)、
-  `docs/Sembazuru_code_review_action_guide.md`。
+- **temp ディレクトリ分類 — 解消（Phase 6.1, COR-006 クローズ）。** `graph.rs::is_intermediate`
+  （`temp_dirs` 前置一致 ＋ `\appdata\local\temp\` substring の双方）と `collect_temp_dirs` /
+  `temp_dirs` パラメータを **完全に除去**。location ベースの drop を廃し、survival ベースの
+  event-sequence 分類へ置換した：
+  - content READ は location に依らず常に input（temp/%TEMP% 配下でも落とさない＝本体の stale hit を解消）。
+  - transient は「同一プロセスが生成（OpenWrite/OpenReadWrite/CreateDir/Move-dst）して **成功裏に**
+    delete / rename-away / RemoveDir した」パスのみ outputs から除去（per-trace `produced` 集合 ＋
+    per-pid 除去で判定）。失敗した delete/rename（`!ev.succeeded()`）は生存出力を残す。
+  - cross-process の delete-then-write（例 incremental link で driver が旧 artifact を削除し linker が
+    新 output を書く）は trace 順に依らず survivor を保持。
+  これにより旧エントリの「`temp_dirs` 空 ＋ TEMP が `appdata\local\temp` 外 → run-varying temp が
+  input 集合に漏れて M2 input-hash flap」という残差は **moot**（location 推測自体が無くなった）。
+  残る既知の限定事項（いずれも false-hit ではなく false-miss、または既存 deferred）：
+  - 稀な cross-process write-then-delete（あるプロセスが書き別プロセスが消す）は survivor 保持の
+    保守側に倒すため、非生存パスが false output として残りうる（action cache の miss 増のみ、誤結果なし）。
+  - 同一トレース内 RMW ＋ rename-away（`OpenRead(A)→OpenWrite(A)→Move(A→B)`）は A を input から落とすが、
+    これは output-shadows-input（ADR 0014(3)）と同族の既存 deferred で、6.1 は悪化させていない（旧コードは
+    無条件 `inputs.remove` でより広く落としていた）。
+  出所: code-review COR-006 ＋ adversarial review（Codex + verifier opus, 多ラウンド, Phase 6.1）。
 
 ## M4（CAS とキャッシュ）— 本バックログの主対象
 
