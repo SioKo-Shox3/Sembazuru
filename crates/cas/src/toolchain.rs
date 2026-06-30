@@ -1,13 +1,36 @@
 //! Toolchain resolution and content-digest helpers, shared by the
 //! agent (and later the worker).
 //!
-//! The primary entry point is [`toolchain_digest`]; all other items are private.
+//! The primary entry points are [`toolchain_identity`] and [`toolchain_digest`];
+//! resolution helpers remain private.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use crate::{Digest, DigestHasher};
+
+/// The classified toolchain identity folded into the weak key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolchainIdentity {
+    /// `argv0` resolved to a real file whose content was hashed.
+    Content { digest: Digest, path: PathBuf },
+    /// `argv0` was unresolved (or unreadable), so the identity is the
+    /// content-blind name constant.
+    NameOnly { digest: Digest, argv0: String },
+}
+
+impl ToolchainIdentity {
+    pub fn digest(&self) -> &Digest {
+        match self {
+            Self::Content { digest, .. } | Self::NameOnly { digest, .. } => digest,
+        }
+    }
+
+    pub fn is_content(&self) -> bool {
+        matches!(self, Self::Content { .. })
+    }
+}
 
 /// The toolchain identity folded into the weak key: the **content digest of the
 /// actual compiler binary** `argv0` resolves to (so a same-named upgrade moves the
@@ -23,12 +46,31 @@ use crate::{Digest, DigestHasher};
 /// the same PATH location is an accepted residual (closed later by the ADR 0014
 /// worker re-verify), no worse than the previous constant which collided all
 /// versions.
-pub fn toolchain_digest(argv0: &str, path_env: Option<&str>, cwd: &str) -> Digest {
-    let name_constant = || Digest::of(format!("toolchain-name:{argv0}").as_bytes());
+pub fn toolchain_identity(argv0: &str, path_env: Option<&str>, cwd: &str) -> ToolchainIdentity {
     match resolve_program(argv0, path_env, cwd) {
-        Some(resolved) => digest_file_memoized(&resolved).unwrap_or_else(name_constant),
-        None => name_constant(),
+        Some(resolved) => match digest_file_memoized(&resolved) {
+            Some(digest) => ToolchainIdentity::Content {
+                digest,
+                path: resolved,
+            },
+            None => ToolchainIdentity::NameOnly {
+                digest: toolchain_name_constant(argv0),
+                argv0: argv0.to_string(),
+            },
+        },
+        None => ToolchainIdentity::NameOnly {
+            digest: toolchain_name_constant(argv0),
+            argv0: argv0.to_string(),
+        },
     }
+}
+
+pub fn toolchain_digest(argv0: &str, path_env: Option<&str>, cwd: &str) -> Digest {
+    toolchain_identity(argv0, path_env, cwd).digest().clone()
+}
+
+fn toolchain_name_constant(argv0: &str) -> Digest {
+    Digest::of(format!("toolchain-name:{argv0}").as_bytes())
 }
 
 /// Resolves `argv0` to the file `CreateProcess` would launch, for content
@@ -187,6 +229,69 @@ mod tests {
             resolve_program("foo.bar", Some(&path_env), "").as_deref(),
             Some(dir.join("foo.bar.exe").as_path()),
             "PATHEXT appends .exe; it must not become foo.exe"
+        );
+    }
+
+    #[test]
+    fn toolchain_identity_content_for_a_real_file() {
+        let dir = tmp("identity-content");
+        let bin_dir = dir.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let exe = bin_dir.join("cl.exe");
+        std::fs::write(&exe, b"REAL-CL-CONTENT").unwrap();
+        let expected = Digest::of(b"REAL-CL-CONTENT");
+
+        let abs = exe.to_string_lossy().into_owned();
+        match toolchain_identity(&abs, None, "") {
+            ToolchainIdentity::Content { digest, path } => {
+                assert_eq!(digest, expected);
+                assert_eq!(path, exe);
+            }
+            other => panic!("expected content identity for absolute path, got {other:?}"),
+        }
+
+        let rel = exe
+            .strip_prefix(&dir)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let cwd = dir.to_string_lossy().into_owned();
+        match toolchain_identity(&rel, None, &cwd) {
+            ToolchainIdentity::Content { digest, path } => {
+                assert_eq!(digest, expected);
+                assert_eq!(path, dir.join(Path::new(&rel)));
+            }
+            other => panic!("expected content identity for cwd-relative path, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toolchain_identity_nameonly_for_bare_unfound() {
+        let name = "sembazuru-definitely-unfound-tool";
+        match toolchain_identity(name, Some(""), "") {
+            ToolchainIdentity::NameOnly { digest, argv0 } => {
+                assert_eq!(argv0, name);
+                assert_eq!(
+                    digest,
+                    Digest::of(format!("toolchain-name:{name}").as_bytes())
+                );
+            }
+            other => panic!("expected name-only identity for bare unfound tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toolchain_digest_matches_toolchain_identity_for_resolved_file() {
+        let dir = tmp("identity-wrapper");
+        let exe = dir.join("cl.exe");
+        std::fs::write(&exe, b"WRAPPER-CONTENT").unwrap();
+        let argv0 = exe.to_string_lossy().into_owned();
+        let identity = toolchain_identity(&argv0, None, "");
+
+        assert!(identity.is_content());
+        assert_eq!(
+            toolchain_digest(&argv0, None, ""),
+            identity.digest().clone()
         );
     }
 

@@ -93,28 +93,26 @@ impl AgentCache {
         self.weak_key_and_tool(argv, env, cwd).0
     }
 
-    /// Returns the weak fingerprint and the toolchain digest folded into it.
+    /// Returns the weak fingerprint and the toolchain identity folded into it.
     pub fn weak_key_and_tool(
         &self,
         argv: &[String],
         env: &[(String, String)],
         cwd: &str,
-    ) -> (Digest, Digest) {
+    ) -> (Digest, sembazuru_cas::toolchain::ToolchainIdentity) {
         // PATH is excluded from the KEY (volatile), but is read here to resolve a
         // bare argv0 to the actual binary, whose content digest IS the identity.
         let path_env = env
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
             .map(|(_, v)| v.as_str());
-        let toolchain = sembazuru_cas::toolchain::toolchain_digest(
+        let identity = sembazuru_cas::toolchain::toolchain_identity(
             argv.first().map(String::as_str).unwrap_or(""),
             path_env,
             cwd,
         );
-        (
-            sembazuru_cas::weak_fingerprint(argv, env, cwd, &toolchain),
-            toolchain,
-        )
+        let weak = sembazuru_cas::weak_fingerprint(argv, env, cwd, identity.digest());
+        (weak, identity)
     }
 
     /// Phase 1: try to resolve an action from cache. On a hit the cached outputs

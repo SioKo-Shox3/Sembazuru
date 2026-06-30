@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sembazuru_cas::Digest;
+use sembazuru_cas::toolchain::ToolchainIdentity;
 use sembazuru_proto::v0::{
     ActionState, Command, ExitStatus, OutputChunk, StateChange, SubmitActionEvent,
     SubmitActionRequest, VfsExecution, local_intake_client::LocalIntakeClient,
@@ -253,6 +254,16 @@ fn worker_tool_matches(reported: &str, expected: &Digest) -> bool {
     !reported.is_empty() && reported == expected.to_string()
 }
 
+fn should_record_cache(
+    tool_verified: bool,
+    agent_identity: &ToolchainIdentity,
+    worker_reported_digest: &str,
+) -> bool {
+    tool_verified
+        && agent_identity.is_content()
+        && worker_tool_matches(worker_reported_digest, agent_identity.digest())
+}
+
 /// Drives one submission to completion and mirrors its terminal events. Without
 /// a VFS context this is a plain dispatch (M6.0). With one, the compile runs
 /// under the read-VFS; with a cache it is resolved first (a hit skips the worker)
@@ -319,7 +330,7 @@ async fn run_submission(
 
     // The weak key keys resolve, predicted_paths, and record. Computed off the
     // async runtime: weak_key_and_tool hashes the toolchain binary from disk.
-    let (weak, agent_tool_digest) = match &ctx.cache {
+    let (weak, agent_tool_identity) = match &ctx.cache {
         Some(cache) => {
             let cache = cache.clone();
             let argv = command.argv.clone();
@@ -333,7 +344,7 @@ async fn run_submission(
             match tokio::task::spawn_blocking(move || cache.weak_key_and_tool(&argv, &env, &cwd))
                 .await
             {
-                Ok((weak, tool_digest)) => (Some(weak), Some(tool_digest)),
+                Ok((weak, identity)) => (Some(weak), Some(identity)),
                 Err(_) => (None, None),
             }
         }
@@ -459,14 +470,14 @@ async fn run_submission(
     // (`tool_verified`, COR-004 — an arbitrary tool is distributed but not cached).
     // Without a trace or any discoverable output, recording is skipped (the build
     // is still correct, just uncached).
-    if let (Some(cache), Some(weak), Some(atd)) = (&ctx.cache, &weak, &agent_tool_digest)
+    if let (Some(cache), Some(weak), Some(identity)) = (&ctx.cache, &weak, &agent_tool_identity)
         && let Execution::Remote(o) = &outcome
         && o.exit_code == Some(0)
         && !trace_dir.is_empty()
         && !non_deterministic
         && tool_verified
     {
-        if worker_tool_matches(&o.resolved_tool_digest, atd) {
+        if should_record_cache(tool_verified, identity, &o.resolved_tool_digest) {
             let cache = cache.clone();
             let weak = weak.clone();
             let br = build_root.clone();
@@ -495,13 +506,21 @@ async fn run_submission(
                 }
             })
             .await;
-        } else {
+        } else if identity.is_content() {
             eprintln!(
                 "sembazuru-agent: heterogeneous toolchain digest mismatch for argv[0]={:?}; \
                  worker reported {:?}, agent expected {}; skipping cache record",
-                argv0, o.resolved_tool_digest, atd
+                argv0,
+                o.resolved_tool_digest,
+                identity.digest()
             );
             metrics.record_compiler_digest_mismatch();
+        } else {
+            eprintln!(
+                "sembazuru-agent: verified tool {:?} did not resolve to a file; \
+                 skipping cache record (name-only identity)",
+                argv0
+            );
         }
     }
 
@@ -662,8 +681,12 @@ pub async fn submit_to_daemon(
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use super::{is_verified_tool, mint_session_id, resolve_loopback_intake, worker_tool_matches};
+    use super::{
+        is_verified_tool, mint_session_id, resolve_loopback_intake, should_record_cache,
+        worker_tool_matches,
+    };
     use crate::status::Metrics;
+    use sembazuru_cas::toolchain::ToolchainIdentity;
 
     #[test]
     fn verified_tool_profile_matches_compilers_only() {
@@ -719,6 +742,63 @@ mod tests {
             metrics.record_compiler_digest_mismatch();
         }
         assert_eq!(metrics.compiler_digest_mismatch.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn verified_tool_unresolved_is_not_recorded() {
+        let d = sembazuru_cas::Digest::of(b"toolchain-name:cl");
+        let identity = ToolchainIdentity::NameOnly {
+            digest: d.clone(),
+            argv0: "cl".into(),
+        };
+
+        assert!(!should_record_cache(true, &identity, &d.to_string()));
+    }
+
+    #[test]
+    fn verified_tool_resolved_file_is_recorded() {
+        let d = sembazuru_cas::Digest::of(b"real-cl-bytes");
+        let identity = ToolchainIdentity::Content {
+            digest: d.clone(),
+            path: "C:/x/cl.exe".into(),
+        };
+
+        assert!(should_record_cache(true, &identity, &d.to_string()));
+    }
+
+    #[test]
+    fn worker_nameonly_identity_skips_record() {
+        let agent = sembazuru_cas::Digest::of(b"agent-content-tool");
+        let worker = sembazuru_cas::Digest::of(b"toolchain-name:cl");
+        let identity = ToolchainIdentity::Content {
+            digest: agent,
+            path: "C:/x/cl.exe".into(),
+        };
+
+        assert!(!should_record_cache(true, &identity, &worker.to_string()));
+    }
+
+    #[test]
+    fn agent_worker_tool_identity_mismatch_skips_record() {
+        let agent = sembazuru_cas::Digest::of(b"agent-content-tool");
+        let worker = sembazuru_cas::Digest::of(b"worker-content-tool");
+        let identity = ToolchainIdentity::Content {
+            digest: agent,
+            path: "C:/x/cl.exe".into(),
+        };
+
+        assert!(!should_record_cache(true, &identity, &worker.to_string()));
+    }
+
+    #[test]
+    fn unverified_resolved_file_is_not_recorded() {
+        let d = sembazuru_cas::Digest::of(b"real-cl-bytes");
+        let identity = ToolchainIdentity::Content {
+            digest: d.clone(),
+            path: "C:/x/cl.exe".into(),
+        };
+
+        assert!(!should_record_cache(false, &identity, &d.to_string()));
     }
 
     #[test]
