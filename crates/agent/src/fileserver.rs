@@ -314,12 +314,14 @@ pub fn normalize_root(root: &str) -> Option<String> {
     }
 }
 
-/// Lexically normalizes an agent-side requested path for scope comparison:
-/// lowercases, unifies separators, and collapses `.`/`..` components WITHOUT
-/// touching the filesystem (so it works for the many non-existent probe paths
-/// and never resolves symlinks). Returns `None` — which the caller treats as out
-/// of scope (fail closed) — for anything that is not a drive-absolute `x:\…`
-/// path or that escapes its drive root via `..`.
+/// Lexically normalizes an agent-side requested/output path for scope and
+/// declared-output comparison: lowercases, unifies separators, and collapses
+/// `.`/`..` components WITHOUT touching the filesystem (so it works for the many
+/// non-existent probe/output paths and never resolves symlinks). Returns `None`
+/// — which the caller treats as out of scope (fail closed) — for anything that
+/// is not a drive-absolute `x:\…` path or that escapes its drive root via `..`.
+/// Exposed so intake and integration tests normalize declared output paths in
+/// the same form WriteBack authorizes.
 ///
 /// Collapsing `..` here is the load-bearing security step (security M7.1 BLOCK-1):
 /// without it a request like `c:\root\..\..\users\dev\.ssh\id_rsa` string-prefix-
@@ -327,7 +329,7 @@ pub fn normalize_root(root: &str) -> Option<String> {
 /// C++ hook's `GetFullPathName`-then-prefix discipline (`interceptor.cpp`). UNC,
 /// `\\?\`, drive-relative `x:foo`, and 8.3 forms are rejected (fail closed),
 /// matching the known residuals in `docs/deferred.md`.
-fn normalize_requested(path: &str) -> Option<String> {
+pub fn normalize_requested(path: &str) -> Option<String> {
     let p = path.replace('/', "\\").to_lowercase();
     let b = p.as_bytes();
     // Require a drive-absolute path: "x:\...". Drive-relative "x:foo", UNC
@@ -554,24 +556,23 @@ fn tmp_sibling(final_path: &std::path::Path) -> PathBuf {
 /// `.pdb`/`.exe` is never buffered whole in memory (M4.4).
 ///
 /// **Output scope (SEC-003, ADR 0013).** A bound session may only write to its
-/// declared outputs (or, when none were declared, to within its authoritative
-/// root) — closing the hole where a worker named any absolute agent-side path. A
-/// legacy/unscoped session keeps the pre-ADR-0013 any-path behaviour. The target
-/// is otherwise NOT remapped — the agent publishes where the action's output goes.
+/// declared outputs — closing the hole where a worker named any absolute
+/// agent-side path. A legacy/unscoped session keeps the pre-ADR-0013 any-path
+/// behaviour. The target is otherwise NOT remapped — the agent publishes where
+/// the action's output goes.
 async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBackResponse {
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     // Gate the target BEFORE creating any directory or temp: a bound session's
-    // output must normalize to a drive-absolute path that is declared (or within
-    // its root). A non-normalizable form (UNC/relative/drive-escaping) is refused.
+    // output must normalize to a drive-absolute path that was declared. A
+    // non-normalizable form (UNC/relative/drive-escaping) is refused.
     if cap.enforces() {
-        let within_root = path_in_scope(&req.path, cap.root());
         let allowed = match normalize_requested(&req.path) {
-            Some(norm) => cap.output_allowed(&norm, within_root),
+            Some(norm) => cap.output_allowed(&norm),
             None => false,
         };
         if !allowed {
-            return wb_err("WriteBack target is outside the session's output scope".into());
+            return wb_err("WriteBack target is not a declared output of this session".into());
         }
     }
 

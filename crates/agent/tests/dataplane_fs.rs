@@ -4,6 +4,7 @@
 //! Read with digest verification, and DirList — before the C++ hook/pipe (M3.2b)
 //! is layered on. No compiler or DLL involved.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -37,6 +38,16 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+fn declared_outputs(paths: &[&str]) -> HashSet<String> {
+    paths
+        .iter()
+        .map(|p| {
+            sembazuru_agent::fileserver::normalize_requested(p)
+                .expect("test output paths must be drive-absolute")
+        })
+        .collect()
 }
 
 /// Starts the production-mode agent file server on an ephemeral port; returns
@@ -189,9 +200,20 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
 
     let dir = TempDir::new("wb");
     let out = dir.join("out/a.obj").to_string_lossy().into_owned();
+    let bad = dir.join("out/bad.obj").to_string_lossy().into_owned();
     let bytes = b"\x00\x01OBJ-bytes\xff".to_vec();
 
-    let (addr, session_id) = start_server().await;
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let session_id = "wb-atomic".to_string();
+    registry
+        .create(
+            session_id.clone(),
+            None,
+            declared_outputs(&[out.as_str(), bad.as_str()]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
 
     // A good WriteBack publishes the bytes at the requested path.
     let client = connect_bound(addr, &session_id).await;
@@ -236,7 +258,6 @@ async fn write_back_publishes_atomically_and_verifies_digest() {
     assert!(hello_header.is_response);
     assert!(HelloResponse::decode(&hello_payload).unwrap().ok);
 
-    let bad = dir.join("out/bad.obj").to_string_lossy().into_owned();
     let payload = WriteBackRequest {
         path: bad.clone(),
         digest_hex: "blake3:0000000000000000000000000000000000000000000000000000000000000000"
@@ -279,7 +300,13 @@ async fn write_back_streams_large_output_in_chunks() {
         .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
         .collect();
 
-    let (addr, session_id) = start_server().await;
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let session_id = "wb-big".to_string();
+    registry
+        .create(session_id.clone(), None, declared_outputs(&[out.as_str()]))
+        .await;
+    let addr = start_server_with_registry(registry).await;
     let client = connect_bound(addr, &session_id).await;
 
     let resp = client.write_back(&out, &big).await.unwrap();
@@ -566,6 +593,163 @@ async fn start_server_with_registry(
         .await;
     });
     addr
+}
+
+#[tokio::test]
+async fn writeback_to_declared_output_succeeds() {
+    let dir = TempDir::new("wb-declared-ok");
+    let out = dir.join("out/ok.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    registry
+        .create(
+            "wb-declared-ok".into(),
+            None,
+            declared_outputs(&[out.as_str()]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let client = connect_bound(addr, "wb-declared-ok").await;
+
+    let resp = client.write_back(&out, b"declared-output").await.unwrap();
+
+    assert!(
+        resp.ok,
+        "declared WriteBack should succeed: {}",
+        resp.detail
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        b"declared-output",
+        "declared output is published"
+    );
+}
+
+#[tokio::test]
+async fn writeback_to_root_but_undeclared_path_fails() {
+    let dir = TempDir::new("wb-root-undeclared");
+    let declared = dir.join("out/declared.obj").to_string_lossy().into_owned();
+    let other = dir.join("out/other.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create(
+            "wb-root-undeclared".into(),
+            root,
+            declared_outputs(&[declared.as_str()]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let client = connect_bound(addr, "wb-root-undeclared").await;
+
+    let resp = client.write_back(&other, b"not declared").await.unwrap();
+
+    assert!(!resp.ok, "undeclared WriteBack must be refused");
+    assert_eq!(
+        resp.detail,
+        "WriteBack target is not a declared output of this session"
+    );
+    assert!(
+        !std::path::Path::new(&other).exists(),
+        "undeclared output must not be published"
+    );
+}
+
+#[tokio::test]
+async fn writeback_empty_declared_outputs_fails() {
+    let dir = TempDir::new("wb-empty-declared");
+    let out = dir.join("out/none.obj").to_string_lossy().into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create("wb-empty-declared".into(), root, HashSet::new())
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let client = connect_bound(addr, "wb-empty-declared").await;
+
+    let resp = client.write_back(&out, b"no authority").await.unwrap();
+
+    assert!(!resp.ok, "empty declared outputs must refuse all WriteBack");
+    assert_eq!(
+        resp.detail,
+        "WriteBack target is not a declared output of this session"
+    );
+    assert!(
+        !std::path::Path::new(&out).exists(),
+        "empty declared set must not publish an output"
+    );
+}
+
+#[tokio::test]
+async fn writeback_dotdot_declared_output_rejected() {
+    let dir = TempDir::new("wb-dotdot");
+    let declared = dir.join("out/good.obj").to_string_lossy().into_owned();
+    let dotdot = format!("{}\\out\\..\\escape.obj", dir.path.to_string_lossy());
+    let escaped = dir.join("escape.obj");
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&dir.path.to_string_lossy());
+    registry
+        .create(
+            "wb-dotdot".into(),
+            root,
+            declared_outputs(&[declared.as_str()]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let client = connect_bound(addr, "wb-dotdot").await;
+
+    let resp = client.write_back(&dotdot, b"dotdot").await.unwrap();
+
+    assert!(!resp.ok, "dotdot path to an undeclared target must fail");
+    assert_eq!(
+        resp.detail,
+        "WriteBack target is not a declared output of this session"
+    );
+    assert!(
+        !escaped.exists(),
+        "dotdot target must not be published when it is not declared"
+    );
+}
+
+#[tokio::test]
+async fn writeback_absolute_outside_root_rejected() {
+    let root_dir = TempDir::new("wb-outside-root");
+    let outside_dir = TempDir::new("wb-outside-other");
+    let declared = root_dir
+        .join("out/declared.obj")
+        .to_string_lossy()
+        .into_owned();
+    let outside = outside_dir
+        .join("outside.obj")
+        .to_string_lossy()
+        .into_owned();
+    let registry =
+        std::sync::Arc::new(sembazuru_agent::session_registry::SessionRegistry::new().unwrap());
+    let root = sembazuru_agent::fileserver::normalize_root(&root_dir.path.to_string_lossy());
+    registry
+        .create(
+            "wb-outside-root".into(),
+            root,
+            declared_outputs(&[declared.as_str()]),
+        )
+        .await;
+    let addr = start_server_with_registry(registry).await;
+    let client = connect_bound(addr, "wb-outside-root").await;
+
+    let resp = client.write_back(&outside, b"outside").await.unwrap();
+
+    assert!(!resp.ok, "outside undeclared WriteBack must be refused");
+    assert_eq!(
+        resp.detail,
+        "WriteBack target is not a declared output of this session"
+    );
+    assert!(
+        !std::path::Path::new(&outside).exists(),
+        "outside output must not be published"
+    );
 }
 
 #[tokio::test]

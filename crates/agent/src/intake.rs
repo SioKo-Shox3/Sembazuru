@@ -436,15 +436,18 @@ async fn run_submission(
 
     // Open the agent-authoritative session BEFORE dispatch (ADR 0013), so the
     // worker's Hello — carrying this session_id — finds it and binds to the
-    // agent's scope root + per-session pin partition + allowed-digest ACL.
-    // Declared outputs are not yet wired into the capability (deferred with
-    // 2-machine WriteBack); the file server's within-root output scoping is still
-    // strictly tighter than the pre-0013 any-path behaviour.
+    // agent's scope root + per-session pin partition + allowed-digest ACL +
+    // normalized declared-output authority. Trace-discovered outputs are cache
+    // record inputs only; they do not grant WriteBack authority (SEC-003).
+    let declared: std::collections::HashSet<String> = declared_outputs
+        .iter()
+        .filter_map(|p| crate::fileserver::normalize_requested(p))
+        .collect();
     ctx.registry
         .create(
             session_id.clone(),
             crate::fileserver::normalize_root(&vfs_root),
-            Default::default(),
+            declared,
         )
         .await;
 

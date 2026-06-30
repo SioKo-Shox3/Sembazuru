@@ -79,7 +79,7 @@ pub struct SessionCapability {
     /// worker cannot widen its own scope (SEC-004).
     root: Option<String>,
     /// The action's declared output set (normalized). WriteBack targets are
-    /// restricted to this (or, when empty, to within `root`) — SEC-003.
+    /// restricted to this exactly — SEC-003.
     declared_outputs: HashSet<String>,
     /// Requested logical path → a single-flight cell yielding the `(digest, size)`
     /// pinned at first touch. The `OnceCell` makes exactly one task read the file
@@ -187,19 +187,13 @@ impl SessionCapability {
     }
 
     /// Whether a (already-normalized) output path may be written for this session
-    /// (SEC-003). A legacy session allows any path. A bound session restricts to
-    /// its declared outputs; when none were declared, it falls back to
-    /// `within_root` (computed by the caller against [`root`](Self::root)), which
-    /// is strictly tighter than the old "any absolute path".
-    pub fn output_allowed(&self, normalized_output: &str, within_root: bool) -> bool {
+    /// (SEC-003). A legacy session allows any path. A bound session may write
+    /// ONLY its declared outputs; an empty declared set forbids all WriteBack.
+    pub fn output_allowed(&self, normalized_output: &str) -> bool {
         if !self.enforce {
             return true;
         }
-        if self.declared_outputs.is_empty() {
-            within_root
-        } else {
-            self.declared_outputs.contains(normalized_output)
-        }
+        self.declared_outputs.contains(normalized_output)
     }
 
     /// The in-progress streamed-output table for this session (the file server's
@@ -495,33 +489,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writeback_scope_restricts_bound_sessions_only() {
-        // declared outputs gate WriteBack for a bound session; with none declared
-        // it falls back to within-root; a legacy session allows anything.
+    async fn writeback_scope_restricts_to_declared_outputs() {
+        // Declared outputs gate WriteBack for a bound session; with none declared
+        // all WriteBack is refused. A legacy session allows anything.
         let mut outs = HashSet::new();
         outs.insert("c:\\proj\\obj\\a.obj".to_string());
         let bound = SessionCapability::new(root_str(Path::new("c:\\proj")), outs, true);
         assert!(
-            bound.output_allowed("c:\\proj\\obj\\a.obj", true),
+            bound.output_allowed("c:\\proj\\obj\\a.obj"),
             "declared output allowed"
         );
         assert!(
-            !bound.output_allowed("c:\\proj\\obj\\evil.obj", true),
+            !bound.output_allowed("c:\\proj\\obj\\evil.obj"),
             "an undeclared output is refused even within root"
         );
 
-        // No declared outputs → within-root fallback (caller computes within_root).
+        // No declared outputs → no WriteBack authority, even within root.
         let bound_no_decl =
             SessionCapability::new(root_str(Path::new("c:\\proj")), HashSet::new(), true);
-        assert!(bound_no_decl.output_allowed("c:\\proj\\bin\\x.exe", true));
         assert!(
-            !bound_no_decl.output_allowed("c:\\windows\\system32\\evil.dll", false),
+            !bound_no_decl.output_allowed("c:\\proj\\bin\\x.exe"),
+            "an in-root output is refused when nothing is declared (SEC-003)"
+        );
+        assert!(
+            !bound_no_decl.output_allowed("c:\\windows\\system32\\evil.dll"),
             "an out-of-root output is refused when nothing is declared (SEC-003)"
         );
 
         // Legacy: any path (pre-ADR-0013 behaviour).
         let legacy = SessionRegistry::legacy_capability(None);
-        assert!(legacy.output_allowed("c:\\anywhere\\at\\all", false));
+        assert!(legacy.output_allowed("c:\\anywhere\\at\\all"));
     }
 
     #[tokio::test]
