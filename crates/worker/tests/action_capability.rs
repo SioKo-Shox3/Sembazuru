@@ -64,7 +64,7 @@ fn capability_for(
         action_id: action_id.to_string(),
         session_id: session_id.to_string(),
         command_digest: capability::command_digest(&command.argv, &command.env, &command.cwd),
-        vfs_root: String::new(),
+        vfs_digest: capability::vfs_digest(None),
         issued_at,
         expires_at,
         nonce: [3; 16],
@@ -145,6 +145,27 @@ async fn execute_with_tampered_command_is_rejected() {
     let status = result.expect_err("tampered command must be rejected");
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert_eq!(status.message(), "command mismatch");
+}
+
+#[tokio::test]
+async fn execute_with_tampered_vfs_is_rejected() {
+    let service = WorkerService::with_capacity(1)
+        .with_action_capability_auth(Some(TOKEN.to_string()), WORKER_ID.to_string());
+    let command = cmd(&["cmd", "/c", "exit", "0"]);
+    let cap = capability_for(WORKER_ID, "act", "sess", &command, 1_000, u64::MAX);
+    let mut request = execute_request("act", "sess", command, cap);
+    request.vfs = Some(sembazuru_proto::v0::VfsExecution {
+        agent_fileserver: "http://attacker".to_string(),
+        vfs_root: String::new(),
+        trace_dir: String::new(),
+        strict: false,
+    });
+
+    let result = service.execute(Request::new(request)).await;
+
+    let status = result.expect_err("tampered vfs must be rejected");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(status.message(), "vfs mismatch");
 }
 
 #[tokio::test]

@@ -220,10 +220,8 @@ impl WorkerService {
         if cap.command_digest != expected_digest {
             return Err(Status::permission_denied("command mismatch"));
         }
-        if let Some(vfs) = vfs
-            && cap.vfs_root != vfs.vfs_root
-        {
-            return Err(Status::permission_denied("vfs root mismatch"));
+        if cap.vfs_digest != capability::vfs_digest(vfs) {
+            return Err(Status::permission_denied("vfs mismatch"));
         }
         Ok(())
     }

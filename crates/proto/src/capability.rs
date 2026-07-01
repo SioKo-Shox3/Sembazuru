@@ -4,6 +4,7 @@ pub const CAPABILITY_TTL_SECS: u64 = 300;
 const CAP_MAGIC: &[u8; 4] = b"SBZC";
 const CLOCK_SKEW_SECS: u64 = 60;
 const COMMAND_DIGEST_DOMAIN: &[u8] = b"sembazuru command-digest v1";
+const VFS_DIGEST_DOMAIN: &[u8] = b"sembazuru vfs-execution v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionCapability {
@@ -12,7 +13,7 @@ pub struct ActionCapability {
     pub action_id: String,
     pub session_id: String,
     pub command_digest: [u8; 32],
-    pub vfs_root: String,
+    pub vfs_digest: [u8; 32],
     pub issued_at: u64,
     pub expires_at: u64,
     pub nonce: [u8; 16],
@@ -72,6 +73,26 @@ pub fn command_digest(
     *hasher.finalize().as_bytes()
 }
 
+pub fn vfs_digest(vfs: Option<&crate::v0::VfsExecution>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(VFS_DIGEST_DOMAIN);
+
+    match vfs {
+        None => {
+            hasher.update(&[0]);
+        }
+        Some(v) => {
+            hasher.update(&[1]);
+            hash_len_prefixed(&mut hasher, v.agent_fileserver.as_bytes());
+            hash_len_prefixed(&mut hasher, v.vfs_root.as_bytes());
+            hash_len_prefixed(&mut hasher, v.trace_dir.as_bytes());
+            hasher.update(&[v.strict as u8]);
+        }
+    }
+
+    *hasher.finalize().as_bytes()
+}
+
 fn hash_count(hasher: &mut blake3::Hasher, len: usize) {
     let len = u32::try_from(len).expect("capability field count exceeds u32");
     hasher.update(&len.to_le_bytes());
@@ -90,7 +111,7 @@ fn signing_bytes(cap: &ActionCapability) -> Vec<u8> {
     append_len_prefixed(&mut out, cap.worker_id.as_bytes());
     append_len_prefixed(&mut out, cap.action_id.as_bytes());
     append_len_prefixed(&mut out, cap.session_id.as_bytes());
-    append_len_prefixed(&mut out, cap.vfs_root.as_bytes());
+    out.extend_from_slice(&cap.vfs_digest);
     out.extend_from_slice(&cap.command_digest);
     out.extend_from_slice(&cap.issued_at.to_le_bytes());
     out.extend_from_slice(&cap.expires_at.to_le_bytes());
@@ -144,7 +165,7 @@ pub fn decode_and_verify(
     let worker_id = cursor.string()?;
     let action_id = cursor.string()?;
     let session_id = cursor.string()?;
-    let vfs_root = cursor.string()?;
+    let vfs_digest = cursor.fixed::<32>()?;
     let command_digest = cursor.fixed::<32>()?;
     let issued_at = cursor.u64()?;
     let expires_at = cursor.u64()?;
@@ -160,7 +181,7 @@ pub fn decode_and_verify(
         action_id,
         session_id,
         command_digest,
-        vfs_root,
+        vfs_digest,
         issued_at,
         expires_at,
         nonce,
@@ -237,7 +258,7 @@ mod tests {
             action_id: "action-1".to_string(),
             session_id: "session-1".to_string(),
             command_digest: [9; 32],
-            vfs_root: "C:\\src".to_string(),
+            vfs_digest: [5; 32],
             issued_at: 1_000,
             expires_at: 1_300,
             nonce: [7; 16],
@@ -257,10 +278,41 @@ mod tests {
         assert_eq!(decoded.action_id, cap.action_id);
         assert_eq!(decoded.session_id, cap.session_id);
         assert_eq!(decoded.command_digest, cap.command_digest);
-        assert_eq!(decoded.vfs_root, cap.vfs_root);
+        assert_eq!(decoded.vfs_digest, cap.vfs_digest);
         assert_eq!(decoded.issued_at, cap.issued_at);
         assert_eq!(decoded.expires_at, cap.expires_at);
         assert_eq!(decoded.nonce, cap.nonce);
+    }
+
+    #[test]
+    fn vfs_digest_binds_presence_and_all_fields() {
+        let v = crate::v0::VfsExecution {
+            agent_fileserver: "127.0.0.1:1234".to_string(),
+            vfs_root: "C:\\src".to_string(),
+            trace_dir: "C:\\trace".to_string(),
+            strict: true,
+        };
+
+        assert_ne!(vfs_digest(None), vfs_digest(Some(&v)));
+
+        let same = v.clone();
+        assert_eq!(vfs_digest(Some(&v)), vfs_digest(Some(&same)));
+
+        let mut changed_agent = v.clone();
+        changed_agent.agent_fileserver = "127.0.0.1:5678".to_string();
+        assert_ne!(vfs_digest(Some(&v)), vfs_digest(Some(&changed_agent)));
+
+        let mut changed_root = v.clone();
+        changed_root.vfs_root = "C:\\other".to_string();
+        assert_ne!(vfs_digest(Some(&v)), vfs_digest(Some(&changed_root)));
+
+        let mut changed_trace = v.clone();
+        changed_trace.trace_dir = "C:\\other-trace".to_string();
+        assert_ne!(vfs_digest(Some(&v)), vfs_digest(Some(&changed_trace)));
+
+        let mut changed_strict = v.clone();
+        changed_strict.strict = false;
+        assert_ne!(vfs_digest(Some(&v)), vfs_digest(Some(&changed_strict)));
     }
 
     #[test]

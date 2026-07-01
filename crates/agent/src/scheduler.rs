@@ -208,18 +208,13 @@ impl Scheduler {
             .as_secs();
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).expect("OS CSPRNG unavailable while minting action capability");
-        let vfs_root = opts
-            .vfs
-            .as_ref()
-            .map(|v| v.vfs_root.clone())
-            .unwrap_or_default();
         let cap = capability::ActionCapability {
             version: capability::CAPABILITY_VERSION,
             worker_id: worker.worker_id.clone(),
             action_id: action_id.to_string(),
             session_id: session_id.to_string(),
             command_digest: capability::command_digest(&command.argv, &command.env, &command.cwd),
-            vfs_root,
+            vfs_digest: capability::vfs_digest(opts.vfs.as_ref()),
             issued_at: now,
             expires_at: now + capability::CAPABILITY_TTL_SECS,
             nonce,
