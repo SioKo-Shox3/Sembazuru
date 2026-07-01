@@ -87,14 +87,26 @@ impl WorkerTable {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Insert or refresh a worker on `Register`. Registration resets capacity to
-    /// "fully idle" (the worker just (re)joined) and counts as a fresh ping.
+    /// Insert or refresh a worker on `Register`.
+    ///
+    /// First registrant wins while live: a same-`worker_id` registration with a
+    /// different `execution_endpoint` is rejected while the existing entry's
+    /// `last_ping` is still inside `dead_timeout`. Phase 5 worker-identity
+    /// integrity depends on this because a signed capability binds the
+    /// `worker_id` string, and that binding is only meaningful if the
+    /// routing-table worker_id-to-endpoint mapping cannot be hijacked by a
+    /// same-worker_id re-registration while the real owner is still live.
+    ///
+    /// Returns `true` when accepted: fresh worker, same-endpoint refresh, or
+    /// reclaim after the previous owner is no longer live. Returns `false` for a
+    /// live same-id/different-endpoint collision. Registration resets capacity
+    /// to "fully idle" (the worker just (re)joined) and counts as a fresh ping.
     pub fn upsert_register(
         &self,
         worker_id: String,
         execution_endpoint: String,
         caps: Capabilities,
-    ) {
+    ) -> bool {
         let idle = caps.cpu_count;
         let mut map = self.lock();
         // Opportunistic reaping (M7.4; M5.1 B2): drop long-dead entries so a daemon
@@ -105,6 +117,12 @@ impl WorkerTable {
         // only removes entries that have been silent far past the dead window.
         let reap_after = self.dead_timeout * REAP_FACTOR;
         map.retain(|_, e| e.last_ping.elapsed() < reap_after);
+        if let Some(existing) = map.get(&worker_id)
+            && existing.execution_endpoint != execution_endpoint
+            && existing.last_ping_age() < self.dead_timeout
+        {
+            return false; // a live worker already owns this identity with a different endpoint
+        }
         map.insert(
             worker_id.clone(),
             WorkerEntry {
@@ -117,6 +135,7 @@ impl WorkerTable {
                 last_ping: Instant::now(),
             },
         );
+        true
     }
 
     /// Record a heartbeat: refresh capacity, the CPU signal, and the liveness
@@ -227,12 +246,17 @@ impl Coordination for CoordinationService {
             }));
         }
         let caps = req.caps.unwrap_or_default();
-        self.table
+        let accepted = self
+            .table
             .upsert_register(req.worker_id, req.execution_endpoint, caps);
         Ok(Response::new(RegisterResponse {
             protocol_version: PROTOCOL_VERSION,
-            accepted: true,
-            detail: String::new(),
+            accepted,
+            detail: if accepted {
+                String::new()
+            } else {
+                "worker_id already registered with a different execution endpoint".to_string()
+            },
         }))
     }
 
@@ -330,6 +354,74 @@ mod tests {
             map.len(),
             1,
             "table is bounded, not growing across restarts"
+        );
+    }
+
+    #[test]
+    fn upsert_register_rejects_live_worker_id_collision() {
+        let table = WorkerTable::new(Duration::from_secs(15));
+
+        assert!(table.upsert_register("w".into(), "http://real".into(), caps(2)));
+        assert!(!table.upsert_register("w".into(), "http://attacker".into(), caps(2)));
+
+        let map = table.lock();
+        let entry = map.get("w").expect("worker entry remains registered");
+        assert_eq!(entry.execution_endpoint, "http://real");
+    }
+
+    #[test]
+    fn upsert_register_allows_same_endpoint_reregistration() {
+        let table = WorkerTable::new(Duration::from_secs(15));
+
+        assert!(table.upsert_register("w".into(), "http://a".into(), caps(2)));
+        assert!(table.upsert_register("w".into(), "http://a".into(), caps(2)));
+    }
+
+    #[tokio::test]
+    async fn upsert_register_allows_reclaiming_after_the_owner_goes_dead() {
+        let table = WorkerTable::new(Duration::from_millis(30));
+
+        assert!(table.upsert_register("w".into(), "http://old".into(), caps(2)));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(table.upsert_register("w".into(), "http://new".into(), caps(2)));
+
+        let map = table.lock();
+        let entry = map.get("w").expect("worker entry remains registered");
+        assert_eq!(entry.execution_endpoint, "http://new");
+    }
+
+    #[tokio::test]
+    async fn register_rpc_rejects_worker_id_collision() {
+        let table = WorkerTable::new(Duration::from_secs(15));
+        let service = CoordinationService::new(table);
+
+        let first = service
+            .register(Request::new(RegisterRequest {
+                worker_id: "w".into(),
+                caps: Some(caps(2)),
+                execution_endpoint: "http://real".into(),
+                auth_token: String::new(),
+            }))
+            .await
+            .expect("first register succeeds")
+            .into_inner();
+        assert!(first.accepted);
+
+        let second = service
+            .register(Request::new(RegisterRequest {
+                worker_id: "w".into(),
+                caps: Some(caps(2)),
+                execution_endpoint: "http://attacker".into(),
+                auth_token: String::new(),
+            }))
+            .await
+            .expect("second register returns a response")
+            .into_inner();
+
+        assert!(!second.accepted);
+        assert_eq!(
+            second.detail,
+            "worker_id already registered with a different execution endpoint"
         );
     }
 
