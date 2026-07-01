@@ -21,7 +21,7 @@ use std::io;
 use std::path::Path;
 
 use crate::determinism;
-use crate::graph::{PathAccess, normalize_path};
+use crate::graph::{ENV_BLOCK_NAME, PathAccess, normalize_path};
 use crate::model::AccessKind;
 use crate::{DependencyGraph, Trace, build_graph, format, normalize_for_compare};
 
@@ -275,6 +275,32 @@ pub struct InputManifest {
     pub cacheable: bool,
 }
 
+pub struct SideEffectPolicy {
+    /// Exact normalized registry key/value pairs known cache-safe.
+    pub allowed_registry: Vec<(String, String)>,
+    /// Exact normalized dir paths whose enumeration is known cache-safe.
+    pub allowed_enumerate: Vec<String>,
+}
+
+impl SideEffectPolicy {
+    pub fn conservative() -> Self {
+        Self {
+            allowed_registry: Vec::new(),
+            allowed_enumerate: Vec::new(),
+        }
+    }
+
+    fn allows_registry(&self, key: &str, value: &str) -> bool {
+        self.allowed_registry
+            .iter()
+            .any(|(allowed_key, allowed_value)| allowed_key == key && allowed_value == value)
+    }
+
+    fn allows_enumerate(&self, dir: &str) -> bool {
+        self.allowed_enumerate.iter().any(|s| s == dir)
+    }
+}
+
 /// Whether a `build_graph` / `load_run_from_dir` warning means a process's reads
 /// were genuinely **unobserved** — so the input set is incomplete and the action
 /// must not be cached (COR-003). Lost-input signals block: a truncated per-process
@@ -315,6 +341,15 @@ fn is_cache_blocking_warning(w: &str) -> bool {
 /// Content is read here only to classify; [`manifest_hash`] re-reads it on the
 /// later build, so the same manifest re-hashes against changed files.
 pub fn input_manifest(graph: &DependencyGraph, root: &str) -> InputManifest {
+    let policy = SideEffectPolicy::conservative();
+    input_manifest_with_policy(graph, root, &policy)
+}
+
+pub fn input_manifest_with_policy(
+    graph: &DependencyGraph,
+    root: &str,
+    policy: &SideEffectPolicy,
+) -> InputManifest {
     let outputs = logical_outputs(graph, root);
     let mut inputs = Vec::new();
     // COR-003: a trace that failed to OBSERVE some process's reads makes the whole
@@ -377,10 +412,41 @@ pub fn input_manifest(graph: &DependencyGraph, root: &str) -> InputManifest {
             None => {
                 // Could not tie this input to a stable absolute path. If it was a
                 // real content read, the strong key cannot cover it → fail closed.
-                // (A bare probe/enumerate with no anchor is not a content
-                // dependency and does not poison the action.)
+                // (A bare probe with no anchor is not a content dependency and
+                // does not poison the action.)
                 if is_content_read(inp) {
                     cacheable = false;
+                }
+            }
+        }
+    }
+    // ADR 0014 §3 — fail-closed side-effect policy.
+    // Registry value DATA is not recorded by the tracer (only key+name are
+    // captured), so a registry QueryValue read can make build output depend on
+    // state the action key does not capture -> stale hit. Similarly, directory
+    // enumeration MEMBERSHIP is not recorded, and a whole-environment block read
+    // pulls in unkeyed/volatile vars. Fail closed: any such read not on the
+    // allow-list makes the action uncacheable. The allow-list is empirically
+    // populated per ADR 0014 §3 (env-gated) — see docs/deferred.md. Default is
+    // empty (maximally safe).
+    if cacheable {
+        if graph
+            .registry
+            .iter()
+            .any(|r| !policy.allows_registry(&r.key, &r.value))
+        {
+            cacheable = false;
+        }
+        if cacheable && graph.env.iter().any(|e| e.name == ENV_BLOCK_NAME) {
+            cacheable = false;
+        }
+        if cacheable {
+            for entry in &graph.inputs {
+                if entry.kinds.contains(&AccessKind::Enumerate)
+                    && !policy.allows_enumerate(&entry.path)
+                {
+                    cacheable = false;
+                    break;
                 }
             }
         }
@@ -444,7 +510,8 @@ pub fn manifest_hash(manifest: &InputManifest) -> io::Result<String> {
 #[cfg(test)]
 mod action_cache_tests {
     use super::*;
-    use crate::graph::PathAccess;
+    use crate::graph::{EnvAccess, PathAccess, RegistryAccess};
+    use crate::model::{EnvOp, Event, EventKind};
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -466,6 +533,13 @@ mod action_cache_tests {
             pids: BTreeSet::from([1]),
         }
     }
+    fn enumerate_access(path: &str) -> PathAccess {
+        PathAccess {
+            path: path.to_string(),
+            kinds: BTreeSet::from([AccessKind::Enumerate]),
+            pids: BTreeSet::from([1]),
+        }
+    }
     fn probe_miss_access(path: &str) -> PathAccess {
         PathAccess {
             path: path.to_string(),
@@ -482,6 +556,170 @@ mod action_cache_tests {
     }
     fn root_str(p: &Path) -> String {
         normalize_for_compare(&p.to_string_lossy())
+    }
+    fn trace(pid: u32, parent: u32, exe: &str, cwd: &str) -> Trace {
+        Trace {
+            version: 0,
+            pid,
+            parent_pid: parent,
+            qpc_frequency: 1,
+            start_qpc: 0,
+            start_filetime: pid as u64,
+            exe_path: exe.to_string(),
+            command_line: String::new(),
+            cwd: cwd.to_string(),
+            events: Vec::new(),
+            truncated: false,
+        }
+    }
+    fn env_block_event() -> Event {
+        Event {
+            kind: EventKind::Env {
+                op: EnvOp::BlockRead,
+            },
+            status: 0,
+            tid: 1,
+            qpc: 0,
+            path: String::new(),
+            aux: String::new(),
+        }
+    }
+    fn registry_access(key: &str, value: &str) -> RegistryAccess {
+        RegistryAccess {
+            key: key.to_string(),
+            value: value.to_string(),
+            pids: BTreeSet::from([1]),
+        }
+    }
+    fn env_access(name: &str) -> EnvAccess {
+        EnvAccess {
+            name: name.to_string(),
+            found: true,
+            pids: BTreeSet::from([1]),
+        }
+    }
+
+    #[test]
+    fn a_registry_read_makes_the_action_uncacheable() {
+        let root = tmp_dir("registry-blocks");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp")]);
+        g.registry
+            .push(registry_access("hklm\\software\\tool", "setting"));
+
+        assert!(!input_manifest(&g, &rs).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_enumeration_makes_the_action_uncacheable() {
+        let root = tmp_dir("enumerate-blocks");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        std::fs::create_dir_all(root.join("incdir")).unwrap();
+        let rs = root_str(&root);
+        let g = graph_with(vec![read_access("a.cpp"), enumerate_access("incdir")]);
+
+        assert!(!input_manifest(&g, &rs).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_whole_environment_block_read_makes_the_action_uncacheable() {
+        let root = tmp_dir("env-block");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp")]);
+        g.env.push(env_access(crate::graph::ENV_BLOCK_NAME));
+
+        assert!(!input_manifest(&g, &rs).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn env_block_read_through_build_graph_makes_action_uncacheable() {
+        let root = tmp_dir("env-block-real-path");
+        let rs = root_str(&root);
+        let mut t = trace(10, 1, "C:\\cl.exe", &rs);
+        t.events.push(env_block_event());
+        let g = build_graph(&[t]);
+
+        assert!(g.env.iter().any(|e| e.name == crate::graph::ENV_BLOCK_NAME));
+        assert!(!input_manifest(&g, &rs).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_clean_file_only_action_stays_cacheable() {
+        let root = tmp_dir("clean-file");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let g = graph_with(vec![read_access("a.cpp")]);
+
+        assert!(input_manifest(&g, &rs).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_single_var_env_read_does_not_block() {
+        let root = tmp_dir("env-var");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp")]);
+        g.env.push(env_access("INCLUDE"));
+
+        assert!(input_manifest(&g, &rs).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_allowlisted_registry_read_stays_cacheable() {
+        let root = tmp_dir("registry-allow");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp")]);
+        g.registry
+            .push(registry_access("hklm\\software\\tool", "setting"));
+        let policy = SideEffectPolicy {
+            allowed_registry: vec![("hklm\\software\\tool".to_string(), "setting".to_string())],
+            allowed_enumerate: Vec::new(),
+        };
+
+        assert!(input_manifest_with_policy(&g, &rs, &policy).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn registry_allowlist_does_not_match_joined_needle_collision() {
+        let root = tmp_dir("registry-allow-collision");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp")]);
+        g.registry
+            .push(registry_access("hklm\\software", "tool\\setting"));
+        let policy = SideEffectPolicy {
+            allowed_registry: vec![("hklm\\software\\tool".to_string(), "setting".to_string())],
+            allowed_enumerate: Vec::new(),
+        };
+
+        assert!(!input_manifest_with_policy(&g, &rs, &policy).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_allowlisted_enumeration_stays_cacheable() {
+        let root = tmp_dir("enumerate-allow");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        std::fs::create_dir_all(root.join("incdir")).unwrap();
+        let rs = root_str(&root);
+        let g = graph_with(vec![read_access("a.cpp"), enumerate_access("incdir")]);
+        let policy = SideEffectPolicy {
+            allowed_registry: Vec::new(),
+            allowed_enumerate: vec!["incdir".to_string()],
+        };
+
+        assert!(input_manifest_with_policy(&g, &rs, &policy).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

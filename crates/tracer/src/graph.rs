@@ -28,7 +28,7 @@ const TELEMETRY_EXES: &[&str] = &["vctip.exe"];
 /// Synthetic env-entry name for a whole-environment-block read
 /// (`GetEnvironmentStringsW`). `=` cannot appear in a real variable name, so
 /// this never collides with a genuine variable.
-const ENV_BLOCK_NAME: &str = "<environment-block>";
+pub(crate) const ENV_BLOCK_NAME: &str = "<environment-block>";
 
 #[derive(Debug, Clone)]
 pub struct ProcessNode {
@@ -421,6 +421,12 @@ pub fn build_graph(traces: &[Trace]) -> DependencyGraph {
                     op: RegistryOp::QueryValue,
                     ..
                 } => {
+                    // Only QueryValue (value-DATA reads) is folded and gated by
+                    // the 6.2 cache policy. RegistryOp::OpenKey (key-existence)
+                    // is intentionally not folded: fail-closing on ubiquitous
+                    // OpenKey would over-block; the deferred fix is keying
+                    // registry key-existence as a probe-style marker (ADR 0014
+                    // §3 / docs/deferred.md).
                     let key = (ev.path.clone(), ev.aux.clone());
                     let entry = acc.registry.entry(key).or_insert_with(|| RegistryAccess {
                         key: ev.path.clone(),

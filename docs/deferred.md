@@ -90,6 +90,23 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
     これは output-shadows-input（ADR 0014(3)）と同族の既存 deferred で、6.1 は悪化させていない（旧コードは
     無条件 `inputs.remove` でより広く落としていた）。
   出所: code-review COR-006 ＋ adversarial review（Codex + verifier opus, 多ラウンド, Phase 6.1）。
+- **side-effect read の cache policy（Phase 6.2, ADR 0014 §3 の fail-closed 化）。** registry / env / dir
+  enumeration は graph に記録されるが action key に入らず cacheable もブロックしていなかった（stale-hit
+  vector）。6.2 で `action_key.rs::input_manifest` に fail-closed gate を追加：registry QueryValue read /
+  directory Enumerate / whole-environment BlockRead は `SideEffectPolicy` の allowlist に無ければ
+  cacheable=false（record/resolve 両方が honor）。初期 profile は空（最大安全）。残る deferred:
+  - **profile 未populated（env-gated）。** cl/clang-cl/dxc の許容 registry/enumerate 範囲は実 compiler
+    trace が必要（clang-cl は local に無し）。空 profile は over-block（compiler が routinely registry/
+    enumerate するなら cache が薄くなる — M4/M8 で要検証）だが false-miss であり false-hit ではない。
+  - **registry OpenKey（key-existence）は未 gate。** hook は記録するが `build_graph` は QueryValue のみ
+    fold する。OpenKey は遍在するため fail-closed fold は cache を潰す；正攻法は file probe と同様に
+    registry key-existence を absent/present marker として **key に取り込む**こと（hook/trace 変更、6.2 scope 外）。
+    現状は稀な key-existence 依存が stale-hit し得る残差。
+  - **single-var env read（非-VFS mode）。** VFS mode は worker が env_clear し cmd.env のみで実行するため
+    single-var read は weak-key で keyed-safe。非-VFS branch は worker env を継承するため、submit されない
+    継承 env var を compiler が読むと unkeyed（stale-hit 残差）。profile tuning と併せて対処。
+  - registry allowlist は将来 populate 時に `(key, value)` tuple 比較（delimiter 衝突回避済み）。
+  出所: ADR 0014 §3 ＋ adversarial review（Codex review + verifier opus, Phase 6.2）。
 
 ## M4（CAS とキャッシュ）— 本バックログの主対象
 
