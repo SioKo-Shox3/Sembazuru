@@ -15,7 +15,20 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 Phase 5.2 で unauthenticated-Execute RCE を signed action capability（blake3 keyed-hash MAC、key は
 cluster token 由来）で封じた（token 設定時に enforce、worker_id/action_id/session_id/command_digest/
 vfs_digest を bind、verify-before-spawn）。三者レビュー（security-reviewer/verifier/Codex）で
-crypto/enforcement は sound・RCE closed と確認。Phase 5.3 で worker_id squatting による
+crypto/enforcement は sound・RCE closed と確認。
+
+**tag `review-fix/phase-05-worker-auth` は `f7c4420`（5.1-5.4）を指すが、実際の完了状態は
+1 commit 先の `1930761`（Heartbeat 認証修正）を含む。** 5.4 commit 後の Codex stop-time review が
+「Phase 5 still lets an unauthenticated stale endpoint receive work」を指摘——`Heartbeat` RPC が
+無認証で（`HeartbeatPing` に token field 自体が無かった）、`on_ping` は age-out した entry を map から
+除去しないため、token 未保持の第三者が既存 worker_id（stale 化したもの含む）へ偽造 heartbeat を送るだけで
+`last_ping` を更新でき、scheduler がそこへ署名済み capability 付きで dispatch し続けてしまい、かつ
+Phase 5.3 の reclaim ガードも実質無効化し得た。`1930761` で `HeartbeatPing.auth_token`（field 6）を追加し
+Register と同じ token 検証を heartbeat にも適用（verifier(opus) CONFIRMED、check-before-on_ping の
+causal proof 込み）。tag の re-move は force-move にあたるため実行者（決定者）判断待ち——`git tag -f`
+で `1930761` へ動かすか、新規 tag を切るか。
+
+Phase 5.3 で worker_id squatting による
 execution_endpoint 乗っ取りも閉じた（`upsert_register` の first-registrant-wins-while-live）。
 
 - **VfsExecution 設定の binding — 解消（F3, commit `6df1de1`）。** `vfs_root` のみ・`req.vfs=Some` 時
