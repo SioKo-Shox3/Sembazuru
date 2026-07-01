@@ -53,11 +53,13 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     eprintln!("sembazuru-worker: Execution service on {local}");
+    let worker_id = default_worker_id();
 
     let service = match config.capacity {
         Some(c) => WorkerService::with_capacity(c),
         None => WorkerService::new(),
     }
+    .with_action_capability_auth(config.cluster_token.clone(), worker_id.clone())
     .with_action_timeout_secs(config.action_timeout_secs);
     // Enable read-VFS execution (M6.1) when all four install paths are configured.
     let service = match config.vfs() {
@@ -101,7 +103,6 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
             }
             None => format!("http://{local}"),
         };
-        let worker_id = default_worker_id();
         let capacity = service.capacity();
         let running = service.running_handle();
         let stop = stop.clone();

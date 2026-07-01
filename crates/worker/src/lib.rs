@@ -25,13 +25,17 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use job::JobObject;
 
-use sembazuru_proto::v0::{
-    AbortRequest, AbortResponse, ActionState, Command, ExecuteEvent, ExecuteRequest, ExitStatus,
-    OutputChunk, StateChange, VfsExecution, execute_event::Event, execution_server::Execution,
+use sembazuru_proto::{
+    capability,
+    v0::{
+        AbortRequest, AbortResponse, ActionState, Command, ExecuteEvent, ExecuteRequest,
+        ExitStatus, OutputChunk, StateChange, VfsExecution, execute_event::Event,
+        execution_server::Execution,
+    },
 };
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -129,6 +133,8 @@ pub struct WorkerService {
     /// whole process tree (launcher + the real compiler grandchild). Keyed by
     /// action_id; entry removed when the action ends (M6.1e).
     aborts: Arc<Mutex<HashMap<String, Arc<JobObject>>>>,
+    cluster_token: Option<String>,
+    worker_id: String,
 }
 
 impl Default for WorkerService {
@@ -160,9 +166,89 @@ impl WorkerService {
             ceiling: default_action_ceiling(),
             vfs: None,
             aborts: Arc::new(Mutex::new(HashMap::new())),
+            cluster_token: None,
+            worker_id: crate::coordination::default_worker_id(),
         }
     }
 
+    /// Enables signed action capability enforcement when a cluster token is configured.
+    pub fn with_action_capability_auth(
+        mut self,
+        cluster_token: Option<String>,
+        worker_id: String,
+    ) -> Self {
+        self.cluster_token = cluster_token.filter(|token| !token.is_empty());
+        self.worker_id = worker_id;
+        self
+    }
+
+    fn now_unix_secs() -> Result<u64, Status> {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .map_err(|_| Status::permission_denied("capability time unavailable"))
+    }
+
+    fn verify_execute_capability(
+        &self,
+        action_capability: &[u8],
+        action_id: &str,
+        session_id: &str,
+        cmd: &Command,
+        vfs: Option<&VfsExecution>,
+    ) -> Result<(), Status> {
+        let Some(token) = &self.cluster_token else {
+            return Ok(());
+        };
+        if action_capability.is_empty() {
+            return Err(Status::permission_denied("missing action capability"));
+        }
+
+        let key = capability::cap_key(token);
+        let cap = capability::decode_and_verify(action_capability, &key, Self::now_unix_secs()?)
+            .map_err(|e| Status::permission_denied(e.reason()))?;
+        if cap.worker_id != self.worker_id {
+            return Err(Status::permission_denied("capability not for this worker"));
+        }
+        if cap.action_id != action_id {
+            return Err(Status::permission_denied("action id mismatch"));
+        }
+        if cap.session_id != session_id {
+            return Err(Status::permission_denied("session id mismatch"));
+        }
+        let expected_digest = capability::command_digest(&cmd.argv, &cmd.env, &cmd.cwd);
+        if cap.command_digest != expected_digest {
+            return Err(Status::permission_denied("command mismatch"));
+        }
+        if let Some(vfs) = vfs
+            && cap.vfs_root != vfs.vfs_root
+        {
+            return Err(Status::permission_denied("vfs root mismatch"));
+        }
+        Ok(())
+    }
+    fn verify_abort_capability(
+        &self,
+        action_capability: &[u8],
+        action_id: &str,
+    ) -> Result<(), Status> {
+        let Some(token) = &self.cluster_token else {
+            return Ok(());
+        };
+        if action_capability.is_empty() {
+            return Err(Status::permission_denied("missing action capability"));
+        }
+        let key = capability::cap_key(token);
+        let cap = capability::decode_and_verify(action_capability, &key, Self::now_unix_secs()?)
+            .map_err(|e| Status::permission_denied(e.reason()))?;
+        if cap.worker_id != self.worker_id {
+            return Err(Status::permission_denied("capability not for this worker"));
+        }
+        if cap.action_id != action_id {
+            return Err(Status::permission_denied("action id mismatch"));
+        }
+        Ok(())
+    }
     /// Enables read-VFS execution (M6.1): VFS-mode `Execute` requests inject the
     /// hook DLL and supply inputs on demand. Without it, a VFS-mode request is
     /// rejected (it would otherwise plain-spawn the compiler with no inputs).
@@ -767,6 +853,13 @@ impl Execution for WorkerService {
         if cmd.argv.is_empty() {
             return Err(Status::invalid_argument("command.argv must be non-empty"));
         }
+        self.verify_execute_capability(
+            &req.action_capability,
+            &req.action_id,
+            &req.session_id,
+            &cmd,
+            req.vfs.as_ref(),
+        )?;
         // M6.1: VFS config and prefetch hint ride the request; the worker's own
         // install config decides whether VFS mode is even possible.
         let action_id = req.action_id;
@@ -826,7 +919,9 @@ impl Execution for WorkerService {
         // plain (non-VFS) action has no job; its stream-drop + kill_on_drop still
         // covers it, and the reassign path drops the stream rather than calling
         // Abort, so this acknowledges either way.
-        let action_id = request.into_inner().action_id;
+        let req = request.into_inner();
+        self.verify_abort_capability(&req.action_capability, &req.action_id)?;
+        let action_id = req.action_id;
         if let Some(job) = self
             .aborts
             .lock()

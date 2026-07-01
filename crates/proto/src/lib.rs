@@ -5,6 +5,8 @@
 //! The latency-critical file-supply data plane (v0 §4) is hand-rolled binary
 //! framing in `sembazuru-dataplane`, with no protobuf on the hot path (§4.2).
 
+pub mod capability;
+
 /// Generated types and gRPC stubs for protocol version 0.
 pub mod v0 {
     tonic::include_proto!("sembazuru.v0");

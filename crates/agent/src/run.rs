@@ -77,7 +77,7 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     );
 
     let table = WorkerTable::new(DEFAULT_DEAD_TIMEOUT);
-    let scheduler = Scheduler::new(table.clone());
+    let scheduler = Scheduler::with_cluster_token(table.clone(), cluster_token.clone());
 
     // The data-plane session registry (ADR 0013): one shared instance threaded
     // into BOTH the file server (which binds a worker's Hello session id to the

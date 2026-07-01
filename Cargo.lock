@@ -3841,6 +3841,7 @@ dependencies = [
 name = "sembazuru-proto"
 version = "0.0.1"
 dependencies = [
+ "blake3",
  "prost",
  "protoc-bin-vendored",
  "tonic",

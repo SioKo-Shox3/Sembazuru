@@ -10,6 +10,34 @@ M3 までで「後回し」「事後判断」「ベストエフォート」と�
 
 ---
 
+## Phase 5（Worker Execution 認証）残差
+
+Phase 5.2 で unauthenticated-Execute RCE を signed action capability（blake3 keyed-hash MAC、key は
+cluster token 由来）で封じた（token 設定時に enforce、worker_id/action_id/session_id/command_digest
+を bind、verify-before-spawn）。三者レビュー（security-reviewer/verifier/Codex）で crypto/enforcement は
+sound・RCE closed と確認。以下は Done-when を阻害しない残差（いずれも token-LAN/loopback trust model に
+bound、mТLS 移行 5.4 で本質的に解消）:
+
+- **capability replay（TTL 300s 内、F2）。** server 側 replay cache が無く、captured cap を TTL 内に
+  同一 worker へ再送すると同一の署名済み action を再実行し得る（worker_id/action_id/session_id/command
+  すべて一致・payload swap 不可）。severity LOW（deterministic build の再実行、token-LAN 内）。closed
+  later: bounded seen-nonce LRU または mTLS。出所: security-reviewer/Codex(Phase 5.2)。
+- **VfsExecution 設定の binding 未完（F3）。** capability は `vfs_root` のみ bind し、しかも worker は
+  `req.vfs=Some` の時だけ照合する。よって有効 cap を `vfs=None` で replay すると VFS を外して plain spawn
+  に downgrade でき（結果は wrong→local fallback で fail-safe）、また `agent_fileserver`/`trace_dir`/
+  `strict` が未 bind のため replay 時に `agent_fileserver` を差し替えると worker の data-plane 接続を
+  誘導し得る。ただし後者の token 露出は既存の **plaintext cluster-token（ADR 0006 LAN-trusted）が
+  on-path attacker に元々 sniff 可能**という残差に包含される（新規露出ではない）。正攻法: capability に
+  VfsExecution 全体の digest（presence 含む）を bind する（focused follow-up）。severity LOW。出所:
+  verifier/Codex(Phase 5.2)。
+- **非-loopback Execution bind gate 未緩和。** capability enforce 時は非-loopback bind も auth 済みで
+  safe だが、run.rs の gate は依然 `unsafe_allow_insecure_execution_lan` を要求する（token 設定時に
+  非-loopback を許す緩和は 5.3/5.4 で検討）。
+- **worker identity は自己申告（`COMPUTERNAME#pid`）。** cluster token が唯一の worker 認証。per-worker
+  鍵/証明書は mTLS（5.4/M7）で導入予定。
+
+---
+
 ## コードレビュー指摘（`Sembazuru_code_review_action_guide.md`）最終ステータス（2026-06-27）
 
 外部静的レビュー全 20 指摘の最終状態。**CLOSED**＝コード実装済み（main マージ済み or 本ブランチ commit）。

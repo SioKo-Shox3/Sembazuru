@@ -58,9 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = tonic::transport::Endpoint::from_shared(worker_endpoint)?
         .connect()
         .await?;
-    let outcome =
-        execute_on_channel_with(channel, command, "exec-vfs".into(), "exec-vfs".into(), opts)
-            .await?;
+    let outcome = execute_on_channel_with(
+        channel,
+        command,
+        "exec-vfs".into(),
+        "exec-vfs".into(),
+        opts,
+        Vec::new(),
+    )
+    .await?;
     let code = outcome.exit_code.unwrap_or(-1);
     eprintln!("exec_vfs: states={:?} exit={code}", outcome.states);
     std::process::exit(code);

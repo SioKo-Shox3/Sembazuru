@@ -173,6 +173,7 @@ pub async fn execute_remote_with(
         action_id,
         session_id,
         ExecOptions::default(),
+        Vec::new(),
     )
     .await
 }
@@ -194,6 +195,7 @@ pub async fn execute_on_channel(
         action_id,
         session_id,
         ExecOptions::default(),
+        Vec::new(),
     )
     .await
 }
@@ -207,6 +209,7 @@ pub async fn execute_on_channel_with(
     action_id: String,
     session_id: String,
     opts: ExecOptions,
+    action_capability: Vec<u8>,
 ) -> Result<ActionOutcome, ExecuteError> {
     drive_execute(
         ExecutionClient::new(channel),
@@ -214,6 +217,7 @@ pub async fn execute_on_channel_with(
         action_id,
         session_id,
         opts,
+        action_capability,
     )
     .await
 }
@@ -250,6 +254,7 @@ async fn drive_execute(
     action_id: String,
     session_id: String,
     opts: ExecOptions,
+    action_capability: Vec<u8>,
 ) -> Result<ActionOutcome, ExecuteError> {
     let request = ExecuteRequest {
         action_id,
@@ -258,7 +263,7 @@ async fn drive_execute(
         predicted_inputs: None,
         predicted_paths: opts.predicted_paths,
         vfs: opts.vfs,
-        action_capability: Vec::new(),
+        action_capability,
     };
 
     let mut stream = client.execute(request).await?.into_inner();

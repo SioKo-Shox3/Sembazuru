@@ -21,9 +21,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sembazuru_proto::v0::Command;
+use sembazuru_proto::{capability, v0::Command};
 
 use crate::coordination::{WorkerEntry, WorkerTable};
 use crate::{
@@ -121,6 +121,7 @@ pub struct Scheduler {
     /// across actions so the control plane pays no per-action handshake.
     channels: Arc<Mutex<HashMap<String, tonic::transport::Channel>>>,
     remote_budget: Duration,
+    cluster_token: Option<String>,
 }
 
 /// Increments a worker's in-flight count for the lifetime of a remote attempt,
@@ -148,15 +149,28 @@ impl Drop for AssignGuard {
 
 impl Scheduler {
     pub fn new(table: WorkerTable) -> Self {
-        Self::with_remote_budget(table, DEFAULT_REMOTE_BUDGET)
+        Self::with_cluster_token(table, None)
+    }
+
+    pub fn with_cluster_token(table: WorkerTable, cluster_token: Option<String>) -> Self {
+        Self::with_remote_budget_and_cluster_token(table, DEFAULT_REMOTE_BUDGET, cluster_token)
     }
 
     pub fn with_remote_budget(table: WorkerTable, remote_budget: Duration) -> Self {
+        Self::with_remote_budget_and_cluster_token(table, remote_budget, None)
+    }
+
+    pub fn with_remote_budget_and_cluster_token(
+        table: WorkerTable,
+        remote_budget: Duration,
+        cluster_token: Option<String>,
+    ) -> Self {
         Self {
             table,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             channels: Arc::new(Mutex::new(HashMap::new())),
             remote_budget,
+            cluster_token,
         }
     }
 
@@ -174,6 +188,43 @@ impl Scheduler {
             .connect_lazy();
         chans.insert(endpoint.to_string(), channel.clone());
         Ok(channel)
+    }
+
+    fn mint_action_capability(
+        &self,
+        worker: &WorkerEntry,
+        command: &Command,
+        action_id: &str,
+        session_id: &str,
+        opts: &ExecOptions,
+    ) -> Vec<u8> {
+        let Some(token) = &self.cluster_token else {
+            return Vec::new();
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is before UNIX_EPOCH while minting action capability")
+            .as_secs();
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).expect("OS CSPRNG unavailable while minting action capability");
+        let vfs_root = opts
+            .vfs
+            .as_ref()
+            .map(|v| v.vfs_root.clone())
+            .unwrap_or_default();
+        let cap = capability::ActionCapability {
+            version: capability::CAPABILITY_VERSION,
+            worker_id: worker.worker_id.clone(),
+            action_id: action_id.to_string(),
+            session_id: session_id.to_string(),
+            command_digest: capability::command_digest(&command.argv, &command.env, &command.cwd),
+            vfs_root,
+            issued_at: now,
+            expires_at: now + capability::CAPABILITY_TTL_SECS,
+            nonce,
+        };
+        cap.encode(&capability::cap_key(token))
     }
 
     /// Drops cached channels whose worker is no longer live, bounding the cache
@@ -438,6 +489,8 @@ impl Scheduler {
                     continue;
                 }
             };
+            let action_capability =
+                self.mint_action_capability(&w, &command, &action_id, &session_id, &opts);
             let attempt = tokio::time::timeout(
                 self.remote_budget,
                 execute_on_channel_with(
@@ -446,6 +499,7 @@ impl Scheduler {
                     action_id.clone(),
                     session_id.clone(),
                     opts.clone(),
+                    action_capability,
                 ),
             )
             .await;
