@@ -27,6 +27,18 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Returns an 8-byte non-cryptographic integrity checksum for codec frames.
+///
+/// This is only a cheap corruption/foreign-blob guard for cache codecs. A
+/// mismatch means the blob is treated as a cache miss, not as authenticated
+/// data.
+pub fn codec_checksum(bytes: &[u8]) -> [u8; 8] {
+    let hash = blake3::hash(bytes);
+    let mut out = [0; 8];
+    out.copy_from_slice(&hash.as_bytes()[..8]);
+    out
+}
+
 /// The content-hash algorithm. ADR 0003 selects BLAKE3; the enum exists so the
 /// wire/on-disk form is self-describing and a future second algorithm is a
 /// non-breaking addition rather than a silent reinterpretation of old hex.

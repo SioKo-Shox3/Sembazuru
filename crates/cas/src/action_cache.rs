@@ -150,6 +150,9 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
 
 fn get_str(buf: &[u8], pos: &mut usize) -> Result<String, CacheCodecError> {
     let len = get_u32(buf, pos)? as usize;
+    if len > MAX_STRING_LEN {
+        return Err(CacheCodecError);
+    }
     let end = pos.checked_add(len).ok_or(CacheCodecError)?;
     let slice = buf.get(*pos..end).ok_or(CacheCodecError)?;
     let s = String::from_utf8(slice.to_vec()).map_err(|_| CacheCodecError)?;
@@ -183,7 +186,9 @@ pub struct CacheCodecError;
 /// change can never be silently misread as a valid result (COR-005 "codec に
 /// version なし"). Bump `RESULT_CODEC_VERSION` whenever the layout below changes.
 const RESULT_CODEC_MAGIC: &[u8; 4] = b"SBZR";
-const RESULT_CODEC_VERSION: u8 = 1;
+const RESULT_CODEC_VERSION: u8 = 2;
+const MAX_OUTPUTS: usize = 65536;
+const MAX_STRING_LEN: usize = 16 << 20;
 
 impl ActionResult {
     fn encode(&self) -> Vec<u8> {
@@ -212,38 +217,51 @@ impl ActionResult {
                 .map(|d| d.canonical())
                 .unwrap_or_default(),
         );
+        buf.extend_from_slice(&crate::codec_checksum(&buf));
         buf
     }
 
     fn decode(buf: &[u8]) -> Result<ActionResult, CacheCodecError> {
+        if buf.len() < 8 {
+            return Err(CacheCodecError);
+        }
+        let (body, sum) = buf.split_at(buf.len() - 8);
+        let expected = crate::codec_checksum(body);
+        if expected[..] != sum[..] {
+            return Err(CacheCodecError);
+        }
+
         // Magic + version gate: a mismatch (old/foreign/corrupt format) is a
         // decode error → cache miss, never a misread result.
-        if buf.get(0..4) != Some(RESULT_CODEC_MAGIC.as_slice()) {
+        if body.get(0..4) != Some(RESULT_CODEC_MAGIC.as_slice()) {
             return Err(CacheCodecError);
         }
-        if buf.get(4) != Some(&RESULT_CODEC_VERSION) {
+        if body.get(4) != Some(&RESULT_CODEC_VERSION) {
             return Err(CacheCodecError);
         }
-        let mut pos = 5;
+        let mut pos = 5usize;
         let exit_code = {
-            let end = pos + 4;
-            let slice = buf.get(pos..end).ok_or(CacheCodecError)?;
+            let end = pos.checked_add(4).ok_or(CacheCodecError)?;
+            let slice = body.get(pos..end).ok_or(CacheCodecError)?;
             pos = end;
             i32::from_le_bytes(slice.try_into().unwrap())
         };
-        let n = get_u32(buf, &mut pos)? as usize;
-        let mut outputs = Vec::with_capacity(n.min(4096));
+        let n = get_u32(body, &mut pos)? as usize;
+        if n > MAX_OUTPUTS {
+            return Err(CacheCodecError);
+        }
+        let mut outputs = Vec::with_capacity(n);
         for _ in 0..n {
-            let logical_path = get_str(buf, &mut pos)?;
-            let digest = Digest::parse(&get_str(buf, &mut pos)?).map_err(|_| CacheCodecError)?;
+            let logical_path = get_str(body, &mut pos)?;
+            let digest = Digest::parse(&get_str(body, &mut pos)?).map_err(|_| CacheCodecError)?;
             outputs.push(OutputFile {
                 logical_path,
                 digest,
             });
         }
-        let stdout = get_opt_digest(buf, &mut pos)?;
-        let stderr = get_opt_digest(buf, &mut pos)?;
-        if pos != buf.len() {
+        let stdout = get_opt_digest(body, &mut pos)?;
+        let stderr = get_opt_digest(body, &mut pos)?;
+        if pos != body.len() {
             return Err(CacheCodecError); // trailing junk → treat as corrupt
         }
         Ok(ActionResult {
@@ -348,6 +366,12 @@ mod tests {
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut out = body.to_vec();
+        out.extend_from_slice(&crate::codec_checksum(body));
+        out
     }
 
     #[test]
@@ -464,6 +488,7 @@ mod tests {
             stderr: None,
         };
         let good = r.encode();
+        assert_eq!(good.get(4), Some(&2), "encoded result version");
         assert_eq!(
             ActionResult::decode(&good).unwrap(),
             r,
@@ -471,22 +496,85 @@ mod tests {
         );
         // An old pre-magic blob (the body without the 5-byte magic+version header)
         // is rejected, not parsed as a valid result.
+        let body_without_header = &good[5..good.len() - 8];
         assert!(
-            ActionResult::decode(&good[5..]).is_err(),
+            ActionResult::decode(&framed(body_without_header)).is_err(),
             "missing magic → miss"
         );
         // Wrong magic / wrong version → rejected.
-        let mut wrong_magic = good.clone();
-        wrong_magic[0] = b'X';
+        let mut wrong_magic_body = good[..good.len() - 8].to_vec();
+        wrong_magic_body[0] = b'X';
         assert!(
-            ActionResult::decode(&wrong_magic).is_err(),
+            ActionResult::decode(&framed(&wrong_magic_body)).is_err(),
             "wrong magic → miss"
         );
-        let mut wrong_ver = good.clone();
-        wrong_ver[4] = 0xff;
+        let mut wrong_ver_body = good[..good.len() - 8].to_vec();
+        wrong_ver_body[4] = 0xff;
         assert!(
-            ActionResult::decode(&wrong_ver).is_err(),
+            ActionResult::decode(&framed(&wrong_ver_body)).is_err(),
             "wrong version → miss"
+        );
+    }
+
+    #[test]
+    fn result_v1_blob_misses_after_version_bump() {
+        let mut body = Vec::new();
+        body.extend_from_slice(RESULT_CODEC_MAGIC);
+        body.push(1);
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        put_str(&mut body, "");
+        put_str(&mut body, "");
+
+        assert!(
+            ActionResult::decode(&framed(&body)).is_err(),
+            "v1 result blobs must miss after the v2 version bump"
+        );
+    }
+
+    #[test]
+    fn result_checksum_corruption_is_a_miss() {
+        let r = ActionResult {
+            exit_code: 0,
+            outputs: vec![],
+            stdout: None,
+            stderr: None,
+        };
+        let mut blob = r.encode();
+        blob[5] ^= 0xff;
+
+        assert!(
+            ActionResult::decode(&blob).is_err(),
+            "a body byte changed after encoding must fail checksum verification"
+        );
+    }
+
+    #[test]
+    fn result_huge_output_count_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(RESULT_CODEC_MAGIC);
+        body.push(2);
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        assert!(
+            ActionResult::decode(&framed(&body)).is_err(),
+            "oversized output count must be rejected before allocation"
+        );
+    }
+
+    #[test]
+    fn result_huge_string_len_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(RESULT_CODEC_MAGIC);
+        body.push(2);
+        body.extend_from_slice(&0i32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&((16u32 << 20) + 1).to_le_bytes());
+
+        assert!(
+            ActionResult::decode(&framed(&body)).is_err(),
+            "oversized string length must be rejected before slicing"
         );
     }
 

@@ -26,7 +26,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sembazuru_cas::{ActionCache, ActionResult, BlobStore, CasError, Digest, OutputFile};
+use sembazuru_cas::{
+    ActionCache, ActionResult, BlobStore, CasError, Digest, OutputFile, codec_checksum,
+};
 use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest};
 use sembazuru_tracer::normalize_for_compare;
 
@@ -540,6 +542,12 @@ fn commit_staged(tmp: &Path, final_path: &Path) -> io::Result<()> {
 
 // --- InputManifest codec (agent-owned; opaque to the cache) ----------------
 
+const MANIFEST_CODEC_MAGIC: &[u8; 4] = b"SBZM";
+const MANIFEST_CODEC_VERSION: u8 = 1;
+const MAX_INPUTS: usize = 1 << 20;
+const MAX_CMDS: usize = 65536;
+const MAX_STRING_LEN: usize = 16 << 20;
+
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
@@ -547,6 +555,9 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
 
 fn get_str(buf: &[u8], pos: &mut usize) -> Option<String> {
     let len = get_u32(buf, pos)? as usize;
+    if len > MAX_STRING_LEN {
+        return None;
+    }
     let end = pos.checked_add(len)?;
     let s = String::from_utf8(buf.get(*pos..end)?.to_vec()).ok()?;
     *pos = end;
@@ -577,6 +588,8 @@ fn kind_from_byte(b: u8) -> Option<InputKind> {
 
 fn encode_manifest(m: &InputManifest) -> Vec<u8> {
     let mut buf = Vec::new();
+    buf.extend_from_slice(MANIFEST_CODEC_MAGIC);
+    buf.push(MANIFEST_CODEC_VERSION);
     buf.push(m.cacheable as u8);
     buf.extend_from_slice(&(m.inputs.len() as u32).to_le_bytes());
     for e in &m.inputs {
@@ -588,19 +601,42 @@ fn encode_manifest(m: &InputManifest) -> Vec<u8> {
     for c in &m.cmds {
         put_str(&mut buf, c);
     }
+    buf.extend_from_slice(&codec_checksum(&buf));
     buf
 }
 
 fn decode_manifest(buf: &[u8]) -> Option<InputManifest> {
-    let mut pos = 0;
-    let cacheable = *buf.get(pos)? != 0;
+    if buf.len() < 8 {
+        return None;
+    }
+    let (body, sum) = buf.split_at(buf.len() - 8);
+    let expected = codec_checksum(body);
+    if expected[..] != sum[..] {
+        return None;
+    }
+    if body.get(0..4) != Some(MANIFEST_CODEC_MAGIC.as_slice()) {
+        return None;
+    }
+    if body.get(4) != Some(&MANIFEST_CODEC_VERSION) {
+        return None;
+    }
+
+    let mut pos = 5;
+    let cacheable = match *body.get(pos)? {
+        0 => false,
+        1 => true,
+        _ => return None, // unexpected cacheable byte -> corrupt/foreign -> miss
+    };
     pos += 1;
-    let n_inputs = get_u32(buf, &mut pos)? as usize;
+    let n_inputs = get_u32(body, &mut pos)? as usize;
+    if n_inputs > MAX_INPUTS {
+        return None;
+    }
     let mut inputs = Vec::with_capacity(n_inputs.min(65536));
     for _ in 0..n_inputs {
-        let logical = get_str(buf, &mut pos)?;
-        let absolute = get_str(buf, &mut pos)?;
-        let kind = kind_from_byte(*buf.get(pos)?)?;
+        let logical = get_str(body, &mut pos)?;
+        let absolute = get_str(body, &mut pos)?;
+        let kind = kind_from_byte(*body.get(pos)?)?;
         pos += 1;
         inputs.push(InputEntry {
             logical,
@@ -608,12 +644,15 @@ fn decode_manifest(buf: &[u8]) -> Option<InputManifest> {
             kind,
         });
     }
-    let n_cmds = get_u32(buf, &mut pos)? as usize;
-    let mut cmds = Vec::with_capacity(n_cmds.min(65536));
-    for _ in 0..n_cmds {
-        cmds.push(get_str(buf, &mut pos)?);
+    let n_cmds = get_u32(body, &mut pos)? as usize;
+    if n_cmds > MAX_CMDS {
+        return None;
     }
-    if pos != buf.len() {
+    let mut cmds = Vec::with_capacity(n_cmds);
+    for _ in 0..n_cmds {
+        cmds.push(get_str(body, &mut pos)?);
+    }
+    if pos != body.len() {
         return None; // trailing junk → corrupt
     }
     Some(InputManifest {
@@ -652,6 +691,20 @@ mod tests {
             cmds: vec!["clang-cl /c a.cpp".into()],
             cacheable: true,
         }
+    }
+
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut out = body.to_vec();
+        out.extend_from_slice(&sembazuru_cas::codec_checksum(body));
+        out
+    }
+
+    fn empty_legacy_manifest_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.push(1);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body
     }
 
     #[test]
@@ -703,6 +756,87 @@ mod tests {
         });
         bytes.push(0);
         assert_eq!(decode_manifest(&bytes), None);
+    }
+
+    #[test]
+    fn manifest_has_magic_and_version() {
+        let bytes = encode_manifest(&InputManifest {
+            inputs: vec![],
+            cmds: vec![],
+            cacheable: true,
+        });
+        assert_eq!(bytes.get(0..4), Some(MANIFEST_CODEC_MAGIC.as_slice()));
+        assert_eq!(bytes.get(4), Some(&MANIFEST_CODEC_VERSION));
+    }
+
+    #[test]
+    fn manifest_missing_magic_is_a_miss() {
+        assert_eq!(decode_manifest(&empty_legacy_manifest_body()), None);
+    }
+
+    #[test]
+    fn manifest_version_mismatch_is_a_miss() {
+        let mut body = Vec::new();
+        body.extend_from_slice(MANIFEST_CODEC_MAGIC);
+        body.push(0xff);
+        body.push(1);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode_manifest(&framed(&body)), None);
+    }
+
+    #[test]
+    fn manifest_bad_cacheable_byte_is_a_miss() {
+        let mut body = Vec::new();
+        body.extend_from_slice(MANIFEST_CODEC_MAGIC);
+        body.push(MANIFEST_CODEC_VERSION);
+        body.push(2);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(decode_manifest(&framed(&body)), None);
+    }
+
+    #[test]
+    fn manifest_checksum_corruption_is_a_miss() {
+        let mut bytes = encode_manifest(&InputManifest {
+            inputs: vec![],
+            cmds: vec![],
+            cacheable: true,
+        });
+        bytes[0] ^= 0x01;
+        assert_eq!(decode_manifest(&bytes), None);
+    }
+
+    #[test]
+    fn manifest_huge_input_count_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(MANIFEST_CODEC_MAGIC);
+        body.push(MANIFEST_CODEC_VERSION);
+        body.push(1);
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_manifest(&framed(&body)), None);
+    }
+
+    #[test]
+    fn manifest_huge_cmd_count_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(MANIFEST_CODEC_MAGIC);
+        body.push(MANIFEST_CODEC_VERSION);
+        body.push(1);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode_manifest(&framed(&body)), None);
+    }
+
+    #[test]
+    fn manifest_huge_string_len_is_rejected() {
+        let mut body = Vec::new();
+        body.extend_from_slice(MANIFEST_CODEC_MAGIC);
+        body.push(MANIFEST_CODEC_VERSION);
+        body.push(1);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&((16u32 << 20) + 1).to_le_bytes());
+        assert_eq!(decode_manifest(&framed(&body)), None);
     }
 
     #[test]
