@@ -258,6 +258,7 @@ async fn drive_execute(
         predicted_inputs: None,
         predicted_paths: opts.predicted_paths,
         vfs: opts.vfs,
+        action_capability: Vec::new(),
     };
 
     let mut stream = client.execute(request).await?.into_inner();

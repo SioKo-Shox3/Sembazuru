@@ -157,6 +157,10 @@ message ExecuteRequest {
   // (the M5 scale path — back-compat). Unlike predicted_paths, this is NOT
   // advisory: a worker that ignores it would run the compiler with no inputs.
   VfsExecution vfs = 6;
+  // Signed action capability authorizing this Execute for Phase 5. Empty when
+  // cluster auth is disabled; verified by the worker when a cluster token is
+  // configured.
+  bytes action_capability = 20;
 }
 
 // Configures the worker's read-VFS execution mode (M6.1). The worker starts a
@@ -247,6 +251,10 @@ message ExecuteEvent {
 message AbortRequest {
   string action_id = 1;
   string reason = 2;            // e.g. "fallback: latency budget exceeded"
+  // Signed action capability authorizing this Abort for Phase 5. Empty when
+  // cluster auth is disabled; verified by the worker when a cluster token is
+  // configured.
+  bytes action_capability = 20;
 }
 
 message AbortResponse {
