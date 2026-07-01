@@ -27,6 +27,9 @@ use std::time::Duration;
 use sembazuru_agent::coordination::{
     WorkerTable, serve_coordination, serve_coordination_with_token,
 };
+use sembazuru_proto::v0::{
+    HeartbeatPing, RegisterRequest, coordination_client::CoordinationClient,
+};
 use sembazuru_worker::coordination::register_and_heartbeat;
 
 /// Starts the agent Coordination server on an ephemeral loopback port and
@@ -200,6 +203,110 @@ async fn right_token_registers_wrong_token_is_rejected() {
         "worker with the wrong token must never become schedulable"
     );
     assert!(table.is_live("good") && !table.is_live("bad"));
+}
+
+#[tokio::test]
+async fn wrong_token_register_attempt_never_populates_table() {
+    let (agent, table) = start_agent_with_token(Duration::from_secs(5), "s3cret").await;
+    let mut client = CoordinationClient::connect(agent)
+        .await
+        .expect("client connects to authenticated agent");
+
+    let resp = client
+        .register(RegisterRequest {
+            worker_id: "intruder".into(),
+            caps: None,
+            execution_endpoint: "http://127.0.0.1:59999".into(),
+            auth_token: "wrong".into(),
+        })
+        .await
+        .expect("rejected register still returns a response")
+        .into_inner();
+
+    assert!(!resp.accepted);
+    assert_eq!(table.live_count(), 0);
+    assert!(
+        table
+            .live_snapshot()
+            .iter()
+            .all(|entry| entry.worker_id != "intruder"),
+        "wrong-token register must not insert the worker"
+    );
+}
+
+#[tokio::test]
+async fn forged_heartbeat_without_token_does_not_revive_stale_registered_worker() {
+    let (agent, table) = start_agent_with_token(Duration::from_millis(250), "s3cret").await;
+    let stop = spawn_worker(&agent, "stale", 0, Duration::from_millis(50), "s3cret");
+
+    assert!(
+        wait_until(|| table.is_live("stale"), Duration::from_secs(3)).await,
+        "legitimate worker should first register and go live"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    assert!(
+        wait_until(|| !table.is_live("stale"), Duration::from_secs(3)).await,
+        "legitimate worker should age out after heartbeats stop"
+    );
+
+    let mut client = CoordinationClient::connect(agent.clone())
+        .await
+        .expect("client connects to authenticated agent");
+    let forged_missing_token = tokio_stream::iter([HeartbeatPing {
+        worker_id: "stale".into(),
+        running_actions: 0,
+        idle_slots: 4,
+        auth_token: String::new(),
+        ..Default::default()
+    }]);
+    let mut pongs = client
+        .heartbeat(tonic::Request::new(forged_missing_token))
+        .await
+        .expect("heartbeat stream opens")
+        .into_inner();
+
+    assert!(
+        pongs
+            .message()
+            .await
+            .expect("heartbeat response stream should not transport-error")
+            .is_none(),
+        "missing-token heartbeat should end without a pong"
+    );
+    assert!(
+        !wait_until(|| table.is_live("stale"), Duration::from_millis(400)).await,
+        "missing-token heartbeat must not refresh liveness for the stale worker"
+    );
+
+    let mut client = CoordinationClient::connect(agent)
+        .await
+        .expect("client connects to authenticated agent");
+    let forged_wrong_token = tokio_stream::iter([HeartbeatPing {
+        worker_id: "stale".into(),
+        running_actions: 0,
+        idle_slots: 4,
+        auth_token: "wrong".into(),
+        ..Default::default()
+    }]);
+    let mut pongs = client
+        .heartbeat(tonic::Request::new(forged_wrong_token))
+        .await
+        .expect("heartbeat stream opens")
+        .into_inner();
+
+    assert!(
+        pongs
+            .message()
+            .await
+            .expect("heartbeat response stream should not transport-error")
+            .is_none(),
+        "wrong-token heartbeat should end without a pong"
+    );
+    assert!(
+        !wait_until(|| table.is_live("stale"), Duration::from_millis(400)).await,
+        "wrong-token heartbeat must not refresh liveness for the stale worker"
+    );
 }
 
 #[tokio::test]

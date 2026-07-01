@@ -115,6 +115,11 @@ message HeartbeatPing {
   // Presence means "this worker reports CPU load"; absence means "no CPU signal",
   // and the agent's effective_idle() then falls back to the legacy slot count.
   optional uint32 idle_cpu_pct = 5;
+  // Shared cluster auth token (ADR 0006/0017), presented on every ping so a
+  // party without the token cannot forge liveness for a worker_id it does not
+  // own. Empty when the cluster runs without auth (M5/M6 back-compat), in which
+  // case the agent accepts unconditionally, matching Register.
+  string auth_token = 6;
 }
 
 message HeartbeatPong {

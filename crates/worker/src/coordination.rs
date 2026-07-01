@@ -104,7 +104,7 @@ pub async fn register_and_heartbeat(
             worker_id: worker_id.clone(),
             caps: Some(caps),
             execution_endpoint,
-            auth_token,
+            auth_token: auth_token.clone(),
         })
         .await?
         .into_inner();
@@ -153,6 +153,7 @@ pub async fn register_and_heartbeat(
                 running_actions: in_flight,
                 idle_slots: cpu_count.saturating_sub(in_flight),
                 idle_cpu_pct,
+                auth_token: auth_token.clone(),
             }
         });
 

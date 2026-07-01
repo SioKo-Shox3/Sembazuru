@@ -266,6 +266,7 @@ impl Coordination for CoordinationService {
     ) -> Result<Response<Self::HeartbeatStream>, Status> {
         let mut inbound = request.into_inner();
         let table = self.table.clone();
+        let expected_token = self.expected_token.clone();
         let start = self.start;
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
@@ -273,6 +274,11 @@ impl Coordination for CoordinationService {
             // pong only keeps the stream alive (the agent dates liveness by ping
             // arrival, not pong content).
             while let Ok(Some(ping)) = inbound.message().await {
+                if sembazuru_proto::auth::check(expected_token.as_deref(), &ping.auth_token)
+                    .is_err()
+                {
+                    break;
+                }
                 table.on_ping(
                     &ping.worker_id,
                     ping.running_actions,
