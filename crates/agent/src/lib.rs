@@ -18,6 +18,7 @@ pub mod coordination;
 pub mod env_filter;
 pub mod fileserver;
 pub mod intake;
+pub mod rootdir;
 pub mod run;
 pub mod scheduler;
 #[cfg(windows)]
