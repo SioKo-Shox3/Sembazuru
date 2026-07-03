@@ -14,6 +14,9 @@ use tokio::sync::mpsc;
 use crate::client::{POLL_INTERVAL, SharedState, UiCommand, Waker, run_client};
 use crate::tray::{Tray, TrayMessage};
 
+const TRAY_HINT_TEXT: &str = "トレイに常駐します。終了はトレイメニューから。";
+const TRAY_HINT_FRAMES: u16 = 180;
+
 pub mod config;
 pub mod dashboard;
 mod services;
@@ -39,6 +42,10 @@ pub struct SembazuruApp {
     tray: Option<Tray>,
     // Set when the user picks "Quit" so the close handler stops minimizing-to-tray.
     quitting: bool,
+    // Set after the first close-to-tray so the residency hint is only shown once.
+    hint_shown: bool,
+    // Remaining frames for the transient tray-residency hint in the nav bar.
+    tray_hint_frames: u16,
     tab: Tab,
     config: config::ConfigPanel,
     services: services::ServicesPanel,
@@ -68,6 +75,8 @@ impl SembazuruApp {
             commands,
             tray,
             quitting: false,
+            hint_shown: false,
+            tray_hint_frames: 0,
             tab: Tab::default(),
             config: config::ConfigPanel::default(),
             services: services::ServicesPanel::default(),
@@ -95,6 +104,11 @@ impl SembazuruApp {
 
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && self.tray.is_some() && !self.quitting {
+            if !self.hint_shown {
+                self.hint_shown = true;
+                self.tray_hint_frames = TRAY_HINT_FRAMES;
+                ctx.request_repaint();
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -115,6 +129,15 @@ impl eframe::App for SembazuruApp {
                 ui.selectable_value(&mut self.tab, Tab::Services, "Services");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
+            if self.tray_hint_frames > 0 {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(TRAY_HINT_TEXT)
+                        .color(egui::Color32::from_rgb(0x4c, 0xaf, 0x50)),
+                );
+                self.tray_hint_frames -= 1;
+                ui.ctx().request_repaint();
+            }
             ui.add_space(2.0);
         });
 
