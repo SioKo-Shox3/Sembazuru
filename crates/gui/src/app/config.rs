@@ -15,6 +15,54 @@ use crate::model::{
     ConfigEdit, ConfigModel, EvictionOutcome, SecretString, SetConfigOutcome, TokenAction,
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SizeUnit {
+    Bytes,
+    Mib,
+    #[default]
+    Gib,
+}
+
+impl SizeUnit {
+    pub fn label(self) -> &'static str {
+        match self {
+            SizeUnit::Bytes => "bytes",
+            SizeUnit::Mib => "MiB",
+            SizeUnit::Gib => "GiB",
+        }
+    }
+
+    fn factor(self) -> u64 {
+        match self {
+            SizeUnit::Bytes => 1,
+            SizeUnit::Mib => 1024 * 1024,
+            SizeUnit::Gib => 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Convert a UI value+unit to bytes (0 stays 0 = uncapped).
+pub fn unit_to_bytes(value: f64, unit: SizeUnit) -> u64 {
+    if value <= 0.0 {
+        return 0;
+    }
+    (value * unit.factor() as f64).round() as u64
+}
+
+/// Pick the most readable unit for a byte count (0 -> 0 GiB).
+pub fn bytes_to_unit(bytes: u64) -> (f64, SizeUnit) {
+    if bytes == 0 {
+        return (0.0, SizeUnit::Gib);
+    }
+    if bytes.is_multiple_of(1024 * 1024 * 1024) {
+        return (bytes as f64 / (1024.0 * 1024.0 * 1024.0), SizeUnit::Gib);
+    }
+    if bytes >= 1024 * 1024 {
+        return (bytes as f64 / (1024.0 * 1024.0), SizeUnit::Mib);
+    }
+    (bytes as f64, SizeUnit::Bytes)
+}
+
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 enum TokenMode {
     /// Leave the stored token untouched.
@@ -36,7 +84,8 @@ pub struct ConfigPanel {
     status: String,
     cache_root: String,
     trace_root: String,
-    cache_max_bytes: String,
+    cache_size_value: String,
+    cache_size_unit: SizeUnit,
     token_mode: TokenMode,
     token_input: String,
     notice: String,
@@ -86,11 +135,24 @@ impl ConfigPanel {
                 field(ui, "Status addr", &mut self.status);
                 field(ui, "Cache root", &mut self.cache_root);
                 field(ui, "Trace root", &mut self.trace_root);
-                field(
-                    ui,
-                    "Cache max bytes (0 = uncapped)",
-                    &mut self.cache_max_bytes,
-                );
+                ui.label("Cache max (0 = uncapped)");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cache_size_value).desired_width(120.0),
+                    );
+                    egui::ComboBox::from_id_salt("cache-unit")
+                        .selected_text(self.cache_size_unit.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cache_size_unit, SizeUnit::Gib, "GiB");
+                            ui.selectable_value(&mut self.cache_size_unit, SizeUnit::Mib, "MiB");
+                            ui.selectable_value(
+                                &mut self.cache_size_unit,
+                                SizeUnit::Bytes,
+                                "bytes",
+                            );
+                        });
+                });
+                ui.end_row();
             });
 
         ui.add_space(8.0);
@@ -204,7 +266,9 @@ impl ConfigPanel {
         self.status = cfg.status_addr.clone();
         self.cache_root = cfg.cache_root.clone();
         self.trace_root = cfg.trace_root.clone();
-        self.cache_max_bytes = cfg.cache_max_bytes.to_string();
+        let (cache_size_value, cache_size_unit) = bytes_to_unit(cfg.cache_max_bytes);
+        self.cache_size_value = cache_size_value.to_string();
+        self.cache_size_unit = cache_size_unit;
         self.loaded = Some(cfg);
     }
 
@@ -229,7 +293,10 @@ impl ConfigPanel {
         self.token_input.clear();
         self.token_mode = TokenMode::Keep;
 
-        let cache_max_bytes = self.cache_max_bytes.trim().parse::<u64>().unwrap_or(0);
+        let cache_max_bytes = unit_to_bytes(
+            self.cache_size_value.trim().parse::<f64>().unwrap_or(0.0),
+            self.cache_size_unit,
+        );
         let edit = ConfigEdit {
             coord_addr: self.coord.trim().to_string(),
             intake_addr: self.intake.trim().to_string(),

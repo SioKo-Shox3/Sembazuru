@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::client::{POLL_INTERVAL, SharedState, UiCommand, Waker, run_client};
 use crate::tray::{Tray, TrayMessage};
 
-mod config;
+pub mod config;
 pub mod dashboard;
 mod services;
 
