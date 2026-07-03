@@ -24,9 +24,9 @@ If it works for a compiler, it works for a shader compiler, a test runner, or an
 
 ## Why it exists
 
-Distributed builds shouldn't be gated behind per-core licensing that scales with your pain. The hard part — transparent process virtualization — is buildable in the open. This project is a long-horizon effort to make that capability free.
+Distributed builds shouldn't require expensive per-core licensing. The hard part — transparent process virtualization — is buildable in the open. This project is a long-horizon effort to make that capability free.
 
-We are clear-eyed about the moat: the incumbent's real advantage is a decade-plus of compatibility edge cases, not the core idea. So the realistic win is **driving the price floor down and becoming a credible alternative in the non-UE, general-Windows segment** — not a fantasy of overnight displacement.
+We are clear-eyed about the challenge: matching the maturity of established tools means covering a decade-plus of compatibility edge cases, not just the core idea. So the realistic goal is **being a dependable free/open-source option for the non-UE, general-Windows segment** — a focused, long-horizon effort.
 
 ## How it works
 
