@@ -12,6 +12,8 @@ name = "sembazuru-gui"
 path = "src/main.rs"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 sembazuru-proto = { path = "../proto" }
 tonic = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
@@ -55,5 +57,7 @@ embed-manifest = "1"
 # and worker are dev-dependencies only (the worker pins the service-name contract
 # the svcctl tests assert), so neither enters the GUI's production dependencies.
 [dev-dependencies]
+toml = "0.8"
 sembazuru-agent = { path = "../agent" }
 sembazuru-worker = { path = "../worker" }
+

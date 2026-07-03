@@ -17,6 +17,7 @@
 
 pub mod app;
 pub mod client;
+pub mod join;
 pub mod model;
 pub mod svcctl;
 pub mod tray;
