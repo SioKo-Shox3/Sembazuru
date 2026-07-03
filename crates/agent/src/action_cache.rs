@@ -23,9 +23,11 @@
 //! strong key, so a stale result is never served.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::rootdir::RootDir;
+use cap_std::fs::OpenOptions;
 use sembazuru_cas::{
     ActionCache, ActionResult, BlobStore, CasError, Digest, OutputFile, codec_checksum,
 };
@@ -54,6 +56,14 @@ pub enum CacheLookup {
     },
     /// Not cached (or its inputs changed): the caller must run the action.
     Miss,
+}
+
+struct StagedCacheOutput {
+    /// The immediate parent directory of `final_name`, opened once relative to
+    /// `build_root_dir` at staging time and reused unchanged at commit time.
+    output_dir: RootDir,
+    tmp_name: String,
+    final_name: String,
 }
 
 impl AgentCache {
@@ -150,10 +160,11 @@ impl AgentCache {
         // published (present-all-or-miss); only one blob is resident in memory at a
         // time (bounded — no whole-set buffering, so a multi-GB output set is fine);
         // and a corrupt-on-disk blob is a miss (re-run) rather than served verbatim.
-        let mut staged: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(result.outputs.len());
-        let unstage = |staged: &[(PathBuf, PathBuf)]| {
-            for (tmp, _) in staged {
-                let _ = std::fs::remove_file(tmp);
+        let build_root_dir = RootDir::open_root(build_root)?;
+        let mut staged: Vec<StagedCacheOutput> = Vec::with_capacity(result.outputs.len());
+        let unstage = |staged: &[StagedCacheOutput]| {
+            for staged in staged {
+                let _ = staged.output_dir.remove_file(&staged.tmp_name);
             }
         };
         for out in &result.outputs {
@@ -193,9 +204,8 @@ impl AgentCache {
                     return Ok(CacheLookup::Miss);
                 }
             };
-            let final_path = build_root.join(&out.logical_path);
-            match stage_sibling(&final_path, &bytes) {
-                Ok(tmp) => staged.push((tmp, final_path)),
+            match stage_sibling(&build_root_dir, &out.logical_path, &bytes) {
+                Ok(staged_output) => staged.push(staged_output),
                 Err(e) => {
                     unstage(&staged);
                     return Err(e);
@@ -205,8 +215,8 @@ impl AgentCache {
         // Pass 2: commit. The renames are the only non-atomic window; a mid-commit
         // I/O failure is surfaced as a hard error (not a silent partial hit), and
         // any temps not yet committed are cleaned up.
-        for (i, (tmp, final_path)) in staged.iter().enumerate() {
-            if let Err(e) = commit_staged(tmp, final_path) {
+        for (i, staged_output) in staged.iter().enumerate() {
+            if let Err(e) = commit_staged(staged_output) {
                 unstage(&staged[i + 1..]);
                 return Err(e);
             }
@@ -487,40 +497,54 @@ fn cacheable_outputs(outputs: impl IntoIterator<Item = String>) -> Vec<String> {
 /// resolves of the same output never collide on a fixed temp name (COR-007).
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Stages `bytes` to a uniquely-named temp SIBLING of `final_path` (same volume,
-/// so the later rename is atomic) and returns the temp path. Created with
-/// `create_new` (O_EXCL / CREATE_NEW), NOT a plain write: the name is otherwise
-/// predictable and a plain write would truncate — and follow — a symlink a
-/// co-located actor might pre-plant to redirect the cached bytes. `create_new`
-/// refuses an existing path, so a planted target makes us retry with the next seq
-/// rather than write through it (the same discipline as `cas::store::write_atomic`).
-/// The caller renames the temp onto `final_path` with [`commit_staged`] only after
-/// ALL of an action's outputs have staged, so a missing/corrupt blob leaves NO
-/// output published (set-atomic publish).
-fn stage_sibling(final_path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
-    let parent = final_path
+/// Stages `bytes` to a uniquely-named temp SIBLING of `final_rel` (same volume,
+/// so the later rename is atomic) and returns the temp path relative to the build
+/// root. Created with `create_new` (O_EXCL / CREATE_NEW), NOT a plain write: the
+/// name is otherwise predictable and a plain write would truncate — and follow —
+/// a symlink a co-located actor might pre-plant to redirect the cached bytes.
+/// `create_new` refuses an existing path, so a planted target makes us retry with
+/// the next seq rather than write through it (the same discipline as
+/// `cas::store::write_atomic`). The caller renames the temp onto `final_rel` with
+/// [`commit_staged`] only after ALL of an action's outputs have staged, so a
+/// missing/corrupt blob leaves NO output published (set-atomic publish).
+fn stage_sibling(
+    build_root_dir: &RootDir,
+    final_rel: &str,
+    bytes: &[u8],
+) -> io::Result<StagedCacheOutput> {
+    let final_rel = normalize_relative_for_root(final_rel)?;
+    let final_rel_path = Path::new(&final_rel);
+    let parent_rel = final_rel_path
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let stem = final_path
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(path_to_root_rel)
+        .transpose()?;
+    if let Some(parent_rel) = parent_rel.as_deref() {
+        build_root_dir.create_dir_all(parent_rel)?;
+    }
+    let output_dir = match parent_rel.as_deref() {
+        Some(parent_rel) => build_root_dir.open_dir(parent_rel)?,
+        None => build_root_dir.clone(),
+    };
+    let stem = final_rel_path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let final_name = file_name_for_root(final_rel_path)?;
     loop {
         let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = parent.join(format!(
-            ".sbz-cache.{}.{seq}.{stem}.tmp",
-            std::process::id()
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
+        let tmp_name = format!(".sbz-cache.{}.{seq}.{stem}.tmp", std::process::id());
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        match output_dir.open_with(&tmp_name, &opts) {
             Ok(mut f) => {
                 use std::io::Write;
                 f.write_all(bytes)?;
-                return Ok(tmp);
+                return Ok(StagedCacheOutput {
+                    output_dir,
+                    tmp_name,
+                    final_name: final_name.clone(),
+                });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -530,14 +554,41 @@ fn stage_sibling(final_path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
 
 /// Renames a staged temp onto its final path (atomic within a volume), removing
 /// the temp on failure so a failed commit leaves no `.sbz-cache.*.tmp` residue.
-fn commit_staged(tmp: &Path, final_path: &Path) -> io::Result<()> {
-    match std::fs::rename(tmp, final_path) {
+fn commit_staged(staged: &StagedCacheOutput) -> io::Result<()> {
+    match staged
+        .output_dir
+        .rename(&staged.tmp_name, &staged.final_name)
+    {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = std::fs::remove_file(tmp);
+            let _ = staged.output_dir.remove_file(&staged.tmp_name);
             Err(e)
         }
     }
+}
+
+fn normalize_relative_for_root(path: &str) -> io::Result<String> {
+    let path = path.replace('/', "\\");
+    if Path::new(&path).is_absolute() || path.split('\\').any(|comp| comp == "..") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("refusing to publish cached output outside the build root: {path:?}"),
+        ));
+    }
+    Ok(path)
+}
+
+fn path_to_root_rel(path: &Path) -> io::Result<String> {
+    path.to_str()
+        .map(|s| s.replace('/', "\\"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not UTF-8"))
+}
+
+fn file_name_for_root(path: &Path) -> io::Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no UTF-8 file name"))
 }
 
 // --- InputManifest codec (agent-owned; opaque to the cache) ----------------
@@ -676,6 +727,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map_err(|e| format!("failed to spawn mklink /J: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink /J failed with status {:?}; stdout: {}; stderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
     }
 
     fn manifest_for(inputs: &[(&str, &Path)]) -> InputManifest {
@@ -938,6 +1009,91 @@ mod tests {
             std::fs::read(build2.join(out_logical)).unwrap(),
             b"OBJECT-BYTES-v1"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_rejects_build_root_intermediate_junction_publish_escape() {
+        let cache_root = tmp("cache-junction-cache");
+        let build = tmp("cache-junction-build");
+        let cache = AgentCache::open(&cache_root).unwrap();
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"int main(){return 0;}").unwrap();
+        std::fs::create_dir_all(build.join("escape")).unwrap();
+        let out_logical = "escape\\a.obj";
+        std::fs::write(build.join(out_logical), b"OBJECT-BYTES").unwrap();
+
+        let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
+        let env: Vec<(String, String)> = vec![];
+        let weak = cache.weak_key(&argv, &env, "");
+        let manifest = manifest_for(&[("a.cpp", &input)]);
+        cache
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &[out_logical.to_string()],
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let fresh = tmp("cache-junction-fresh");
+        let outside = tmp("cache-junction-outside");
+        create_junction(&fresh.join("escape"), &outside)
+            .expect("mklink /J should create an unprivileged junction on Windows");
+
+        let result = cache.resolve(&weak, &fresh);
+
+        assert!(
+            result.is_err(),
+            "cache publish must reject an intermediate junction under build_root"
+        );
+        assert!(
+            !outside.join("a.obj").exists(),
+            "cache publish must not materialize output through the junction target"
+        );
+
+        let _ = std::fs::remove_dir(fresh.join("escape"));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&build);
+        let _ = std::fs::remove_dir_all(&fresh);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cache_publish_does_not_publish_attacker_bytes_after_plain_parent_recreate() {
+        let build = tmp("cache-parent-recreate-build");
+        let parent = build.join("escape");
+        std::fs::create_dir_all(&parent).unwrap();
+        let build_root_dir = RootDir::open_root(&build).unwrap();
+        let staged = stage_sibling(&build_root_dir, "escape\\a.obj", b"verified bytes").unwrap();
+        let tmp_abs = parent.join(&staged.tmp_name);
+        let final_abs = build.join("escape").join("a.obj");
+
+        std::fs::remove_file(&tmp_abs).unwrap();
+        match std::fs::remove_dir(&parent) {
+            Ok(()) => {
+                eprintln!("cache parent remove_dir succeeded while RootDir handle was open");
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::write(&tmp_abs, b"attacker bytes").unwrap();
+            }
+            Err(e) => {
+                eprintln!("cache parent remove_dir refused while RootDir handle was open: {e}");
+            }
+        }
+
+        let _ = commit_staged(&staged);
+
+        assert_ne!(
+            std::fs::read(&final_abs).ok().as_deref(),
+            Some(b"attacker bytes".as_slice()),
+            "cache publish must never expose bytes staged in a recreated plain parent directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&build);
     }
 
     #[test]

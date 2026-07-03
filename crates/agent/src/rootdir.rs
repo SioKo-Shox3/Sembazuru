@@ -20,13 +20,15 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata, OpenOptions, ReadDir};
 
 /// A handle to a trusted root directory for contained filesystem operations.
+#[derive(Clone)]
 pub struct RootDir {
-    dir: Dir,
+    dir: Arc<Dir>,
 }
 
 impl RootDir {
@@ -36,7 +38,7 @@ impl RootDir {
     /// session or build root. All subsequent path operations should use the
     /// returned `RootDir` with relative paths.
     pub fn open_root(path: &Path) -> io::Result<Self> {
-        Dir::open_ambient_dir(path, ambient_authority()).map(|dir| Self { dir })
+        Dir::open_ambient_dir(path, ambient_authority()).map(|dir| Self { dir: Arc::new(dir) })
     }
 
     /// Opens an existing file below this root for reading.
@@ -62,6 +64,13 @@ impl RootDir {
     /// Reads a directory below this root.
     pub fn read_dir(&self, rel: &str) -> io::Result<ReadDir> {
         self.dir.read_dir(rel)
+    }
+
+    /// Opens a directory below this root as a new contained root.
+    pub fn open_dir(&self, rel: &str) -> io::Result<RootDir> {
+        self.dir
+            .open_dir(rel)
+            .map(|dir| RootDir { dir: Arc::new(dir) })
     }
 
     /// Creates a single directory below this root.

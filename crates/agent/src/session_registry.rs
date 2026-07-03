@@ -48,6 +48,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::rootdir::RootDir;
+use cap_std::fs::OpenOptions;
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -70,12 +72,22 @@ static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// at first touch. `Arc` so concurrent racers of the same path share one cell.
 type PinCell = Arc<OnceCell<(Digest, u64)>>;
 
+/// A newly-created staging sibling and the parent directory capability that
+/// contains it.
+pub struct StagingTemp {
+    pub path: PathBuf,
+    pub rel: String,
+    pub parent_dir: RootDir,
+}
+
 /// In-progress streamed WriteBack for one output id: the temp file being
 /// appended to, how many bytes have landed (the next expected offset), and the
 /// running digest so the whole output is verified without buffering it. Lives
 /// per session now (was a field of the process-wide `Session`).
 pub struct WritebackState {
     pub tmp: PathBuf,
+    pub tmp_rel: String,
+    pub parent_dir: RootDir,
     pub written: u64,
     pub hasher: DigestHasher,
 }
@@ -86,6 +98,11 @@ pub struct WritebackState {
 pub struct StagedOutput {
     pub staging_path: PathBuf,
     pub final_path: PathBuf,
+    /// The directory handle opened once at staging time (`create_staging_temp`)
+    /// for `final_path`'s immediate parent. Reused unchanged at commit time so a
+    /// delete+recreate of that directory between staging and commit cannot
+    /// redirect the publish rename onto attacker-controlled bytes.
+    pub parent_dir: RootDir,
 }
 
 /// The agent's authority over one action's data-plane session: the scope root it
@@ -98,6 +115,9 @@ pub struct SessionCapability {
     /// the value the agent dispatched, NOT the worker-declared Hello root, so a
     /// worker cannot widen its own scope (SEC-004).
     root: Option<String>,
+    /// Handle-based containment for the authoritative scope root. `None` means
+    /// setup could not open the root, so callers fall back to lexical scoping.
+    root_dir: Option<RootDir>,
     /// Output id → agent-authoritative output spec. WriteBack names only the id;
     /// the path and size cap remain controlled by the agent — SEC-003.
     outputs: HashMap<u32, OutputSpec>,
@@ -131,8 +151,12 @@ pub struct SessionCapability {
 
 impl SessionCapability {
     fn new(root: Option<String>, outputs: HashMap<u32, OutputSpec>, enforce: bool) -> Self {
+        let root_dir = root
+            .as_deref()
+            .and_then(|path| RootDir::open_root(Path::new(path)).ok());
         SessionCapability {
             root,
+            root_dir,
             outputs,
             pinned: Mutex::new(HashMap::new()),
             allowed_digests: Mutex::new(HashSet::new()),
@@ -149,6 +173,11 @@ impl SessionCapability {
     /// scopes Stat/OpenRead/DirList against THIS, ignoring the worker's Hello root.
     pub fn root(&self) -> Option<&str> {
         self.root.as_deref()
+    }
+
+    /// Handle-based containment for the authoritative root, if setup opened it.
+    pub fn root_dir(&self) -> Option<&RootDir> {
+        self.root_dir.as_ref()
     }
 
     /// Whether this is a bound (enforcing) session vs a legacy/unscoped one.
@@ -184,6 +213,16 @@ impl SessionCapability {
         requested: &str,
         actual: PathBuf,
     ) -> Option<(Digest, u64)> {
+        self.pin_contained(store, requested, actual, None).await
+    }
+
+    pub(crate) async fn pin_contained(
+        &self,
+        store: &BlobStore,
+        requested: &str,
+        actual: PathBuf,
+        root_read: Option<(RootDir, String)>,
+    ) -> Option<(Digest, u64)> {
         let cell = {
             let mut pinned = self.pinned.lock().await;
             pinned
@@ -192,8 +231,11 @@ impl SessionCapability {
                 .clone()
         };
         let res: Result<&(Digest, u64), ()> = cell
-            .get_or_try_init(|| async {
-                let bytes = tokio::fs::read(&actual).await.map_err(|_| ())?;
+            .get_or_try_init(|| async move {
+                let bytes = match root_read {
+                    Some((root_dir, rel)) => read_root_file(root_dir, rel).await.map_err(|_| ())?,
+                    None => tokio::fs::read(&actual).await.map_err(|_| ())?,
+                };
                 let size = bytes.len() as u64;
                 let digest = store.put(&bytes).map_err(|_| ())?;
                 self.allowed_digests.lock().await.insert(digest.clone());
@@ -234,12 +276,15 @@ impl SessionCapability {
         output_id: u32,
         staging_path: PathBuf,
         final_path: PathBuf,
+        parent_dir: RootDir,
     ) -> bool {
         let old = {
             let mut staged = self.staged.lock().await;
             if self.is_closed() {
                 drop(staged);
-                let _ = tokio::fs::remove_file(&staging_path).await;
+                if let Ok(tmp_rel) = file_name_string(&staging_path) {
+                    let _ = remove_root_file(parent_dir, tmp_rel).await;
+                }
                 return false;
             }
             staged.insert(
@@ -247,11 +292,14 @@ impl SessionCapability {
                 StagedOutput {
                     staging_path,
                     final_path,
+                    parent_dir,
                 },
             )
         };
-        if let Some(old) = old {
-            let _ = tokio::fs::remove_file(old.staging_path).await;
+        if let Some(old) = old
+            && let Ok(tmp_rel) = file_name_string(&old.staging_path)
+        {
+            let _ = remove_root_file(old.parent_dir, tmp_rel).await;
         }
         true
     }
@@ -267,15 +315,7 @@ impl SessionCapability {
 
         let mut first_err = None;
         for staged in entries {
-            if let Some(parent) = staged.final_path.parent()
-                && let Err(e) = tokio::fs::create_dir_all(parent).await
-            {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-                continue;
-            }
-            if let Err(e) = tokio::fs::rename(&staged.staging_path, &staged.final_path).await
+            if let Err(e) = publish_staged_output(staged).await
                 && first_err.is_none()
             {
                 first_err = Some(e);
@@ -292,25 +332,43 @@ impl SessionCapability {
     /// WriteBack temps. Used after failed/aborted/closed actions and after the
     /// publish attempt to avoid leaving session-owned temp files behind.
     pub async fn discard_staged(&self) {
-        let staged_paths = {
+        let staged_entries = {
             let mut staged = self.staged.lock().await;
-            staged
-                .drain()
-                .map(|(_, staged)| staged.staging_path)
-                .collect::<Vec<_>>()
+            staged.drain().map(|(_, staged)| staged).collect::<Vec<_>>()
         };
-        let writeback_paths = {
+        let writeback_entries = {
             let mut writebacks = self.writebacks.lock().await;
             writebacks
                 .drain()
-                .map(|(_, state)| state.tmp)
+                .map(|(_, state)| state)
                 .collect::<Vec<_>>()
         };
 
-        for path in staged_paths.into_iter().chain(writeback_paths) {
-            let _ = tokio::fs::remove_file(path).await;
+        for staged in staged_entries {
+            if let Ok(tmp_rel) = file_name_string(&staged.staging_path) {
+                let _ = remove_root_file(staged.parent_dir, tmp_rel).await;
+            }
+        }
+        for state in writeback_entries {
+            let _ = remove_root_file(state.parent_dir, state.tmp_rel).await;
         }
     }
+}
+
+async fn read_root_file(root_dir: RootDir, rel: String) -> io::Result<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        let mut file = root_dir.open_read(&rel)?;
+        let mut bytes = Vec::new();
+        use std::io::Read as _;
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+    .await
+    .map_err(join_error_to_io)?
+}
+
+fn join_error_to_io(e: tokio::task::JoinError) -> io::Error {
+    io::Error::other(format!("blocking filesystem task failed: {e}"))
 }
 
 /// A same-directory, CSPRNG-named staging sibling. Keeping staging beside the
@@ -324,6 +382,99 @@ pub fn staging_temp(final_path: &Path) -> PathBuf {
         Some(parent) => parent.join(name),
         None => PathBuf::from(name),
     }
+}
+
+pub async fn create_staging_temp(final_path: &Path) -> io::Result<StagingTemp> {
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output path has no parent"))?;
+    tokio::fs::create_dir_all(parent).await?;
+    // Residual: anchoring at the immediate parent contains the staging sibling
+    // and final leaf, but it does not protect a reparse point in an ancestor
+    // above this parent.
+    let parent_dir = open_immediate_parent_root(parent.to_path_buf()).await?;
+    loop {
+        let path = staging_temp(final_path);
+        let rel = file_name_string(&path)?;
+        match create_new_root_file(parent_dir.clone(), rel.clone()).await {
+            Ok(()) => {
+                return Ok(StagingTemp {
+                    path,
+                    rel,
+                    parent_dir,
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+async fn publish_staged_output(staged: StagedOutput) -> io::Result<()> {
+    let parent = staged
+        .final_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output path has no parent"))?;
+    if staged.staging_path.parent() != Some(parent) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staging path is not a sibling of final path",
+        ));
+    }
+    let tmp_rel = file_name_string(&staged.staging_path)?;
+    let final_rel = file_name_string(&staged.final_path)?;
+    let parent_dir = staged.parent_dir;
+    match rename_root_file(parent_dir.clone(), tmp_rel.clone(), final_rel).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = remove_root_file(parent_dir, tmp_rel).await;
+            Err(e)
+        }
+    }
+}
+
+fn file_name_string(path: &Path) -> io::Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no UTF-8 file name"))
+}
+
+async fn open_immediate_parent_root(path: PathBuf) -> io::Result<RootDir> {
+    let grandparent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output parent has no parent"))?
+        .to_path_buf();
+    let leaf = file_name_string(&path)?;
+    tokio::task::spawn_blocking(move || {
+        let grandparent_dir = RootDir::open_root(&grandparent)?;
+        grandparent_dir.open_dir(&leaf)
+    })
+    .await
+    .map_err(join_error_to_io)?
+}
+
+async fn create_new_root_file(root_dir: RootDir, rel: String) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        drop(root_dir.open_with(&rel, &opts)?);
+        Ok(())
+    })
+    .await
+    .map_err(join_error_to_io)?
+}
+
+async fn rename_root_file(root_dir: RootDir, from: String, to: String) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || root_dir.rename(&from, &to))
+        .await
+        .map_err(join_error_to_io)?
+}
+
+pub(crate) async fn remove_root_file(root_dir: RootDir, rel: String) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || root_dir.remove_file(&rel))
+        .await
+        .map_err(join_error_to_io)?
 }
 
 /// RAII tracker for a live connection bound to a session, so the idle sweeper
@@ -492,6 +643,26 @@ mod tests {
         Some(p.to_string_lossy().to_lowercase().replace('/', "\\"))
     }
 
+    #[cfg(windows)]
+    fn create_junction(link: &Path, target: &Path) -> Result<(), String> {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map_err(|e| format!("failed to spawn mklink /J: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink /J failed with status {:?}; stdout: {}; stderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn create_get_finish_lifecycle() {
         let reg = SessionRegistry::new().unwrap();
@@ -567,10 +738,11 @@ mod tests {
         let staging_path = dir.join("staged.tmp");
         let final_path = dir.join("out.bin");
         std::fs::write(&staging_path, b"verified bytes").unwrap();
+        let parent_dir = RootDir::open_root(&dir).unwrap();
 
         assert!(reg.finish("sess-closed").await);
         let staged = cap
-            .record_staged(0, staging_path.clone(), final_path.clone())
+            .record_staged(0, staging_path.clone(), final_path.clone(), parent_dir)
             .await;
 
         assert!(!staged);
@@ -581,6 +753,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn publish_staged_rejects_immediate_parent_junction_swap() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("sess-parent-swap".into(), None, Vec::new())
+            .await;
+        let root = tmp("publish-junction-root");
+        let outside = tmp("publish-junction-outside");
+        let parent = root.join("out");
+        std::fs::create_dir_all(&parent).unwrap();
+        let staging_path = parent.join(".sbz-staging-fixed");
+        let final_path = parent.join("final.obj");
+        std::fs::write(&staging_path, b"verified bytes").unwrap();
+        let parent_dir = RootDir::open_root(&parent).unwrap();
+        assert!(
+            cap.record_staged(0, staging_path.clone(), final_path, parent_dir)
+                .await
+        );
+
+        std::fs::remove_file(&staging_path).unwrap();
+        if std::fs::remove_dir(&parent).is_ok() {
+            eprintln!(
+                "writeback junction parent remove_dir succeeded while RootDir handle was open"
+            );
+            create_junction(&parent, &outside)
+                .expect("mklink /J should create an unprivileged junction on Windows");
+            std::fs::write(outside.join(".sbz-staging-fixed"), b"attacker bytes").unwrap();
+        } else {
+            eprintln!("writeback junction parent remove_dir refused while RootDir handle was open");
+        }
+
+        let result = cap.publish_staged().await;
+
+        assert!(
+            result.is_err(),
+            "publish must reject an immediate parent replaced by an out-of-root junction"
+        );
+        assert!(
+            !outside.join("final.obj").exists(),
+            "publish must not create the final output through the junction target"
+        );
+
+        let _ = std::fs::remove_dir(&parent);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn publish_staged_does_not_publish_attacker_bytes_after_plain_parent_recreate() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("sess-parent-recreate".into(), None, Vec::new())
+            .await;
+        let root = tmp("publish-parent-recreate-root");
+        let parent = root.join("out");
+        std::fs::create_dir_all(&parent).unwrap();
+        let final_path = parent.join("final.obj");
+        let StagingTemp {
+            path: staging_path,
+            rel: _,
+            parent_dir,
+        } = create_staging_temp(&final_path).await.unwrap();
+        std::fs::write(&staging_path, b"verified bytes").unwrap();
+        assert!(
+            cap.record_staged(0, staging_path.clone(), final_path.clone(), parent_dir)
+                .await
+        );
+
+        std::fs::remove_file(&staging_path).unwrap();
+        match std::fs::remove_dir(&parent) {
+            Ok(()) => {
+                eprintln!("writeback parent remove_dir succeeded while RootDir handle was open");
+                std::fs::create_dir(&parent).unwrap();
+                std::fs::write(&staging_path, b"attacker bytes").unwrap();
+            }
+            Err(e) => {
+                eprintln!("writeback parent remove_dir refused while RootDir handle was open: {e}");
+            }
+        }
+
+        let _ = cap.publish_staged().await;
+
+        assert_ne!(
+            std::fs::read(&final_path).ok().as_deref(),
+            Some(b"attacker bytes".as_slice()),
+            "writeback publish must never expose bytes staged in a recreated plain parent directory"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn sweep_idle_discards_staging_of_reaped_sessions() {
         let reg = SessionRegistry::new().unwrap();
@@ -589,7 +854,11 @@ mod tests {
         let staging_path = dir.join("staged.tmp");
         let final_path = dir.join("out.bin");
         std::fs::write(&staging_path, b"verified bytes").unwrap();
-        assert!(cap.record_staged(0, staging_path.clone(), final_path).await);
+        let parent_dir = RootDir::open_root(&dir).unwrap();
+        assert!(
+            cap.record_staged(0, staging_path.clone(), final_path, parent_dir)
+                .await
+        );
 
         let reaped = reg.sweep_idle(Duration::ZERO).await;
 

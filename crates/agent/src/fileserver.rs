@@ -53,7 +53,10 @@ impl ServerStats {
     }
 }
 
-use crate::session_registry::{SessionCapability, SessionRegistry, WritebackState, staging_temp};
+use crate::rootdir::RootDir;
+use crate::session_registry::{
+    SessionCapability, SessionRegistry, WritebackState, create_staging_temp, remove_root_file,
+};
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
@@ -370,6 +373,67 @@ fn path_in_scope(requested: &str, root: Option<&str>) -> bool {
     norm == root || norm.starts_with(&format!("{root}\\"))
 }
 
+fn root_relative_path(requested: &str, root: &str) -> Option<String> {
+    let norm = normalize_requested(requested)?;
+    if norm == root {
+        Some(".".to_string())
+    } else {
+        norm.strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('\\'))
+            .map(ToOwned::to_owned)
+    }
+}
+
+fn contained_root_access(
+    cap: &SessionCapability,
+    map: &PathMap,
+    requested: &str,
+) -> Option<(RootDir, String)> {
+    if !matches!(map, PathMap::Identity) {
+        return None;
+    }
+    let root = cap.root()?;
+    let root_dir = cap.root_dir()?.clone();
+    let rel = root_relative_path(requested, root)?;
+    Some((root_dir, rel))
+}
+
+async fn root_metadata(root_dir: RootDir, rel: String) -> io::Result<cap_std::fs::Metadata> {
+    tokio::task::spawn_blocking(move || root_dir.metadata(&rel))
+        .await
+        .map_err(blocking_join_to_io)?
+}
+
+async fn root_dir_entries(root_dir: RootDir, rel: String) -> io::Result<Vec<DirEntry>> {
+    tokio::task::spawn_blocking(move || {
+        let rd = root_dir.read_dir(&rel)?;
+        let mut entries = Vec::new();
+        for ent in rd {
+            let Ok(ent) = ent else {
+                break;
+            };
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let (is_dir, size) = match ent.metadata() {
+                Ok(md) => (md.is_dir(), md.len()),
+                Err(_) => (false, 0),
+            };
+            entries.push(DirEntry {
+                rel_path: name,
+                is_dir,
+                size,
+            });
+        }
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        Ok(entries)
+    })
+    .await
+    .map_err(blocking_join_to_io)?
+}
+
+fn blocking_join_to_io(e: tokio::task::JoinError) -> io::Error {
+    io::Error::other(format!("blocking filesystem task failed: {e}"))
+}
+
 /// Server side of the session-open handshake (M7.0 auth + M7.1 scoping). The
 /// peer's first frame must be a `Hello` carrying the cluster token and the
 /// declared root; this validates the token, resolves the session id, and replies
@@ -455,7 +519,7 @@ async fn dispatch(
 
     match op {
         OpCode::StatBatch => match StatRequest::decode(payload) {
-            Ok(req) => stat_batch(req, map, cap.root()).await.encode(),
+            Ok(req) => stat_batch(req, map, cap).await.encode(),
             Err(_) => StatResponse { entries: vec![] }.encode(),
         },
         OpCode::OpenRead => match OpenReadRequest::decode(payload) {
@@ -467,7 +531,7 @@ async fn dispatch(
             Err(_) => ReadResponse { bytes: vec![] }.encode(),
         },
         OpCode::DirList => match DirListRequest::decode(payload) {
-            Ok(req) => dir_list(req, map, cap.root()).await.encode(),
+            Ok(req) => dir_list(req, map, cap).await.encode(),
             Err(_) => DirListResponse {
                 exists: false,
                 entries: vec![],
@@ -549,8 +613,6 @@ fn wb_io_err(category: &'static str, detail: impl std::fmt::Display) -> WriteBac
 /// per-output size cap. Unknown ids are rejected before any directory or temp
 /// file is created.
 async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBackResponse {
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
     let spec = match cap.output_spec(req.output_id) {
         Some(spec) => spec,
         None => return wb_err("unknown output id".into()),
@@ -561,25 +623,22 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
 
     // offset 0 (re)starts the stream: ensure the dir, create a fresh temp.
     if req.offset == 0 {
-        if let Some(parent) = final_path.parent()
-            && let Err(e) = tokio::fs::create_dir_all(parent).await
-        {
-            return wb_io_err("create output dir failed", e);
-        }
-        let tmp = staging_temp(&final_path);
-        if let Err(e) = tokio::fs::File::create_new(&tmp).await {
-            return wb_io_err("create temp failed", e);
-        }
+        let temp = match create_staging_temp(&final_path).await {
+            Ok(temp) => temp,
+            Err(e) => return wb_io_err("create temp failed", e),
+        };
         let old = wbs.insert(
             req.output_id,
             WritebackState {
-                tmp,
+                tmp: temp.path,
+                tmp_rel: temp.rel,
+                parent_dir: temp.parent_dir,
                 written: 0,
                 hasher: DigestHasher::new(),
             },
         );
         if let Some(old) = old {
-            let _ = tokio::fs::remove_file(old.tmp).await;
+            let _ = remove_root_file(old.parent_dir, old.tmp_rel).await;
         }
     }
 
@@ -595,14 +654,14 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         }
         match state.written.checked_add(req.bytes.len() as u64) {
             Some(new_written) if new_written <= spec.max_size => Ok(new_written),
-            _ => Err(state.tmp.clone()),
+            _ => Err((state.parent_dir.clone(), state.tmp_rel.clone())),
         }
     };
     let new_written = match new_written {
         Ok(new_written) => new_written,
-        Err(tmp) => {
+        Err((parent_dir, tmp_rel)) => {
             wbs.remove(&req.output_id);
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = remove_root_file(parent_dir, tmp_rel).await;
             return wb_err("output exceeds max size".into());
         }
     };
@@ -612,20 +671,15 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         let state = wbs
             .get_mut(&req.output_id)
             .expect("state present after size check");
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&state.tmp)
-            .await
+        if let Err(e) = write_root_file_at(
+            state.parent_dir.clone(),
+            state.tmp_rel.clone(),
+            req.offset,
+            req.bytes.clone(),
+        )
+        .await
         {
-            Ok(mut f) => {
-                if let Err(e) = f.seek(std::io::SeekFrom::Start(req.offset)).await {
-                    return wb_io_err("seek temp failed", e);
-                }
-                if let Err(e) = f.write_all(&req.bytes).await {
-                    return wb_io_err("write temp failed", e);
-                }
-            }
-            Err(e) => return wb_io_err("open temp failed", e),
+            return wb_io_err("write temp failed", e);
         }
         state.hasher.update(&req.bytes);
         state.written = new_written;
@@ -645,14 +699,14 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
     drop(wbs);
     let actual = state.hasher.finalize().canonical();
     if actual != req.digest_hex {
-        let _ = tokio::fs::remove_file(&state.tmp).await;
+        let _ = remove_root_file(state.parent_dir, state.tmp_rel).await;
         return wb_err(format!(
             "digest mismatch: declared {}, got {actual}",
             req.digest_hex
         ));
     }
     if cap
-        .record_staged(req.output_id, state.tmp, final_path)
+        .record_staged(req.output_id, state.tmp, final_path, state.parent_dir)
         .await
     {
         WriteBackResponse {
@@ -662,6 +716,24 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
     } else {
         wb_err("session closed during writeback".into())
     }
+}
+
+async fn write_root_file_at(
+    root_dir: RootDir,
+    rel: String,
+    offset: u64,
+    bytes: Vec<u8>,
+) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.write(true);
+        let mut file = root_dir.open_with(&rel, &opts)?;
+        use std::io::{Seek as _, Write as _};
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        file.write_all(&bytes)
+    })
+    .await
+    .map_err(blocking_join_to_io)?
 }
 
 fn not_found_open() -> OpenReadResponse {
@@ -676,13 +748,13 @@ fn not_found_open() -> OpenReadResponse {
 /// Existence + attributes only (no digest): header resolution probes many
 /// non-existent paths, so this stays cheap and ingests nothing. Digest/content
 /// come from OpenRead (which is also where snapshot pinning happens).
-async fn stat_batch(req: StatRequest, map: &PathMap, root: Option<&str>) -> StatResponse {
+async fn stat_batch(req: StatRequest, map: &PathMap, cap: &SessionCapability) -> StatResponse {
     let mut entries = Vec::with_capacity(req.paths.len());
     for p in &req.paths {
         // Out-of-scope paths report "does not exist" — same as a real negative
         // probe, so a rogue worker cannot even learn whether a path outside the
         // declared root is present (M7.1 path scoping).
-        if !path_in_scope(p, root) {
+        if !path_in_scope(p, cap.root()) {
             entries.push(StatEntry {
                 exists: false,
                 is_dir: false,
@@ -691,20 +763,39 @@ async fn stat_batch(req: StatRequest, map: &PathMap, root: Option<&str>) -> Stat
             });
             continue;
         }
-        let actual = map.resolve(p);
-        let entry = match tokio::fs::metadata(&actual).await {
-            Ok(md) => StatEntry {
-                exists: true,
-                is_dir: md.is_dir(),
-                size: md.len(),
-                digest_hex: String::new(),
+        let contained = contained_root_access(cap, map, p);
+        let entry = match contained {
+            Some((root_dir, rel)) => match root_metadata(root_dir, rel).await {
+                Ok(md) => StatEntry {
+                    exists: true,
+                    is_dir: md.is_dir(),
+                    size: md.len(),
+                    digest_hex: String::new(),
+                },
+                Err(_) => StatEntry {
+                    exists: false,
+                    is_dir: false,
+                    size: 0,
+                    digest_hex: String::new(),
+                },
             },
-            Err(_) => StatEntry {
-                exists: false,
-                is_dir: false,
-                size: 0,
-                digest_hex: String::new(),
-            },
+            None => {
+                let actual = map.resolve(p);
+                match tokio::fs::metadata(&actual).await {
+                    Ok(md) => StatEntry {
+                        exists: true,
+                        is_dir: md.is_dir(),
+                        size: md.len(),
+                        digest_hex: String::new(),
+                    },
+                    Err(_) => StatEntry {
+                        exists: false,
+                        is_dir: false,
+                        size: 0,
+                        digest_hex: String::new(),
+                    },
+                }
+            }
         };
         entries.push(entry);
     }
@@ -725,9 +816,10 @@ async fn open_read(
         return not_found_open();
     }
     let actual = map.resolve(&req.path);
+    let contained = contained_root_access(cap, map, &req.path);
     // Pin (single-flight) into the session's partition; this also records the
     // digest in the session's allowed-digest ACL so the later Read/Has succeeds.
-    let Some((digest, size)) = cap.pin(store, &req.path, actual).await else {
+    let Some((digest, size)) = cap.pin_contained(store, &req.path, actual, contained).await else {
         return not_found_open();
     };
     // Inline the first chunk only if asked. A worker-local-cache client sends
@@ -799,12 +891,24 @@ async fn has(req: HasRequest, cap: &SessionCapability, store: &BlobStore) -> Has
 
 /// Lists a directory's immediate children (depth is reserved for deeper
 /// prefetch; M3.2 serves one level, which covers the include-dir snapshot case).
-async fn dir_list(req: DirListRequest, map: &PathMap, root: Option<&str>) -> DirListResponse {
+async fn dir_list(req: DirListRequest, map: &PathMap, cap: &SessionCapability) -> DirListResponse {
     // Out-of-scope directory reports "does not exist" (existence-hiding, M7.1).
-    if !path_in_scope(&req.path, root) {
+    if !path_in_scope(&req.path, cap.root()) {
         return DirListResponse {
             exists: false,
             entries: vec![],
+        };
+    }
+    if let Some((root_dir, rel)) = contained_root_access(cap, map, &req.path) {
+        return match root_dir_entries(root_dir, rel).await {
+            Ok(entries) => DirListResponse {
+                exists: true,
+                entries,
+            },
+            Err(_) => DirListResponse {
+                exists: false,
+                entries: vec![],
+            },
         };
     }
     let actual = map.resolve(&req.path);
@@ -841,6 +945,78 @@ async fn dir_list(req: DirListRequest, map: &PathMap, root: Option<&str>) -> Dir
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::path::{Path, PathBuf};
+    #[cfg(windows)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[cfg(windows)]
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(windows)]
+    struct ScratchDir {
+        path: PathBuf,
+        reparse_dirs: Vec<PathBuf>,
+    }
+
+    #[cfg(windows)]
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("sbz-fs-{}-{tag}-{seq}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self {
+                path,
+                reparse_dirs: Vec::new(),
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn register_reparse_dir(&mut self, path: PathBuf) {
+            self.reparse_dirs.push(path);
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            for path in self.reparse_dirs.iter().rev() {
+                let _ = std::fs::remove_dir(path);
+            }
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_junction(
+        root: &mut ScratchDir,
+        link_name: &str,
+        target: &Path,
+    ) -> Result<(), String> {
+        let link = root.path().join(link_name);
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target)
+            .output()
+            .map_err(|e| format!("failed to spawn mklink /J: {e}"))?;
+        if output.status.success() {
+            root.register_reparse_dir(link);
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink /J failed with status {:?}; stdout: {}; stderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
 
     #[test]
     fn remap_redirects_under_logical_root() {
@@ -943,6 +1119,74 @@ mod tests {
         assert!(!path_in_scope("c:foo", root));
         assert!(!path_in_scope("\\\\host\\share\\work\\proj\\x", root));
         assert!(!path_in_scope("\\\\?\\c:\\work\\proj\\x", root));
+    }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn identity_stat_open_and_dir_list_reject_intermediate_junction_escape() {
+        let outside = ScratchDir::new("outside");
+        std::fs::write(outside.path().join("secret.txt"), b"outside").unwrap();
+        let mut root = ScratchDir::new("root");
+        create_junction(&mut root, "escape", outside.path())
+            .expect("mklink /J should create an unprivileged junction on Windows");
+        let requested = root
+            .path()
+            .join("escape")
+            .join("secret.txt")
+            .to_string_lossy()
+            .into_owned();
+        let root = normalize_root(&root.path().to_string_lossy()).expect("absolute temp root");
+        let registry = SessionRegistry::new().unwrap();
+        let cap = registry
+            .create("junction-read".into(), Some(root), Vec::new())
+            .await;
+
+        let stat = stat_batch(
+            StatRequest {
+                paths: vec![requested.clone()],
+            },
+            &PathMap::Identity,
+            &cap,
+        )
+        .await;
+        assert!(
+            !stat.entries[0].exists,
+            "stat must not follow an intermediate junction outside the session root"
+        );
+
+        let open = open_read(
+            OpenReadRequest {
+                path: requested,
+                want_inline: true,
+            },
+            &cap,
+            registry.store(),
+            &PathMap::Identity,
+            &ServerStats::default(),
+        )
+        .await;
+        assert!(
+            !open.exists,
+            "open_read must not pin bytes reached through an out-of-root junction"
+        );
+
+        let listed = dir_list(
+            DirListRequest {
+                path: root_path_string(cap.root().unwrap(), "escape"),
+                depth: 1,
+            },
+            &PathMap::Identity,
+            &cap,
+        )
+        .await;
+        assert!(
+            !listed.exists,
+            "dir_list must not enumerate through an out-of-root junction"
+        );
+    }
+
+    #[cfg(windows)]
+    fn root_path_string(root: &str, child: &str) -> String {
+        format!("{root}\\{child}")
     }
     // (The temp content-store scrub-on-drop is now `SessionRegistry`'s; it is
     // covered by the session_registry module's own tests, ADR 0013.)
