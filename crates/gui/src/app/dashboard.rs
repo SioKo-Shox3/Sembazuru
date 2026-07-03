@@ -18,6 +18,15 @@ pub enum DashAction {
     OpenServices,
 }
 
+/// Human badge text for the connected-worker count. Pure (no egui) so it is unit-tested.
+pub fn worker_badge_text(count: usize) -> String {
+    match count {
+        0 => "No workers connected".to_string(),
+        1 => "1 worker connected ✓".to_string(),
+        n => format!("{n} workers connected ✓"),
+    }
+}
+
 /// Renders the dashboard for the current connection state into `ui`, returning any
 /// action the user requested.
 pub fn render(ui: &mut egui::Ui, state: &ConnectionState) -> Option<DashAction> {
@@ -80,6 +89,15 @@ fn render_daemon_down(ui: &mut egui::Ui) -> Option<DashAction> {
 }
 
 fn render_dashboard(ui: &mut egui::Ui, dash: &DashboardModel) {
+    let worker_count = dash.workers.len();
+    let badge_color = if worker_count == 0 { MUTED } else { HEALTHY };
+    ui.label(
+        RichText::new(worker_badge_text(worker_count))
+            .size(18.0)
+            .strong()
+            .color(badge_color),
+    );
+    ui.add_space(6.0);
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new("In-flight:").color(MUTED));

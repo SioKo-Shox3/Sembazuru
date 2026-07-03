@@ -15,7 +15,7 @@ use crate::client::{POLL_INTERVAL, SharedState, UiCommand, Waker, run_client};
 use crate::tray::{Tray, TrayMessage};
 
 mod config;
-mod dashboard;
+pub mod dashboard;
 mod services;
 
 /// Which view the window is showing.
