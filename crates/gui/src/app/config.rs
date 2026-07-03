@@ -129,18 +129,52 @@ impl ConfigPanel {
             .num_columns(2)
             .spacing([12.0, 6.0])
             .show(ui, |ui| {
-                field(ui, "Coordination addr", &mut self.coord);
-                field(ui, "Intake addr", &mut self.intake);
-                field(ui, "File-server addr", &mut self.fileserver);
-                field(ui, "Status addr", &mut self.status);
-                field(ui, "Cache root", &mut self.cache_root);
-                field(ui, "Trace root", &mut self.trace_root);
-                ui.label("Cache max (0 = uncapped)");
+                field_hint(
+                    ui,
+                    "Coordination addr",
+                    &mut self.coord,
+                    "ワーカーが登録/heartbeat する待受アドレス。1台運用は 127.0.0.1:50070。LAN 参加は Join タブのトグルで設定。",
+                );
+                field_hint(
+                    ui,
+                    "Intake addr",
+                    &mut self.intake,
+                    "ローカル実行クライアントからの要求を受ける待受アドレス。通常は 127.0.0.1 のまま。",
+                );
+                field_hint(
+                    ui,
+                    "File-server addr",
+                    &mut self.fileserver,
+                    "ワーカーがファイル供給を受ける待受アドレス。LAN では 0.0.0.0 ではなく実 IP を使う（Join タブが自動設定）。",
+                );
+                field_hint(
+                    ui,
+                    "Status addr",
+                    &mut self.status,
+                    "GUI が daemon 状態を読む loopback Status RPC の待受アドレス。通常は 127.0.0.1:50073。",
+                );
+                field_hint(
+                    ui,
+                    "Cache root",
+                    &mut self.cache_root,
+                    "CAS とファイル供給キャッシュを置くディレクトリ。空ならキャッシュは無効。",
+                );
+                field_hint(
+                    ui,
+                    "Trace root",
+                    &mut self.trace_root,
+                    "診断トレースを書き出すディレクトリ。空なら既定の場所を使う。",
+                );
+                let cache_hint = "ディスクキャッシュの上限。0 は無制限。単位を GiB/MiB/bytes から選べます。";
+                ui.label("Cache max (0 = uncapped)")
+                    .on_hover_text(cache_hint);
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.cache_size_value).desired_width(120.0),
-                    );
-                    egui::ComboBox::from_id_salt("cache-unit")
+                        egui::TextEdit::singleline(&mut self.cache_size_value)
+                            .desired_width(120.0),
+                    )
+                    .on_hover_text(cache_hint);
+                    let combo = egui::ComboBox::from_id_salt("cache-unit")
                         .selected_text(self.cache_size_unit.label())
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut self.cache_size_unit, SizeUnit::Gib, "GiB");
@@ -151,6 +185,7 @@ impl ConfigPanel {
                                 "bytes",
                             );
                         });
+                    combo.response.on_hover_text(cache_hint);
                 });
                 ui.end_row();
             });
@@ -334,9 +369,10 @@ impl Drop for ConfigPanel {
     }
 }
 
-/// One labelled single-line field row in the config grid.
-fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.label(label);
-    ui.add(egui::TextEdit::singleline(value).desired_width(320.0));
+/// One labelled single-line field row in the config grid, with a shared hover hint.
+fn field_hint(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(label).on_hover_text(hint);
+    ui.add(egui::TextEdit::singleline(value).desired_width(320.0))
+        .on_hover_text(hint);
     ui.end_row();
 }
