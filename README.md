@@ -6,7 +6,7 @@
 
 *A thousand workers fold a single build, like a thousand cranes fold into one.*
 
-[![status](https://img.shields.io/badge/status-pre--alpha%20(single--box%20M1--M8)-orange)]()
+[![status](https://img.shields.io/badge/status-pre--alpha%20(single--box%2C%20M9%20built%20%C2%B7%20unreleased)-orange)]()
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue)]()
 [![platform](https://img.shields.io/badge/platform-Windows-lightgrey)]()
 
@@ -156,7 +156,7 @@ Milestones advance by a **"Done when"** condition, not by date. This is a spare-
 | **M6** | Build-system integrations | Existing projects build distributed with minimal setup | ✅ |
 | **M7** | Hardening | Reliable enough for daily use (signing, AV allowlist, OS-update CI) | ✅ |
 | **M8** | Beyond compilation | Non-compile workloads distribute with no special support | ✅ |
-| **M9** | Productization & UX | A non-developer installs from a signed wizard and drives the resident GUI to distribute a build | ⬜ planned |
+| **M9** | Productization & UX | A non-developer installs from a signed wizard and drives the resident GUI to distribute a build | 🔧 built · unreleased |
 | **M10** | Real two-machine LAN | Byte-identical output across physically separate machines, no latency collapse, fallback on disconnect | ⬜ planned |
 
 M0–M8 each meet their "Done when" on the **single-machine** path, gated in CI
@@ -171,19 +171,23 @@ and is useful by itself.
 ## What's not done yet
 
 The mechanism is proven end to end on one box; the gap to *daily, real-world use by
-others* is two things, in order — becoming installable software, then going truly
-multi-machine. Packaging comes first so that a second machine is "install, configure,
-done" before any real-LAN measurement begins.
+others* is, in order — cutting a real release, then going truly multi-machine.
+The installable software itself (installer + resident GUI) is **built and code-complete**;
+what remains is publishing the first release and proving install→join on real hardware.
 
-- **Windows install wizard (M9).** Today you build from source in a VS developer
-  shell (`cmake` + `cargo`) and wire env vars by hand. A signed installer
-  (MSI/winget/WiX) that drops the daemon, worker, launcher, and hook DLLs in place,
-  registers the service, and configures firewall/auth — wired to the M7.2 signing
-  pipeline and EDR allowlist — is **not built yet**.
-- **Resident GUI application (M9).** The daemon and worker are headless CLI
-  processes you start in terminals. A Windows tray/GUI app that runs the daemon
-  resident, shows cluster/worker/cache status, and exposes start/stop and config is
-  **not built yet**.
+- **Windows install wizard (M9) — built, unreleased.** A WiX MSI
+  (`installer/sembazuru.wxs`) bundles the daemon, worker, launcher, hook DLLs, and the
+  GUI into one package; it registers the services, adds firewall rules, seeds config,
+  and cleanly uninstalls. A tag-triggered GitHub-release pipeline
+  (`.github/workflows/release.yml`) builds and (when a signing cert is configured)
+  signs it. **No release has been cut yet** (no `v*` tag), and it has not been installed
+  on a clean second machine — that first release + real-machine acceptance is the
+  remaining M9 work.
+- **Resident GUI application (M9) — built.** A tray-resident egui app
+  (`crates/gui`) runs alongside the daemon/worker services, shows cluster/worker/cache
+  status on a loopback Status feed, and exposes start/stop and config. The one piece
+  still in progress is the **GUI-only 2nd-machine worker-join flow** (M11) so a second
+  PC can join a cluster without hand-editing `worker.toml`.
 - **Real two-machine LAN (M10).** Everything above runs daemon + worker + build on a
   single host (speed numbers use RTT emulation). The cross-machine specifics —
   `cwd`=input-root drift, returning the trace over the data plane, write-back scope,

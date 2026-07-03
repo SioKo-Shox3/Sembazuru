@@ -9,6 +9,22 @@ which is how the gates in `hooks/test/` exercise it). It is the right way to try
 the mechanism end to end today; real two-machine LAN is a separate, deferred
 milestone (`docs/deferred.md`).
 
+> **Installing from a release (M9 — built, not yet published).** A one-click MSI
+> (`installer/`) bundles the daemon, worker, launcher, hook DLLs, and the resident
+> tray GUI, installs the services, and adds firewall rules. It is code-complete but
+> **no GitHub Release has been cut yet**, so the supported path today is the
+> build-from-source steps below. When the first release is published, installing will
+> be: download `Sembazuru.msi` from the GitHub Releases page → run it (an unsigned build
+> shows a SmartScreen "unknown publisher" screen — click **More info → Run anyway**) →
+> the tray GUI starts and the services register automatically.
+>
+> **What the GUI does today vs. not yet.** The current tray GUI shows cluster / worker /
+> cache status and starts/stops the local daemon and worker services. It does **not yet**
+> have a 2nd-machine worker-join flow: bringing another PC online as a worker still means
+> setting its `%ProgramData%\Sembazuru\worker.toml` by hand (coordinator `agent` address,
+> shared `cluster_token`, `listen_addr`/`advertise`) as in §3 above. A GUI **Join** flow
+> that writes `worker.toml` for you is **M11 (in progress)**, not available yet.
+
 > **clang-cl is the first-class target.** A distributed `clang-cl` object is
 > byte-identical to a local one and incremental header tracking works through the
 > launcher. Native MSVC `cl` works too (mechanism + cache), but its bytes are
