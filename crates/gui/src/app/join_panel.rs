@@ -8,6 +8,8 @@ use crate::join::worker_toml::{JoinError, JoinInput, render_worker_toml, validat
 use crate::join::writer::{ConfigWriter, StubConfigWriter, WriteError, WriteTarget};
 use crate::svcctl::Service;
 
+use super::services::RestartOutcome;
+
 const CONFIG_WRITE_UNCONFIGURED: &str = "config-write mechanism not configured (roadmap §2.0, owner-managed); cannot persist config from the GUI yet";
 const CONFIG_WRITE_DOC_LABEL: &str = "docs/superpowers/plans/2026-07-02-gui-completion.md §2.0";
 
@@ -219,10 +221,17 @@ impl JoinPanel {
         };
 
         match self.writer.write(WriteTarget::WorkerToml, &toml) {
-            Ok(()) => {
-                self.notice = "worker.toml saved; restarting Worker service…".to_string();
-                services.restart(Service::Worker, ctx);
-            }
+            Ok(()) => match services.restart(Service::Worker, ctx) {
+                RestartOutcome::Started => {
+                    self.notice = "worker.toml saved; restarting Worker service…".to_string();
+                }
+                RestartOutcome::Busy => {
+                    self.notice = "worker.toml saved; Worker restart did not start because another service action is running. Use the Services tab to retry.".to_string();
+                }
+                RestartOutcome::NoAction => {
+                    self.notice = "worker.toml saved; Worker restart did not start because the service is not installed or its state is unknown. Use the Services tab to inspect it.".to_string();
+                }
+            },
             Err(WriteError::MechanismUnconfigured) => {
                 self.notice = CONFIG_WRITE_UNCONFIGURED.to_string();
                 self.show_write_docs_link = true;

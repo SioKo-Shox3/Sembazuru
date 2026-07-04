@@ -15,6 +15,12 @@ const MUTED: Color32 = Color32::from_rgb(0x9e, 0x9e, 0x9e);
 
 type ActionResult = (Service, &'static str, Result<i32, String>);
 
+pub enum RestartOutcome {
+    Started,
+    Busy,
+    NoAction,
+}
+
 #[derive(Default)]
 pub struct ServicesPanel {
     last_query: f64,
@@ -64,11 +70,14 @@ impl ServicesPanel {
         self.trigger(Service::Daemon, Action::Start, ctx);
     }
 
-    // Wired by the later LAN-worker toggle; B4 lands the orchestration first.
-    #[allow(dead_code)]
-    pub fn restart(&mut self, service: Service, ctx: &egui::Context) {
+    pub fn restart(&mut self, service: Service, ctx: &egui::Context) -> RestartOutcome {
         if self.busy {
-            return;
+            self.notice = format!(
+                "Cannot restart {}: another service action is already running.",
+                service.label()
+            );
+            ctx.request_repaint();
+            return RestartOutcome::Busy;
         }
         let current = svcctl::query_state(service);
         let plan = svcctl::restart_plan(current);
@@ -80,9 +89,10 @@ impl ServicesPanel {
             );
             self.last_query = 0.0;
             ctx.request_repaint();
-            return;
+            return RestartOutcome::NoAction;
         }
         self.trigger_actions(service, plan, "Restarting", ctx);
+        RestartOutcome::Started
     }
 
     fn row(

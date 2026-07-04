@@ -156,7 +156,9 @@ impl eframe::App for SembazuruApp {
             }
             Tab::Services => self.services.render(ui, &ctx),
             Tab::Join => self.join_panel.render(ui, &mut self.services, &ctx),
-            Tab::Settings => self.config.render(ui, &self.commands),
+            Tab::Settings => self
+                .config
+                .render(ui, &self.commands, &mut self.services, &ctx),
         }
 
         // Keep heartbeat ages ticking even if a repaint signal is ever missed.

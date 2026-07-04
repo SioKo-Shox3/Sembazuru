@@ -15,6 +15,7 @@ use sembazuru_agent::fileserver::ServerStats;
 use sembazuru_agent::status::{Metrics, StatusState, serve_status_service};
 use sembazuru_proto::v0::Capabilities;
 
+use sembazuru_gui::app::config::lan_daemon_addrs;
 use sembazuru_gui::client::{apply_config, fetch_config, fetch_status};
 use sembazuru_gui::model::{ConfigEdit, ConnectionState, TokenAction};
 
@@ -30,6 +31,14 @@ fn tmp_config() -> std::path::PathBuf {
 /// Stands up the loopback Status plane over `table` with `config_path`, returning
 /// the `http://` endpoint the GUI client dials.
 async fn start_status(table: WorkerTable, config_path: std::path::PathBuf) -> String {
+    start_status_with_admin(table, config_path, true).await
+}
+
+async fn start_status_with_admin(
+    table: WorkerTable,
+    config_path: std::path::PathBuf,
+    admin_enabled: bool,
+) -> String {
     let state = StatusState {
         table,
         server_stats: Arc::new(ServerStats::default()),
@@ -38,7 +47,7 @@ async fn start_status(table: WorkerTable, config_path: std::path::PathBuf) -> St
         metrics: Arc::new(Metrics::default()),
         auth_enabled: false,
         config_path,
-        admin_enabled: true, // the GUI round-trip test exercises SetConfig (ADR 0016)
+        admin_enabled,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -200,6 +209,56 @@ async fn config_round_trip_with_token_presence_clear_set() {
     );
 }
 
+#[tokio::test]
+async fn config_round_trip_lan_daemon_addrs_use_concrete_ip() {
+    let endpoint = start_status(WorkerTable::new(Duration::from_secs(60)), tmp_config()).await;
+    let (coord_addr, fileserver_addr) = lan_daemon_addrs("192.168.50.25", 50070, 50072);
+
+    let outcome = apply_config(
+        &endpoint,
+        ConfigEdit {
+            coord_addr: coord_addr.clone(),
+            fileserver_addr: fileserver_addr.clone(),
+            token: TokenAction::Keep,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("set_config lan daemon addrs");
+    assert!(outcome.ok);
+
+    let cfg = fetch_config(&endpoint).await.expect("get_config");
+    assert_eq!(cfg.coord_addr, coord_addr);
+    assert_eq!(cfg.fileserver_addr, fileserver_addr);
+    assert!(!cfg.coord_addr.starts_with("0.0.0.0:"));
+    assert!(!cfg.fileserver_addr.starts_with("0.0.0.0:"));
+}
+
+#[tokio::test]
+async fn set_config_admin_gate_mentions_status_admin() {
+    let endpoint = start_status_with_admin(
+        WorkerTable::new(Duration::from_secs(60)),
+        tmp_config(),
+        false,
+    )
+    .await;
+
+    let err = apply_config(
+        &endpoint,
+        ConfigEdit {
+            coord_addr: "192.168.50.25:50070".into(),
+            token: TokenAction::Keep,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("set_config should be admin-gated by default");
+
+    assert!(
+        err.0.contains("SEMBAZURU_STATUS_ADMIN") && err.0.contains("config-mutation"),
+        "admin-gate error should guide the GUI's §2.0/status_admin notice: {err}"
+    );
+}
 #[tokio::test]
 async fn run_client_polls_serves_commands_and_stops_on_channel_close() {
     use std::sync::atomic::AtomicU64;
