@@ -19,6 +19,7 @@ const TRAY_HINT_FRAMES: u16 = 180;
 
 pub mod config;
 pub mod dashboard;
+pub mod join_panel;
 mod services;
 
 /// Which view the window is showing.
@@ -27,6 +28,7 @@ enum Tab {
     #[default]
     Dashboard,
     Services,
+    Join,
     Settings,
 }
 
@@ -48,6 +50,7 @@ pub struct SembazuruApp {
     tray_hint_frames: u16,
     tab: Tab,
     config: config::ConfigPanel,
+    join_panel: join_panel::JoinPanel,
     services: services::ServicesPanel,
 }
 
@@ -79,6 +82,7 @@ impl SembazuruApp {
             tray_hint_frames: 0,
             tab: Tab::default(),
             config: config::ConfigPanel::default(),
+            join_panel: join_panel::JoinPanel::default(),
             services: services::ServicesPanel::default(),
         }
     }
@@ -127,6 +131,7 @@ impl eframe::App for SembazuruApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Dashboard, "Dashboard");
                 ui.selectable_value(&mut self.tab, Tab::Services, "Services");
+                ui.selectable_value(&mut self.tab, Tab::Join, "Join");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
             if self.tray_hint_frames > 0 {
@@ -150,6 +155,7 @@ impl eframe::App for SembazuruApp {
                 }
             }
             Tab::Services => self.services.render(ui, &ctx),
+            Tab::Join => self.join_panel.render(ui, &mut self.services, &ctx),
             Tab::Settings => self.config.render(ui, &self.commands),
         }
 
