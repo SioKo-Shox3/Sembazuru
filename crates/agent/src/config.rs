@@ -310,9 +310,11 @@ impl DaemonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    static RUN_ID: OnceLock<u128> = OnceLock::new();
     /// Serializes the env-mutating tests: cargo runs tests as threads in one
     /// process, and `SEMBAZURU_*` env vars are process-global, so two tests setting
     /// the same var concurrently would race. Poison-tolerant (a panicking test
@@ -321,8 +323,14 @@ mod tests {
 
     fn tmp_file() -> PathBuf {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let run_id = RUN_ID.get_or_init(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        });
         std::env::temp_dir()
-            .join(format!("sbz-cfg-{}-{seq}", std::process::id()))
+            .join(format!("sbz-cfg-{}-{run_id}-{seq}", std::process::id()))
             .join("daemon.toml")
     }
 
