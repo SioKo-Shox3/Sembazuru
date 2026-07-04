@@ -106,6 +106,15 @@ impl ServiceState {
     }
 }
 
+/// The action sequence to reach a freshly-(re)started service from `current`. Pure.
+pub fn restart_plan(current: ServiceState) -> Vec<Action> {
+    match current {
+        ServiceState::Running => vec![Action::Stop, Action::Start],
+        ServiceState::Stopped => vec![Action::Start],
+        ServiceState::NotInstalled | ServiceState::Unknown => vec![],
+    }
+}
+
 /// Entry point for the hidden `--svcctl <action> <service>` subcommand: the
 /// elevated child parses the closed enums, performs the SCM op, and returns a
 /// process exit code (0 = ok, 1 = failed, 2 = bad arguments).
@@ -293,7 +302,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Service, run_cli};
+    use super::{Action, Service, ServiceState, restart_plan, run_cli};
 
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
@@ -334,6 +343,24 @@ mod tests {
             Service::from_arg(Service::Worker.as_arg()),
             Some(Service::Worker)
         );
+    }
+
+    #[test]
+    fn restart_plan_stops_then_starts_when_running() {
+        assert_eq!(
+            restart_plan(ServiceState::Running),
+            vec![Action::Stop, Action::Start]
+        );
+    }
+
+    #[test]
+    fn restart_plan_just_starts_when_stopped() {
+        assert_eq!(restart_plan(ServiceState::Stopped), vec![Action::Start]);
+    }
+
+    #[test]
+    fn restart_plan_noop_when_not_installed() {
+        assert!(restart_plan(ServiceState::NotInstalled).is_empty());
     }
 
     // The hardcoded service names that cross the elevation boundary must match the

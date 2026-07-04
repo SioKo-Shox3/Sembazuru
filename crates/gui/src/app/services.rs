@@ -11,7 +11,7 @@ const RUNNING: Color32 = Color32::from_rgb(0x4c, 0xaf, 0x50);
 const STOPPED: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
 const MUTED: Color32 = Color32::from_rgb(0x9e, 0x9e, 0x9e);
 
-type ActionResult = (Service, Action, Result<i32, String>);
+type ActionResult = (Service, &'static str, Result<i32, String>);
 
 #[derive(Default)]
 pub struct ServicesPanel {
@@ -62,6 +62,27 @@ impl ServicesPanel {
         self.trigger(Service::Daemon, Action::Start, ctx);
     }
 
+    // Wired by the later LAN-worker toggle; B4 lands the orchestration first.
+    #[allow(dead_code)]
+    pub fn restart(&mut self, service: Service, ctx: &egui::Context) {
+        if self.busy {
+            return;
+        }
+        let current = svcctl::query_state(service);
+        let plan = svcctl::restart_plan(current);
+        if plan.is_empty() {
+            self.notice = format!(
+                "Restarting {}: no action for {} service.",
+                service.label(),
+                current.label()
+            );
+            self.last_query = 0.0;
+            ctx.request_repaint();
+            return;
+        }
+        self.trigger_actions(service, plan, "Restarting", ctx);
+    }
+
     fn row(
         &mut self,
         ui: &mut egui::Ui,
@@ -98,18 +119,28 @@ impl ServicesPanel {
     }
 
     fn trigger(&mut self, service: Service, action: Action, ctx: &egui::Context) {
+        self.trigger_actions(service, vec![action], action.progressive(), ctx);
+    }
+
+    fn trigger_actions(
+        &mut self,
+        service: Service,
+        actions: Vec<Action>,
+        operation: &'static str,
+        ctx: &egui::Context,
+    ) {
         if self.busy {
             return;
         }
         self.busy = true;
-        self.notice = format!("{} {}…", action.progressive(), service.label());
+        self.notice = format!("{} {}…", operation, service.label());
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.result_rx = Some(rx);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = svcctl::request_action(service, action);
-            let _ = tx.send((service, action, result));
+            let result = run_actions(service, actions);
+            let _ = tx.send((service, operation, result));
             // Wake the UI so the result and refreshed badges show immediately.
             ctx.request_repaint();
         });
@@ -117,19 +148,15 @@ impl ServicesPanel {
 
     fn poll_result(&mut self) {
         let received = self.result_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some((service, action, result)) = received {
+        if let Some((service, operation, result)) = received {
             self.busy = false;
             self.result_rx = None;
             self.notice = match result {
-                Ok(0) => format!("{} {}: done.", action.progressive(), service.label()),
+                Ok(0) => format!("{} {}: done.", operation, service.label()),
                 Ok(code) => {
-                    format!(
-                        "{} {} failed (exit {code}).",
-                        action.progressive(),
-                        service.label()
-                    )
+                    format!("{} {} failed (exit {code}).", operation, service.label())
                 }
-                Err(message) => format!("{} {}: {message}", action.progressive(), service.label()),
+                Err(message) => format!("{} {}: {message}", operation, service.label()),
             };
             // Force an immediate state re-query on the next refresh.
             self.last_query = 0.0;
@@ -144,6 +171,17 @@ impl ServicesPanel {
             self.worker = Some(svcctl::query_state(Service::Worker));
         }
     }
+}
+
+fn run_actions(service: Service, actions: Vec<Action>) -> Result<i32, String> {
+    let mut last = Ok(0);
+    for action in actions {
+        last = svcctl::request_action(service, action);
+        if !matches!(last, Ok(0)) {
+            break;
+        }
+    }
+    last
 }
 
 fn badge_color(state: ServiceState) -> Color32 {
