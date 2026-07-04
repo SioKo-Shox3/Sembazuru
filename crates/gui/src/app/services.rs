@@ -3,6 +3,8 @@
 //! runs the elevation (`runas`) on a background thread so the UAC prompt and the
 //! SCM wait never block the UI thread; the result refreshes the badges.
 
+use std::time::Duration;
+
 use eframe::egui::{self, Color32};
 
 use crate::svcctl::{self, Action, Service, ServiceState};
@@ -173,15 +175,71 @@ impl ServicesPanel {
     }
 }
 
+const STOP_SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
+const STOP_SETTLE_POLL: Duration = Duration::from_millis(200);
+
 fn run_actions(service: Service, actions: Vec<Action>) -> Result<i32, String> {
+    run_actions_with(
+        service,
+        actions,
+        svcctl::request_action,
+        svcctl::query_state,
+        std::thread::sleep,
+        STOP_SETTLE_TIMEOUT,
+        STOP_SETTLE_POLL,
+    )
+}
+
+fn run_actions_with(
+    service: Service,
+    actions: Vec<Action>,
+    mut request_action: impl FnMut(Service, Action) -> Result<i32, String>,
+    mut query_state: impl FnMut(Service) -> ServiceState,
+    mut sleep: impl FnMut(Duration),
+    stop_timeout: Duration,
+    stop_poll: Duration,
+) -> Result<i32, String> {
     let mut last = Ok(0);
-    for action in actions {
-        last = svcctl::request_action(service, action);
+    let mut actions = actions.into_iter().peekable();
+    while let Some(action) = actions.next() {
+        last = request_action(service, action);
         if !matches!(last, Ok(0)) {
             break;
         }
+        if action == Action::Stop
+            && actions.peek().is_some_and(|next| *next == Action::Start)
+            && !wait_until_stopped(
+                service,
+                &mut query_state,
+                &mut sleep,
+                stop_timeout,
+                stop_poll,
+            )
+        {
+            return Err("service did not stop before restart".to_string());
+        }
     }
     last
+}
+
+fn wait_until_stopped(
+    service: Service,
+    query_state: &mut impl FnMut(Service) -> ServiceState,
+    sleep: &mut impl FnMut(Duration),
+    stop_timeout: Duration,
+    stop_poll: Duration,
+) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        if query_state(service) == ServiceState::Stopped {
+            return true;
+        }
+        if waited >= stop_timeout {
+            return false;
+        }
+        sleep(stop_poll);
+        waited += stop_poll;
+    }
 }
 
 fn badge_color(state: ServiceState) -> Color32 {
@@ -189,5 +247,81 @@ fn badge_color(state: ServiceState) -> Color32 {
         ServiceState::Running => RUNNING,
         ServiceState::Stopped => STOPPED,
         ServiceState::NotInstalled | ServiceState::Unknown => MUTED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn restart_waits_for_stopped_before_starting() {
+        let calls = RefCell::new(Vec::new());
+        let states = RefCell::new(VecDeque::from([
+            ServiceState::Running,
+            ServiceState::Stopped,
+        ]));
+
+        let result = run_actions_with(
+            Service::Worker,
+            vec![Action::Stop, Action::Start],
+            |_, action| {
+                calls.borrow_mut().push(match action {
+                    Action::Stop => "request stop",
+                    Action::Start => "request start",
+                });
+                Ok(0)
+            },
+            |_| {
+                calls.borrow_mut().push("query");
+                states
+                    .borrow_mut()
+                    .pop_front()
+                    .unwrap_or(ServiceState::Stopped)
+            },
+            |_| calls.borrow_mut().push("sleep"),
+            Duration::from_millis(400),
+            Duration::from_millis(200),
+        );
+
+        assert_eq!(result, Ok(0));
+        assert_eq!(
+            calls.into_inner(),
+            vec!["request stop", "query", "sleep", "query", "request start"]
+        );
+    }
+
+    #[test]
+    fn restart_does_not_start_when_stop_never_settles() {
+        let calls = RefCell::new(Vec::new());
+
+        let result = run_actions_with(
+            Service::Worker,
+            vec![Action::Stop, Action::Start],
+            |_, action| {
+                calls.borrow_mut().push(match action {
+                    Action::Stop => "request stop",
+                    Action::Start => "request start",
+                });
+                Ok(0)
+            },
+            |_| {
+                calls.borrow_mut().push("query");
+                ServiceState::Running
+            },
+            |_| calls.borrow_mut().push("sleep"),
+            Duration::from_millis(400),
+            Duration::from_millis(200),
+        );
+
+        assert_eq!(
+            result,
+            Err("service did not stop before restart".to_string())
+        );
+        assert!(!calls.into_inner().contains(&"request start"));
     }
 }

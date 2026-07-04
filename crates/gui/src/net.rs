@@ -25,6 +25,7 @@ pub fn lan_ipv4_candidates() -> Vec<Ipv4Addr> {
 
 #[cfg(windows)]
 mod imp {
+    use std::mem::{MaybeUninit, size_of};
     use std::net::Ipv4Addr;
 
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
@@ -36,13 +37,18 @@ mod imp {
 
     const GAA_BUFFER_SIZE: usize = 15 * 1024;
 
+    fn adapter_buffer() -> Vec<MaybeUninit<IP_ADAPTER_ADDRESSES_LH>> {
+        let count = GAA_BUFFER_SIZE.div_ceil(size_of::<IP_ADAPTER_ADDRESSES_LH>());
+        Vec::with_capacity(count)
+    }
+
     pub fn enumerate() -> Vec<Ipv4Addr> {
-        let mut buffer = vec![0u8; GAA_BUFFER_SIZE];
-        let mut size = buffer.len() as u32;
+        let mut buffer = adapter_buffer();
+        let mut size = (buffer.capacity() * size_of::<IP_ADAPTER_ADDRESSES_LH>()) as u32;
         let addresses = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
         let mut ips = Vec::new();
 
-        // SAFETY: `addresses` points to a writable buffer of `size` bytes for the
+        // SAFETY: `addresses` points to an aligned writable buffer of `size` bytes for the
         // single GetAdaptersAddresses call. On success, Windows initializes an
         // IP_ADAPTER_ADDRESSES linked list inside that buffer; the buffer remains
         // alive while we walk `Next` and each adapter's `FirstUnicastAddress` list.
@@ -78,5 +84,19 @@ mod imp {
         }
 
         ips
+    }
+    #[cfg(test)]
+    mod tests {
+        use std::mem::align_of;
+
+        use super::{IP_ADAPTER_ADDRESSES_LH, adapter_buffer};
+
+        #[test]
+        fn adapter_buffer_is_aligned_for_adapter_addresses() {
+            let mut buffer = adapter_buffer();
+            let address = buffer.as_mut_ptr() as usize;
+
+            assert_eq!(address % align_of::<IP_ADAPTER_ADDRESSES_LH>(), 0);
+        }
     }
 }
