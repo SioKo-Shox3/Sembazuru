@@ -3,16 +3,21 @@
 //! two entry points — the plain CLI (Ctrl-C → shutdown) and the Windows Service
 //! wrapper (SCM Stop → shutdown) — and exercised by tests without an SCM.
 //!
-//! Shutdown is a [`CancellationToken`]: the four servers run as spawned tasks and
-//! the call blocks in a `select!` on the LocalIntake server vs the token. When the
-//! token is cancelled, `run_daemon` returns; the caller then drops the Tokio
-//! runtime, which stops the spawned servers. In-flight remote actions that get cut
-//! off are still correct — the agent's local fallback completes the build
-//! (DESIGN §2) — so an abrupt stop never breaks a build; a fuller per-server drain
-//! is a refinement (M7.4 deferred note).
+//! Shutdown is a [`CancellationToken`]: Coordination, file supply, Status, and
+//! LocalIntake run as supervised server tasks. Cancelling the token is a clean
+//! stop. Any supervised server task that returns `Err`, panics, or exits
+//! unexpectedly with `Ok(())` before shutdown makes the daemon return an error
+//! naming that server role. In-flight remote actions that get cut off are still
+//! correct — the agent's local fallback completes the build (DESIGN §2) — so an
+//! abrupt stop never breaks a build; a fuller per-server drain is a refinement
+//! (M7.4 deferred note).
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
+use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::action_cache::AgentCache;
@@ -25,6 +30,160 @@ use crate::session_registry::SessionRegistry;
 use crate::status::{StatusState, evict_cache_to_cap, serve_status_service};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type ServerFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum ServerRole {
+    Coordination,
+    FileServer,
+    Status,
+    LocalIntake,
+}
+
+impl ServerRole {
+    #[cfg(test)]
+    const ALL: [Self; 4] = [
+        Self::Coordination,
+        Self::FileServer,
+        Self::Status,
+        Self::LocalIntake,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Coordination => "Coordination",
+            Self::FileServer => "file server",
+            Self::Status => "Status",
+            Self::LocalIntake => "LocalIntake",
+        }
+    }
+}
+
+struct RequiredServerTasks {
+    coordination: ServerFuture,
+    file_server: ServerFuture,
+    status: ServerFuture,
+    local_intake: ServerFuture,
+}
+
+impl RequiredServerTasks {
+    fn new(
+        coordination: ServerFuture,
+        file_server: ServerFuture,
+        status: ServerFuture,
+        local_intake: ServerFuture,
+    ) -> Self {
+        Self {
+            coordination,
+            file_server,
+            status,
+            local_intake,
+        }
+    }
+}
+
+struct SupervisedServers {
+    tasks: JoinSet<Result<(), BoxError>>,
+    roles: HashMap<Id, ServerRole>,
+}
+
+impl SupervisedServers {
+    fn spawn(tasks: RequiredServerTasks) -> Self {
+        let mut supervised = Self {
+            tasks: JoinSet::new(),
+            roles: HashMap::new(),
+        };
+        supervised.spawn_one(ServerRole::Coordination, tasks.coordination);
+        supervised.spawn_one(ServerRole::FileServer, tasks.file_server);
+        supervised.spawn_one(ServerRole::Status, tasks.status);
+        supervised.spawn_one(ServerRole::LocalIntake, tasks.local_intake);
+        supervised
+    }
+
+    fn spawn_one(&mut self, role: ServerRole, task: ServerFuture) {
+        let handle = self.tasks.spawn(task);
+        self.roles.insert(handle.id(), role);
+    }
+
+    fn abort_all(&mut self) {
+        self.tasks.abort_all();
+    }
+
+    async fn next_exit(&mut self) -> Result<(), BoxError> {
+        match self.tasks.join_next_with_id().await {
+            Some(exit) => self.classify_exit(exit),
+            None => Err("daemon has no supervised server tasks".into()),
+        }
+    }
+
+    fn try_next_exit(&mut self) -> Option<Result<(), BoxError>> {
+        self.tasks
+            .try_join_next_with_id()
+            .map(|exit| self.classify_exit(exit))
+    }
+
+    fn classify_exit(
+        &mut self,
+        exit: Result<(Id, Result<(), BoxError>), tokio::task::JoinError>,
+    ) -> Result<(), BoxError> {
+        match exit {
+            Ok((id, Ok(()))) => {
+                let role = self.role_label_for(id);
+                Err(format!("{role} task unexpectedly exited successfully").into())
+            }
+            Ok((id, Err(e))) => {
+                let role = self.role_label_for(id);
+                Err(format!("{role} task exited with error: {e}").into())
+            }
+            Err(e) => {
+                let role = self.role_label_for(e.id());
+                if e.is_panic() {
+                    Err(format!("{role} task panicked: {e}").into())
+                } else if e.is_cancelled() {
+                    Err(format!("{role} server task was cancelled before shutdown").into())
+                } else {
+                    Err(format!("{role} server task failed to join: {e}").into())
+                }
+            }
+        }
+    }
+
+    fn role_label_for(&mut self, id: Id) -> String {
+        self.roles
+            .remove(&id)
+            .map(|role| role.label().to_owned())
+            .unwrap_or_else(|| format!("unknown task {id:?}"))
+    }
+
+    #[cfg(test)]
+    fn registered_roles(&self) -> Vec<ServerRole> {
+        self.roles.values().copied().collect()
+    }
+}
+
+async fn supervise_server_tasks_until_shutdown(
+    tasks: RequiredServerTasks,
+    shutdown: CancellationToken,
+) -> Result<(), BoxError> {
+    let mut servers = SupervisedServers::spawn(tasks);
+    tokio::select! {
+        biased;
+        result = servers.next_exit() => {
+            servers.abort_all();
+            result
+        }
+        _ = shutdown.cancelled() => {
+            tokio::task::yield_now().await;
+            if let Some(result) = servers.try_next_exit() {
+                servers.abort_all();
+                return result;
+            }
+            eprintln!("sembazuru-daemon: shutdown requested; stopping");
+            servers.abort_all();
+            Ok(())
+        }
+    }
+}
 
 /// Refuses unauthenticated LAN-reachable Coordination/file-server binds by
 /// default. Loopback, or auth enabled, is fine. The unsafe override exists only
@@ -99,15 +258,12 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         cluster_token.is_some(),
         config.unsafe_allow_unauthenticated_lan,
     )?;
-    {
+    let coordination_task = {
         let t = table.clone();
         let tok = cluster_token.clone();
-        tokio::spawn(async move {
-            if let Err(e) = serve_coordination_with_token(coord_listener, t, tok).await {
-                eprintln!("sembazuru-daemon: Coordination server exited: {e}");
-            }
-        });
-    }
+        Box::pin(async move { serve_coordination_with_token(coord_listener, t, tok).await })
+            as ServerFuture
+    };
 
     // File supply: workers pull inputs on demand over the data plane. The bound
     // address is what VFS-mode workers dial, so capture it for VfsExecution. Stats
@@ -129,28 +285,20 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         );
     }
     let server_stats = Arc::new(ServerStats::default());
-    {
+    let file_server_task = {
         let stats = server_stats.clone();
         let tok = cluster_token.clone();
         let reg = registry.clone();
         let legacy_sessions_enabled = config.unsafe_legacy_dataplane_sessions;
-        tokio::spawn(async move {
+        Box::pin(async move {
             // Empty/unknown session ids are rejected by default (ADD-002); the
             // legacy empty-session compatibility path is wired from config and
             // defaults off.
-            if let Err(e) = serve_files_with_stats_token(
-                file_listener,
-                stats,
-                tok,
-                reg,
-                legacy_sessions_enabled,
-            )
-            .await
-            {
-                eprintln!("sembazuru-daemon: file server exited: {e}");
-            }
-        });
-    }
+            serve_files_with_stats_token(file_listener, stats, tok, reg, legacy_sessions_enabled)
+                .await?;
+            Ok(())
+        }) as ServerFuture
+    };
 
     // Action cache (M4): opt-in via config.cache_root. Per-action trace dirs go
     // under trace_root.
@@ -196,7 +344,7 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         "sembazuru-daemon: Status on {}",
         status_listener.local_addr()?
     );
-    {
+    let status_task = {
         let state = StatusState {
             table: table.clone(),
             server_stats: server_stats.clone(),
@@ -209,12 +357,8 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             // (default off) because the loopback Status plane has no caller auth.
             admin_enabled: config.status_admin,
         };
-        tokio::spawn(async move {
-            if let Err(e) = serve_status_service(status_listener, state).await {
-                eprintln!("sembazuru-daemon: Status server exited: {e}");
-            }
-        });
-    }
+        Box::pin(async move { serve_status_service(status_listener, state).await }) as ServerFuture
+    };
 
     // Periodic CAS eviction sweep (M9.2 / deferred #8): bounds the cache when a cap
     // is configured. Correctness-safe (only ever a miss).
@@ -266,18 +410,24 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             eprintln!("sembazuru-daemon: LocalIntake on {addr}");
         }
     }
-    tokio::select! {
-        r = intake_transport.serve(intake) => r?,
-        _ = shutdown.cancelled() => {
-            eprintln!("sembazuru-daemon: shutdown requested; stopping");
-        }
-    }
-    Ok(())
+    let local_intake_task = Box::pin(async move { intake_transport.serve(intake).await });
+    supervise_server_tasks_until_shutdown(
+        RequiredServerTasks::new(
+            coordination_task,
+            file_server_task,
+            status_task,
+            local_intake_task,
+        ),
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::future;
     use std::time::Duration;
 
     /// `run_daemon` must return promptly when the shutdown token is cancelled —
@@ -374,5 +524,162 @@ mod tests {
             refuse_unauthenticated_lan("file server", "0.0.0.0:1".parse().unwrap(), false, true)
                 .is_ok()
         );
+    }
+
+    fn pending_server_tasks() -> RequiredServerTasks {
+        RequiredServerTasks::new(
+            Box::pin(future::pending()),
+            Box::pin(future::pending()),
+            Box::pin(future::pending()),
+            Box::pin(future::pending()),
+        )
+    }
+
+    fn one_error_server_task(failing_role: ServerRole, message: String) -> RequiredServerTasks {
+        let task = move |role| -> ServerFuture {
+            if role == failing_role {
+                let message = message.clone();
+                Box::pin(async move { Err(message.into()) })
+            } else {
+                Box::pin(future::pending())
+            }
+        };
+        RequiredServerTasks::new(
+            task(ServerRole::Coordination),
+            task(ServerRole::FileServer),
+            task(ServerRole::Status),
+            task(ServerRole::LocalIntake),
+        )
+    }
+
+    fn one_ok_server_task(finishing_role: ServerRole) -> RequiredServerTasks {
+        let task = move |role| -> ServerFuture {
+            if role == finishing_role {
+                Box::pin(future::ready(Ok(())))
+            } else {
+                Box::pin(future::pending())
+            }
+        };
+        RequiredServerTasks::new(
+            task(ServerRole::Coordination),
+            task(ServerRole::FileServer),
+            task(ServerRole::Status),
+            task(ServerRole::LocalIntake),
+        )
+    }
+
+    fn one_panicking_server_task(panicking_role: ServerRole) -> RequiredServerTasks {
+        let task = move |role| -> ServerFuture {
+            if role == panicking_role {
+                Box::pin(async {
+                    panic!("synthetic supervisor panic");
+                    #[allow(unreachable_code)]
+                    Ok(())
+                })
+            } else {
+                Box::pin(future::pending())
+            }
+        };
+        RequiredServerTasks::new(
+            task(ServerRole::Coordination),
+            task(ServerRole::FileServer),
+            task(ServerRole::Status),
+            task(ServerRole::LocalIntake),
+        )
+    }
+
+    #[tokio::test]
+    async fn supervisor_pending_servers_shutdown_returns_ok() {
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(supervise_server_tasks_until_shutdown(
+            pending_server_tasks(),
+            shutdown.clone(),
+        ));
+
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("supervisor did not return within 5s")
+            .expect("supervisor task panicked");
+        assert!(result.is_ok(), "supervisor returned error: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn supervisor_server_failure_wins_when_shutdown_is_already_cancelled() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let message = "injected failure during shutdown race".to_owned();
+        let result = supervise_server_tasks_until_shutdown(
+            one_error_server_task(ServerRole::Coordination, message.clone()),
+            shutdown,
+        )
+        .await;
+
+        let err = result.expect_err("server error must win over already-cancelled shutdown");
+        let text = err.to_string();
+        assert!(text.contains(ServerRole::Coordination.label()), "{text}");
+        assert!(text.contains(&message), "{text}");
+    }
+
+    #[tokio::test]
+    async fn supervisor_each_role_error_reports_role_and_source_error() {
+        for role in ServerRole::ALL {
+            let message = format!("injected failure for {}", role.label());
+            let result = supervise_server_tasks_until_shutdown(
+                one_error_server_task(role, message.clone()),
+                CancellationToken::new(),
+            )
+            .await;
+            let err = result.expect_err("server error must fail daemon");
+            let text = err.to_string();
+            assert!(text.contains(role.label()), "{text}");
+            assert!(text.contains(&message), "{text}");
+            assert!(!text.contains("server server"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_each_role_panic_reports_role_and_panic() {
+        for role in ServerRole::ALL {
+            let result = supervise_server_tasks_until_shutdown(
+                one_panicking_server_task(role),
+                CancellationToken::new(),
+            )
+            .await;
+            let err = result.expect_err("server panic must fail daemon");
+            let text = err.to_string();
+            assert!(text.contains(role.label()), "{text}");
+            assert!(text.contains("panicked"), "{text}");
+            assert!(!text.contains("server server"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_each_role_unexpected_ok_reports_role_and_exit() {
+        for role in ServerRole::ALL {
+            let result = supervise_server_tasks_until_shutdown(
+                one_ok_server_task(role),
+                CancellationToken::new(),
+            )
+            .await;
+            let err = result.expect_err("unexpected server success must fail daemon");
+            let text = err.to_string();
+            assert!(text.contains(role.label()), "{text}");
+            assert!(text.contains("unexpected"), "{text}");
+            assert!(text.contains("exited"), "{text}");
+            assert!(!text.contains("server server"), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_registers_fixed_four_server_roles() {
+        let supervised = SupervisedServers::spawn(pending_server_tasks());
+        let actual: BTreeSet<_> = supervised.registered_roles().into_iter().collect();
+        let expected: BTreeSet<_> = ServerRole::ALL.into_iter().collect();
+
+        assert_eq!(ServerRole::ALL.len(), 4);
+        assert_eq!(actual, expected);
     }
 }

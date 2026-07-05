@@ -39,6 +39,17 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 define_windows_service!(ffi_service_main, service_main);
 
+fn fatal_service_exit_code() -> ServiceExitCode {
+    ServiceExitCode::ServiceSpecific(1)
+}
+
+fn daemon_service_exit_code<E>(result: Result<(), E>) -> ServiceExitCode {
+    match result {
+        Ok(()) => ServiceExitCode::Win32(0),
+        Err(_) => fatal_service_exit_code(),
+    }
+}
+
 /// SCM entry point (runs on a background thread). There is no console in service
 /// context; diagnostics go to stderr (Event Log integration is a future refinement).
 fn service_main(_args: Vec<OsString>) {
@@ -67,12 +78,12 @@ fn run_service() -> windows_service::Result<()> {
     };
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
-    let set = |state, accept, wait_hint| {
+    let set = |state, accept, wait_hint, exit_code| {
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
             current_state: state,
             controls_accepted: accept,
-            exit_code: ServiceExitCode::Win32(0),
+            exit_code,
             checkpoint: 0,
             wait_hint,
             process_id: None,
@@ -85,6 +96,7 @@ fn run_service() -> windows_service::Result<()> {
         ServiceState::StartPending,
         ServiceControlAccept::empty(),
         Duration::from_secs(10),
+        ServiceExitCode::Win32(0),
     )?;
 
     // A multi-thread Tokio runtime on this SCM thread runs the daemon. A service
@@ -100,6 +112,7 @@ fn run_service() -> windows_service::Result<()> {
                 ServiceState::Stopped,
                 ServiceControlAccept::empty(),
                 Duration::default(),
+                fatal_service_exit_code(),
             )?;
             return Ok(());
         }
@@ -109,12 +122,14 @@ fn run_service() -> windows_service::Result<()> {
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
         Duration::default(),
+        ServiceExitCode::Win32(0),
     )?;
 
     let config = DaemonConfig::load_effective(&DaemonConfig::path_from_env());
     let result = runtime.block_on(run_daemon(config, shutdown));
     // Dropping the runtime stops the spawned servers.
     drop(runtime);
+    let exit_code = daemon_service_exit_code(result.as_ref().map(|_| ()));
     if let Err(e) = result {
         eprintln!("sembazuru-daemon: daemon exited with error: {e}");
     }
@@ -123,6 +138,7 @@ fn run_service() -> windows_service::Result<()> {
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
         Duration::default(),
+        exit_code,
     )?;
     Ok(())
 }
@@ -315,5 +331,23 @@ mod tests {
         assert!(ServiceAccount::System.warning().is_some());
         assert!(ServiceAccount::Virtual.warning().is_none());
         assert!(ServiceAccount::NetworkService.warning().is_none());
+    }
+
+    #[test]
+    fn daemon_service_exit_code_maps_success_to_win32_zero() {
+        assert_eq!(
+            daemon_service_exit_code(Ok::<(), std::io::Error>(())),
+            ServiceExitCode::Win32(0)
+        );
+    }
+
+    #[test]
+    fn daemon_service_exit_code_maps_failure_to_non_zero() {
+        let err = std::io::Error::other("fatal daemon exit");
+        assert_ne!(
+            daemon_service_exit_code(Err(&err)),
+            ServiceExitCode::Win32(0)
+        );
+        assert_ne!(fatal_service_exit_code(), ServiceExitCode::Win32(0));
     }
 }
