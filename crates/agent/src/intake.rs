@@ -268,6 +268,19 @@ fn should_record_cache(
         && worker_tool_matches(worker_reported_digest, agent_identity.digest())
 }
 
+fn declared_output_specs(declared_outputs: &[String], root: Option<&str>) -> Vec<OutputSpec> {
+    declared_outputs
+        .iter()
+        .filter_map(|p| crate::fileserver::normalize_declared_output(p, root))
+        .enumerate()
+        .map(|(id, normalized)| OutputSpec {
+            id: id as u32,
+            final_path: PathBuf::from(normalized),
+            max_size: DEFAULT_OUTPUT_MAX_BYTES,
+        })
+        .collect()
+}
+
 async fn publish_remote_or_fallback(
     outcome: Execution,
     cap: &SessionCapability,
@@ -447,6 +460,7 @@ async fn run_submission(
     } else {
         input_root.clone()
     };
+    let normalized_vfs_root = crate::fileserver::normalize_root(&vfs_root);
 
     let opts = ExecOptions {
         predicted_paths,
@@ -463,23 +477,10 @@ async fn run_submission(
     // agent's scope root + per-session pin partition + allowed-digest ACL +
     // normalized output-id authority. Trace-discovered outputs are cache record
     // inputs only; they do not grant WriteBack authority (SEC-003).
-    let outputs: Vec<OutputSpec> = declared_outputs
-        .iter()
-        .filter_map(|p| crate::fileserver::normalize_requested(p))
-        .enumerate()
-        .map(|(id, normalized)| OutputSpec {
-            id: id as u32,
-            final_path: PathBuf::from(normalized),
-            max_size: DEFAULT_OUTPUT_MAX_BYTES,
-        })
-        .collect();
+    let outputs = declared_output_specs(&declared_outputs, normalized_vfs_root.as_deref());
     let cap = ctx
         .registry
-        .create(
-            session_id.clone(),
-            crate::fileserver::normalize_root(&vfs_root),
-            outputs,
-        )
+        .create(session_id.clone(), normalized_vfs_root, outputs)
         .await;
 
     let fallback_command = command.clone();
@@ -768,9 +769,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        IntakeService, LocalIntakeTransport, SubmitOptions, is_verified_tool, mint_session_id,
-        publish_remote_or_fallback, resolve_loopback_intake, should_record_cache, submit_to_daemon,
-        worker_tool_matches,
+        IntakeService, LocalIntakeTransport, SubmitOptions, declared_output_specs,
+        is_verified_tool, mint_session_id, publish_remote_or_fallback, resolve_loopback_intake,
+        should_record_cache, submit_to_daemon, worker_tool_matches,
     };
     use crate::Execution;
     use crate::coordination::WorkerTable;
@@ -818,6 +819,29 @@ mod tests {
         assert!(
             !is_verified_tool("my-codegen"),
             "removed → no longer verified"
+        );
+    }
+
+    #[test]
+    fn path_corpus_declared_output_specs_keep_short_alias_root_prefix() {
+        let root = crate::fileserver::normalize_root(
+            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root",
+        )
+        .expect("root");
+        let declared_outputs = vec![
+            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj".to_string(),
+            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\PROGRA~1\\tool.obj"
+                .to_string(),
+        ];
+
+        let specs = declared_output_specs(&declared_outputs, Some(&root));
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].final_path,
+            std::path::PathBuf::from(
+                "c:\\users\\kingka~1\\appdata\\local\\temp\\sbz-dp-root\\obj\\out.obj"
+            )
         );
     }
 

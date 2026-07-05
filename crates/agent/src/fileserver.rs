@@ -335,6 +335,15 @@ pub fn normalize_requested(path: &str) -> Option<String> {
     normalize_requested_inner(path, ShortAliasPolicy::Reject)
 }
 
+pub(crate) fn normalize_declared_output(path: &str, root: Option<&str>) -> Option<String> {
+    let Some(root) = root else {
+        return normalize_requested(path);
+    };
+    let normalized = normalize_requested_inner(path, ShortAliasPolicy::Allow)?;
+    root_relative_path(path, root)?;
+    Some(normalized)
+}
+
 #[derive(Copy, Clone)]
 enum ShortAliasPolicy {
     Reject,
@@ -1337,6 +1346,55 @@ mod tests {
             root_relative_path(
                 "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\PROGRA~1\\tool.exe",
                 root
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn path_corpus_declared_output_normalization_allows_short_alias_root_prefix_only() {
+        let root =
+            normalize_root("C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root").expect("root");
+
+        assert_eq!(
+            normalize_declared_output(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj",
+                Some(&root)
+            ),
+            Some(
+                "c:\\users\\kingka~1\\appdata\\local\\temp\\sbz-dp-root\\obj\\out.obj".to_string()
+            )
+        );
+        assert_eq!(
+            normalize_declared_output(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\PROGRA~1\\tool.obj",
+                Some(&root)
+            ),
+            None
+        );
+        assert_eq!(
+            normalize_declared_output(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\outside\\obj\\out.obj",
+                Some(&root)
+            ),
+            None
+        );
+
+        for rejected in [
+            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj:ads",
+            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\NUL.txt",
+            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\bad.",
+            "\\\\host\\share\\obj\\out.obj",
+            "C:obj\\out.obj",
+            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\..\\outside\\out.obj",
+        ] {
+            assert_eq!(normalize_declared_output(rejected, Some(&root)), None);
+        }
+
+        assert_eq!(
+            normalize_declared_output(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj",
+                None
             ),
             None
         );
