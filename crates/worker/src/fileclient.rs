@@ -25,13 +25,14 @@ use std::time::{Duration, Instant};
 use sembazuru_cas::Digest;
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
-    DirListRequest, DirListResponse, HasRequest, HasResponse, OpenReadRequest, OpenReadResponse,
-    ReadRequest, ReadResponse, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
+    DirListRequest, DirListResponse, HasRequest, HasResponse, MAX_HAS_DIGESTS, MAX_STAT_PATHS,
+    OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse, StatRequest, StatResponse,
+    WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, Semaphore, oneshot};
 
 /// How much to request per Read after the inlined first chunk.
 const READ_CHUNK: u32 = 256 * 1024;
@@ -45,6 +46,8 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// fixed chunks). A small output fits in a single chunk.
 const WRITEBACK_CHUNK: usize = 1024 * 1024;
 
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 128;
+
 /// A decoded frame (header + payload), handed from the reader task to a waiter.
 type Frame = (FrameHeader, Vec<u8>);
 /// Outstanding requests by id, each awaiting its correlated response frame.
@@ -56,6 +59,7 @@ type PendingMap = HashMap<u64, oneshot::Sender<Frame>>;
 struct Mux {
     write: Mutex<OwnedWriteHalf>,
     pending: Mutex<PendingMap>,
+    in_flight: Semaphore,
     /// Set once the reader task exits (connection dead). Checked under the
     /// `pending` lock so a call cannot register a waiter that will never be woken
     /// — without it, a request issued after the reader stopped would hang forever.
@@ -92,6 +96,12 @@ impl Mux {
     /// One request/response over the multiplexed connection. Registers a waiter
     /// under a fresh id, writes the request, and awaits its correlated response.
     async fn call(&self, op: OpCode, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let _permit = self.in_flight.acquire().await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "data-plane in-flight limiter closed",
+            )
+        })?;
         if !self.rtt.is_zero() {
             // Emulate one network round-trip. Spin-wait, not tokio::time::sleep:
             // the OS/timer granularity on Windows (~15 ms) makes sub-15 ms sleeps
@@ -210,6 +220,17 @@ impl FileClient {
         root: String,
         session_id: String,
     ) -> io::Result<Self> {
+        Self::connect_inner(addr, rtt, token, root, session_id, MAX_IN_FLIGHT_REQUESTS).await
+    }
+
+    async fn connect_inner<A: ToSocketAddrs>(
+        addr: A,
+        rtt: Duration,
+        token: String,
+        root: String,
+        session_id: String,
+        max_in_flight: usize,
+    ) -> io::Result<Self> {
         use tokio::io::AsyncWriteExt;
 
         let mut stream = TcpStream::connect(addr).await?;
@@ -248,6 +269,7 @@ impl FileClient {
         let mux = Arc::new(Mux {
             write: Mutex::new(wr),
             pending: Mutex::new(HashMap::new()),
+            in_flight: Semaphore::new(max_in_flight),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             rtt,
@@ -261,12 +283,21 @@ impl FileClient {
     }
 
     pub async fn stat_batch(&self, paths: &[String]) -> io::Result<StatResponse> {
-        let payload = StatRequest {
-            paths: paths.to_vec(),
+        if paths.is_empty() {
+            return Ok(StatResponse {
+                entries: Vec::new(),
+            });
         }
-        .encode();
-        let resp = self.call(OpCode::StatBatch, &payload).await?;
-        StatResponse::decode(&resp).map_err(to_io)
+        let mut entries = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(MAX_STAT_PATHS) {
+            let payload = StatRequest {
+                paths: chunk.to_vec(),
+            }
+            .encode();
+            let resp = self.call(OpCode::StatBatch, &payload).await?;
+            entries.extend(StatResponse::decode(&resp).map_err(to_io)?.entries);
+        }
+        Ok(StatResponse { entries })
     }
 
     /// Resolves `path`, optionally inlining its first chunk. With
@@ -295,12 +326,19 @@ impl FileClient {
     /// Asks the agent which of `digests` it already holds (`§4.3`). Used before
     /// uploading outputs so a rebuild re-sends nothing the agent already has.
     pub async fn has(&self, digests: &[String]) -> io::Result<Vec<bool>> {
-        let payload = HasRequest {
-            digests: digests.to_vec(),
+        if digests.is_empty() {
+            return Ok(Vec::new());
         }
-        .encode();
-        let resp = self.call(OpCode::Has, &payload).await?;
-        Ok(HasResponse::decode(&resp).map_err(to_io)?.present)
+        let mut present = Vec::with_capacity(digests.len());
+        for chunk in digests.chunks(MAX_HAS_DIGESTS) {
+            let payload = HasRequest {
+                digests: chunk.to_vec(),
+            }
+            .encode();
+            let resp = self.call(OpCode::Has, &payload).await?;
+            present.extend(HasResponse::decode(&resp).map_err(to_io)?.present);
+        }
+        Ok(present)
     }
 
     /// Returns a produced output to the agent for atomic publication at the
@@ -424,4 +462,190 @@ fn verify(bytes: &[u8], digest: &Digest) -> io::Result<()> {
 
 fn to_io(e: sembazuru_dataplane::wire::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sembazuru_dataplane::ops::{HelloResponse, StatEntry};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn accept_test_handshake(listener: TcpListener) -> TcpStream {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (header, _) = read_frame(&mut sock).await.unwrap();
+        let payload = HelloResponse {
+            ok: true,
+            detail: String::new(),
+        }
+        .encode();
+        write_frame(
+            &mut sock,
+            FrameHeader {
+                request_id: header.request_id,
+                op: OpCode::Hello,
+                is_response: true,
+            },
+            &payload,
+        )
+        .await
+        .unwrap();
+        sock.flush().await.unwrap();
+        sock
+    }
+
+    #[tokio::test]
+    async fn fileclient_in_flight_requests_are_bounded() {
+        const TEST_MAX_IN_FLIGHT: usize = 2;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let sock = accept_test_handshake(listener).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(sock);
+        });
+        let client = FileClient::connect_inner(
+            addr,
+            Duration::ZERO,
+            String::new(),
+            String::new(),
+            String::new(),
+            TEST_MAX_IN_FLIGHT,
+        )
+        .await
+        .unwrap();
+
+        let mut calls = Vec::new();
+        for i in 0..TEST_MAX_IN_FLIGHT {
+            let c = client.clone();
+            calls.push(tokio::spawn(async move {
+                let _ = c.open_read(&format!("c:\\blocked\\{i}.h"), false).await;
+            }));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.mux.pending.lock().await.len() == TEST_MAX_IN_FLIGHT {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cap requests should enter the pending map");
+
+        let extra_client = client.clone();
+        let extra = tokio::spawn(async move {
+            let _ = extra_client.open_read("c:\\blocked\\extra.h", false).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !extra.is_finished(),
+            "cap+1 request must wait while all in-flight slots are held"
+        );
+        assert_eq!(client.mux.pending.lock().await.len(), TEST_MAX_IN_FLIGHT);
+
+        for call in calls {
+            call.abort();
+        }
+        extra.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stat_batch_chunks_requests_and_concatenates_entries() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            let mut sock = accept_test_handshake(listener).await;
+            while let Ok((header, payload)) = read_frame(&mut sock).await {
+                let req = StatRequest::decode(&payload).unwrap();
+                server_seen.lock().await.push(req.paths.len());
+                let entries = req
+                    .paths
+                    .into_iter()
+                    .map(|path| StatEntry {
+                        exists: true,
+                        is_dir: false,
+                        size: path.len() as u64,
+                        digest_hex: String::new(),
+                    })
+                    .collect();
+                let resp = StatResponse { entries }.encode();
+                write_frame(
+                    &mut sock,
+                    FrameHeader {
+                        request_id: header.request_id,
+                        op: OpCode::StatBatch,
+                        is_response: true,
+                    },
+                    &resp,
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        let client = FileClient::connect(addr).await.unwrap();
+        let paths = (0..(MAX_STAT_PATHS + 1))
+            .map(|i| format!("c:\\src\\file-{i}.h"))
+            .collect::<Vec<_>>();
+
+        let response = client.stat_batch(&paths).await.unwrap();
+
+        assert_eq!(response.entries.len(), paths.len());
+        assert_eq!(*seen.lock().await, vec![MAX_STAT_PATHS, 1]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn has_chunks_requests_and_concatenates_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            let mut sock = accept_test_handshake(listener).await;
+            while let Ok((header, payload)) = read_frame(&mut sock).await {
+                let req = HasRequest::decode(&payload).unwrap();
+                server_seen.lock().await.push(req.digests.len());
+                let resp = HasResponse {
+                    present: req
+                        .digests
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| i % 2 == 0)
+                        .collect(),
+                }
+                .encode();
+                write_frame(
+                    &mut sock,
+                    FrameHeader {
+                        request_id: header.request_id,
+                        op: OpCode::Has,
+                        is_response: true,
+                    },
+                    &resp,
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        let client = FileClient::connect(addr).await.unwrap();
+        let digests = (0..(MAX_HAS_DIGESTS + 1))
+            .map(|i| format!("blake3:{i:064x}"))
+            .collect::<Vec<_>>();
+
+        let present = client.has(&digests).await.unwrap();
+
+        assert_eq!(present.len(), digests.len());
+        assert_eq!(*seen.lock().await, vec![MAX_HAS_DIGESTS, 1]);
+        assert!(present[0]);
+        assert!(!present[1]);
+        assert!(present[MAX_HAS_DIGESTS]);
+        server.abort();
+    }
 }

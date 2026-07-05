@@ -58,15 +58,35 @@ use crate::session_registry::{
     SessionCapability, SessionRegistry, WritebackState, create_staging_temp, remove_root_file,
 };
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
-use sembazuru_dataplane::async_io::{read_frame, write_frame};
+use sembazuru_dataplane::async_io::{read_frame, read_frame_with_body_guard, write_frame};
 use sembazuru_dataplane::ops::{
     DirEntry, DirListRequest, DirListResponse, HasRequest, HasResponse, HelloRequest,
-    HelloResponse, OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse, StatEntry,
-    StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
+    HelloResponse, MAX_DIRLIST_ENTRIES, OpenReadRequest, OpenReadResponse, ReadRequest,
+    ReadResponse, StatEntry, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+
+pub const MAX_UNAUTHENTICATED_HANDSHAKES: usize = 64;
+pub const MAX_DATA_PLANE_IN_FLIGHT_REQUESTS: usize = 256;
+
+#[derive(Clone, Copy)]
+struct QuotaLimits {
+    max_unauthenticated_handshakes: usize,
+    max_data_plane_in_flight_requests: usize,
+}
+
+#[derive(Clone)]
+struct ConnShared {
+    registry: Arc<SessionRegistry>,
+    map: Arc<PathMap>,
+    stats: Arc<ServerStats>,
+    expected_token: Arc<Option<String>>,
+    legacy_sessions_enabled: bool,
+    request_slots: Arc<Semaphore>,
+}
 
 const INLINE_CHUNK: usize = 64 * 1024;
 
@@ -191,27 +211,56 @@ async fn serve_with_map(
     registry: Arc<SessionRegistry>,
     legacy_sessions_enabled: bool,
 ) -> io::Result<()> {
-    let map = Arc::new(map);
-    let expected_token = Arc::new(expected_token);
+    serve_with_map_and_quotas(
+        listener,
+        map,
+        stats,
+        expected_token,
+        registry,
+        legacy_sessions_enabled,
+        QuotaLimits {
+            max_unauthenticated_handshakes: MAX_UNAUTHENTICATED_HANDSHAKES,
+            max_data_plane_in_flight_requests: MAX_DATA_PLANE_IN_FLIGHT_REQUESTS,
+        },
+    )
+    .await
+}
+
+async fn serve_with_map_and_quotas(
+    listener: TcpListener,
+    map: PathMap,
+    stats: Arc<ServerStats>,
+    expected_token: Option<String>,
+    registry: Arc<SessionRegistry>,
+    legacy_sessions_enabled: bool,
+    quotas: QuotaLimits,
+) -> io::Result<()> {
+    let handshake_slots = Arc::new(Semaphore::new(quotas.max_unauthenticated_handshakes));
+    let shared = ConnShared {
+        registry,
+        map: Arc::new(map),
+        stats,
+        expected_token: Arc::new(expected_token),
+        legacy_sessions_enabled,
+        request_slots: Arc::new(Semaphore::new(quotas.max_data_plane_in_flight_requests)),
+    };
     loop {
         let (sock, _peer) = listener.accept().await?;
-        let reg = registry.clone();
-        let m = map.clone();
-        let st = stats.clone();
-        let tok = expected_token.clone();
+        let Ok(handshake_permit) = Arc::clone(&handshake_slots).try_acquire_owned() else {
+            drop(sock);
+            continue;
+        };
+        let shared = shared.clone();
         tokio::spawn(async move {
-            let _ = handle_conn(sock, reg, m, st, tok, legacy_sessions_enabled).await;
+            let _ = handle_conn(sock, shared, handshake_permit).await;
         });
     }
 }
 
 async fn handle_conn(
     sock: TcpStream,
-    registry: Arc<SessionRegistry>,
-    map: Arc<PathMap>,
-    stats: Arc<ServerStats>,
-    expected_token: Arc<Option<String>>,
-    legacy_sessions_enabled: bool,
+    shared: ConnShared,
+    handshake_permit: OwnedSemaphorePermit,
 ) -> io::Result<()> {
     // Pipelining (M5.3): read requests off the connection and dispatch each on
     // its own task, writing responses (tagged with the request id) as they
@@ -232,43 +281,87 @@ async fn handle_conn(
     let cap = match handshake(
         &mut rd,
         &mut wr,
-        expected_token.as_deref(),
-        registry.as_ref(),
-        legacy_sessions_enabled,
+        shared.expected_token.as_deref(),
+        shared.registry.as_ref(),
+        shared.legacy_sessions_enabled,
     )
     .await?
     {
         HandshakeResult::Reject => return Ok(()), // rejected; connection closed
         HandshakeResult::Accept { cap } => cap,
     };
+    drop(handshake_permit);
     // Hold a connection guard for the connection's whole life so the idle sweeper
     // never reaps a session that still has a live data-plane connection.
     let _conn = SessionRegistry::bind(cap.clone());
 
     let wr = Arc::new(Mutex::new(wr));
     loop {
-        let (header, payload) = match read_frame(&mut rd).await {
+        let (header, payload, request_permit) = match read_frame_with_body_guard(&mut rd, |_| {
+            acquire_request_slot(&shared.request_slots)
+        })
+        .await
+        {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(e),
         };
-        let registry = registry.clone();
+        let registry = shared.registry.clone();
         let cap = cap.clone();
-        let map = map.clone();
-        let stats = stats.clone();
+        let map = shared.map.clone();
+        let stats = shared.stats.clone();
         let wr = wr.clone();
         tokio::spawn(async move {
+            let _request_permit = request_permit;
             let resp_payload =
                 dispatch(header.op, &payload, &cap, registry.store(), &map, &stats).await;
-            let resp_header = FrameHeader {
-                request_id: header.request_id,
-                op: header.op,
-                is_response: true,
-            };
-            let mut w = wr.lock().await;
-            let _ = write_frame(&mut *w, resp_header, &resp_payload).await;
+            match resp_payload {
+                Ok(resp_payload) => {
+                    let resp_header = FrameHeader {
+                        request_id: header.request_id,
+                        op: header.op,
+                        is_response: true,
+                    };
+                    let mut w = wr.lock().await;
+                    let _ = write_response_or_shutdown(&mut *w, resp_header, &resp_payload).await;
+                }
+                Err(_) => {
+                    let mut w = wr.lock().await;
+                    shutdown_response_writer(&mut *w).await;
+                }
+            }
         });
     }
+}
+
+async fn acquire_request_slot(slots: &Arc<Semaphore>) -> io::Result<OwnedSemaphorePermit> {
+    Arc::clone(slots).acquire_owned().await.map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "data-plane request limiter closed",
+        )
+    })
+}
+
+async fn write_response_or_shutdown<W>(
+    w: &mut W,
+    header: FrameHeader,
+    payload: &[u8],
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match write_frame(&mut *w, header, payload).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            shutdown_response_writer(w).await;
+            Err(e)
+        }
+    }
+}
+
+async fn shutdown_response_writer<W: AsyncWrite + Unpin>(w: &mut W) {
+    let _ = w.shutdown().await;
 }
 
 /// Outcome of the session-open handshake.
@@ -500,6 +593,12 @@ async fn root_dir_entries(root_dir: RootDir, rel: String) -> io::Result<Vec<DirE
                 is_dir,
                 size,
             });
+            if entries.len() > MAX_DIRLIST_ENTRIES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "DirList entry quota exceeded",
+                ));
+            }
         }
         entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         Ok(entries)
@@ -588,14 +687,14 @@ async fn dispatch(
     store: &BlobStore,
     map: &PathMap,
     stats: &ServerStats,
-) -> Vec<u8> {
+) -> io::Result<Vec<u8>> {
     if cap.is_closed() {
         // ADD-001: finished sessions may leave a lingering connection; no late
         // op may run, and WriteBack is a hard reject.
-        return closed_response(op);
+        return Ok(closed_response(op));
     }
 
-    match op {
+    Ok(match op {
         OpCode::StatBatch => match StatRequest::decode(payload) {
             Ok(req) => stat_batch(req, map, cap).await.encode(),
             Err(_) => StatResponse { entries: vec![] }.encode(),
@@ -609,12 +708,13 @@ async fn dispatch(
             Err(_) => ReadResponse { bytes: vec![] }.encode(),
         },
         OpCode::DirList => match DirListRequest::decode(payload) {
-            Ok(req) => dir_list(req, map, cap).await.encode(),
-            Err(_) => DirListResponse {
-                exists: false,
-                entries: vec![],
+            Ok(req) => dir_list(req, map, cap).await?.encode(),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed DirList request",
+                ));
             }
-            .encode(),
         },
         OpCode::Has => match HasRequest::decode(payload) {
             Ok(req) => has(req, cap, store).await.encode(),
@@ -637,7 +737,7 @@ async fn dispatch(
             detail: "unexpected handshake after session open".to_string(),
         }
         .encode(),
-    }
+    })
 }
 
 fn closed_response(op: OpCode) -> Vec<u8> {
@@ -1048,40 +1148,45 @@ async fn has(req: HasRequest, cap: &SessionCapability, store: &BlobStore) -> Has
 
 /// Lists a directory's immediate children (depth is reserved for deeper
 /// prefetch; M3.2 serves one level, which covers the include-dir snapshot case).
-async fn dir_list(req: DirListRequest, map: &PathMap, cap: &SessionCapability) -> DirListResponse {
+async fn dir_list(
+    req: DirListRequest,
+    map: &PathMap,
+    cap: &SessionCapability,
+) -> io::Result<DirListResponse> {
     // Out-of-scope directory reports "does not exist" (existence-hiding, M7.1).
     if !path_in_scope(&req.path, cap.root()) {
-        return DirListResponse {
+        return Ok(DirListResponse {
             exists: false,
             entries: vec![],
-        };
+        });
     }
     if cap.requires_contained_root() {
-        return DirListResponse {
+        return Ok(DirListResponse {
             exists: false,
             entries: vec![],
-        };
+        });
     }
     if let Some((root_dir, rel)) = contained_root_access(cap, map, &req.path) {
         return match root_dir_entries(root_dir, rel).await {
-            Ok(entries) => DirListResponse {
+            Ok(entries) => Ok(DirListResponse {
                 exists: true,
                 entries,
-            },
-            Err(_) => DirListResponse {
+            }),
+            Err(e) if e.kind() == io::ErrorKind::InvalidData => Err(e),
+            Err(_) => Ok(DirListResponse {
                 exists: false,
                 entries: vec![],
-            },
+            }),
         };
     }
     let actual = map.resolve(&req.path);
     let mut rd = match tokio::fs::read_dir(&actual).await {
         Ok(rd) => rd,
         Err(_) => {
-            return DirListResponse {
+            return Ok(DirListResponse {
                 exists: false,
                 entries: vec![],
-            };
+            });
         }
     };
     let mut entries = Vec::new();
@@ -1096,13 +1201,19 @@ async fn dir_list(req: DirListRequest, map: &PathMap, cap: &SessionCapability) -
             is_dir,
             size,
         });
+        if entries.len() > MAX_DIRLIST_ENTRIES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DirList entry quota exceeded",
+            ));
+        }
     }
     // Stable order so a directory snapshot hashes/compares the same run-to-run.
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    DirListResponse {
+    Ok(DirListResponse {
         exists: true,
         entries,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1209,6 +1320,106 @@ mod tests {
             PathMap::Identity.resolve("c:\\x\\y.h"),
             PathBuf::from("c:\\x\\y.h")
         );
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_handshake_flood_is_bounded() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        tokio::spawn(async move {
+            let _ = serve_with_map_and_quotas(
+                listener,
+                PathMap::Identity,
+                Arc::new(ServerStats::default()),
+                None,
+                registry,
+                true,
+                QuotaLimits {
+                    max_unauthenticated_handshakes: 1,
+                    max_data_plane_in_flight_requests: MAX_DATA_PLANE_IN_FLIGHT_REQUESTS,
+                },
+            )
+            .await;
+        });
+
+        let slow = TcpStream::connect(addr).await.unwrap();
+        let mut overflow = TcpStream::connect(addr).await.unwrap();
+        let overflow_result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut overflow))
+                .await;
+        assert!(
+            overflow_result.is_ok(),
+            "overflow unauthenticated connection should be closed promptly, not pinned"
+        );
+
+        drop(slow);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match sembazuru_worker::fileclient::FileClient::connect(addr).await {
+                Ok(client) => {
+                    drop(client);
+                    break;
+                }
+                Err(err) if tokio::time::Instant::now() < deadline => {
+                    let _ = err;
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(err) => {
+                    panic!(
+                        "valid client should connect after the slow handshake releases its slot: {err}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn server_request_in_flight_cap_blocks_until_a_slot_is_released() {
+        let slots = Arc::new(Semaphore::new(1));
+        let first = acquire_request_slot(&slots).await.unwrap();
+        let waiting_slots = Arc::clone(&slots);
+        let second = tokio::spawn(async move { acquire_request_slot(&waiting_slots).await });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !second.is_finished(),
+            "request dispatch must wait while all request slots are held"
+        );
+
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+            .await
+            .expect("request slot should become available")
+            .unwrap()
+            .unwrap();
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn response_write_failure_shuts_down_writer() {
+        use sembazuru_dataplane::wire::{HEADER_BYTES, MAX_FRAME_BODY};
+        use tokio::io::AsyncReadExt;
+
+        let (mut writer, mut peer) = tokio::io::duplex(64);
+        let header = FrameHeader {
+            request_id: 42,
+            op: OpCode::Read,
+            is_response: true,
+        };
+        let payload = vec![0u8; MAX_FRAME_BODY - HEADER_BYTES + 1];
+
+        let err = write_response_or_shutdown(&mut writer, header, &payload)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let mut one = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), peer.read(&mut one))
+            .await
+            .expect("peer should observe EOF promptly")
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]
@@ -1458,7 +1669,8 @@ mod tests {
             &PathMap::Identity,
             &cap,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             !listed.exists,
             "dir_list must fail closed instead of ambiently listing under an unopened root"
@@ -1610,7 +1822,8 @@ mod tests {
             &PathMap::Identity,
             &cap,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(
             !listed.exists,
             "dir_list must not enumerate through an out-of-root junction"

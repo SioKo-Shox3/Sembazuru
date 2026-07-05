@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use sembazuru_agent::session_registry::{DEFAULT_OUTPUT_MAX_BYTES, OutputSpec, staging_temp};
+use sembazuru_dataplane::ops::MAX_DIRLIST_ENTRIES;
 use sembazuru_worker::fileclient::FileClient;
 
 /// A self-cleaning temp directory, so the test needs no `tempfile` dependency.
@@ -617,6 +618,34 @@ async fn dir_list_snapshots_a_directory() {
     assert_eq!(names, vec!["stdio.h", "stdlib.h", "sys"]);
     let sys = resp.entries.iter().find(|e| e.rel_path == "sys").unwrap();
     assert!(sys.is_dir);
+}
+
+#[tokio::test]
+async fn dir_list_over_entry_quota_fails_remote_call_without_partial_entries() {
+    let dir = TempDir::new("dir-quota");
+    std::fs::create_dir_all(dir.join("inc")).unwrap();
+    for i in 0..(MAX_DIRLIST_ENTRIES + 1) {
+        std::fs::write(dir.join(&format!("inc/h{i}.h")), b"x").unwrap();
+    }
+
+    let (addr, session_id) = start_server().await;
+    let client = connect_bound(addr, &session_id).await;
+
+    let inc = dir.join("inc").to_string_lossy().into_owned();
+    let err = client
+        .dir_list(&inc, 0)
+        .await
+        .expect_err("over-quota directory snapshots must fail, not truncate");
+
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        "over-quota DirList should fail closed, got {err:?}"
+    );
 }
 
 #[tokio::test]

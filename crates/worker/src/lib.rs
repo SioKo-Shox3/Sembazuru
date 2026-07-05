@@ -31,6 +31,7 @@ use job::JobObject;
 
 use sembazuru_proto::{
     capability,
+    quotas::MAX_PREDICTED_PATHS,
     v0::{
         AbortRequest, AbortResponse, ActionState, Command, ExecuteEvent, ExecuteRequest,
         ExitStatus, OutputChunk, StateChange, VfsExecution, execute_event::Event,
@@ -342,6 +343,11 @@ fn resolved_tool_digest(cmd: &Command) -> String {
         &cmd.cwd,
     )
     .to_string()
+}
+
+fn cap_predicted_paths(mut predicted_paths: Vec<String>) -> Vec<String> {
+    predicted_paths.truncate(MAX_PREDICTED_PATHS);
+    predicted_paths
 }
 
 fn exit_event(
@@ -866,7 +872,7 @@ impl Execution for WorkerService {
         // bind file supply to the authoritative session (root/pins/outputs).
         let session_id = req.session_id;
         let vfs_req = req.vfs;
-        let predicted_paths = req.predicted_paths;
+        let predicted_paths = cap_predicted_paths(req.predicted_paths);
         let vfs_cfg = self.vfs.clone();
         let aborts = Arc::clone(&self.aborts);
 
@@ -993,6 +999,21 @@ mod tests {
         assert!(
             !resolved_tool_digest(&cmd).is_empty(),
             "worker tool digest wiring should report a non-empty digest"
+        );
+    }
+
+    #[test]
+    fn execute_truncates_predicted_paths_before_prefetch() {
+        let paths = (0..(MAX_PREDICTED_PATHS + 1))
+            .map(|i| format!("c:\\src\\h{i}.h"))
+            .collect::<Vec<_>>();
+
+        let capped = cap_predicted_paths(paths);
+
+        assert_eq!(capped.len(), MAX_PREDICTED_PATHS);
+        assert_eq!(
+            capped[MAX_PREDICTED_PATHS - 1],
+            format!("c:\\src\\h{}.h", MAX_PREDICTED_PATHS - 1)
         );
     }
 }

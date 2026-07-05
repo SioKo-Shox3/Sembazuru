@@ -32,6 +32,7 @@ use sembazuru_cas::{
     ActionCache, ActionResult, BlobStore, CasError, Digest, DigestHasher, OutputFile,
     codec_checksum,
 };
+use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
 use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest};
 use sembazuru_tracer::normalize_for_compare;
 
@@ -430,7 +431,12 @@ impl AgentCache {
         let Some(manifest) = decode_manifest(&bytes) else {
             return Ok(Vec::new()); // corrupt manifest → no prediction
         };
-        Ok(manifest.inputs.into_iter().map(|e| e.logical).collect())
+        Ok(manifest
+            .inputs
+            .into_iter()
+            .take(MAX_PREDICTED_PATHS)
+            .map(|e| e.logical)
+            .collect())
     }
 
     /// Loads a trace directory and extracts the observed-input manifest. Thin
@@ -1878,6 +1884,41 @@ mod tests {
         // An unknown action still predicts nothing.
         let other = cache.weak_key(&["other".to_string()], &[], "");
         assert!(cache.predicted_paths(&other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn predicted_paths_are_capped_to_quota() {
+        let root = tmp("predict-quota");
+        let cache = AgentCache::open(&root).unwrap();
+        let weak = cache.weak_key(
+            &["clang-cl".to_string(), "/c".into(), "a.cpp".into()],
+            &[],
+            "",
+        );
+        let manifest = InputManifest {
+            inputs: (0..(MAX_PREDICTED_PATHS + 1))
+                .map(|i| InputEntry {
+                    logical: format!("include\\h{i}.h"),
+                    absolute: format!("c:\\src\\include\\h{i}.h"),
+                    kind: InputKind::Content,
+                })
+                .collect(),
+            cmds: vec!["clang-cl /c a.cpp".into()],
+            cacheable: true,
+        };
+        cache
+            .cache
+            .put_manifest(&weak, &encode_manifest(&manifest))
+            .unwrap();
+
+        let predicted = cache.predicted_paths(&weak).unwrap();
+
+        assert_eq!(predicted.len(), MAX_PREDICTED_PATHS);
+        assert_eq!(predicted[0], "include\\h0.h");
+        assert_eq!(
+            predicted[MAX_PREDICTED_PATHS - 1],
+            format!("include\\h{}.h", MAX_PREDICTED_PATHS - 1)
+        );
     }
 
     #[test]

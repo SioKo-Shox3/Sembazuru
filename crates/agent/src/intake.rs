@@ -38,6 +38,7 @@ use crate::session_registry::{
 };
 use crate::status::Metrics;
 use crate::{ExecOptions, ExecuteError, Execution, LocalFallbackReason, run_local};
+use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
 
 /// Per-action options the launcher hands to the daemon alongside the command
 /// (the non-command fields of [`SubmitActionRequest`]). Bundled so adding a knob
@@ -422,7 +423,7 @@ async fn run_submission(
     }
 
     // Prior build's inputs to warm ahead of process I/O (M5.4 prefetch).
-    let predicted_paths = match (&ctx.cache, &weak) {
+    let mut predicted_paths = match (&ctx.cache, &weak) {
         (Some(cache), Some(weak)) => {
             let cache = cache.clone();
             let weak = weak.clone();
@@ -434,6 +435,7 @@ async fn run_submission(
         }
         _ => Vec::new(),
     };
+    predicted_paths.truncate(MAX_PREDICTED_PATHS);
 
     // Per-action trace dir (only needed when recording to the cache). The worker
     // points the injected DLL's trace at it; on a single machine the daemon reads

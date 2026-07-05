@@ -11,12 +11,16 @@
 
 use crate::wire::{Error, Reader, Writer};
 
+pub const MAX_STAT_PATHS: usize = 4096;
+pub const MAX_HAS_DIGESTS: usize = 4096;
+pub const MAX_DIRLIST_ENTRIES: usize = 4096;
+
 /// Bounds an up-front `Vec::with_capacity` hint taken from an untrusted count,
 /// so a hostile length can't drive a huge allocation before the per-element
 /// reads fail. The loop still runs the real count; it just doesn't pre-reserve
 /// for it.
 fn cap_hint(n: usize) -> usize {
-    n.min(4096)
+    n.min(MAX_STAT_PATHS)
 }
 
 // --- StatBatch -----------------------------------------------------------
@@ -57,6 +61,9 @@ impl StatRequest {
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(buf);
         let n = r.u32()? as usize;
+        if n > MAX_STAT_PATHS {
+            return Err(Error::TooLarge);
+        }
         let mut paths = Vec::with_capacity(cap_hint(n));
         for _ in 0..n {
             paths.push(r.str()?);
@@ -271,6 +278,9 @@ impl DirListResponse {
         let mut r = Reader::new(buf);
         let exists = r.bool()?;
         let n = r.u32()? as usize;
+        if n > MAX_DIRLIST_ENTRIES {
+            return Err(Error::TooLarge);
+        }
         let mut entries = Vec::with_capacity(cap_hint(n));
         for _ in 0..n {
             entries.push(DirEntry {
@@ -394,6 +404,9 @@ impl HasRequest {
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(buf);
         let n = r.u32()? as usize;
+        if n > MAX_HAS_DIGESTS {
+            return Err(Error::TooLarge);
+        }
         let mut digests = Vec::with_capacity(cap_hint(n));
         for _ in 0..n {
             digests.push(r.str()?);
@@ -634,6 +647,14 @@ mod tests {
     }
 
     #[test]
+    fn stat_request_decode_rejects_too_many_paths() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((MAX_STAT_PATHS + 1) as u32).to_le_bytes());
+
+        assert_eq!(StatRequest::decode(&bytes), Err(Error::TooLarge));
+    }
+
+    #[test]
     fn open_read_round_trips_with_inline_chunk() {
         let resp = OpenReadResponse {
             exists: true,
@@ -666,6 +687,14 @@ mod tests {
             present: vec![true, false, true],
         };
         assert_eq!(HasResponse::decode(&resp.encode()).unwrap(), resp);
+    }
+
+    #[test]
+    fn has_request_decode_rejects_too_many_digests() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((MAX_HAS_DIGESTS + 1) as u32).to_le_bytes());
+
+        assert_eq!(HasRequest::decode(&bytes), Err(Error::TooLarge));
     }
 
     #[test]
@@ -705,6 +734,15 @@ mod tests {
             ],
         };
         assert_eq!(DirListResponse::decode(&resp.encode()).unwrap(), resp);
+    }
+
+    #[test]
+    fn dir_list_response_decode_rejects_too_many_entries() {
+        let mut bytes = Vec::new();
+        bytes.push(1);
+        bytes.extend_from_slice(&((MAX_DIRLIST_ENTRIES + 1) as u32).to_le_bytes());
+
+        assert_eq!(DirListResponse::decode(&bytes), Err(Error::TooLarge));
     }
 
     #[test]

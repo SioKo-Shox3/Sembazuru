@@ -6,6 +6,7 @@
 //! framing in `sembazuru-dataplane`, with no protobuf on the hot path (§4.2).
 
 pub mod capability;
+pub mod quotas;
 
 /// Generated types and gRPC stubs for protocol version 0.
 pub mod v0 {

@@ -88,11 +88,11 @@ pub struct FrameHeader {
 
 const FLAG_RESPONSE: u8 = 0x01;
 // request_id(8) + op(1) + flags(1) + reserved(2)
-const HEADER_BYTES: usize = 12;
+pub const HEADER_BYTES: usize = 12;
 
 /// Builds a complete frame ready to write to a stream: a `u32` length prefix
 /// (covering the header and payload) followed by the header and payload.
-pub fn encode_frame(header: FrameHeader, payload: &[u8]) -> Vec<u8> {
+fn encode_frame(header: FrameHeader, payload: &[u8]) -> Vec<u8> {
     let body_len = HEADER_BYTES + payload.len();
     let mut out = Vec::with_capacity(4 + body_len);
     out.extend_from_slice(&(body_len as u32).to_le_bytes());
@@ -102,6 +102,16 @@ pub fn encode_frame(header: FrameHeader, payload: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&0u16.to_le_bytes()); // reserved
     out.extend_from_slice(payload);
     out
+}
+
+pub fn try_encode_frame(header: FrameHeader, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    let body_len = HEADER_BYTES
+        .checked_add(payload.len())
+        .ok_or(Error::TooLarge)?;
+    if body_len > MAX_FRAME_BODY {
+        return Err(Error::TooLarge);
+    }
+    Ok(encode_frame(header, payload))
 }
 
 /// Parses a frame body (the `length`-prefixed bytes *after* the `u32` prefix has
@@ -273,7 +283,7 @@ mod tests {
             op: OpCode::Read,
             is_response: true,
         };
-        let framed = encode_frame(h, payload);
+        let framed = try_encode_frame(h, payload).unwrap();
         let (got, body, consumed) = decode_frame(&framed).unwrap();
         assert_eq!(got, h);
         assert_eq!(body, payload);
@@ -281,23 +291,37 @@ mod tests {
     }
 
     #[test]
+    fn try_encode_frame_rejects_body_larger_than_max_frame_body() {
+        let h = FrameHeader {
+            request_id: 1,
+            op: OpCode::Read,
+            is_response: false,
+        };
+        let payload = vec![0u8; MAX_FRAME_BODY - HEADER_BYTES + 1];
+
+        assert_eq!(try_encode_frame(h, &payload), Err(Error::TooLarge));
+    }
+
+    #[test]
     fn two_frames_decode_sequentially() {
-        let a = encode_frame(
+        let a = try_encode_frame(
             FrameHeader {
                 request_id: 1,
                 op: OpCode::StatBatch,
                 is_response: false,
             },
             b"a",
-        );
-        let b = encode_frame(
+        )
+        .unwrap();
+        let b = try_encode_frame(
             FrameHeader {
                 request_id: 2,
                 op: OpCode::DirList,
                 is_response: false,
             },
             b"bb",
-        );
+        )
+        .unwrap();
         let mut both = a.clone();
         both.extend_from_slice(&b);
         let (h1, p1, n1) = decode_frame(&both).unwrap();
@@ -310,14 +334,15 @@ mod tests {
 
     #[test]
     fn truncated_frame_is_an_error_not_a_panic() {
-        let framed = encode_frame(
+        let framed = try_encode_frame(
             FrameHeader {
                 request_id: 9,
                 op: OpCode::OpenRead,
                 is_response: false,
             },
             b"payload",
-        );
+        )
+        .unwrap();
         // Hand the decoder every short prefix; none may panic.
         for n in 0..framed.len() {
             assert!(matches!(
@@ -329,14 +354,15 @@ mod tests {
 
     #[test]
     fn unknown_op_is_rejected() {
-        let mut framed = encode_frame(
+        let mut framed = try_encode_frame(
             FrameHeader {
                 request_id: 1,
                 op: OpCode::Read,
                 is_response: false,
             },
             b"",
-        );
+        )
+        .unwrap();
         framed[12] = 99; // the op byte (after u32 len + u64 request_id)
         assert_eq!(decode_frame(&framed), Err(Error::UnknownOp(99)));
     }

@@ -22,4 +22,24 @@ pub mod wire;
 #[cfg(feature = "tokio")]
 pub mod async_io;
 
-pub use wire::{Error, FrameHeader, OpCode, decode_frame, decode_frame_body, encode_frame};
+pub use wire::{Error, FrameHeader, OpCode, decode_frame, decode_frame_body, try_encode_frame};
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crate_root_try_encode_frame_encodes_valid_frame() {
+        let header = FrameHeader {
+            request_id: 7,
+            op: OpCode::Read,
+            is_response: true,
+        };
+
+        let framed = try_encode_frame(header, b"ok").unwrap();
+        let (got, payload, consumed) = decode_frame(&framed).unwrap();
+
+        assert_eq!(got, header);
+        assert_eq!(payload, b"ok");
+        assert_eq!(consumed, framed.len());
+    }
+}

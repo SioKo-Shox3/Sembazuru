@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sembazuru_cas::BlobStore;
+use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{Mutex, OnceCell};
@@ -101,8 +102,8 @@ impl VfsState {
     /// predicted files warm in roughly one round-trip's wall time instead of N.
     /// Best-effort: a path that fails to warm is simply hydrated for real later.
     async fn prefetch_warm(self: &Arc<Self>, paths: &[String]) {
-        let mut tasks = Vec::with_capacity(paths.len());
-        for p in paths {
+        let mut tasks = Vec::with_capacity(paths.len().min(MAX_PREDICTED_PATHS));
+        for p in bounded_prefetch_paths(paths) {
             let state = Arc::clone(self);
             let p = p.clone();
             tasks.push(tokio::spawn(async move {
@@ -113,6 +114,10 @@ impl VfsState {
             let _ = t.await;
         }
     }
+}
+
+fn bounded_prefetch_paths(paths: &[String]) -> impl Iterator<Item = &String> {
+    paths.iter().take(MAX_PREDICTED_PATHS)
 }
 
 /// Maps an agent-side logical path to its location in the scratch tree by
@@ -484,6 +489,21 @@ mod tests {
             stats.content_bytes(),
             after_warm,
             "opens after prefetch transfer zero additional content"
+        );
+    }
+
+    #[test]
+    fn prefetch_warm_caps_predicted_path_tasks_to_quota() {
+        let paths = (0..(MAX_PREDICTED_PATHS + 1))
+            .map(|i| format!("c:\\src\\h{i}.h"))
+            .collect::<Vec<_>>();
+
+        let bounded = bounded_prefetch_paths(&paths).collect::<Vec<_>>();
+
+        assert_eq!(bounded.len(), MAX_PREDICTED_PATHS);
+        assert_eq!(
+            bounded[MAX_PREDICTED_PATHS - 1].as_str(),
+            format!("c:\\src\\h{}.h", MAX_PREDICTED_PATHS - 1)
         );
     }
 }
