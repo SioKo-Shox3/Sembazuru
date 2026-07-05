@@ -14,14 +14,14 @@
 //! local fallback completes the build (DESIGN §2, non-negotiable #2) — so the worker
 //! does NOT wait to drain in-flight actions on shutdown; a stop is always safe.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::config::WorkerConfig;
-use crate::coordination::{default_worker_id, register_and_heartbeat};
+use crate::coordination::{
+    GlobalShutdownStop, default_worker_id, register_and_heartbeat_reconnect_loop,
+};
 use crate::{WorkerService, serve_on_listener_with};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -74,11 +74,12 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
         None => service,
     };
 
-    // Heartbeat stop flag: cancelling `shutdown` sets it true so the heartbeat loop
-    // ends its stream and the worker stops reporting capacity. The agent then ages
-    // this worker out on the next dead-timeout (the protocol has no explicit
-    // Deregister). Shared with the heartbeat task below.
-    let stop = Arc::new(AtomicBool::new(false));
+    // Coordination shutdown flag: cancelling `shutdown` sets it true so the
+    // heartbeat stream ends and the worker stops reporting capacity. The agent then
+    // ages this worker out on the next dead-timeout (the protocol has no explicit
+    // Deregister). This is separate from each reconnect attempt's local stop.
+    let stop = GlobalShutdownStop::new();
+    let coordination_shutdown = shutdown.child_token();
 
     // If an agent is configured, register and heartbeat in the background. The
     // worker announces the endpoint the agent should dial for Execution. A worker
@@ -106,6 +107,7 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
         let capacity = service.capacity();
         let running = service.running_handle();
         let stop = stop.clone();
+        let coordination_shutdown = coordination_shutdown.clone();
         // Shared cluster token (ADR 0006), presented on Register. Empty when the
         // cluster runs without auth; the agent then accepts unconditionally. Read
         // verbatim from config (== cluster_token_from_env's bytes), never trimmed.
@@ -116,7 +118,7 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
         let participation = config.participation();
         eprintln!("sembazuru-worker: registering with agent {agent} as {worker_id}");
         tokio::spawn(async move {
-            if let Err(e) = register_and_heartbeat(
+            if let Err(e) = register_and_heartbeat_reconnect_loop(
                 agent,
                 worker_id,
                 execution_endpoint,
@@ -126,6 +128,7 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
                 stop,
                 auth_token,
                 participation,
+                coordination_shutdown,
             )
             .await
             {
@@ -137,11 +140,16 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
     // The Execution server is the blocking server; the worker runs until it exits OR
     // `shutdown` is cancelled (Ctrl-C in CLI mode, SCM Stop in service mode).
     tokio::select! {
-        r = serve_on_listener_with(listener, service) => r,
+        r = serve_on_listener_with(listener, service) => {
+            stop.stop();
+            coordination_shutdown.cancel();
+            r
+        },
         _ = shutdown.cancelled() => {
             eprintln!("sembazuru-worker: shutdown requested; deregistering and stopping");
             // Signal the heartbeat loop to end its stream (cooperative deregister).
-            stop.store(true, Ordering::SeqCst);
+            stop.stop();
+            coordination_shutdown.cancel();
             Ok(())
         }
     }
