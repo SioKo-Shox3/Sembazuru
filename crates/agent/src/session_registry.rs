@@ -44,11 +44,11 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-use crate::rootdir::RootDir;
+use crate::rootdir::{FileSnapshot, RootDir, file_snapshot};
 use cap_std::fs::OpenOptions;
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use tokio::sync::{Mutex, OnceCell};
@@ -78,6 +78,8 @@ pub struct StagingTemp {
     pub path: PathBuf,
     pub rel: String,
     pub parent_dir: RootDir,
+    pub file: cap_std::fs::File,
+    pub(crate) snapshot: FileSnapshot,
 }
 
 /// In-progress streamed WriteBack for one output id: the temp file being
@@ -88,6 +90,8 @@ pub struct WritebackState {
     pub tmp: PathBuf,
     pub tmp_rel: String,
     pub parent_dir: RootDir,
+    pub file: Arc<StdMutex<cap_std::fs::File>>,
+    pub(crate) snapshot: FileSnapshot,
     pub written: u64,
     pub hasher: DigestHasher,
 }
@@ -95,9 +99,11 @@ pub struct WritebackState {
 /// A worker-produced output that has been fully streamed and digest-verified,
 /// but is not yet published to its final path. Intake publishes these only after
 /// the remote action exits successfully.
-pub struct StagedOutput {
+struct StagedOutput {
     pub staging_path: PathBuf,
     pub final_path: PathBuf,
+    pub digest_hex: String,
+    snapshot: FileSnapshot,
     /// The directory handle opened once at staging time (`create_staging_temp`)
     /// for `final_path`'s immediate parent. Reused unchanged at commit time so a
     /// delete+recreate of that directory between staging and commit cannot
@@ -115,8 +121,9 @@ pub struct SessionCapability {
     /// the value the agent dispatched, NOT the worker-declared Hello root, so a
     /// worker cannot widen its own scope (SEC-004).
     root: Option<String>,
-    /// Handle-based containment for the authoritative scope root. `None` means
-    /// setup could not open the root, so callers fall back to lexical scoping.
+    /// Handle-based containment for the authoritative scope root. For an
+    /// enforcing session with `root.is_some()`, `None` means setup could not open
+    /// the root and file supply must fail closed rather than ambiently reading.
     root_dir: Option<RootDir>,
     /// Output id → agent-authoritative output spec. WriteBack names only the id;
     /// the path and size cap remain controlled by the agent — SEC-003.
@@ -178,6 +185,12 @@ impl SessionCapability {
     /// Handle-based containment for the authoritative root, if setup opened it.
     pub fn root_dir(&self) -> Option<&RootDir> {
         self.root_dir.as_ref()
+    }
+
+    /// Whether an enforcing scoped session lost its handle authority and must not
+    /// fall back to ambient filesystem access.
+    pub fn requires_contained_root(&self) -> bool {
+        self.enforce && self.root.is_some() && self.root_dir.is_none()
     }
 
     /// Whether this is a bound (enforcing) session vs a legacy/unscoped one.
@@ -271,11 +284,13 @@ impl SessionCapability {
     /// Returns false and deletes staging_path if the session is already closed.
     /// The closed check is performed under the same lock that discard_staged drains,
     /// so no temp can be inserted after discard has run.
-    pub async fn record_staged(
+    pub(crate) async fn record_staged(
         &self,
         output_id: u32,
         staging_path: PathBuf,
         final_path: PathBuf,
+        digest_hex: String,
+        snapshot: FileSnapshot,
         parent_dir: RootDir,
     ) -> bool {
         let old = {
@@ -292,6 +307,8 @@ impl SessionCapability {
                 StagedOutput {
                     staging_path,
                     final_path,
+                    digest_hex,
+                    snapshot,
                     parent_dir,
                 },
             )
@@ -350,7 +367,14 @@ impl SessionCapability {
             }
         }
         for state in writeback_entries {
-            let _ = remove_root_file(state.parent_dir, state.tmp_rel).await;
+            let WritebackState {
+                parent_dir,
+                tmp_rel,
+                file,
+                ..
+            } = state;
+            drop(file);
+            let _ = remove_root_file(parent_dir, tmp_rel).await;
         }
     }
 }
@@ -388,25 +412,109 @@ pub async fn create_staging_temp(final_path: &Path) -> io::Result<StagingTemp> {
     let parent = final_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output path has no parent"))?;
-    tokio::fs::create_dir_all(parent).await?;
-    // Residual: anchoring at the immediate parent contains the staging sibling
-    // and final leaf, but it does not protect a reparse point in an ancestor
-    // above this parent.
-    let parent_dir = open_immediate_parent_root(parent.to_path_buf()).await?;
+    let parent_dir = open_or_create_dir_all_contained(parent.to_path_buf()).await?;
     loop {
         let path = staging_temp(final_path);
         let rel = file_name_string(&path)?;
         match create_new_root_file(parent_dir.clone(), rel.clone()).await {
-            Ok(()) => {
+            Ok(file) => {
+                let snapshot = file_snapshot(&file)?;
+                if snapshot.link_count != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "new writeback staging temp has unexpected hardlink count",
+                    ));
+                }
                 return Ok(StagingTemp {
                     path,
                     rel,
                     parent_dir,
+                    file,
+                    snapshot,
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
+    }
+}
+
+async fn open_or_create_dir_all_contained(path: PathBuf) -> io::Result<RootDir> {
+    tokio::task::spawn_blocking(move || open_or_create_dir_all_contained_sync(&path))
+        .await
+        .map_err(join_error_to_io)?
+}
+
+#[cfg(windows)]
+fn open_or_create_dir_all_contained_sync(path: &Path) -> io::Result<RootDir> {
+    let path = path.to_string_lossy().replace('/', "\\");
+    let b = path.as_bytes();
+    if !(b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output parent must be drive-absolute",
+        ));
+    }
+    let mut dir = RootDir::open_root(Path::new(&path[..3]))?;
+    for component in path[3..].split('\\') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "output parent must not contain '..'",
+            ));
+        }
+        dir = open_or_create_child_dir(dir, component)?;
+    }
+    Ok(dir)
+}
+
+#[cfg(not(windows))]
+fn open_or_create_dir_all_contained_sync(path: &Path) -> io::Result<RootDir> {
+    let mut components = path.components();
+    let Some(std::path::Component::RootDir) = components.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output parent must be absolute",
+        ));
+    };
+    let mut dir = RootDir::open_root(Path::new("/"))?;
+    for component in components {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "output parent must not contain '..'",
+                ));
+            }
+            std::path::Component::Normal(name) => {
+                let name = name.to_str().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "output parent is not UTF-8")
+                })?;
+                dir = open_or_create_child_dir(dir, name)?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unexpected output parent component",
+                ));
+            }
+        }
+    }
+    Ok(dir)
+}
+
+fn open_or_create_child_dir(parent: RootDir, child: &str) -> io::Result<RootDir> {
+    match parent.open_dir(child) {
+        Ok(dir) => Ok(dir),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            parent.create_dir(child)?;
+            parent.open_dir(child)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -424,13 +532,82 @@ async fn publish_staged_output(staged: StagedOutput) -> io::Result<()> {
     let tmp_rel = file_name_string(&staged.staging_path)?;
     let final_rel = file_name_string(&staged.final_path)?;
     let parent_dir = staged.parent_dir;
+    if let Err(e) = verify_root_file_snapshot_and_digest(
+        parent_dir.clone(),
+        tmp_rel.clone(),
+        staged.snapshot,
+        staged.digest_hex.clone(),
+    )
+    .await
+    {
+        let _ = remove_root_file(parent_dir, tmp_rel).await;
+        return Err(e);
+    }
     match rename_root_file(parent_dir.clone(), tmp_rel.clone(), final_rel).await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Err(e) = verify_root_file_snapshot_and_digest(
+                parent_dir.clone(),
+                file_name_string(&staged.final_path)?,
+                staged.snapshot,
+                staged.digest_hex,
+            )
+            .await
+            {
+                let _ = remove_root_file(parent_dir, file_name_string(&staged.final_path)?).await;
+                return Err(e);
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = remove_root_file(parent_dir, tmp_rel).await;
             Err(e)
         }
     }
+}
+
+async fn verify_root_file_snapshot_and_digest(
+    root_dir: RootDir,
+    rel: String,
+    expected_snapshot: FileSnapshot,
+    expected: String,
+) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut file = root_dir.open_read(&rel)?;
+        let actual_snapshot = file_snapshot(&file)?;
+        if actual_snapshot.identity != expected_snapshot.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staging temp file identity changed before publish",
+            ));
+        }
+        if actual_snapshot.link_count != expected_snapshot.link_count {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staging temp hardlink count changed before publish",
+            ));
+        }
+        let mut hasher = DigestHasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        use std::io::Read as _;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual = hasher.finalize().canonical();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staging temp path no longer contains the verified bytes",
+            ))
+        }
+    })
+    .await
+    .map_err(join_error_to_io)?
 }
 
 fn file_name_string(path: &Path) -> io::Result<String> {
@@ -440,26 +617,11 @@ fn file_name_string(path: &Path) -> io::Result<String> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no UTF-8 file name"))
 }
 
-async fn open_immediate_parent_root(path: PathBuf) -> io::Result<RootDir> {
-    let grandparent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output parent has no parent"))?
-        .to_path_buf();
-    let leaf = file_name_string(&path)?;
-    tokio::task::spawn_blocking(move || {
-        let grandparent_dir = RootDir::open_root(&grandparent)?;
-        grandparent_dir.open_dir(&leaf)
-    })
-    .await
-    .map_err(join_error_to_io)?
-}
-
-async fn create_new_root_file(root_dir: RootDir, rel: String) -> io::Result<()> {
+async fn create_new_root_file(root_dir: RootDir, rel: String) -> io::Result<cap_std::fs::File> {
     tokio::task::spawn_blocking(move || {
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
-        drop(root_dir.open_with(&rel, &opts)?);
-        Ok(())
+        root_dir.open_with(&rel, &opts)
     })
     .await
     .map_err(join_error_to_io)?
@@ -663,6 +825,55 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn create_directory_symlink(link: &Path, target: &Path) -> Result<(), String> {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/D"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map_err(|e| format!("failed to spawn mklink /D: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink /D failed with status {:?}; stdout: {}; stderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    fn create_relative_directory_symlink(
+        parent: &Path,
+        link_name: &str,
+        target: &Path,
+    ) -> Result<(), String> {
+        let target_name = target
+            .file_name()
+            .ok_or_else(|| format!("relative symlink target has no file name: {target:?}"))?;
+        let relative_target = Path::new("..").join(target_name);
+        let output = std::process::Command::new("cmd")
+            .current_dir(parent)
+            .args(["/C", "mklink", "/D"])
+            .arg(link_name)
+            .arg(&relative_target)
+            .output()
+            .map_err(|e| format!("failed to spawn mklink /D: {e}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mklink /D failed with status {:?}; stdout: {}; stderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
     #[tokio::test]
     async fn create_get_finish_lifecycle() {
         let reg = SessionRegistry::new().unwrap();
@@ -739,10 +950,20 @@ mod tests {
         let final_path = dir.join("out.bin");
         std::fs::write(&staging_path, b"verified bytes").unwrap();
         let parent_dir = RootDir::open_root(&dir).unwrap();
+        let file = parent_dir.open_read("staged.tmp").unwrap();
+        let snapshot = file_snapshot(&file).unwrap();
+        drop(file);
 
         assert!(reg.finish("sess-closed").await);
         let staged = cap
-            .record_staged(0, staging_path.clone(), final_path.clone(), parent_dir)
+            .record_staged(
+                0,
+                staging_path.clone(),
+                final_path.clone(),
+                Digest::of(b"verified bytes").canonical(),
+                snapshot,
+                parent_dir,
+            )
             .await;
 
         assert!(!staged);
@@ -768,9 +989,19 @@ mod tests {
         let final_path = parent.join("final.obj");
         std::fs::write(&staging_path, b"verified bytes").unwrap();
         let parent_dir = RootDir::open_root(&parent).unwrap();
+        let file = parent_dir.open_read(".sbz-staging-fixed").unwrap();
+        let snapshot = file_snapshot(&file).unwrap();
+        drop(file);
         assert!(
-            cap.record_staged(0, staging_path.clone(), final_path, parent_dir)
-                .await
+            cap.record_staged(
+                0,
+                staging_path.clone(),
+                final_path,
+                Digest::of(b"verified bytes").canonical(),
+                snapshot,
+                parent_dir
+            )
+            .await
         );
 
         std::fs::remove_file(&staging_path).unwrap();
@@ -816,11 +1047,20 @@ mod tests {
             path: staging_path,
             rel: _,
             parent_dir,
+            file: _,
+            snapshot,
         } = create_staging_temp(&final_path).await.unwrap();
         std::fs::write(&staging_path, b"verified bytes").unwrap();
         assert!(
-            cap.record_staged(0, staging_path.clone(), final_path.clone(), parent_dir)
-                .await
+            cap.record_staged(
+                0,
+                staging_path.clone(),
+                final_path.clone(),
+                Digest::of(b"verified bytes").canonical(),
+                snapshot,
+                parent_dir
+            )
+            .await
         );
 
         std::fs::remove_file(&staging_path).unwrap();
@@ -846,6 +1086,280 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_create_staging_temp_rejects_ancestor_junction_escape() {
+        let root = tmp("path-corpus-stage-junction-root");
+        let outside = tmp("path-corpus-stage-junction-outside");
+        let link = root.join("escape");
+        create_junction(&link, &outside)
+            .expect("mklink /J should create an unprivileged junction on Windows");
+
+        let final_path = link.join("deep").join("final.obj");
+        let result = create_staging_temp(&final_path).await;
+
+        assert!(
+            result.is_err(),
+            "staging must reject an output parent whose ancestor is an out-of-root junction"
+        );
+        assert!(
+            !outside.join("deep").exists(),
+            "staging must not create parent directories through the junction target"
+        );
+
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_create_staging_temp_rejects_ancestor_directory_symlink_escape() {
+        let root = tmp("path-corpus-stage-symlink-root");
+        let outside = tmp("path-corpus-stage-symlink-outside");
+        let link = root.join("escape");
+        create_directory_symlink(&link, &outside)
+            .expect("mklink /D failed; Windows Developer Mode or admin rights may be required for directory symlink path-corpus evidence");
+
+        let final_path = link.join("deep").join("final.obj");
+        let result = create_staging_temp(&final_path).await;
+
+        assert!(
+            result.is_err(),
+            "staging must reject an output parent whose ancestor is an out-of-root symlink"
+        );
+        assert!(
+            !outside.join("deep").exists(),
+            "staging must not create parent directories through the symlink target"
+        );
+
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_create_staging_temp_rejects_relative_ancestor_directory_symlink_escape() {
+        let root = tmp("path-corpus-stage-relative-symlink-root");
+        let outside = tmp("path-corpus-stage-relative-symlink-outside");
+        create_relative_directory_symlink(&root, "escape", &outside)
+            .expect("mklink /D failed; Windows Developer Mode or admin rights may be required for relative directory symlink path-corpus evidence");
+
+        let final_path = root.join("escape").join("deep").join("final.obj");
+        let result = create_staging_temp(&final_path).await;
+
+        assert!(
+            result.is_err(),
+            "staging must reject an output parent whose ancestor is a relative out-of-root symlink"
+        );
+        assert!(
+            !outside.join("deep").exists(),
+            "staging must not create parent directories through the relative symlink target"
+        );
+
+        let _ = std::fs::remove_dir(root.join("escape"));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_publish_staged_preserves_external_hardlink_peer_or_fails_closed() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("sess-final-hardlink".into(), None, Vec::new())
+            .await;
+        let root = tmp("path-corpus-final-hardlink-root");
+        let outside = tmp("path-corpus-final-hardlink-outside");
+        let parent = root.join("out");
+        std::fs::create_dir_all(&parent).unwrap();
+        let final_path = parent.join("final.obj");
+        let external_peer = outside.join("peer.obj");
+        std::fs::write(&external_peer, b"external-old").unwrap();
+        std::fs::hard_link(&external_peer, &final_path).unwrap();
+
+        let StagingTemp {
+            path: staging_path,
+            rel: _,
+            parent_dir,
+            file: _,
+            snapshot,
+        } = create_staging_temp(&final_path).await.unwrap();
+        std::fs::write(&staging_path, b"verified-new").unwrap();
+        assert!(
+            cap.record_staged(
+                0,
+                staging_path.clone(),
+                final_path.clone(),
+                Digest::of(b"verified-new").canonical(),
+                snapshot,
+                parent_dir
+            )
+            .await
+        );
+
+        match cap.publish_staged().await {
+            Ok(()) => {
+                assert_eq!(
+                    std::fs::read(&final_path).unwrap(),
+                    b"verified-new",
+                    "successful publish must replace the final path with staged bytes"
+                );
+                assert_eq!(
+                    std::fs::read(&external_peer).unwrap(),
+                    b"external-old",
+                    "publishing over an existing hardlink must not rewrite the external peer"
+                );
+            }
+            Err(_) => {
+                // Fail-closed satisfies the Phase 7.3 invariant here: the
+                // publish is abandoned instead of writing through an ambiguous
+                // existing hardlink, so both peers keep their old bytes.
+                assert_eq!(std::fs::read(&final_path).unwrap(), b"external-old");
+                assert_eq!(std::fs::read(&external_peer).unwrap(), b"external-old");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn path_corpus_publish_staged_rejects_replaced_staging_temp() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("sess-replaced-staging".into(), None, Vec::new())
+            .await;
+        let root = tmp("path-corpus-replaced-staging-root");
+        let final_path = root.join("out").join("final.obj");
+        let StagingTemp {
+            path: staging_path,
+            rel: _,
+            parent_dir,
+            file: _,
+            snapshot,
+        } = create_staging_temp(&final_path).await.unwrap();
+        std::fs::write(&staging_path, b"verified bytes").unwrap();
+        assert!(
+            cap.record_staged(
+                0,
+                staging_path.clone(),
+                final_path.clone(),
+                Digest::of(b"verified bytes").canonical(),
+                snapshot,
+                parent_dir
+            )
+            .await
+        );
+
+        std::fs::remove_file(&staging_path).unwrap();
+        std::fs::write(&staging_path, b"attacker bytes").unwrap();
+        let result = cap.publish_staged().await;
+
+        assert!(
+            result.is_err(),
+            "publish must fail closed when staging bytes change after record_staged"
+        );
+        assert_ne!(
+            std::fs::read(&final_path).ok().as_deref(),
+            Some(b"attacker bytes".as_slice()),
+            "publish must never expose attacker bytes swapped into the staging temp"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_publish_staged_rejects_same_content_hardlink_staging_swap() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("sess-hardlink-staging-swap".into(), None, Vec::new())
+            .await;
+        let root = tmp("path-corpus-hardlink-staging-swap-root");
+        let outside = tmp("path-corpus-hardlink-staging-swap-outside");
+        let final_path = root.join("out").join("final.obj");
+        let external_peer = outside.join("peer.obj");
+        let StagingTemp {
+            path: staging_path,
+            rel: _,
+            parent_dir,
+            file: _,
+            snapshot,
+        } = create_staging_temp(&final_path).await.unwrap();
+        std::fs::write(&staging_path, b"same verified bytes").unwrap();
+        assert!(
+            cap.record_staged(
+                0,
+                staging_path.clone(),
+                final_path.clone(),
+                Digest::of(b"same verified bytes").canonical(),
+                snapshot,
+                parent_dir
+            )
+            .await
+        );
+
+        std::fs::write(&external_peer, b"same verified bytes").unwrap();
+        std::fs::remove_file(&staging_path).unwrap();
+        std::fs::hard_link(&external_peer, &staging_path).expect(
+            "failed to create hardlink required for writeback staging identity path-corpus evidence",
+        );
+        let result = cap.publish_staged().await;
+
+        assert!(
+            result.is_err(),
+            "publish must fail closed when the verified staging temp is replaced by a same-content external hardlink"
+        );
+        assert!(
+            !final_path.exists(),
+            "publish must not rename an external hardlink into the final output"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[tokio::test]
+    async fn path_corpus_discard_staged_removes_in_progress_writeback_temp() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("sess-discard-writeback".into(), None, Vec::new())
+            .await;
+        let root = tmp("discard-writeback-temp");
+        let final_path = root.join("out.bin");
+        let StagingTemp {
+            path: staging_path,
+            rel,
+            parent_dir,
+            file,
+            snapshot,
+        } = create_staging_temp(&final_path).await.unwrap();
+        assert!(staging_path.exists());
+        cap.writebacks().lock().await.insert(
+            1,
+            WritebackState {
+                tmp: staging_path.clone(),
+                tmp_rel: rel,
+                parent_dir,
+                file: Arc::new(StdMutex::new(file)),
+                snapshot,
+                written: 0,
+                hasher: DigestHasher::new(),
+            },
+        );
+
+        cap.discard_staged().await;
+
+        assert!(
+            !staging_path.exists(),
+            "discard_staged must drop the open writeback handle before removing the temp"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn sweep_idle_discards_staging_of_reaped_sessions() {
         let reg = SessionRegistry::new().unwrap();
@@ -855,9 +1369,19 @@ mod tests {
         let final_path = dir.join("out.bin");
         std::fs::write(&staging_path, b"verified bytes").unwrap();
         let parent_dir = RootDir::open_root(&dir).unwrap();
+        let file = parent_dir.open_read("staged.tmp").unwrap();
+        let snapshot = file_snapshot(&file).unwrap();
+        drop(file);
         assert!(
-            cap.record_staged(0, staging_path.clone(), final_path, parent_dir)
-                .await
+            cap.record_staged(
+                0,
+                staging_path.clone(),
+                final_path,
+                Digest::of(b"verified bytes").canonical(),
+                snapshot,
+                parent_dir
+            )
+            .await
         );
 
         let reaped = reg.sweep_idle(Duration::ZERO).await;

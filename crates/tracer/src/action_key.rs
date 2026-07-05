@@ -130,7 +130,49 @@ pub fn is_under_build_root(logical: &str) -> bool {
     if u.split('\\').any(|c| c == "..") {
         return false;
     }
+    if u.split('\\').any(is_ambiguous_windows_component) {
+        return false;
+    }
     true
+}
+
+fn is_ambiguous_windows_component(component: &str) -> bool {
+    if component.is_empty() || component == "." {
+        return false;
+    }
+    if component.contains(':') || component.ends_with('.') || component.ends_with(' ') {
+        return true;
+    }
+
+    let stem = component.split('.').next().unwrap_or(component);
+    let stem_upper = stem.to_ascii_uppercase();
+    let reserved = matches!(
+        stem_upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || {
+        let bytes = stem_upper.as_bytes();
+        bytes.len() == 4
+            && matches!(&bytes[..3], b"COM" | b"LPT")
+            && (b'1'..=b'9').contains(&bytes[3])
+    };
+    if reserved {
+        return true;
+    }
+
+    let (name, ext) = component
+        .split_once('.')
+        .map_or((component, None), |(name, ext)| (name, Some(ext)));
+    let Some((prefix, generation)) = name.split_once('~') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix.len() <= 6
+        && !generation.is_empty()
+        && generation
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+        && ext.is_none_or(|ext| !ext.is_empty() && ext.len() <= 3 && !ext.contains('.'))
 }
 
 /// Anchors a traced input path to a re-readable, drive-absolute form under
@@ -738,6 +780,29 @@ mod action_cache_tests {
         assert!(!is_under_build_root("..\\secret"));
         assert!(!is_under_build_root("obj\\..\\..\\secret"));
         assert!(!is_under_build_root("a/../../b"));
+    }
+
+    #[test]
+    fn path_corpus_is_under_build_root_rejects_ambiguous_relative_components() {
+        for logical in [
+            "obj\\out.obj:ads",
+            "out.",
+            "out ",
+            "obj\\con",
+            "obj\\nul.txt",
+            "obj\\com1.obj",
+            "obj\\lpt9.log",
+            "PROGRA~1\\tool.exe",
+            "obj\\LONGFI~12.TXT",
+        ] {
+            assert!(
+                !is_under_build_root(logical),
+                "{logical:?} must fail closed"
+            );
+        }
+
+        assert!(is_under_build_root("obj\\file~backup.obj"));
+        assert!(is_under_build_root("temp\\probe.obj"));
     }
 
     #[test]

@@ -25,6 +25,20 @@ use std::sync::Arc;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, Metadata, OpenOptions, ReadDir};
 
+/// Stable file-object identity plus its observed hardlink count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileSnapshot {
+    pub identity: FileIdentity,
+    pub link_count: u64,
+}
+
+/// Platform file-object identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileIdentity {
+    volume: u64,
+    index: u128,
+}
+
 /// A handle to a trusted root directory for contained filesystem operations.
 #[derive(Clone)]
 pub struct RootDir {
@@ -97,6 +111,84 @@ impl RootDir {
 /// Opens a trusted root directory using ambient filesystem authority.
 pub fn open_root(path: &Path) -> io::Result<RootDir> {
     RootDir::open_root(path)
+}
+
+pub(crate) fn file_snapshot(file: &File) -> io::Result<FileSnapshot> {
+    platform_file_snapshot(file)
+}
+
+#[cfg(windows)]
+fn platform_file_snapshot(file: &File) -> io::Result<FileSnapshot> {
+    use std::ffi::c_void;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
+    let ok = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    let index =
+        (u128::from(information.file_index_high) << 32) | u128::from(information.file_index_low);
+    Ok(FileSnapshot {
+        identity: FileIdentity {
+            volume: u64::from(information.volume_serial_number),
+            index,
+        },
+        link_count: u64::from(information.number_of_links),
+    })
+}
+
+#[cfg(unix)]
+fn platform_file_snapshot(file: &File) -> io::Result<FileSnapshot> {
+    use cap_std::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(FileSnapshot {
+        identity: FileIdentity {
+            volume: metadata.dev(),
+            index: u128::from(metadata.ino()),
+        },
+        link_count: metadata.nlink(),
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn platform_file_snapshot(_file: &File) -> io::Result<FileSnapshot> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable file identity is not implemented on this platform",
+    ))
 }
 
 #[cfg(test)]

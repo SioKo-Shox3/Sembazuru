@@ -26,10 +26,11 @@ use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::rootdir::RootDir;
+use crate::rootdir::{FileSnapshot, RootDir, file_snapshot};
 use cap_std::fs::OpenOptions;
 use sembazuru_cas::{
-    ActionCache, ActionResult, BlobStore, CasError, Digest, OutputFile, codec_checksum,
+    ActionCache, ActionResult, BlobStore, CasError, Digest, DigestHasher, OutputFile,
+    codec_checksum,
 };
 use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest};
 use sembazuru_tracer::normalize_for_compare;
@@ -64,6 +65,8 @@ struct StagedCacheOutput {
     output_dir: RootDir,
     tmp_name: String,
     final_name: String,
+    digest_hex: String,
+    snapshot: FileSnapshot,
 }
 
 impl AgentCache {
@@ -366,11 +369,16 @@ impl AgentCache {
             }
         }
 
+        let build_root_dir = RootDir::open_root(build_root)?;
         self.cache.put_manifest(weak, &encode_manifest(manifest))?;
 
         let mut outputs = Vec::with_capacity(output_logical_paths.len());
         for logical in output_logical_paths {
-            let bytes = std::fs::read(build_root.join(logical))?;
+            let rel = logical.replace('/', "\\");
+            let mut file = build_root_dir.open_read(&rel)?;
+            let mut bytes = Vec::new();
+            use std::io::Read as _;
+            file.read_to_end(&mut bytes)?;
             let digest = self.store.put(&bytes)?;
             outputs.push(OutputFile {
                 logical_path: logical.clone(),
@@ -540,10 +548,20 @@ fn stage_sibling(
             Ok(mut f) => {
                 use std::io::Write;
                 f.write_all(bytes)?;
+                f.flush()?;
+                let snapshot = file_snapshot(&f)?;
+                if snapshot.link_count != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "new cache staging temp has unexpected hardlink count",
+                    ));
+                }
                 return Ok(StagedCacheOutput {
                     output_dir,
                     tmp_name,
                     final_name: final_name.clone(),
+                    digest_hex: Digest::of(bytes).canonical(),
+                    snapshot,
                 });
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -555,11 +573,31 @@ fn stage_sibling(
 /// Renames a staged temp onto its final path (atomic within a volume), removing
 /// the temp on failure so a failed commit leaves no `.sbz-cache.*.tmp` residue.
 fn commit_staged(staged: &StagedCacheOutput) -> io::Result<()> {
+    if let Err(e) = verify_cache_staging_file(
+        &staged.output_dir,
+        &staged.tmp_name,
+        staged.snapshot,
+        &staged.digest_hex,
+    ) {
+        let _ = staged.output_dir.remove_file(&staged.tmp_name);
+        return Err(e);
+    }
     match staged
         .output_dir
         .rename(&staged.tmp_name, &staged.final_name)
     {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if let Err(e) = verify_cache_staging_file(
+                &staged.output_dir,
+                &staged.final_name,
+                staged.snapshot,
+                &staged.digest_hex,
+            ) {
+                let _ = staged.output_dir.remove_file(&staged.final_name);
+                return Err(e);
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = staged.output_dir.remove_file(&staged.tmp_name);
             Err(e)
@@ -567,9 +605,49 @@ fn commit_staged(staged: &StagedCacheOutput) -> io::Result<()> {
     }
 }
 
+fn verify_cache_staging_file(
+    output_dir: &RootDir,
+    rel: &str,
+    expected_snapshot: FileSnapshot,
+    expected_digest: &str,
+) -> io::Result<()> {
+    let mut file = output_dir.open_read(rel)?;
+    let actual_snapshot = file_snapshot(&file)?;
+    if actual_snapshot.identity != expected_snapshot.identity {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache staging file identity changed before publish",
+        ));
+    }
+    if actual_snapshot.link_count != expected_snapshot.link_count {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache staging file hardlink count changed before publish",
+        ));
+    }
+    let mut hasher = DigestHasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    use std::io::Read as _;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    if hasher.finalize().canonical() == expected_digest {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache staging file digest changed before publish",
+        ))
+    }
+}
+
 fn normalize_relative_for_root(path: &str) -> io::Result<String> {
     let path = path.replace('/', "\\");
-    if Path::new(&path).is_absolute() || path.split('\\').any(|comp| comp == "..") {
+    if Path::new(&path).is_absolute() || !action_key::is_under_build_root(&path) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("refusing to publish cached output outside the build root: {path:?}"),
@@ -798,6 +876,245 @@ mod tests {
         );
         // No outputs at all → nothing to cache (also empty).
         assert!(cacheable_outputs(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn path_corpus_cacheable_outputs_rejects_ambiguous_relative_components() {
+        for logical in [
+            "obj\\out.obj:ads",
+            "obj\\out.",
+            "obj\\out ",
+            "obj\\con",
+            "obj\\nul.txt",
+            "obj\\com1.obj",
+            "obj\\lpt9.log",
+            "PROGRA~1\\tool.exe",
+            "obj\\LONGFI~12.TXT",
+        ] {
+            assert!(
+                cacheable_outputs(["ok.obj".to_string(), logical.to_string()]).is_empty(),
+                "{logical:?} must make the whole action uncacheable"
+            );
+            assert!(
+                normalize_relative_for_root(logical).is_err(),
+                "{logical:?} must not be publishable"
+            );
+        }
+
+        assert_eq!(
+            cacheable_outputs(["obj\\file~backup.obj".to_string()]),
+            vec!["obj\\file~backup.obj".to_string()]
+        );
+        assert_eq!(
+            normalize_relative_for_root("obj\\file~backup.obj").unwrap(),
+            "obj\\file~backup.obj"
+        );
+    }
+
+    #[test]
+    fn path_corpus_record_rejects_ambiguous_logical_output() {
+        let cache_root = tmp("path-corpus-record-cache");
+        let build = tmp("path-corpus-record-build");
+        let cache = AgentCache::open(&cache_root).unwrap();
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"int main(){return 0;}").unwrap();
+
+        let weak = cache.weak_key(&["clang-cl".into()], &[], "");
+        let manifest = manifest_for(&[("a.cpp", &input)]);
+        let err = cache
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["PROGRA~1\\a.obj".to_string()],
+                0,
+                &[],
+                &[],
+            )
+            .expect_err("ambiguous output must be rejected before any filesystem read");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&build);
+    }
+
+    #[test]
+    fn path_corpus_resolve_rejects_stored_ambiguous_logical_output() {
+        let cache_root = tmp("path-corpus-resolve-cache");
+        let build = tmp("path-corpus-resolve-build");
+        let cache = AgentCache::open(&cache_root).unwrap();
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"int main(){return 0;}").unwrap();
+
+        let weak = cache.weak_key(&["clang-cl".into()], &[], "");
+        let manifest = manifest_for(&[("a.cpp", &input)]);
+        cache
+            .cache
+            .put_manifest(&weak, &encode_manifest(&manifest))
+            .unwrap();
+        let input_hash = action_key::manifest_hash(&manifest).unwrap();
+        let strong = sembazuru_cas::strong_fingerprint(&weak, &input_hash);
+        let digest = cache.store.put(b"OBJECT").unwrap();
+        cache
+            .cache
+            .put_result(
+                &strong,
+                &ActionResult {
+                    exit_code: 0,
+                    outputs: vec![OutputFile {
+                        logical_path: "PROGRA~1\\a.obj".to_string(),
+                        digest,
+                    }],
+                    stdout: None,
+                    stderr: None,
+                },
+            )
+            .unwrap();
+
+        let err = cache
+            .resolve(&weak, &build)
+            .expect_err("stored ambiguous output must fail closed at publish time");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!build.join("PROGRA~1").join("a.obj").exists());
+
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&build);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_corpus_cache_publish_preserves_external_hardlink_peer() {
+        let cache_root = tmp("path-corpus-cache-hardlink-cache");
+        let build = tmp("path-corpus-cache-hardlink-record-build");
+        let cache = AgentCache::open(&cache_root).unwrap();
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"int main(){return 0;}").unwrap();
+        let out_logical = "out\\a.obj";
+        std::fs::create_dir_all(build.join("out")).unwrap();
+        std::fs::write(build.join(out_logical), b"CACHED-OBJECT").unwrap();
+
+        let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
+        let env: Vec<(String, String)> = vec![];
+        let weak = cache.weak_key(&argv, &env, "");
+        let manifest = manifest_for(&[("a.cpp", &input)]);
+        cache
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &[out_logical.to_string()],
+                0,
+                &[],
+                &[],
+            )
+            .unwrap();
+
+        let fresh = tmp("path-corpus-cache-hardlink-fresh-build");
+        let outside = tmp("path-corpus-cache-hardlink-outside");
+        let final_path = fresh.join(out_logical);
+        let external_peer = outside.join("peer.obj");
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        std::fs::write(&external_peer, b"EXTERNAL-OLD").unwrap();
+        std::fs::hard_link(&external_peer, &final_path)
+            .expect("failed to create hardlink required for action-cache hardlink path-corpus publish evidence");
+
+        match cache.resolve(&weak, &fresh) {
+            Ok(CacheLookup::Hit { .. }) => {
+                assert_eq!(
+                    std::fs::read(&final_path).unwrap(),
+                    b"CACHED-OBJECT",
+                    "a successful cache hit must publish the cached bytes"
+                );
+                assert_eq!(
+                    std::fs::read(&external_peer).unwrap(),
+                    b"EXTERNAL-OLD",
+                    "cache publish must not rewrite the external hardlink peer"
+                );
+            }
+            Err(_) => {
+                // Fail-closed is acceptable for Phase 7.3: the cache hit is
+                // abandoned rather than publishing through an ambiguous existing
+                // hardlink, and the external peer remains untouched.
+                assert_eq!(std::fs::read(&final_path).unwrap(), b"EXTERNAL-OLD");
+                assert_eq!(std::fs::read(&external_peer).unwrap(), b"EXTERNAL-OLD");
+            }
+            Ok(CacheLookup::Miss) => panic!("fresh strong-key setup should resolve to hit or err"),
+        }
+
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&build);
+        let _ = std::fs::remove_dir_all(&fresh);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_corpus_record_rejects_output_parent_junction_escape() {
+        let cache_root = tmp("path-corpus-record-junction-cache");
+        let build = tmp("path-corpus-record-junction-build");
+        let outside = tmp("path-corpus-record-junction-outside");
+        let cache = AgentCache::open(&cache_root).unwrap();
+        let input = build.join("a.cpp");
+        std::fs::write(&input, b"int main(){return 0;}").unwrap();
+        std::fs::write(outside.join("a.obj"), b"OUTSIDE-BYTES").unwrap();
+        create_junction(&build.join("escape"), &outside)
+            .expect("mklink /J should create an unprivileged junction on Windows");
+
+        let weak = cache.weak_key(&["clang-cl".into()], &[], "");
+        let manifest = manifest_for(&[("a.cpp", &input)]);
+        let err = cache
+            .record(
+                &weak,
+                &manifest,
+                &build,
+                &["escape\\a.obj".to_string()],
+                0,
+                &[],
+                &[],
+            )
+            .expect_err(
+                "record must fail closed instead of reading output bytes through a junction",
+            );
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            cache.resolve(&weak, &build).unwrap(),
+            CacheLookup::Miss,
+            "outside bytes reached through the junction must not be saved as a cache result"
+        );
+
+        let _ = std::fs::remove_dir(build.join("escape"));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        let _ = std::fs::remove_dir_all(&build);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_corpus_cache_publish_rejects_same_content_staging_hardlink_swap() {
+        let build = tmp("path-corpus-cache-staging-hardlink-build");
+        let outside = tmp("path-corpus-cache-staging-hardlink-outside");
+        let build_root_dir = RootDir::open_root(&build).unwrap();
+        let staged =
+            stage_sibling(&build_root_dir, "out\\a.obj", b"same-content").expect("stage output");
+        let tmp_path = build.join("out").join(&staged.tmp_name);
+        let final_path = build.join("out").join("a.obj");
+        let external_peer = outside.join("peer.obj");
+        std::fs::write(&external_peer, b"same-content").unwrap();
+        std::fs::remove_file(&tmp_path).unwrap();
+        std::fs::hard_link(&external_peer, &tmp_path).expect(
+            "failed to create hardlink required for action-cache staging identity path-corpus evidence",
+        );
+
+        let err = commit_staged(&staged)
+            .expect_err("commit must reject a same-content external hardlink staging swap");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            !final_path.exists(),
+            "cache publish must fail closed instead of renaming an external hardlink into the output"
+        );
+
+        let _ = std::fs::remove_dir_all(&build);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

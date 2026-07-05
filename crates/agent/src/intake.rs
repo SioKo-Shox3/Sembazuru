@@ -33,9 +33,11 @@ use tonic::{Request, Response, Status};
 
 use crate::action_cache::{AgentCache, CacheLookup};
 use crate::scheduler::Scheduler;
-use crate::session_registry::{DEFAULT_OUTPUT_MAX_BYTES, OutputSpec, SessionRegistry};
+use crate::session_registry::{
+    DEFAULT_OUTPUT_MAX_BYTES, OutputSpec, SessionCapability, SessionRegistry,
+};
 use crate::status::Metrics;
-use crate::{ExecOptions, ExecuteError, Execution};
+use crate::{ExecOptions, ExecuteError, Execution, LocalFallbackReason, run_local};
 
 /// Per-action options the launcher hands to the daemon alongside the command
 /// (the non-command fields of [`SubmitActionRequest`]). Bundled so adding a knob
@@ -266,6 +268,26 @@ fn should_record_cache(
         && worker_tool_matches(worker_reported_digest, agent_identity.digest())
 }
 
+async fn publish_remote_or_fallback(
+    outcome: Execution,
+    cap: &SessionCapability,
+    fallback_command: &Command,
+) -> Execution {
+    if let Execution::Remote(o) = &outcome
+        && o.exit_code == Some(0)
+        && let Err(e) = cap.publish_staged().await
+    {
+        eprintln!("sembazuru-agent: publishing staged outputs failed: {e}");
+        let detail = format!("remote writeback publish failed: {e}");
+        let exit_code = run_local(fallback_command).await.unwrap_or(-1);
+        return Execution::LocalFallback {
+            exit_code,
+            reason: LocalFallbackReason::RemoteExhausted(detail),
+        };
+    }
+    outcome
+}
+
 /// Drives one submission to completion and mirrors its terminal events. Without
 /// a VFS context this is a plain dispatch (M6.0). With one, the compile runs
 /// under the read-VFS; with a cache it is resolved first (a hit skips the worker)
@@ -460,6 +482,7 @@ async fn run_submission(
         )
         .await;
 
+    let fallback_command = command.clone();
     let outcome = scheduler
         .dispatch(command, action_id, session_id.clone(), opts)
         .await;
@@ -471,13 +494,7 @@ async fn run_submission(
     // WriteBack cannot race cache record/publish, the ADD-001 closed gate
     // rejects any late detached read, and the idle sweeper stays a crash backstop.
     ctx.registry.finish(&session_id).await;
-    if let Execution::Remote(o) = &outcome
-        && o.exit_code == Some(0)
-    {
-        if let Err(e) = cap.publish_staged().await {
-            eprintln!("sembazuru-agent: publishing staged outputs failed: {e}");
-        }
-    }
+    let outcome = publish_remote_or_fallback(outcome, &cap, &fallback_command).await;
     cap.discard_staged().await;
 
     // Record a successful remote run so the next identical build hits. Needs the
@@ -752,13 +769,17 @@ mod tests {
 
     use super::{
         IntakeService, LocalIntakeTransport, SubmitOptions, is_verified_tool, mint_session_id,
-        resolve_loopback_intake, should_record_cache, submit_to_daemon, worker_tool_matches,
+        publish_remote_or_fallback, resolve_loopback_intake, should_record_cache, submit_to_daemon,
+        worker_tool_matches,
     };
+    use crate::Execution;
     use crate::coordination::WorkerTable;
     use crate::scheduler::Scheduler;
+    use crate::session_registry::{SessionRegistry, StagingTemp, create_staging_temp};
     use crate::status::Metrics;
+    use sembazuru_cas::Digest;
     use sembazuru_cas::toolchain::ToolchainIdentity;
-    use sembazuru_proto::v0::Command;
+    use sembazuru_proto::v0::{ActionState, Command};
     use tokio::net::TcpListener;
 
     #[test]
@@ -976,5 +997,87 @@ mod tests {
             note.starts_with("local fallback:"),
             "empty worker table should dispatch via local fallback, got {note:?}"
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_publish_failure_runs_local_fallback() {
+        let reg = SessionRegistry::new().unwrap();
+        let cap = reg
+            .create("intake-publish-fallback".into(), None, Vec::new())
+            .await;
+        let root = std::env::temp_dir().join(format!(
+            "sbz-intake-publish-fallback-{}",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "sbz-intake-publish-fallback-outside-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let final_path = root.join("out.txt");
+        let external_peer = outside.join("peer.txt");
+        let StagingTemp {
+            path: staging_path,
+            rel: _,
+            parent_dir,
+            file: _,
+            snapshot,
+        } = create_staging_temp(&final_path).await.unwrap();
+        std::fs::write(&staging_path, b"same verified bytes").unwrap();
+        assert!(
+            cap.record_staged(
+                0,
+                staging_path.clone(),
+                final_path.clone(),
+                Digest::of(b"same verified bytes").canonical(),
+                snapshot,
+                parent_dir
+            )
+            .await
+        );
+        std::fs::write(&external_peer, b"same verified bytes").unwrap();
+        std::fs::remove_file(&staging_path).unwrap();
+        std::fs::hard_link(&external_peer, &staging_path)
+            .expect("hardlink path-corpus evidence is required for intake publish fallback");
+
+        let fallback_cmd = Command {
+            argv: vec![
+                "cmd".into(),
+                "/C".into(),
+                format!("echo fallback>{}", final_path.display()),
+            ],
+            env: Default::default(),
+            cwd: String::new(),
+        };
+        let outcome = publish_remote_or_fallback(
+            Execution::Remote(crate::ActionOutcome {
+                states: vec![ActionState::Completed as i32],
+                exit_code: Some(0),
+                ..Default::default()
+            }),
+            &cap,
+            &fallback_cmd,
+        )
+        .await;
+
+        match outcome {
+            Execution::LocalFallback { reason, .. } => assert!(
+                reason
+                    .to_string()
+                    .contains("remote writeback publish failed"),
+                "publish failure must become a remote-exhausted local fallback, got {reason}"
+            ),
+            other => panic!("publish failure must replace remote success with fallback: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&final_path).unwrap().trim(),
+            "fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

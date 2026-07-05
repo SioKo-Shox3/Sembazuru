@@ -29,8 +29,8 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 /// Counters for content bytes the agent actually pushed over the data plane —
 /// the quantity the M4 "Done when" (transfer ≈ 0 on a rebuild) is measured by.
@@ -53,7 +53,7 @@ impl ServerStats {
     }
 }
 
-use crate::rootdir::RootDir;
+use crate::rootdir::{FileSnapshot, RootDir, file_snapshot};
 use crate::session_registry::{
     SessionCapability, SessionRegistry, WritebackState, create_staging_temp, remove_root_file,
 };
@@ -330,9 +330,18 @@ pub fn normalize_root(root: &str) -> Option<String> {
 /// without it a request like `c:\root\..\..\users\dev\.ssh\id_rsa` string-prefix-
 /// matches the root yet the OS resolves it OUTSIDE the root. This mirrors the
 /// C++ hook's `GetFullPathName`-then-prefix discipline (`interceptor.cpp`). UNC,
-/// `\\?\`, drive-relative `x:foo`, and 8.3 forms are rejected (fail closed),
-/// matching the known residuals in `docs/deferred.md`.
+/// `\\?\`, drive-relative `x:foo`, and 8.3 forms are rejected (fail closed).
 pub fn normalize_requested(path: &str) -> Option<String> {
+    normalize_requested_inner(path, ShortAliasPolicy::Reject)
+}
+
+#[derive(Copy, Clone)]
+enum ShortAliasPolicy {
+    Reject,
+    Allow,
+}
+
+fn normalize_requested_inner(path: &str, short_alias_policy: ShortAliasPolicy) -> Option<String> {
     let p = path.replace('/', "\\").to_lowercase();
     let b = p.as_bytes();
     // Require a drive-absolute path: "x:\...". Drive-relative "x:foo", UNC
@@ -350,37 +359,97 @@ pub fn normalize_requested(path: &str) -> Option<String> {
             ".." => {
                 stack.pop()?; // `..` above the drive root: escape → fail closed
             }
+            other if is_ambiguous_windows_component(other) => return None,
+            other
+                if matches!(short_alias_policy, ShortAliasPolicy::Reject)
+                    && is_short_name_alias_component(other) =>
+            {
+                return None;
+            }
             other => stack.push(other),
         }
     }
     Some(format!("{drive}\\{}", stack.join("\\")))
 }
 
+fn is_ambiguous_windows_component(component: &str) -> bool {
+    if component.is_empty() || component == "." {
+        return false;
+    }
+    if component.contains(':') || component.ends_with('.') || component.ends_with(' ') {
+        return true;
+    }
+
+    let stem = component.split('.').next().unwrap_or(component);
+    let stem_upper = stem.to_ascii_uppercase();
+    matches!(
+        stem_upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || {
+        let bytes = stem_upper.as_bytes();
+        bytes.len() == 4
+            && matches!(&bytes[..3], b"COM" | b"LPT")
+            && (b'1'..=b'9').contains(&bytes[3])
+    }
+}
+
+fn is_short_name_alias_component(component: &str) -> bool {
+    let (name, ext) = component
+        .split_once('.')
+        .map_or((component, None), |(name, ext)| (name, Some(ext)));
+    let Some((prefix, generation)) = name.split_once('~') else {
+        return false;
+    };
+    !prefix.is_empty()
+        && prefix.len() <= 6
+        && !generation.is_empty()
+        && generation
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit())
+        && ext.is_none_or(|ext| !ext.is_empty() && ext.len() <= 3 && !ext.contains('.'))
+}
+
 /// Whether the requested (agent-side logical) path is within the session's
 /// declared root. `None` root = unscoped (always in). The requested path is
-/// lexically normalized first ([`normalize_requested`] collapses `.`/`..`), then
-/// matched against the root with a path-component boundary, so `…\proj` does not
-/// match a sibling `…\project` and `…\proj\..\secret` does not escape. A path
-/// that will not normalize (non-absolute, UNC, `\\?\`, drive-escaping) is OUT of
-/// scope (fail closed).
+/// lexically normalized first (collapsing `.`/`..`), then matched against the
+/// root with a path-component boundary, so `…\proj` does not match a sibling
+/// `…\project` and `…\proj\..\secret` does not escape. A path that will not
+/// normalize (non-absolute, UNC, `\\?\`, drive-escaping) is OUT of scope (fail
+/// closed). 8.3-like components are allowed only in the already-declared root
+/// prefix; the root-relative suffix still rejects them fail-closed.
 fn path_in_scope(requested: &str, root: Option<&str>) -> bool {
     let Some(root) = root else {
         return true;
     };
-    let Some(norm) = normalize_requested(requested) else {
+    let Some(norm) = normalize_requested_inner(requested, ShortAliasPolicy::Allow) else {
         return false;
     };
-    norm == root || norm.starts_with(&format!("{root}\\"))
+    if norm == root {
+        return true;
+    }
+    let Some(rel) = norm
+        .strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('\\'))
+    else {
+        return false;
+    };
+    !rel.split('\\').any(is_short_name_alias_component)
 }
 
 fn root_relative_path(requested: &str, root: &str) -> Option<String> {
-    let norm = normalize_requested(requested)?;
+    let norm = normalize_requested_inner(requested, ShortAliasPolicy::Allow)?;
     if norm == root {
         Some(".".to_string())
     } else {
-        norm.strip_prefix(root)
-            .and_then(|rest| rest.strip_prefix('\\'))
-            .map(ToOwned::to_owned)
+        let rel = norm
+            .strip_prefix(root)
+            .and_then(|rest| rest.strip_prefix('\\'))?;
+        if rel.split('\\').any(is_short_name_alias_component) {
+            None
+        } else {
+            Some(rel.to_owned())
+        }
     }
 }
 
@@ -633,11 +702,14 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
                 tmp: temp.path,
                 tmp_rel: temp.rel,
                 parent_dir: temp.parent_dir,
+                file: Arc::new(StdMutex::new(temp.file)),
+                snapshot: temp.snapshot,
                 written: 0,
                 hasher: DigestHasher::new(),
             },
         );
         if let Some(old) = old {
+            drop(old.file);
             let _ = remove_root_file(old.parent_dir, old.tmp_rel).await;
         }
     }
@@ -654,13 +726,18 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         }
         match state.written.checked_add(req.bytes.len() as u64) {
             Some(new_written) if new_written <= spec.max_size => Ok(new_written),
-            _ => Err((state.parent_dir.clone(), state.tmp_rel.clone())),
+            _ => Err((
+                state.parent_dir.clone(),
+                state.tmp_rel.clone(),
+                state.file.clone(),
+            )),
         }
     };
     let new_written = match new_written {
         Ok(new_written) => new_written,
-        Err((parent_dir, tmp_rel)) => {
+        Err((parent_dir, tmp_rel, file)) => {
             wbs.remove(&req.output_id);
+            drop(file);
             let _ = remove_root_file(parent_dir, tmp_rel).await;
             return wb_err("output exceeds max size".into());
         }
@@ -671,13 +748,8 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         let state = wbs
             .get_mut(&req.output_id)
             .expect("state present after size check");
-        if let Err(e) = write_root_file_at(
-            state.parent_dir.clone(),
-            state.tmp_rel.clone(),
-            req.offset,
-            req.bytes.clone(),
-        )
-        .await
+        if let Err(e) =
+            write_staging_file_at(state.file.clone(), req.offset, req.bytes.clone()).await
         {
             return wb_io_err("write temp failed", e);
         }
@@ -697,16 +769,35 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
         .remove(&req.output_id)
         .expect("state present (just appended)");
     drop(wbs);
-    let actual = state.hasher.finalize().canonical();
+    let WritebackState {
+        tmp,
+        tmp_rel,
+        parent_dir,
+        file,
+        snapshot,
+        written: _,
+        hasher,
+    } = state;
+    let actual = hasher.finalize().canonical();
     if actual != req.digest_hex {
-        let _ = remove_root_file(state.parent_dir, state.tmp_rel).await;
+        drop(file);
+        let _ = remove_root_file(parent_dir, tmp_rel).await;
         return wb_err(format!(
             "digest mismatch: declared {}, got {actual}",
             req.digest_hex
         ));
     }
+    if let Err(e) =
+        verify_root_file_snapshot_and_digest(parent_dir.clone(), tmp_rel.clone(), snapshot, &actual)
+            .await
+    {
+        drop(file);
+        let _ = remove_root_file(parent_dir, tmp_rel).await;
+        return wb_io_err("verify temp failed", e);
+    }
+    drop(file);
     if cap
-        .record_staged(req.output_id, state.tmp, final_path, state.parent_dir)
+        .record_staged(req.output_id, tmp, final_path, actual, snapshot, parent_dir)
         .await
     {
         WriteBackResponse {
@@ -718,19 +809,64 @@ async fn write_back(req: WriteBackRequest, cap: &SessionCapability) -> WriteBack
     }
 }
 
-async fn write_root_file_at(
-    root_dir: RootDir,
-    rel: String,
+async fn write_staging_file_at(
+    file: Arc<StdMutex<cap_std::fs::File>>,
     offset: u64,
     bytes: Vec<u8>,
 ) -> io::Result<()> {
     tokio::task::spawn_blocking(move || {
-        let mut opts = cap_std::fs::OpenOptions::new();
-        opts.write(true);
-        let mut file = root_dir.open_with(&rel, &opts)?;
+        let mut file = file
+            .lock()
+            .map_err(|_| io::Error::other("staging file lock poisoned"))?;
         use std::io::{Seek as _, Write as _};
         file.seek(std::io::SeekFrom::Start(offset))?;
         file.write_all(&bytes)
+    })
+    .await
+    .map_err(blocking_join_to_io)?
+}
+
+async fn verify_root_file_snapshot_and_digest(
+    root_dir: RootDir,
+    rel: String,
+    expected_snapshot: FileSnapshot,
+    expected: &str,
+) -> io::Result<()> {
+    let expected = expected.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut file = root_dir.open_read(&rel)?;
+        let actual_snapshot = file_snapshot(&file)?;
+        if actual_snapshot.identity != expected_snapshot.identity {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staging temp file identity changed before final writeback verification",
+            ));
+        }
+        if actual_snapshot.link_count != expected_snapshot.link_count {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staging temp hardlink count changed before final writeback verification",
+            ));
+        }
+        let mut hasher = DigestHasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        use std::io::Read as _;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        let actual = hasher.finalize().canonical();
+        if actual == expected {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "staging temp path no longer contains the verified bytes",
+            ))
+        }
     })
     .await
     .map_err(blocking_join_to_io)?
@@ -755,6 +891,15 @@ async fn stat_batch(req: StatRequest, map: &PathMap, cap: &SessionCapability) ->
         // probe, so a rogue worker cannot even learn whether a path outside the
         // declared root is present (M7.1 path scoping).
         if !path_in_scope(p, cap.root()) {
+            entries.push(StatEntry {
+                exists: false,
+                is_dir: false,
+                size: 0,
+                digest_hex: String::new(),
+            });
+            continue;
+        }
+        if cap.requires_contained_root() {
             entries.push(StatEntry {
                 exists: false,
                 is_dir: false,
@@ -813,6 +958,9 @@ async fn open_read(
     // nothing, so no out-of-root content ever enters the store. The scope is the
     // session's AUTHORITATIVE root (the agent's, not the worker's) — SEC-004.
     if !path_in_scope(&req.path, cap.root()) {
+        return not_found_open();
+    }
+    if cap.requires_contained_root() {
         return not_found_open();
     }
     let actual = map.resolve(&req.path);
@@ -894,6 +1042,12 @@ async fn has(req: HasRequest, cap: &SessionCapability, store: &BlobStore) -> Has
 async fn dir_list(req: DirListRequest, map: &PathMap, cap: &SessionCapability) -> DirListResponse {
     // Out-of-scope directory reports "does not exist" (existence-hiding, M7.1).
     if !path_in_scope(&req.path, cap.root()) {
+        return DirListResponse {
+            exists: false,
+            entries: vec![],
+        };
+    }
+    if cap.requires_contained_root() {
         return DirListResponse {
             exists: false,
             entries: vec![],
@@ -1120,6 +1274,227 @@ mod tests {
         assert!(!path_in_scope("\\\\host\\share\\work\\proj\\x", root));
         assert!(!path_in_scope("\\\\?\\c:\\work\\proj\\x", root));
     }
+
+    #[test]
+    fn path_corpus_normalize_requested_rejects_ambiguous_windows_forms() {
+        for requested in [
+            "C:\\work\\proj\\out.obj:ads",
+            "\\\\?\\C:\\work\\proj\\out.obj",
+            "\\??\\C:\\work\\proj\\out.obj",
+            "\\\\server\\share\\proj\\out.obj",
+            "C:work\\proj\\out.obj",
+            "\\work\\proj\\out.obj",
+            "C:\\work\\proj\\out.",
+            "C:\\work\\proj\\out ",
+            "C:\\work\\proj\\con",
+            "C:\\work\\proj\\nul.txt",
+            "C:\\work\\proj\\com1.obj",
+            "C:\\work\\proj\\lpt9.log",
+            "C:\\work\\proj\\PROGRA~1\\tool.exe",
+            "C:\\work\\proj\\LONGFI~12.TXT",
+        ] {
+            assert_eq!(
+                normalize_requested(requested),
+                None,
+                "{requested:?} must fail closed"
+            );
+        }
+
+        assert_eq!(
+            normalize_requested("C:\\work\\proj\\obj\\file~backup.obj"),
+            Some("c:\\work\\proj\\obj\\file~backup.obj".to_string())
+        );
+    }
+
+    #[test]
+    fn path_corpus_scope_allows_short_name_component_in_declared_root_prefix_only() {
+        let root =
+            normalize_root("C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x").expect("root");
+        let root = root.as_str();
+
+        assert!(
+            path_in_scope(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\src\\in.h",
+                Some(root)
+            ),
+            "a short-name component inherited from the declared root prefix must not break supply"
+        );
+        assert_eq!(
+            root_relative_path(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\src\\in.h",
+                root
+            ),
+            Some("src\\in.h".to_string())
+        );
+        assert!(
+            !path_in_scope(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\PROGRA~1\\tool.exe",
+                Some(root)
+            ),
+            "a short-name component in the root-relative suffix must still fail closed"
+        );
+        assert_eq!(
+            root_relative_path(
+                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\PROGRA~1\\tool.exe",
+                root
+            ),
+            None
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_enforcing_session_without_root_handle_fails_closed() {
+        let root = ScratchDir::new("missing-root-handle");
+        let root_path = root.path().join("declared");
+        let requested = root_path.join("src").join("in.h");
+        let root_norm = normalize_root(&root_path.to_string_lossy()).expect("absolute temp root");
+        let registry = SessionRegistry::new().unwrap();
+        let cap = registry
+            .create("missing-root-handle".into(), Some(root_norm), Vec::new())
+            .await;
+        assert!(cap.enforces());
+        assert!(cap.root().is_some());
+        assert!(
+            cap.root_dir().is_none(),
+            "test setup requires the authoritative root handle to be unavailable"
+        );
+        std::fs::create_dir_all(requested.parent().unwrap()).unwrap();
+        std::fs::write(&requested, b"must not be served ambiently").unwrap();
+        let requested = requested.to_string_lossy().into_owned();
+
+        let stat = stat_batch(
+            StatRequest {
+                paths: vec![requested.clone()],
+            },
+            &PathMap::Identity,
+            &cap,
+        )
+        .await;
+        assert!(
+            !stat.entries[0].exists,
+            "stat must fail closed instead of falling back to ambient metadata"
+        );
+
+        let open = open_read(
+            OpenReadRequest {
+                path: requested.clone(),
+                want_inline: true,
+            },
+            &cap,
+            registry.store(),
+            &PathMap::Identity,
+            &ServerStats::default(),
+        )
+        .await;
+        assert!(
+            !open.exists,
+            "open_read must fail closed instead of ambiently reading under an unopened root"
+        );
+
+        let listed = dir_list(
+            DirListRequest {
+                path: root_path.to_string_lossy().into_owned(),
+                depth: 1,
+            },
+            &PathMap::Identity,
+            &cap,
+        )
+        .await;
+        assert!(
+            !listed.exists,
+            "dir_list must fail closed instead of ambiently listing under an unopened root"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn path_corpus_writeback_rejects_staging_temp_replaced_by_hardlink_between_chunks() {
+        use sembazuru_dataplane::ops::WriteBackRequest;
+
+        let root = ScratchDir::new("wb-hardlink-root");
+        let outside = ScratchDir::new("wb-hardlink-outside");
+        let final_path = root.path().join("out").join("final.obj");
+        let external_peer = outside.path().join("peer.obj");
+        std::fs::write(&external_peer, b"ABCDEFGH").unwrap();
+
+        let registry = SessionRegistry::new().unwrap();
+        let cap = registry
+            .create(
+                "path-corpus-hardlink".into(),
+                None,
+                vec![crate::session_registry::OutputSpec {
+                    id: 7,
+                    final_path: final_path.clone(),
+                    max_size: 64,
+                }],
+            )
+            .await;
+        let digest = Digest::of(b"ABCDEFGH").canonical();
+
+        let first = write_back(
+            WriteBackRequest {
+                output_id: 7,
+                offset: 0,
+                bytes: b"ABCD".to_vec(),
+                last: false,
+                digest_hex: digest.clone(),
+            },
+            &cap,
+        )
+        .await;
+        assert!(
+            first.ok,
+            "first chunk should stage normally: {}",
+            first.detail
+        );
+
+        let tmp_path = {
+            let wbs = cap.writebacks().lock().await;
+            wbs.get(&7).expect("writeback state").tmp.clone()
+        };
+        let replaced = match std::fs::remove_file(&tmp_path) {
+            Ok(()) => {
+                std::fs::hard_link(&external_peer, &tmp_path).unwrap();
+                true
+            }
+            Err(e) => {
+                eprintln!("staging temp removal refused while file handle is open: {e}");
+                false
+            }
+        };
+
+        let second = write_back(
+            WriteBackRequest {
+                output_id: 7,
+                offset: 4,
+                bytes: b"EFGH".to_vec(),
+                last: true,
+                digest_hex: digest,
+            },
+            &cap,
+        )
+        .await;
+
+        if replaced {
+            assert!(
+                !second.ok,
+                "writeback must reject a staging temp replaced by a same-content external hardlink"
+            );
+        } else {
+            assert!(
+                second.ok,
+                "writeback may continue when the open staging temp could not be replaced: {}",
+                second.detail
+            );
+        }
+        assert_eq!(
+            std::fs::read(&external_peer).unwrap(),
+            b"ABCDEFGH",
+            "a chunk append must not modify the external hardlink peer"
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn identity_stat_open_and_dir_list_reject_intermediate_junction_escape() {
