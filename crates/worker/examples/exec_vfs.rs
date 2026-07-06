@@ -6,7 +6,7 @@
 //! DLL and supplies inputs on demand.
 //!
 //! Usage:
-//!   exec_vfs <worker_endpoint> <agent_fileserver> <vfs_root> <trace_dir> -- <argv...>
+//!   exec_vfs <worker_endpoint> <agent_fileserver> <vfs_root> <trace_dir|--empty-trace-dir> -- <argv...>
 //! e.g.
 //!   exec_vfs http://127.0.0.1:50061 127.0.0.1:50072 C:\src C:\trace -- probe.exe C:\src\a.txt
 
@@ -14,6 +14,8 @@ use std::collections::HashMap;
 
 use sembazuru_agent::{ExecOptions, execute_on_channel_with};
 use sembazuru_proto::v0::{Command, VfsExecution};
+
+const EMPTY_TRACE_DIR_SENTINEL: &str = "--empty-trace-dir";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -24,14 +26,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .ok_or("missing `--` before the command argv")?;
     if sep < 4 {
         return Err(
-            "usage: exec_vfs <worker> <agent_fileserver> <vfs_root> <trace_dir> -- <argv...>"
+            "usage: exec_vfs <worker> <agent_fileserver> <vfs_root> <trace_dir|--empty-trace-dir> -- <argv...>"
                 .into(),
         );
     }
     let worker_endpoint = args[0].clone();
     let agent_fileserver = args[1].clone();
     let vfs_root = args[2].clone();
-    let trace_dir = args[3].clone();
+    let trace_dir = if args[3] == EMPTY_TRACE_DIR_SENTINEL {
+        String::new()
+    } else {
+        args[3].clone()
+    };
     let argv: Vec<String> = args[sep + 1..].to_vec();
     if argv.is_empty() {
         return Err("empty command argv".into());
@@ -62,12 +68,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         channel,
         command,
         "exec-vfs".into(),
-        "exec-vfs".into(),
+        // This dev harness bypasses the daemon, so no agent-side session
+        // registry entry exists. Use the legacy empty session id accepted by
+        // fileserver_host; production intake still mints a bound session id.
+        String::new(),
         opts,
         Vec::new(),
     )
     .await?;
     let code = outcome.exit_code.unwrap_or(-1);
-    eprintln!("exec_vfs: states={:?} exit={code}", outcome.states);
+    println!("exec_vfs: states={:?} exit={code}", outcome.states);
     std::process::exit(code);
 }

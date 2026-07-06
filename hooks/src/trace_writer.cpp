@@ -202,6 +202,22 @@ void Initialize(HMODULE self) {
     // Not hooked and loader-lock safe (reads the PEB, no file I/O).
     DWORD cwdLen = GetCurrentDirectoryW(ARRAYSIZE(g_cwdW), g_cwdW);
     g_cwdLen = (cwdLen > 0 && cwdLen < ARRAYSIZE(g_cwdW)) ? static_cast<int>(cwdLen) : 0;
+    // A service worker may start the process from a scratch mirror when the
+    // submitted cwd is not accessible to the worker account. Preserve the
+    // submitted cwd in the trace so relative reads and outputs stay anchored to
+    // the logical build root rather than to the disposable scratch tree.
+    wchar_t vfsCwd[1024];
+    DWORD vfsCwdLen = TrueGetEnvironmentVariableW(L"SEMBAZURU_VFS_CWD", vfsCwd,
+                                                  ARRAYSIZE(vfsCwd));
+    if (vfsCwdLen > 0 && vfsCwdLen < ARRAYSIZE(vfsCwd)) {
+        wchar_t full[1024];
+        DWORD fullLen = GetFullPathNameW(vfsCwd, ARRAYSIZE(full), full, nullptr);
+        if (fullLen > 0 && fullLen < ARRAYSIZE(full)) {
+            memcpy(g_cwdW, full,
+                   (static_cast<size_t>(fullLen) + 1) * sizeof(wchar_t));
+            g_cwdLen = static_cast<int>(fullLen);
+        }
+    }
 
     DWORD len = GetModuleFileNameW(self, g_dllPathW, ARRAYSIZE(g_dllPathW));
     if (len > 0 && len < ARRAYSIZE(g_dllPathW)) {

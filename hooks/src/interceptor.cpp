@@ -19,6 +19,7 @@
 #include <winternl.h>
 
 #include <cstddef>
+#include <cstring>
 #include <cwchar>
 #include <cwctype>
 
@@ -44,6 +45,14 @@ HANDLE(WINAPI* TrueFindFirstFileExW)
 HANDLE(WINAPI* TrueFindFirstFileExA)
 (LPCSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD) =
     FindFirstFileExA;
+DWORD(WINAPI* TrueGetCurrentDirectoryW)(DWORD, LPWSTR) = GetCurrentDirectoryW;
+DWORD(WINAPI* TrueGetCurrentDirectoryA)(DWORD, LPSTR) = GetCurrentDirectoryA;
+BOOL(WINAPI* TrueSetCurrentDirectoryW)(LPCWSTR) = SetCurrentDirectoryW;
+BOOL(WINAPI* TrueSetCurrentDirectoryA)(LPCSTR) = SetCurrentDirectoryA;
+DWORD(WINAPI* TrueGetFullPathNameW)(LPCWSTR, DWORD, LPWSTR, LPWSTR*) =
+    GetFullPathNameW;
+DWORD(WINAPI* TrueGetFullPathNameA)(LPCSTR, DWORD, LPSTR, LPSTR*) =
+    GetFullPathNameA;
 BOOL(WINAPI* TrueDeleteFileW)(LPCWSTR) = DeleteFileW;
 BOOL(WINAPI* TrueDeleteFileA)(LPCSTR) = DeleteFileA;
 BOOL(WINAPI* TrueMoveFileW)(LPCWSTR, LPCWSTR) = MoveFileW;
@@ -131,14 +140,33 @@ int g_vfsRootLen = 0;
 wchar_t g_vfsPipe[260];     // full \\.\pipe\<name>
 wchar_t g_vfsScratch[1024]; // lowercased scratch root, no trailing backslash
 int g_vfsScratchLen = 0;    // 0 = not configured (no scratch guard)
+wchar_t g_vfsCwd[1024]; // lowercased submitted cwd, no trailing backslash
+int g_vfsCwdLen = 0;    // 0 = resolve relatives against the process cwd
+wchar_t g_vfsCwdDisplay[1024]; // submitted cwd spelling for API returns
+int g_vfsCwdDisplayLen = 0;
+wchar_t g_vfsActualCwd[1024]; // lowercased process cwd, no trailing backslash
+int g_vfsActualCwdLen = 0;    // lower length for prefix checks
+int g_vfsActualCwdDisplayLen = 0; // display length for suffix slicing
 // Strict virtualization (M8.2 (2), ADR 0007 §a(2)). When true, a read-only open
 // committed to the VFS (under vfs_root) that cannot be supplied FAILS instead of
 // falling through to a local open, and drops kUnvirtMarker so the worker re-runs
 // the action locally. Default false keeps the compiler-compatible fail-open.
 bool g_vfsStrict = false;
-// Marker dropped in the scratch root on a strict unvirtualized access. Must match
-// `UNVIRT_MARKER` in `crates/worker/src/lib.rs`.
+// Marker dropped in the scratch root when the remote attempt must be abandoned
+// and re-run locally. Strict unsupplied reads and VFS-root wildcard enumeration
+// both use it. Must match `UNVIRT_MARKER` in `crates/worker/src/lib.rs`.
 const wchar_t* kUnvirtMarker = L".sbz-unvirtualized";
+// Marker dropped when a scratch-cwd action writes under the logical root. Until
+// the worker uploads outputs through WriteBack, such a run must fall back locally
+// rather than report remote success with outputs stranded in scratch.
+const wchar_t* kUnsafeOutputMarker = L".sbz-unsafe-output";
+
+int TrimTrailingBackslashes(wchar_t* s, DWORD len) {
+    while (len > 0 && s[len - 1] == L'\\') {
+        s[--len] = L'\0';
+    }
+    return static_cast<int>(len);
+}
 
 // Lowercases [0,len) in place and strips trailing backslashes, returning the
 // new length. Shared by the root/scratch config readers.
@@ -146,10 +174,7 @@ int LowerAndTrim(wchar_t* s, DWORD len) {
     for (DWORD i = 0; i < len; i++) {
         s[i] = towlower(s[i]);
     }
-    while (len > 0 && s[len - 1] == L'\\') {
-        s[--len] = L'\0';
-    }
-    return static_cast<int>(len);
+    return TrimTrailingBackslashes(s, len);
 }
 
 // Reads the VFS configuration from the environment. Called once at attach,
@@ -187,6 +212,46 @@ void InitVfsConfig() {
                (static_cast<size_t>(sl) + 1) * sizeof(wchar_t));
         g_vfsScratchLen = sl;
     }
+    // When the service worker cannot enter the submitted cwd directly, it starts
+    // the child from the scratch tree. Keep resolving relative source reads as if
+    // the child were still in the submitted cwd, so bare compiler inputs remain
+    // virtualized under SEMBAZURU_VFS_ROOT.
+    wchar_t cwd[1024];
+    DWORD cwn = GetEnvironmentVariableW(L"SEMBAZURU_VFS_CWD", cwd, 1024);
+    if (cwn > 0 && cwn < 1024) {
+        wchar_t cwdAbs[1024];
+        DWORD can = TrueGetFullPathNameW(cwd, 1024, cwdAbs, nullptr);
+        if (can > 0 && can < 1024) {
+            int displayLen = TrimTrailingBackslashes(cwdAbs, can);
+            memcpy(g_vfsCwdDisplay, cwdAbs,
+                   (static_cast<size_t>(displayLen) + 1) * sizeof(wchar_t));
+            g_vfsCwdDisplayLen = displayLen;
+            wchar_t cwdLower[1024];
+            memcpy(cwdLower, cwdAbs,
+                   (static_cast<size_t>(displayLen) + 1) * sizeof(wchar_t));
+            int cl = LowerAndTrim(cwdLower, displayLen);
+            memcpy(g_vfsCwd, cwdLower,
+                   (static_cast<size_t>(cl) + 1) * sizeof(wchar_t));
+            g_vfsCwdLen = cl;
+            wchar_t actualCwdDisplay[1024];
+            DWORD acn = TrueGetCurrentDirectoryW(1024, actualCwdDisplay);
+            if (acn > 0 && acn < 1024) {
+                int actualDisplayLen =
+                    TrimTrailingBackslashes(actualCwdDisplay, acn);
+                wchar_t actualCwdLower[1024];
+                memcpy(actualCwdLower, actualCwdDisplay,
+                       (static_cast<size_t>(actualDisplayLen) + 1) *
+                           sizeof(wchar_t));
+                int actualLowerLen =
+                    LowerAndTrim(actualCwdLower, actualDisplayLen);
+                memcpy(g_vfsActualCwd, actualCwdLower,
+                       (static_cast<size_t>(actualLowerLen) + 1) *
+                           sizeof(wchar_t));
+                g_vfsActualCwdLen = actualLowerLen;
+                g_vfsActualCwdDisplayLen = actualDisplayLen;
+            }
+        }
+    }
     // Strict mode (M8.2 (2)): any set, non-"0" value enables it.
     wchar_t strict[16];
     DWORD stn = GetEnvironmentVariableW(L"SEMBAZURU_VFS_STRICT", strict, 16);
@@ -219,20 +284,113 @@ bool PathUnderPrefix(const wchar_t* abs, int absLen, const wchar_t* prefix,
     return after == L'\0' || after == L'\\';
 }
 
+bool IsSlash(wchar_t c) { return c == L'\\' || c == L'/'; }
+
+bool HasDrivePrefix(const wchar_t* path) {
+    return path != nullptr && path[0] != L'\0' && path[1] == L':';
+}
+
+bool IsFullyQualifiedPath(const wchar_t* path) {
+    if (path == nullptr || path[0] == L'\0') {
+        return false;
+    }
+    if (HasDrivePrefix(path) && IsSlash(path[2])) {
+        return true;
+    }
+    return IsSlash(path[0]) && IsSlash(path[1]);
+}
+
+bool ComposeUnderVfsCwd(const wchar_t* path, wchar_t* out, int cap) {
+    if (g_vfsCwdLen == 0 || path == nullptr || cap <= 0) {
+        return false;
+    }
+    const wchar_t* cwd =
+        g_vfsCwdDisplayLen > 0 ? g_vfsCwdDisplay : g_vfsCwd;
+    if (HasDrivePrefix(path) && !IsSlash(path[2])) {
+        if (g_vfsCwdLen < 2 || g_vfsCwd[1] != L':' ||
+            towlower(g_vfsCwd[0]) != towlower(path[0])) {
+            return false;
+        }
+        return _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%s", cwd,
+                            path + 2) >= 0;
+    }
+    if (IsSlash(path[0]) && !IsSlash(path[1])) {
+        if (g_vfsCwdLen < 2 || g_vfsCwd[1] != L':') {
+            return false;
+        }
+        return _snwprintf_s(out, cap, _TRUNCATE, L"%c:%s", cwd[0], path) >=
+               0;
+    }
+    return _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%s", cwd, path) >= 0;
+}
+
+bool ComposeFromActualCwdPath(const wchar_t* actualDisplay,
+                              const wchar_t* actualLower, int actualLen,
+                              wchar_t* out, int cap) {
+    if (g_vfsCwdLen == 0 || g_vfsActualCwdLen == 0 ||
+        g_vfsActualCwdDisplayLen == 0 ||
+        !PathUnderPrefix(actualLower, actualLen, g_vfsActualCwd,
+                         g_vfsActualCwdLen)) {
+        return false;
+    }
+    // Slice the display path with the display length. The lower length above is
+    // only for boundary-aware prefix checks.
+    const wchar_t* suffix = actualDisplay + g_vfsActualCwdDisplayLen;
+    if (*suffix == L'\\') {
+        suffix++;
+    }
+    const wchar_t* cwd =
+        g_vfsCwdDisplayLen > 0 ? g_vfsCwdDisplay : g_vfsCwd;
+    if (*suffix == L'\0') {
+        return _snwprintf_s(out, cap, _TRUNCATE, L"%s", cwd) >= 0;
+    }
+    return _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%s", cwd, suffix) >= 0;
+}
+
+DWORD FullPathForVfsRootCheck(const wchar_t* path, wchar_t* absOut, int absCap) {
+    if (g_vfsCwdLen > 0 && !IsFullyQualifiedPath(path)) {
+        wchar_t joined[1024];
+        if (ComposeUnderVfsCwd(path, joined, 1024)) {
+            DWORD n = TrueGetFullPathNameW(joined, absCap, absOut, nullptr);
+            if (n > 0 && n < static_cast<DWORD>(absCap)) {
+                return n;
+            }
+        }
+    }
+    DWORD n = TrueGetFullPathNameW(path, absCap, absOut, nullptr);
+    if (n > 0 && n < static_cast<DWORD>(absCap)) {
+        wchar_t actualDisplay[1024];
+        memcpy(actualDisplay, absOut,
+               (static_cast<size_t>(n) + 1) * sizeof(wchar_t));
+        wchar_t actualLower[1024];
+        memcpy(actualLower, absOut,
+               (static_cast<size_t>(n) + 1) * sizeof(wchar_t));
+        int actualLen = LowerAndTrim(actualLower, n);
+        if (ComposeFromActualCwdPath(actualDisplay, actualLower, actualLen,
+                                     absOut, absCap)) {
+            return static_cast<DWORD>(lstrlenW(absOut));
+        }
+    }
+    return n;
+}
+
 // True if `path` (resolved to absolute against the cwd) lies under g_vfsRoot and
-// NOT under the scratch root. Writes the lowercased absolute path into `absOut`.
+// NOT under the scratch root. Writes the display-spelled absolute path into
+// `absOut`; lowercased copies are used only for prefix checks.
 // Excluding scratch is the anti-recursion guard: a scratch open must never be
 // re-redirected even if scratch happens to sit under the VFS root.
 bool IsUnderVfsRoot(const wchar_t* path, wchar_t* absOut, int absCap) {
-    DWORD an = GetFullPathNameW(path, absCap, absOut, nullptr);
+    DWORD an = FullPathForVfsRootCheck(path, absOut, absCap);
     if (an == 0 || an >= static_cast<DWORD>(absCap)) {
         return false;  // unresolved or too long: do not redirect (fall to local)
     }
-    int absLen = LowerAndTrim(absOut, an);
-    if (PathUnderPrefix(absOut, absLen, g_vfsScratch, g_vfsScratchLen)) {
+    wchar_t lower[1024];
+    memcpy(lower, absOut, (static_cast<size_t>(an) + 1) * sizeof(wchar_t));
+    int absLen = LowerAndTrim(lower, an);
+    if (PathUnderPrefix(lower, absLen, g_vfsScratch, g_vfsScratchLen)) {
         return false;  // a scratch path: never redirect (anti-recursion)
     }
-    return PathUnderPrefix(absOut, absLen, g_vfsRoot, g_vfsRootLen);
+    return PathUnderPrefix(lower, absLen, g_vfsRoot, g_vfsRootLen);
 }
 
 bool WriteAllPipe(HANDLE h, const void* buf, DWORD len) {
@@ -324,21 +482,16 @@ bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
     return ok;
 }
 
-// Drops the unvirtualized-access marker (kUnvirtMarker) in the scratch root,
-// once per process, so the worker turns this action into a local re-run
-// (M8.2 (2)). Best-effort: uses the real CreateFileW; if it cannot be written the
-// worker simply won't fall back (same as the non-strict path) — never worse.
-void VfsMarkUnvirtualized() {
-    static LONG written = 0;
-    if (InterlockedExchange(&written, 1) != 0) {
-        return;  // already marked this action
-    }
+// Drops a marker in the scratch root. Best-effort: uses the real CreateFileW; if
+// it cannot be written the worker simply won't fall back - never worse than the
+// pre-marker path.
+void VfsMarkScratchMarker(const wchar_t* markerName) {
     if (g_vfsScratchLen == 0) {
         return;  // no scratch root to drop the marker in
     }
     wchar_t marker[1100];
     if (_snwprintf_s(marker, 1100, _TRUNCATE, L"%s\\%s", g_vfsScratch,
-                     kUnvirtMarker) < 0) {
+                     markerName) < 0) {
         return;
     }
     HANDLE h = TrueCreateFileW(marker, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -348,26 +501,67 @@ void VfsMarkUnvirtualized() {
     }
 }
 
+// Drops the local-rerun marker (kUnvirtMarker) in the scratch root, once per
+// process, so the worker turns this action into a local re-run.
+void VfsMarkUnvirtualized() {
+    static LONG written = 0;
+    if (InterlockedExchange(&written, 1) != 0) {
+        return;  // already marked this action
+    }
+    VfsMarkScratchMarker(kUnvirtMarker);
+}
+
+// Drops the unsafe-output marker once when a scratch-cwd action mutates a path
+// under the logical root. The worker will fail the remote attempt and let the
+// daemon's mandatory local fallback preserve outputs.
+void VfsMarkUnsafeOutput() {
+    static LONG written = 0;
+    if (InterlockedExchange(&written, 1) != 0) {
+        return;
+    }
+    VfsMarkScratchMarker(kUnsafeOutputMarker);
+}
+
+bool CanonicalScratchPath(const wchar_t* local, wchar_t* canonOut, int canonCap) {
+    if (g_vfsScratchLen == 0 || local == nullptr || canonOut == nullptr ||
+        canonCap <= 0) {
+        return false;
+    }
+    DWORD cn = TrueGetFullPathNameW(local, canonCap, canonOut, nullptr);
+    if (cn == 0 || cn >= static_cast<DWORD>(canonCap)) {
+        return false;
+    }
+    int cl = LowerAndTrim(canonOut, cn);
+    return PathUnderPrefix(canonOut, cl, g_vfsScratch, g_vfsScratchLen);
+}
+
 // If VFS mode applies to this read-only open, returns a redirected handle to the
 // hydrated scratch copy. Returns INVALID_HANDLE_VALUE with *handled=false when
-// the open should proceed normally (not vfs mode, not a read, outside root, or —
-// in non-strict mode — the worker could not supply it, so local fallback).
+// the open should proceed normally (not vfs mode, not a read, outside root, or -
+// in non-strict mode - the worker could not supply it, so local fallback).
 //
 // Once IsUnderVfsRoot passes we are COMMITTED to virtualizing this path. Any
 // later failure to produce a valid hydrated handle is an unvirtualized access:
 // in strict mode (M8.2 (2)) it FAILS the open (sets *handled, drops the marker) so
-// the worker re-runs locally — never a silent local read of a wrong/absent file;
+// the worker re-runs locally - never a silent local read of a wrong/absent file;
 // in non-strict mode it keeps the compiler-compatible fail-open (handled=false).
 HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
                       LPSECURITY_ATTRIBUTES sa, DWORD disposition, DWORD flags,
-                      HANDLE templ, bool* handled) {
+                      HANDLE templ, bool* handled, wchar_t* logicalOut,
+                      int logicalCap) {
     *handled = false;
+    if (logicalOut != nullptr && logicalCap > 0) {
+        logicalOut[0] = L'\0';
+    }
     if (!g_vfsMode || path == nullptr || !IsReadOnlyOpen(access, disposition)) {
         return INVALID_HANDLE_VALUE;
     }
     wchar_t abs[1024];
     if (!IsUnderVfsRoot(path, abs, 1024)) {
         return INVALID_HANDLE_VALUE;  // outside root: a worker-local file, open it
+    }
+    if (logicalOut != nullptr && logicalCap > 0) {
+        _snwprintf_s(logicalOut, logicalCap, _TRUNCATE, L"%s", abs);
     }
     // Committed-failure exit for a path under vfs_root we could not virtualize.
     auto committedFailure = [&]() -> HANDLE {
@@ -383,7 +577,7 @@ HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
         return committedFailure();  // agent could not supply it
     }
     // Trust but verify: the worker must return a path under the scratch root.
-    // This bounds the damage a buggy/hostile worker can do — it cannot redirect a
+    // This bounds the damage a buggy/hostile worker can do - it cannot redirect a
     // read to an arbitrary file the compiler would consume as source (M7.1).
     //
     //  * A scratch root MUST be configured in VFS mode; if it is not, fail closed
@@ -396,16 +590,76 @@ HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
         return committedFailure();  // no scratch guard configured
     }
     wchar_t canon[1024];
-    DWORD cn = GetFullPathNameW(local, 1024, canon, nullptr);
-    if (cn == 0 || cn >= 1024) {
-        return committedFailure();  // unresolvable / too long
-    }
-    int cl = LowerAndTrim(canon, cn);
-    if (!PathUnderPrefix(canon, cl, g_vfsScratch, g_vfsScratchLen)) {
+    if (!CanonicalScratchPath(local, canon, 1024)) {
         return committedFailure();  // worker returned an out-of-scratch path
     }
     *handled = true;
     return TrueCreateFileW(canon, access, share, sa, disposition, flags, templ);
+}
+
+bool VfsMaterializeForProbe(const wchar_t* path, wchar_t* localOut,
+                            int localCap, wchar_t* logicalOut,
+                            int logicalCap, bool* handled) {
+    *handled = false;
+    if (logicalOut != nullptr && logicalCap > 0) {
+        logicalOut[0] = L'\0';
+    }
+    if (!g_vfsMode || path == nullptr) {
+        return false;
+    }
+
+    wchar_t abs[1024];
+    if (!IsUnderVfsRoot(path, abs, 1024)) {
+        return false;
+    }
+    if (logicalOut != nullptr && logicalCap > 0) {
+        _snwprintf_s(logicalOut, logicalCap, _TRUNCATE, L"%s", abs);
+    }
+
+    auto committedFailure = [&]() -> bool {
+        if (g_vfsStrict) {
+            VfsMarkUnvirtualized();
+            *handled = true;
+            SetLastError(ERROR_FILE_NOT_FOUND);
+        }
+        return false;
+    };
+
+    wchar_t local[1024];
+    if (!VfsHydrate(abs, local, 1024)) {
+        return committedFailure();
+    }
+    if (!CanonicalScratchPath(local, localOut, localCap)) {
+        return committedFailure();
+    }
+    *handled = true;
+    return true;
+}
+
+bool HasWildcard(const wchar_t* path) {
+    return path != nullptr && wcspbrk(path, L"*?") != nullptr;
+}
+
+bool VfsFailWildcardEnumeration(const wchar_t* pattern, wchar_t* logicalOut,
+                                int logicalCap, bool* handled) {
+    *handled = false;
+    if (logicalOut != nullptr && logicalCap > 0) {
+        logicalOut[0] = L'\0';
+    }
+    if (!g_vfsMode || !HasWildcard(pattern)) {
+        return false;
+    }
+    wchar_t abs[1024];
+    if (!IsUnderVfsRoot(pattern, abs, 1024)) {
+        return false;
+    }
+    if (logicalOut != nullptr && logicalCap > 0) {
+        _snwprintf_s(logicalOut, logicalCap, _TRUNCATE, L"%s", abs);
+    }
+    VfsMarkUnvirtualized();
+    *handled = true;
+    SetLastError(ERROR_FILE_NOT_FOUND);
+    return true;
 }
 
 // --- Helpers -------------------------------------------------------------
@@ -460,6 +714,109 @@ class WideArg {
     int len_ = 0;
 };
 
+bool WideToAnsi(const wchar_t* w, char* out, DWORD outCap, int* bytesNoNul) {
+    if (w == nullptr || out == nullptr || outCap == 0) {
+        return false;
+    }
+    int needed = WideCharToMultiByte(CP_ACP, 0, w, -1, nullptr, 0, nullptr,
+                                     nullptr);
+    if (needed <= 0 || static_cast<DWORD>(needed) > outCap) {
+        return false;
+    }
+    int written = WideCharToMultiByte(CP_ACP, 0, w, -1, out, outCap, nullptr,
+                                      nullptr);
+    if (written <= 0) {
+        return false;
+    }
+    if (bytesNoNul != nullptr) {
+        *bytesNoNul = written - 1;
+    }
+    return true;
+}
+
+void SetFilePartW(LPWSTR buffer, LPWSTR* filePart) {
+    if (filePart == nullptr) {
+        return;
+    }
+    *filePart = nullptr;
+    if (buffer == nullptr) {
+        return;
+    }
+    wchar_t* last = wcsrchr(buffer, L'\\');
+    if (last != nullptr && last[1] != L'\0') {
+        *filePart = last + 1;
+    }
+}
+
+void SetFilePartA(LPSTR buffer, LPSTR* filePart) {
+    if (filePart == nullptr) {
+        return;
+    }
+    *filePart = nullptr;
+    if (buffer == nullptr) {
+        return;
+    }
+    char* last = strrchr(buffer, '\\');
+    if (last != nullptr && last[1] != '\0') {
+        *filePart = last + 1;
+    }
+}
+
+DWORD CopyLogicalPathW(const wchar_t* src, DWORD srcLen, DWORD bufferLen,
+                       LPWSTR buffer, LPWSTR* filePart) {
+    if (bufferLen <= srcLen || buffer == nullptr) {
+        return srcLen + 1;
+    }
+    memcpy(buffer, src, (static_cast<size_t>(srcLen) + 1) * sizeof(wchar_t));
+    SetFilePartW(buffer, filePart);
+    return srcLen;
+}
+
+DWORD CopyLogicalPathA(const wchar_t* src, DWORD bufferLen, LPSTR buffer,
+                       LPSTR* filePart) {
+    char tmp[2048];
+    int bytesNoNul = 0;
+    if (!WideToAnsi(src, tmp, ARRAYSIZE(tmp), &bytesNoNul)) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    DWORD srcLen = static_cast<DWORD>(bytesNoNul);
+    if (bufferLen <= srcLen || buffer == nullptr) {
+        return srcLen + 1;
+    }
+    memcpy(buffer, tmp, static_cast<size_t>(srcLen) + 1);
+    SetFilePartA(buffer, filePart);
+    return srcLen;
+}
+
+DWORD LogicalFullPathName(const wchar_t* path, wchar_t* out, int cap) {
+    if (g_vfsCwdLen == 0 || path == nullptr || out == nullptr || cap <= 0) {
+        return 0;
+    }
+    if (!IsFullyQualifiedPath(path)) {
+        wchar_t joined[1024];
+        if (ComposeUnderVfsCwd(path, joined, 1024)) {
+            DWORD n = TrueGetFullPathNameW(joined, cap, out, nullptr);
+            if (n > 0 && n < static_cast<DWORD>(cap)) {
+                return n;
+            }
+        }
+    }
+
+    wchar_t actual[1024];
+    DWORD n = TrueGetFullPathNameW(path, 1024, actual, nullptr);
+    if (n == 0 || n >= 1024) {
+        return 0;
+    }
+    wchar_t actualLower[1024];
+    memcpy(actualLower, actual, (static_cast<size_t>(n) + 1) * sizeof(wchar_t));
+    int actualLen = LowerAndTrim(actualLower, n);
+    if (ComposeFromActualCwdPath(actual, actualLower, actualLen, out, cap)) {
+        return static_cast<DWORD>(lstrlenW(out));
+    }
+    return 0;
+}
+
 // CreateFile classification per docs/trace-format.md §5.2: the access mask
 // decides read/write intent, and a disposition that can create or truncate
 // the file is a write effect even with a read-only mask.
@@ -481,6 +838,25 @@ BYTE ClassifyCreateFile(DWORD access, DWORD disposition) {
         return trace::kOpenRead;
     }
     return trace::kProbe;  // metadata-only open (e.g. attribute query)
+}
+
+void MaybeMarkVfsMutation(const wchar_t* path) {
+    if (!g_vfsMode || g_vfsCwdLen == 0 || path == nullptr) {
+        return;
+    }
+    wchar_t logical[1024];
+    if (IsUnderVfsRoot(path, logical, 1024)) {
+        VfsMarkUnsafeOutput();
+    }
+}
+
+void MaybeMarkVfsCreateMutation(const wchar_t* path, DWORD access,
+                                DWORD disposition) {
+    BYTE cls = ClassifyCreateFile(access, disposition);
+    if (cls == trace::kOpenRead || cls == trace::kProbe) {
+        return;
+    }
+    MaybeMarkVfsMutation(path);
 }
 
 ULONGLONG PackAccessDisposition(DWORD access, DWORD disposition) {
@@ -614,22 +990,26 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR path, DWORD access, DWORD share,
     // agent (hydrated to a local scratch copy). On any miss we fall through to
     // the normal local open below.
     bool handled = false;
+    wchar_t logical[1024];
     HANDLE redirected = VfsTryRedirect(path, access, share, sa, disposition,
-                                       flags, templ, &handled);
+                                       flags, templ, &handled, logical,
+                                       ARRAYSIZE(logical));
     if (handled) {
         // Record the redirected read under its LOGICAL (requested) path so the
-        // action's true input set — the VFS-supplied sources and headers — is
+        // action's true input set - the VFS-supplied sources and headers - is
         // captured in the trace. Without this a redirected read is invisible to
         // the trace, so a changed source would not move the action cache's strong
         // key and a stale result could be served (BLOCK-A). Preserve the
         // redirected open's own GetLastError across the recording I/O.
         DWORD saved = GetLastError();
-        RecordCreateFile(path, -1, access, disposition,
+        const wchar_t* recordPath = logical[0] != L'\0' ? logical : path;
+        RecordCreateFile(recordPath, -1, access, disposition,
                          redirected == INVALID_HANDLE_VALUE ? saved : 0);
         SetLastError(saved);
         return redirected;
     }
 
+    MaybeMarkVfsCreateMutation(path, access, disposition);
     HANDLE h =
         TrueCreateFileW(path, access, share, sa, disposition, flags, templ);
     DWORD saved = GetLastError();
@@ -642,22 +1022,26 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR path, DWORD access, DWORD share,
 HANDLE WINAPI HookedCreateFileA(LPCSTR path, DWORD access, DWORD share,
                                 LPSECURITY_ATTRIBUTES sa, DWORD disposition,
                                 DWORD flags, HANDLE templ) {
+    WideArg w(path);
     // VFS mode: classify on the widened path and redirect read-only opens the
     // same way as the W variant. The redirected handle is opened via the W path
     // (a handle is a handle), avoiding an ANSI round-trip on the scratch name.
     if (g_vfsMode && path != nullptr) {
-        WideArg wp(path);
-        if (wp.get() != nullptr) {
+        if (w.get() != nullptr) {
             bool handled = false;
-            HANDLE redirected = VfsTryRedirect(wp.get(), access, share, sa,
+            wchar_t logical[1024];
+            HANDLE redirected = VfsTryRedirect(w.get(), access, share, sa,
                                                disposition, flags, templ,
-                                               &handled);
+                                               &handled, logical,
+                                               ARRAYSIZE(logical));
             if (handled) {
                 // Record the redirected read under its logical (requested) path,
-                // same as the W variant — keep VFS-supplied inputs in the trace
+                // same as the W variant - keep VFS-supplied inputs in the trace
                 // so the action cache's strong key covers them (BLOCK-A).
                 DWORD saved = GetLastError();
-                RecordCreateFile(wp.get(), wp.length(), access, disposition,
+                const wchar_t* recordPath =
+                    logical[0] != L'\0' ? logical : w.get();
+                RecordCreateFile(recordPath, -1, access, disposition,
                                  redirected == INVALID_HANDLE_VALUE ? saved : 0);
                 SetLastError(saved);
                 return redirected;
@@ -665,32 +1049,125 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR path, DWORD access, DWORD share,
         }
     }
 
+    MaybeMarkVfsCreateMutation(w.get(), access, disposition);
     HANDLE h =
         TrueCreateFileA(path, access, share, sa, disposition, flags, templ);
     DWORD saved = GetLastError();
-    WideArg w(path);
     RecordCreateFile(w.get(), w.length(), access, disposition,
                      h == INVALID_HANDLE_VALUE ? saved : 0);
     SetLastError(saved);
     return h;
 }
 
+DWORD WINAPI HookedGetCurrentDirectoryW(DWORD bufferLen, LPWSTR buffer) {
+    if (g_vfsCwdLen > 0) {
+        const wchar_t* cwd =
+            g_vfsCwdDisplayLen > 0 ? g_vfsCwdDisplay : g_vfsCwd;
+        DWORD cwdLen = static_cast<DWORD>(
+            g_vfsCwdDisplayLen > 0 ? g_vfsCwdDisplayLen : g_vfsCwdLen);
+        return CopyLogicalPathW(cwd, cwdLen, bufferLen, buffer, nullptr);
+    }
+    return TrueGetCurrentDirectoryW(bufferLen, buffer);
+}
+
+DWORD WINAPI HookedGetCurrentDirectoryA(DWORD bufferLen, LPSTR buffer) {
+    if (g_vfsCwdLen > 0) {
+        const wchar_t* cwd =
+            g_vfsCwdDisplayLen > 0 ? g_vfsCwdDisplay : g_vfsCwd;
+        return CopyLogicalPathA(cwd, bufferLen, buffer, nullptr);
+    }
+    return TrueGetCurrentDirectoryA(bufferLen, buffer);
+}
+
+BOOL WINAPI HookedSetCurrentDirectoryW(LPCWSTR path) {
+    // In scratch-cwd VFS mode, changing cwd would desync the static
+    // logical/scratch cwd mapping. Fail fast in the remote attempt and mark it
+    // for local rerun instead of exposing inconsistent cwd behavior.
+    if (g_vfsMode && g_vfsCwdLen > 0) {
+        VfsMarkUnvirtualized();
+        SetLastError(ERROR_RETRY);
+        return FALSE;
+    }
+    return TrueSetCurrentDirectoryW(path);
+}
+
+BOOL WINAPI HookedSetCurrentDirectoryA(LPCSTR path) {
+    if (g_vfsMode && g_vfsCwdLen > 0) {
+        VfsMarkUnvirtualized();
+        SetLastError(ERROR_RETRY);
+        return FALSE;
+    }
+    return TrueSetCurrentDirectoryA(path);
+}
+
+DWORD WINAPI HookedGetFullPathNameW(LPCWSTR path, DWORD bufferLen,
+                                    LPWSTR buffer, LPWSTR* filePart) {
+    wchar_t logical[1024];
+    DWORD logicalLen = LogicalFullPathName(path, logical, 1024);
+    if (logicalLen > 0) {
+        return CopyLogicalPathW(logical, logicalLen, bufferLen, buffer,
+                                filePart);
+    }
+    return TrueGetFullPathNameW(path, bufferLen, buffer, filePart);
+}
+
+DWORD WINAPI HookedGetFullPathNameA(LPCSTR path, DWORD bufferLen, LPSTR buffer,
+                                    LPSTR* filePart) {
+    WideArg w(path);
+    if (w.get() != nullptr) {
+        wchar_t logical[1024];
+        DWORD logicalLen = LogicalFullPathName(w.get(), logical, 1024);
+        if (logicalLen > 0) {
+            return CopyLogicalPathA(logical, bufferLen, buffer, filePart);
+        }
+    }
+    return TrueGetFullPathNameA(path, bufferLen, buffer, filePart);
+}
+
 DWORD WINAPI HookedGetFileAttributesW(LPCWSTR path) {
-    DWORD attrs = TrueGetFileAttributesW(path);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = path;
+    DWORD attrs = INVALID_FILE_ATTRIBUTES;
+    if (VfsMaterializeForProbe(path, local, 1024, logical, 1024, &handled)) {
+        attrs = TrueGetFileAttributesW(local);
+        recordPath = logical;
+    } else if (handled) {
+        attrs = INVALID_FILE_ATTRIBUTES;
+        recordPath = logical;
+    } else {
+        attrs = TrueGetFileAttributesW(path);
+    }
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kProbe,
-                  attrs == INVALID_FILE_ATTRIBUTES ? saved : 0, attrs, path);
+                  attrs == INVALID_FILE_ATTRIBUTES ? saved : 0, attrs,
+                  recordPath);
     SetLastError(saved);
     return attrs;
 }
 
 DWORD WINAPI HookedGetFileAttributesA(LPCSTR path) {
-    DWORD attrs = TrueGetFileAttributesA(path);
-    DWORD saved = GetLastError();
     WideArg w(path);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = w.get();
+    DWORD attrs = INVALID_FILE_ATTRIBUTES;
+    if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
+                               &handled)) {
+        attrs = TrueGetFileAttributesW(local);
+        recordPath = logical;
+    } else if (handled) {
+        attrs = INVALID_FILE_ATTRIBUTES;
+        recordPath = logical;
+    } else {
+        attrs = TrueGetFileAttributesA(path);
+    }
+    DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kProbe,
                   attrs == INVALID_FILE_ATTRIBUTES ? saved : 0, attrs,
-                  w.get(), w.length());
+                  recordPath, -1);
     SetLastError(saved);
     return attrs;
 }
@@ -706,10 +1183,23 @@ ULONGLONG ExAttrsExtra(BOOL ok, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
 BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR path,
                                        GET_FILEEX_INFO_LEVELS level,
                                        LPVOID info) {
-    BOOL ok = TrueGetFileAttributesExW(path, level, info);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = path;
+    BOOL ok = FALSE;
+    if (VfsMaterializeForProbe(path, local, 1024, logical, 1024, &handled)) {
+        ok = TrueGetFileAttributesExW(local, level, info);
+        recordPath = logical;
+    } else if (handled) {
+        ok = FALSE;
+        recordPath = logical;
+    } else {
+        ok = TrueGetFileAttributesExW(path, level, info);
+    }
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kProbe, ok ? 0 : saved,
-                  ExAttrsExtra(ok, level, info), path);
+                  ExAttrsExtra(ok, level, info), recordPath);
     SetLastError(saved);
     return ok;
 }
@@ -717,31 +1207,81 @@ BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR path,
 BOOL WINAPI HookedGetFileAttributesExA(LPCSTR path,
                                        GET_FILEEX_INFO_LEVELS level,
                                        LPVOID info) {
-    BOOL ok = TrueGetFileAttributesExA(path, level, info);
-    DWORD saved = GetLastError();
     WideArg w(path);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = w.get();
+    BOOL ok = FALSE;
+    if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
+                               &handled)) {
+        ok = TrueGetFileAttributesExW(local, level, info);
+        recordPath = logical;
+    } else if (handled) {
+        ok = FALSE;
+        recordPath = logical;
+    } else {
+        ok = TrueGetFileAttributesExA(path, level, info);
+    }
+    DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kProbe, ok ? 0 : saved,
-                  ExAttrsExtra(ok, level, info), w.get(), w.length());
+                  ExAttrsExtra(ok, level, info), recordPath, -1);
     SetLastError(saved);
     return ok;
 }
 
 HANDLE WINAPI HookedFindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
-    HANDLE h = TrueFindFirstFileW(pattern, data);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = pattern;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (VfsFailWildcardEnumeration(pattern, logical, 1024, &handled)) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else if (VfsMaterializeForProbe(pattern, local, 1024, logical, 1024,
+                                      &handled)) {
+        h = TrueFindFirstFileW(local, data);
+        recordPath = logical;
+    } else if (handled) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else {
+        h = TrueFindFirstFileW(pattern, data);
+    }
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, pattern);
+                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath);
     SetLastError(saved);
     return h;
 }
 
 HANDLE WINAPI HookedFindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
-    HANDLE h = TrueFindFirstFileA(pattern, data);
-    DWORD saved = GetLastError();
     WideArg w(pattern);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = w.get();
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (VfsFailWildcardEnumeration(w.get(), logical, 1024, &handled)) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
+                                      &handled)) {
+        char localA[2048];
+        if (WideToAnsi(local, localA, ARRAYSIZE(localA), nullptr)) {
+            h = TrueFindFirstFileA(localA, data);
+        }
+        recordPath = logical;
+    } else if (handled) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else {
+        h = TrueFindFirstFileA(pattern, data);
+    }
+    DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, w.get(),
-                  w.length());
+                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath, -1);
     SetLastError(saved);
     return h;
 }
@@ -750,10 +1290,27 @@ HANDLE WINAPI HookedFindFirstFileExW(LPCWSTR pattern,
                                      FINDEX_INFO_LEVELS level, LPVOID data,
                                      FINDEX_SEARCH_OPS op, LPVOID filter,
                                      DWORD flags) {
-    HANDLE h = TrueFindFirstFileExW(pattern, level, data, op, filter, flags);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = pattern;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (VfsFailWildcardEnumeration(pattern, logical, 1024, &handled)) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else if (VfsMaterializeForProbe(pattern, local, 1024, logical, 1024,
+                                      &handled)) {
+        h = TrueFindFirstFileExW(local, level, data, op, filter, flags);
+        recordPath = logical;
+    } else if (handled) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else {
+        h = TrueFindFirstFileExW(pattern, level, data, op, filter, flags);
+    }
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, pattern);
+                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath);
     SetLastError(saved);
     return h;
 }
@@ -761,17 +1318,37 @@ HANDLE WINAPI HookedFindFirstFileExW(LPCWSTR pattern,
 HANDLE WINAPI HookedFindFirstFileExA(LPCSTR pattern, FINDEX_INFO_LEVELS level,
                                      LPVOID data, FINDEX_SEARCH_OPS op,
                                      LPVOID filter, DWORD flags) {
-    HANDLE h = TrueFindFirstFileExA(pattern, level, data, op, filter, flags);
-    DWORD saved = GetLastError();
     WideArg w(pattern);
+    wchar_t local[1024];
+    wchar_t logical[1024];
+    bool handled = false;
+    const wchar_t* recordPath = w.get();
+    HANDLE h = INVALID_HANDLE_VALUE;
+    if (VfsFailWildcardEnumeration(w.get(), logical, 1024, &handled)) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
+                                      &handled)) {
+        char localA[2048];
+        if (WideToAnsi(local, localA, ARRAYSIZE(localA), nullptr)) {
+            h = TrueFindFirstFileExA(localA, level, data, op, filter, flags);
+        }
+        recordPath = logical;
+    } else if (handled) {
+        h = INVALID_HANDLE_VALUE;
+        recordPath = logical;
+    } else {
+        h = TrueFindFirstFileExA(pattern, level, data, op, filter, flags);
+    }
+    DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, w.get(),
-                  w.length());
+                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath, -1);
     SetLastError(saved);
     return h;
 }
 
 BOOL WINAPI HookedDeleteFileW(LPCWSTR path) {
+    MaybeMarkVfsMutation(path);
     BOOL ok = TrueDeleteFileW(path);
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kDelete, ok ? 0 : saved, 0, path);
@@ -780,9 +1357,10 @@ BOOL WINAPI HookedDeleteFileW(LPCWSTR path) {
 }
 
 BOOL WINAPI HookedDeleteFileA(LPCSTR path) {
+    WideArg w(path);
+    MaybeMarkVfsMutation(w.get());
     BOOL ok = TrueDeleteFileA(path);
     DWORD saved = GetLastError();
-    WideArg w(path);
     trace::Record(trace::kFile, trace::kDelete, ok ? 0 : saved, 0, w.get(),
                   w.length());
     SetLastError(saved);
@@ -790,6 +1368,8 @@ BOOL WINAPI HookedDeleteFileA(LPCSTR path) {
 }
 
 BOOL WINAPI HookedMoveFileW(LPCWSTR from, LPCWSTR to) {
+    MaybeMarkVfsMutation(from);
+    MaybeMarkVfsMutation(to);
     BOOL ok = TrueMoveFileW(from, to);
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kMove, ok ? 0 : saved, 0, from, -1, to);
@@ -798,10 +1378,12 @@ BOOL WINAPI HookedMoveFileW(LPCWSTR from, LPCWSTR to) {
 }
 
 BOOL WINAPI HookedMoveFileA(LPCSTR from, LPCSTR to) {
-    BOOL ok = TrueMoveFileA(from, to);
-    DWORD saved = GetLastError();
     WideArg wf(from);
     WideArg wt(to);
+    MaybeMarkVfsMutation(wf.get());
+    MaybeMarkVfsMutation(wt.get());
+    BOOL ok = TrueMoveFileA(from, to);
+    DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kMove, ok ? 0 : saved, 0, wf.get(),
                   wf.length(), wt.get(), wt.length());
     SetLastError(saved);
@@ -809,6 +1391,8 @@ BOOL WINAPI HookedMoveFileA(LPCSTR from, LPCSTR to) {
 }
 
 BOOL WINAPI HookedMoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
+    MaybeMarkVfsMutation(from);
+    MaybeMarkVfsMutation(to);
     BOOL ok = TrueMoveFileExW(from, to, flags);
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kMove, ok ? 0 : saved, flags, from, -1,
@@ -818,10 +1402,12 @@ BOOL WINAPI HookedMoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
 }
 
 BOOL WINAPI HookedMoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
-    BOOL ok = TrueMoveFileExA(from, to, flags);
-    DWORD saved = GetLastError();
     WideArg wf(from);
     WideArg wt(to);
+    MaybeMarkVfsMutation(wf.get());
+    MaybeMarkVfsMutation(wt.get());
+    BOOL ok = TrueMoveFileExA(from, to, flags);
+    DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kMove, ok ? 0 : saved, flags, wf.get(),
                   wf.length(), wt.get(), wt.length());
     SetLastError(saved);
@@ -829,6 +1415,7 @@ BOOL WINAPI HookedMoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
 }
 
 BOOL WINAPI HookedCreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
+    MaybeMarkVfsMutation(path);
     BOOL ok = TrueCreateDirectoryW(path, sa);
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kCreateDir, ok ? 0 : saved, 0, path);
@@ -837,9 +1424,10 @@ BOOL WINAPI HookedCreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES sa) {
 }
 
 BOOL WINAPI HookedCreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa) {
+    WideArg w(path);
+    MaybeMarkVfsMutation(w.get());
     BOOL ok = TrueCreateDirectoryA(path, sa);
     DWORD saved = GetLastError();
-    WideArg w(path);
     trace::Record(trace::kFile, trace::kCreateDir, ok ? 0 : saved, 0, w.get(),
                   w.length());
     SetLastError(saved);
@@ -847,6 +1435,7 @@ BOOL WINAPI HookedCreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa) {
 }
 
 BOOL WINAPI HookedRemoveDirectoryW(LPCWSTR path) {
+    MaybeMarkVfsMutation(path);
     BOOL ok = TrueRemoveDirectoryW(path);
     DWORD saved = GetLastError();
     trace::Record(trace::kFile, trace::kRemoveDir, ok ? 0 : saved, 0, path);
@@ -855,9 +1444,10 @@ BOOL WINAPI HookedRemoveDirectoryW(LPCWSTR path) {
 }
 
 BOOL WINAPI HookedRemoveDirectoryA(LPCSTR path) {
+    WideArg w(path);
+    MaybeMarkVfsMutation(w.get());
     BOOL ok = TrueRemoveDirectoryA(path);
     DWORD saved = GetLastError();
-    WideArg w(path);
     trace::Record(trace::kFile, trace::kRemoveDir, ok ? 0 : saved, 0, w.get(),
                   w.length());
     SetLastError(saved);
@@ -1227,6 +1817,12 @@ const HookPair kHooks[] = {
     HOOK(FindFirstFileA),
     HOOK(FindFirstFileExW),
     HOOK(FindFirstFileExA),
+    HOOK(GetCurrentDirectoryW),
+    HOOK(GetCurrentDirectoryA),
+    HOOK(SetCurrentDirectoryW),
+    HOOK(SetCurrentDirectoryA),
+    HOOK(GetFullPathNameW),
+    HOOK(GetFullPathNameA),
     HOOK(DeleteFileW),
     HOOK(DeleteFileA),
     HOOK(MoveFileW),

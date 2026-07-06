@@ -21,7 +21,7 @@ pub mod vfs_pipe;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -48,6 +48,67 @@ use crate::vfs_pipe::serve_vfs_with_prefetch_ready;
 
 /// Disambiguates per-action VFS pipe/scratch names within a worker process.
 static EXEC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VfsChildCwd {
+    None,
+    Original(PathBuf),
+    Scratch(PathBuf),
+}
+
+impl VfsChildCwd {
+    fn path(&self) -> Option<&Path> {
+        match self {
+            VfsChildCwd::None => None,
+            VfsChildCwd::Original(path) | VfsChildCwd::Scratch(path) => Some(path),
+        }
+    }
+}
+
+fn vfs_child_cwd(cmd_cwd: &str, vfs_root: &str, scratch: &Path) -> VfsChildCwd {
+    if cmd_cwd.is_empty() {
+        return VfsChildCwd::None;
+    }
+    if vfs_root.is_empty() {
+        return VfsChildCwd::Original(PathBuf::from(cmd_cwd));
+    }
+
+    let cwd = Path::new(cmd_cwd);
+    let root = Path::new(vfs_root);
+    match strip_prefix_case_insensitive(cwd, root) {
+        Some(rel) if rel.as_os_str().is_empty() => VfsChildCwd::Scratch(scratch.to_path_buf()),
+        Some(rel) if is_safe_relative_child_cwd(&rel) => VfsChildCwd::Scratch(scratch.join(rel)),
+        Some(_) => VfsChildCwd::Original(cwd.to_path_buf()),
+        None => VfsChildCwd::Original(cwd.to_path_buf()),
+    }
+}
+
+fn is_safe_relative_child_cwd(rel: &Path) -> bool {
+    rel.components().all(|c| {
+        !matches!(
+            c,
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir
+        )
+    })
+}
+
+fn strip_prefix_case_insensitive(path: &Path, base: &Path) -> Option<PathBuf> {
+    let mut path_components = path.components();
+    for base_component in base.components() {
+        let path_component = path_components.next()?;
+        let path_text = path_component.as_os_str().to_string_lossy();
+        let base_text = base_component.as_os_str().to_string_lossy();
+        if !path_text.eq_ignore_ascii_case(base_text.as_ref()) {
+            return None;
+        }
+    }
+
+    let mut rel = PathBuf::new();
+    for component in path_components {
+        rel.push(component.as_os_str());
+    }
+    Some(rel)
+}
 
 /// Worker-local install config for read-VFS execution (M6.1). Set from the
 /// worker daemon's environment; absent on a plain (M5 scale) worker. The agent
@@ -90,13 +151,16 @@ const QUEUE_FACTOR: u32 = 8;
 /// sides.
 const MAX_CAPACITY: u32 = 256;
 
-/// Marker the injected DLL drops in the per-action scratch dir when, under strict
-/// VFS (ADR 0007 §a②), a read-only open under `vfs_root` could not be supplied by
-/// the agent and was therefore failed instead of opened locally. Its presence
-/// after the child exits means the process saw a wrong/missing input, so the
-/// worker reports the action as not-completed and the agent re-runs it locally.
+/// Marker the injected DLL drops in the per-action scratch dir when a VFS remote
+/// attempt must be abandoned and re-run locally. Strict unsupplied reads and
+/// unsupported VFS-root wildcard enumeration both use it.
 /// Must match `kUnvirtMarker` in `hooks/src/interceptor.cpp`.
 const UNVIRT_MARKER: &str = ".sbz-unvirtualized";
+/// Marker the injected DLL drops when a scratch-cwd action mutates a logical-root
+/// path. Until output WriteBack is wired end-to-end, those outputs would be
+/// stranded in scratch, so the worker must force local fallback instead.
+/// Must match `kUnsafeOutputMarker` in `hooks/src/interceptor.cpp`.
+const UNSAFE_OUTPUT_MARKER: &str = ".sbz-unsafe-output";
 
 /// Hard ceiling on a single action's wall time when none is configured. This is
 /// a runaway/hung-child backstop (a process the agent never reaps still frees
@@ -485,7 +549,7 @@ async fn run_action(
     // run; `job` is the process-tree kill handle; `scratch_dir` is the hydrated
     // input tree to remove after the run (deferred #8 / M9.2). All are cleaned up
     // after the child exits.
-    let (mut child, pipe_task, job, unvirt_marker, scratch_dir) =
+    let (mut child, pipe_task, job, unvirt_marker, unsafe_output_marker, scratch_dir) =
         match build_child(&cmd, vfs_plan, predicted_paths, session_id).await {
             Ok(parts) => parts,
             Err(detail) => {
@@ -536,18 +600,24 @@ async fn run_action(
                 // has the full diagnostics in hand when it sees the exit code.
                 if let Some(h) = stdout_reader.take() { let _ = h.await; }
                 if let Some(h) = stderr_reader.take() { let _ = h.await; }
-                // Fail-closed (M8.2 ②): under strict VFS, if the DLL marked an
-                // unvirtualized access (a read under vfs_root the agent could not
-                // supply), the process ran against a wrong/missing input — its
-                // exit code is untrustworthy. Report NOT-completed (Failed, no
-                // exit) so the agent re-runs the whole action locally. This is the
-                // sanctioned fallback channel: the agent treats "no exit status"
-                // as a fallback trigger (a nonzero exit would NOT fall back).
+                // Fail-closed: if the DLL marked an unsupported VFS access, the
+                // process did not complete against a trustworthy remote view.
+                // Report NOT-completed (Failed, no exit) so the agent re-runs the
+                // whole action locally. This is the sanctioned fallback channel:
+                // the agent treats "no exit status" as a fallback trigger (a
+                // nonzero exit would NOT fall back).
                 if unvirt_marker.as_ref().is_some_and(|m| m.exists()) {
                     let _ = tx
                         .send(state_event(
                             ActionState::Failed,
-                            "unvirtualized access under vfs_root (strict): re-run locally",
+                            "unsupported VFS access under vfs_root: re-run locally",
+                        ))
+                        .await;
+                } else if unsafe_output_marker.as_ref().is_some_and(|m| m.exists()) {
+                    let _ = tx
+                        .send(state_event(
+                            ActionState::Failed,
+                            "output under virtual cwd requires WriteBack: re-run locally",
                         ))
                         .await;
                 } else {
@@ -636,8 +706,10 @@ async fn build_child(
         tokio::process::Child,
         Option<tokio::task::JoinHandle<std::io::Result<()>>>,
         Option<JobObject>,
-        // Strict-VFS unvirtualized-access marker path to check after exit (M8.2
-        // ②); `None` in plain mode or when strict VFS is off.
+        // VFS local-rerun marker path to check after exit; `None` in plain mode.
+        Option<std::path::PathBuf>,
+        // Scratch-cwd output-mutation marker path to check after exit; `None`
+        // when the child ran in its submitted cwd or in plain mode.
         Option<std::path::PathBuf>,
         // Per-action hydrated scratch dir to remove after the run (deferred #8 /
         // M9.2); `None` in plain mode, where no scratch tree is created.
@@ -704,7 +776,7 @@ async fn build_child(
                 None => Ok(j), // already exited; nothing to assign
             })
             .map_err(|e| setup_err("job object setup failed", e))?;
-        return Ok((child, None, Some(job), None, None));
+        return Ok((child, None, Some(job), None, None, None));
     };
 
     // VFS mode. Per-action unique pipe + scratch so concurrent actions never
@@ -731,6 +803,16 @@ async fn build_child(
         tokio::fs::create_dir_all(&v.trace_dir)
             .await
             .map_err(|e| setup_err("create trace dir failed", e))?;
+    }
+    let child_cwd = vfs_child_cwd(&cmd.cwd, &v.vfs_root, &scratch);
+    if let VfsChildCwd::Scratch(path) = &child_cwd {
+        match tokio::fs::create_dir_all(path).await {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
+                return Err(setup_err("create child cwd failed", e));
+            }
+        }
     }
     let scratch_str = scratch.to_string_lossy().into_owned();
 
@@ -773,15 +855,24 @@ async fn build_child(
     let mut command = tokio::process::Command::new(&cfg.launcher);
     command.arg(&cfg.dll);
     command.args(&cmd.argv);
-    if !cmd.cwd.is_empty() {
-        command.current_dir(&cmd.cwd);
+    if let Some(cwd) = child_cwd.path() {
+        command.current_dir(cwd);
     }
     command.env_clear();
     for (k, val) in &cmd.env {
         command.env(k, val);
     }
+    // Authoritative VFS cwd: cmd.env must not smuggle fake logical cwd remaps
+    // when this action is not intentionally running from scratch.
+    command.env_remove("SEMBAZURU_VFS_CWD");
+    // Authoritative trace destination: only the worker-selected trace dir may
+    // collect hook traces for this action.
+    command.env_remove("SEMBAZURU_TRACE_DIR");
     command.env("SEMBAZURU_MODE", "vfs");
     command.env("SEMBAZURU_VFS_ROOT", &v.vfs_root);
+    if let VfsChildCwd::Scratch(_) = &child_cwd {
+        command.env("SEMBAZURU_VFS_CWD", &cmd.cwd);
+    }
     command.env("SEMBAZURU_VFS_PIPE", &pipe_name);
     command.env("SEMBAZURU_VFS_SCRATCH", &scratch_str);
     if !v.trace_dir.is_empty() {
@@ -794,8 +885,9 @@ async fn build_child(
     // action's cmd.env cannot smuggle strict on and desync the DLL from this
     // worker's marker check (security M8.2 MEDIUM-1).
     command.env("SEMBAZURU_VFS_STRICT", if v.strict { "1" } else { "0" });
-    let unvirt_marker = if v.strict {
-        Some(std::path::PathBuf::from(&scratch_str).join(UNVIRT_MARKER))
+    let unvirt_marker = Some(std::path::PathBuf::from(&scratch_str).join(UNVIRT_MARKER));
+    let unsafe_output_marker = if matches!(&child_cwd, VfsChildCwd::Scratch(_)) {
+        Some(std::path::PathBuf::from(&scratch_str).join(UNSAFE_OUTPUT_MARKER))
     } else {
         None
     };
@@ -838,6 +930,7 @@ async fn build_child(
         Some(pipe_task),
         Some(job),
         unvirt_marker,
+        unsafe_output_marker,
         Some(scratch_for_cleanup),
     ))
 }
@@ -1014,6 +1107,66 @@ mod tests {
         assert_eq!(
             capped[MAX_PREDICTED_PATHS - 1],
             format!("c:\\src\\h{}.h", MAX_PREDICTED_PATHS - 1)
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_maps_vfs_root_to_scratch() {
+        let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
+
+        assert_eq!(
+            vfs_child_cwd(r"C:\src\proj", r"C:\src\proj", scratch),
+            VfsChildCwd::Scratch(scratch.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_preserves_relative_subdir_under_scratch() {
+        let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
+
+        assert_eq!(
+            vfs_child_cwd(r"C:\src\proj\sub\dir", r"C:\src\proj", scratch),
+            VfsChildCwd::Scratch(scratch.join(r"sub\dir"))
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_matches_windows_paths_case_insensitively() {
+        let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
+
+        assert_eq!(
+            vfs_child_cwd(r"C:\SRC\proj\sub", r"c:\src\PROJ", scratch),
+            VfsChildCwd::Scratch(scratch.join("sub"))
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_rejects_parent_dir_suffix_under_root() {
+        let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
+
+        assert_eq!(
+            vfs_child_cwd(r"C:\src\proj\..\outside", r"C:\src\proj", scratch),
+            VfsChildCwd::Original(PathBuf::from(r"C:\src\proj\..\outside"))
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_leaves_outside_root_unchanged() {
+        assert_eq!(
+            vfs_child_cwd(
+                r"D:\other",
+                r"C:\src\proj",
+                std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run")
+            ),
+            VfsChildCwd::Original(PathBuf::from(r"D:\other"))
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_omits_empty_cwd() {
+        assert_eq!(
+            vfs_child_cwd("", r"C:\src\proj", std::path::Path::new(r"C:\scratch")),
+            VfsChildCwd::None
         );
     }
 }
