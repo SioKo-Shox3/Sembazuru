@@ -28,12 +28,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rootdir::{FileSnapshot, RootDir, file_snapshot};
 use cap_std::fs::OpenOptions;
+use sembazuru_cas::toolchain::ToolchainIdentity;
 use sembazuru_cas::{
     ActionCache, ActionResult, BlobStore, CasError, Digest, DigestHasher, OutputFile,
     codec_checksum,
 };
 use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
-use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest};
+use sembazuru_tracer::action_key::{self, InputEntry, InputKind, InputManifest, SideEffectPolicy};
 use sembazuru_tracer::normalize_for_compare;
 
 /// Owns the on-disk CAS + action cache rooted at one directory.
@@ -115,7 +116,7 @@ impl AgentCache {
         argv: &[String],
         env: &[(String, String)],
         cwd: &str,
-    ) -> (Digest, sembazuru_cas::toolchain::ToolchainIdentity) {
+    ) -> (Digest, ToolchainIdentity) {
         // PATH is excluded from the KEY (volatile), but is read here to resolve a
         // bare argv0 to the actual binary, whose content digest IS the identity.
         let path_env = env
@@ -456,6 +457,24 @@ impl AgentCache {
         Ok(action_key::input_manifest(&graph, &root))
     }
 
+    /// Loads a trace directory with the verified compiler side-effect policy.
+    /// This is intentionally narrower than [`AgentCache::manifest_from_trace_dir`]:
+    /// only a content-identified tool may allow the whole env block plus exact
+    /// enumeration of the resolved tool path and its ancestors.
+    pub fn manifest_from_trace_dir_verified_tool(
+        &self,
+        trace_dir: &str,
+        root_override: Option<&str>,
+        identity: &ToolchainIdentity,
+    ) -> Result<InputManifest, String> {
+        let (graph, cwd) = action_key::load_run_from_dir(trace_dir)?;
+        let root = effective_root(root_override, &cwd);
+        let policy = verified_tool_side_effect_policy(identity);
+        Ok(action_key::input_manifest_with_policy(
+            &graph, &root, &policy,
+        ))
+    }
+
     /// The build-root-relative output paths a traced run produced (observed
     /// writes/renames), for trace-based output discovery when the launcher could
     /// not declare them (ADR 0007 §b; the M8.1 compiler-independence path). This
@@ -491,6 +510,93 @@ fn effective_root(root_override: Option<&str>, trace_cwd: &str) -> String {
     match root_override {
         Some(r) if !r.trim().is_empty() => normalize_for_compare(r),
         _ => trace_cwd.to_string(),
+    }
+}
+
+fn verified_tool_side_effect_policy(identity: &ToolchainIdentity) -> SideEffectPolicy {
+    let mut policy = SideEffectPolicy::conservative();
+    if let ToolchainIdentity::Content { path, .. } = identity {
+        policy.allow_env_block = true;
+        policy.allowed_enumerate = normalized_path_and_ancestors(path);
+    }
+    policy
+}
+
+fn normalized_path_and_ancestors(path: &Path) -> Vec<String> {
+    let mut current = normalize_for_compare(&path.to_string_lossy());
+    let mut entries = Vec::new();
+    loop {
+        if current.is_empty() || is_broad_enumerate_root(&current) {
+            break;
+        }
+        if !entries.iter().any(|entry| entry == &current) {
+            entries.push(current.clone());
+        }
+        let Some(parent) = normalized_parent(&current) else {
+            break;
+        };
+        current = parent;
+    }
+    entries
+}
+
+fn normalized_parent(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('\\');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let idx = trimmed.rfind('\\')?;
+    if idx == 0 {
+        return None;
+    }
+    if let Some(unc_tail) = trimmed.strip_prefix("\\\\") {
+        let server_end = unc_tail.find('\\').map(|i| i + 2)?;
+        if idx <= server_end {
+            return None;
+        }
+    }
+    let parent = &trimmed[..idx];
+    if is_broad_enumerate_root(parent) {
+        return None;
+    }
+    Some(parent.to_string())
+}
+
+fn is_broad_enumerate_root(path: &str) -> bool {
+    if is_drive_root_like(path) || is_unc_share_root(path) {
+        return true;
+    }
+    let Some(tail) = drive_root_tail(path) else {
+        return false;
+    };
+    matches!(
+        tail,
+        "program files"
+            | "program files (x86)"
+            | "program files\\microsoft visual studio"
+            | "program files (x86)\\microsoft visual studio"
+    )
+}
+
+fn is_unc_share_root(path: &str) -> bool {
+    let Some(tail) = path.strip_prefix("\\\\") else {
+        return false;
+    };
+    let mut parts = tail.split('\\').filter(|part| !part.is_empty());
+    parts.next().is_some() && parts.next().is_some() && parts.next().is_none()
+}
+
+fn is_drive_root_like(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn drive_root_tail(path: &str) -> Option<&str> {
+    let bytes = path.as_bytes();
+    if bytes.len() > 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\' {
+        Some(&path[3..])
+    } else {
+        None
     }
 }
 
@@ -811,6 +917,118 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn verified_tool_policy_allows_only_content_tool_path_and_ancestors() {
+        let identity = ToolchainIdentity::Content {
+            digest: Digest::of(b"clang-cl"),
+            path: PathBuf::from(r"C:\Program Files\LLVM\bin\clang-cl.exe"),
+        };
+
+        let policy = verified_tool_side_effect_policy(&identity);
+
+        assert!(policy.allow_env_block);
+        assert!(policy.allowed_registry.is_empty());
+        for path in [
+            r"C:\Program Files\LLVM\bin\clang-cl.exe",
+            r"C:\Program Files\LLVM\bin",
+            r"C:\Program Files\LLVM",
+        ] {
+            let normalized = normalize_for_compare(path);
+            assert!(
+                policy.allowed_enumerate.contains(&normalized),
+                "missing {normalized}"
+            );
+        }
+        for path in [r"C:\Program Files", r"C:\", r"C:"] {
+            let normalized = normalize_for_compare(path);
+            assert!(
+                !policy.allowed_enumerate.contains(&normalized),
+                "unexpected broad ancestor {normalized}"
+            );
+        }
+        assert!(
+            !policy
+                .allowed_enumerate
+                .contains(&normalize_for_compare(r"C:\work\project"))
+        );
+    }
+
+    #[test]
+    fn verified_tool_policy_stops_visual_studio_at_version_root() {
+        let identity = ToolchainIdentity::Content {
+            digest: Digest::of(b"vs-clang-cl"),
+            path: PathBuf::from(
+                r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin\clang-cl.exe",
+            ),
+        };
+
+        let policy = verified_tool_side_effect_policy(&identity);
+
+        for path in [
+            r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin\clang-cl.exe",
+            r"C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin",
+            r"C:\Program Files\Microsoft Visual Studio\2022",
+        ] {
+            let normalized = normalize_for_compare(path);
+            assert!(
+                policy.allowed_enumerate.contains(&normalized),
+                "missing {normalized}"
+            );
+        }
+        for path in [
+            r"C:\Program Files\Microsoft Visual Studio",
+            r"C:\Program Files",
+            r"C:\",
+        ] {
+            let normalized = normalize_for_compare(path);
+            assert!(
+                !policy.allowed_enumerate.contains(&normalized),
+                "unexpected broad ancestor {normalized}"
+            );
+        }
+    }
+
+    #[test]
+    fn verified_tool_policy_stops_unc_at_share_root() {
+        let identity = ToolchainIdentity::Content {
+            digest: Digest::of(b"unc-clang-cl"),
+            path: PathBuf::from(r"\\buildshare\tools\LLVM\bin\clang-cl.exe"),
+        };
+
+        let policy = verified_tool_side_effect_policy(&identity);
+
+        for path in [
+            r"\\buildshare\tools\LLVM\bin\clang-cl.exe",
+            r"\\buildshare\tools\LLVM\bin",
+            r"\\buildshare\tools\LLVM",
+        ] {
+            let normalized = normalize_for_compare(path);
+            assert!(
+                policy.allowed_enumerate.contains(&normalized),
+                "missing {normalized}"
+            );
+        }
+        let share_root = normalize_for_compare(r"\\buildshare\tools");
+        assert!(
+            !policy.allowed_enumerate.contains(&share_root),
+            "unexpected broad UNC share root {share_root}"
+        );
+    }
+
+    #[test]
+    fn verified_tool_policy_keeps_nameonly_conservative() {
+        let identity = ToolchainIdentity::NameOnly {
+            digest: Digest::of(b"name-only"),
+            argv0: "clang-cl".to_string(),
+        };
+
+        let policy = verified_tool_side_effect_policy(&identity);
+
+        assert!(!policy.allow_env_block);
+        assert!(policy.allowed_registry.is_empty());
+        assert!(policy.allowed_enumerate.is_empty());
     }
 
     #[cfg(windows)]

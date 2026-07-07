@@ -318,6 +318,8 @@ pub struct InputManifest {
 }
 
 pub struct SideEffectPolicy {
+    /// Whether a whole environment block read is known cache-safe.
+    pub allow_env_block: bool,
     /// Exact normalized registry key/value pairs known cache-safe.
     pub allowed_registry: Vec<(String, String)>,
     /// Exact normalized dir paths whose enumeration is known cache-safe.
@@ -327,6 +329,7 @@ pub struct SideEffectPolicy {
 impl SideEffectPolicy {
     pub fn conservative() -> Self {
         Self {
+            allow_env_block: false,
             allowed_registry: Vec::new(),
             allowed_enumerate: Vec::new(),
         }
@@ -479,7 +482,10 @@ pub fn input_manifest_with_policy(
         {
             cacheable = false;
         }
-        if cacheable && graph.env.iter().any(|e| e.name == ENV_BLOCK_NAME) {
+        if cacheable
+            && !policy.allow_env_block
+            && graph.env.iter().any(|e| e.name == ENV_BLOCK_NAME)
+        {
             cacheable = false;
         }
         if cacheable {
@@ -679,6 +685,27 @@ mod action_cache_tests {
     }
 
     #[test]
+    fn explicit_policy_can_allow_env_block_and_exact_directory_enumeration() {
+        let root = tmp_dir("env-block-enumerate-allow");
+        std::fs::write(root.join("a.cpp"), b"src").unwrap();
+        std::fs::create_dir_all(root.join("incdir")).unwrap();
+        let rs = root_str(&root);
+        let mut g = graph_with(vec![read_access("a.cpp"), enumerate_access("incdir")]);
+        g.env.push(env_access(crate::graph::ENV_BLOCK_NAME));
+
+        assert!(!input_manifest_with_policy(&g, &rs, &SideEffectPolicy::conservative()).cacheable);
+
+        let policy = SideEffectPolicy {
+            allow_env_block: true,
+            allowed_registry: Vec::new(),
+            allowed_enumerate: vec!["incdir".to_string()],
+        };
+
+        assert!(input_manifest_with_policy(&g, &rs, &policy).cacheable);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn env_block_read_through_build_graph_makes_action_uncacheable() {
         let root = tmp_dir("env-block-real-path");
         let rs = root_str(&root);
@@ -723,6 +750,7 @@ mod action_cache_tests {
         g.registry
             .push(registry_access("hklm\\software\\tool", "setting"));
         let policy = SideEffectPolicy {
+            allow_env_block: false,
             allowed_registry: vec![("hklm\\software\\tool".to_string(), "setting".to_string())],
             allowed_enumerate: Vec::new(),
         };
@@ -740,6 +768,7 @@ mod action_cache_tests {
         g.registry
             .push(registry_access("hklm\\software", "tool\\setting"));
         let policy = SideEffectPolicy {
+            allow_env_block: false,
             allowed_registry: vec![("hklm\\software\\tool".to_string(), "setting".to_string())],
             allowed_enumerate: Vec::new(),
         };
@@ -756,6 +785,7 @@ mod action_cache_tests {
         let rs = root_str(&root);
         let g = graph_with(vec![read_access("a.cpp"), enumerate_access("incdir")]);
         let policy = SideEffectPolicy {
+            allow_env_block: false,
             allowed_registry: Vec::new(),
             allowed_enumerate: vec!["incdir".to_string()],
         };

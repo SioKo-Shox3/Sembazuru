@@ -524,6 +524,7 @@ async fn run_submission(
             let declared = declared_outputs.clone();
             let td = trace_dir.clone();
             let rd = root_decl.clone();
+            let identity = (*identity).clone();
             // The remote run's console output, captured so a later hit replays the same
             // diagnostics (COR-007). Cloned (not moved) — `outcome` is still emitted below.
             let rec_stdout = o.stdout.clone();
@@ -540,7 +541,8 @@ async fn run_submission(
                 // could not cover a real source, or an out-of-scope output, simply
                 // does not get stored — the build stays correct, just uncached.
                 if !outs.is_empty()
-                    && let Ok(manifest) = cache.manifest_from_trace_dir(&td, root)
+                    && let Ok(manifest) =
+                        cache.manifest_from_trace_dir_verified_tool(&td, root, &identity)
                 {
                     let _ = cache.record(&weak, &manifest, &br, &outs, 0, &rec_stdout, &rec_stderr);
                 }

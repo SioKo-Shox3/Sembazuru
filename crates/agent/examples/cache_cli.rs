@@ -80,7 +80,7 @@ fn main() -> ExitCode {
         }
     };
     let env: Vec<(String, String)> = std::env::vars().collect();
-    let weak = agent.weak_key(&argv, &env, "");
+    let (weak, tool_identity) = agent.weak_key_and_tool(&argv, &env, "");
     let build_root = PathBuf::from(build_root);
 
     match mode {
@@ -92,7 +92,11 @@ fn main() -> ExitCode {
             // Root the manifest at the same build root used to record/publish,
             // so logical paths line up (mirrors the daemon's effective-root use).
             let root_s = build_root.to_string_lossy().into_owned();
-            let manifest = match agent.manifest_from_trace_dir(&trace_dir, Some(&root_s)) {
+            let manifest = match agent.manifest_from_trace_dir_verified_tool(
+                &trace_dir,
+                Some(&root_s),
+                &tool_identity,
+            ) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("cache_cli record: load trace: {e}");

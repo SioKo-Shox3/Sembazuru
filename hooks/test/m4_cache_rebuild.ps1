@@ -146,10 +146,11 @@ function Invoke-CacheGate {
     # 3. Second build: delete the output, resolve -> must HIT and republish.
     Remove-Item (Join-Path $root 'a.obj') -Force
     $r = (& $cli resolve --cache $cache --build-root $root -- @argv | Out-String).Trim()
+    $resolveExit = $LASTEXITCODE
     Write-Host "resolve(unchanged) -> $r"
-    if ($LASTEXITCODE -ne 0 -or -not ($r -match '^HIT')) {
+    if ($resolveExit -ne 0 -or -not ($r -match '^HIT')) {
         Write-TraceSideEffectSummary -TraceDir $trace
-        return "${Cc}: second build was not a cache hit (got '$r', exit $LASTEXITCODE)"
+        return "${Cc}: second build was not a cache hit (got '$r', exit $resolveExit)"
     }
     if (-not (Test-Path (Join-Path $root 'a.obj'))) { return "${Cc}: hit did not republish a.obj" }
     if (-not (Bytes-Equal (Join-Path $root 'a.obj') $obj1)) {
