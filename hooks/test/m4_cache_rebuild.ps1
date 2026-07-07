@@ -41,6 +41,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'cache_cli build failed' }
 } finally { Pop-Location }
 $cli = Join-Path $repo 'target\debug\examples\cache_cli.exe'
+$traceCli = Join-Path $repo 'target\release\sembazuru-trace.exe'
 
 $WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
 if (Test-Path $WorkRoot) { Remove-Item -Recurse -Force $WorkRoot }
@@ -77,6 +78,52 @@ function Bytes-Equal {
         [System.IO.File]::ReadAllBytes($P), [System.IO.File]::ReadAllBytes($Q))
 }
 
+function Write-TraceSideEffectSummary {
+    param([string]$TraceDir)
+
+    if (-not (Test-Path $traceCli)) {
+        Write-Host "trace side-effect diagnostic unavailable: missing $traceCli"
+        return
+    }
+
+    try {
+        $json = & $traceCli export --trace-dir $TraceDir --json 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "trace side-effect diagnostic export failed:"
+            Write-Host $json
+            return
+        }
+        $graph = $json | ConvertFrom-Json
+    } catch {
+        Write-Host "trace side-effect diagnostic failed: $_"
+        return
+    }
+
+    Write-Host '--- trace side-effect diagnostic ---'
+    if ($graph.warnings.Count -gt 0) {
+        Write-Host 'warnings:'
+        $graph.warnings | ForEach-Object { Write-Host "  $_" }
+    }
+    if ($graph.registry.Count -gt 0) {
+        Write-Host "registry reads: $($graph.registry.Count)"
+        $graph.registry | Select-Object -First 40 | ForEach-Object {
+            Write-Host "  $($_.key) :: $($_.value)"
+        }
+    }
+    $envBlock = @($graph.env | Where-Object { $_.name -eq '<environment-block>' })
+    if ($envBlock.Count -gt 0) {
+        Write-Host "whole environment block reads: $($envBlock.Count)"
+    }
+    $enumerated = @($graph.inputs | Where-Object { $_.kinds -contains 'enumerate' })
+    if ($enumerated.Count -gt 0) {
+        Write-Host "directory enumerations: $($enumerated.Count)"
+        $enumerated | Select-Object -First 40 | ForEach-Object {
+            Write-Host "  $($_.path)"
+        }
+    }
+    Write-Host '--- end trace side-effect diagnostic ---'
+}
+
 # Runs the full record -> hit -> rebuild -> miss cycle for one compiler.
 # Returns $null on pass, or a failure message.
 function Invoke-CacheGate {
@@ -101,6 +148,7 @@ function Invoke-CacheGate {
     $r = (& $cli resolve --cache $cache --build-root $root -- @argv | Out-String).Trim()
     Write-Host "resolve(unchanged) -> $r"
     if ($LASTEXITCODE -ne 0 -or -not ($r -match '^HIT')) {
+        Write-TraceSideEffectSummary -TraceDir $trace
         return "${Cc}: second build was not a cache hit (got '$r', exit $LASTEXITCODE)"
     }
     if (-not (Test-Path (Join-Path $root 'a.obj'))) { return "${Cc}: hit did not republish a.obj" }
