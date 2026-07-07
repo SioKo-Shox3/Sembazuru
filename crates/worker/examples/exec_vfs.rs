@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             vfs_root,
             trace_dir,
             strict: false,
+            allow_original_cwd: false,
         }),
     };
 

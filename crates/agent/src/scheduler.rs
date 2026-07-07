@@ -49,6 +49,74 @@ pub(crate) const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// is a scaffold tuned against the M5.5 efficiency measurement (ADR 0004 §5).
 pub const DEFAULT_REMOTE_BUDGET: Duration = Duration::from_secs(120);
 
+fn valid_endpoint_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
+}
+
+fn execution_endpoint_host(endpoint: &str) -> Option<&str> {
+    let (_, rest) = endpoint.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+
+    if let Some(after_open) = authority.strip_prefix('[') {
+        let (host, tail) = after_open.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        if tail.is_empty() {
+            return Some(host);
+        }
+        let port = tail.strip_prefix(':')?;
+        return valid_endpoint_port(port).then_some(host);
+    }
+
+    if authority.contains('[') || authority.contains(']') {
+        return None;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((_host, port)) if port.contains(':') => {
+            return None;
+        }
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(port) = port
+        && !valid_endpoint_port(port)
+    {
+        return None;
+    }
+    Some(host)
+}
+
+fn is_loopback_execution_endpoint(endpoint: &str) -> bool {
+    let Some(host) = execution_endpoint_host(endpoint) else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    matches!(
+        host.parse::<std::net::IpAddr>(),
+        Ok(std::net::IpAddr::V4(ip)) if ip.is_loopback()
+    ) || matches!(
+        host.parse::<std::net::IpAddr>(),
+        Ok(std::net::IpAddr::V6(ip)) if ip.is_loopback()
+    )
+}
+
+fn vfs_options_for_worker(opts: &ExecOptions, execution_endpoint: &str) -> ExecOptions {
+    let mut worker_opts = opts.clone();
+    if let Some(vfs) = &mut worker_opts.vfs {
+        vfs.allow_original_cwd = is_loopback_execution_endpoint(execution_endpoint);
+    }
+    worker_opts
+}
+
 /// SplitMix64 finalizer — avalanches every input bit into every output bit.
 fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -484,8 +552,9 @@ impl Scheduler {
                     continue;
                 }
             };
+            let worker_opts = vfs_options_for_worker(&opts, &w.execution_endpoint);
             let action_capability =
-                self.mint_action_capability(&w, &command, &action_id, &session_id, &opts);
+                self.mint_action_capability(&w, &command, &action_id, &session_id, &worker_opts);
             let attempt = tokio::time::timeout(
                 self.remote_budget,
                 execute_on_channel_with(
@@ -493,7 +562,7 @@ impl Scheduler {
                     command.clone(),
                     action_id.clone(),
                     session_id.clone(),
-                    opts.clone(),
+                    worker_opts,
                     action_capability,
                 ),
             )
@@ -629,7 +698,7 @@ fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sembazuru_proto::v0::Capabilities;
+    use sembazuru_proto::v0::{Capabilities, VfsExecution};
 
     /// A version-matched capability set: the default test worker is admissible by
     /// ADR 0011 (its `worker_version` equals this agent's). Tests that exercise the
@@ -671,6 +740,61 @@ mod tests {
             env: Default::default(),
             cwd: String::new(),
         }
+    }
+
+    #[test]
+    fn vfs_options_for_worker_allows_original_cwd_only_for_loopback_endpoint() {
+        let opts = ExecOptions {
+            predicted_paths: vec!["src/main.cpp".to_string()],
+            vfs: Some(VfsExecution {
+                agent_fileserver: "http://127.0.0.1:19000".to_string(),
+                vfs_root: "C:\\src".to_string(),
+                trace_dir: "C:\\trace".to_string(),
+                strict: true,
+                allow_original_cwd: false,
+            }),
+        };
+
+        let loopback = vfs_options_for_worker(&opts, "http://127.0.0.1:50051");
+        let ipv4_loopback_alias = vfs_options_for_worker(&opts, "http://127.0.0.2:50051");
+        let ipv6_loopback = vfs_options_for_worker(&opts, "http://[::1]:50051");
+        let localhost = vfs_options_for_worker(&opts, "http://localhost:50051");
+        let lan = vfs_options_for_worker(&opts, "http://192.168.1.20:50051");
+        let invalid = vfs_options_for_worker(&opts, "not an endpoint");
+        let invalid_port = vfs_options_for_worker(&opts, "http://127.0.0.1:notaport");
+
+        assert!(
+            loopback.vfs.as_ref().unwrap().allow_original_cwd,
+            "IPv4 loopback worker endpoints may enter the agent's original cwd"
+        );
+        assert!(
+            ipv4_loopback_alias.vfs.as_ref().unwrap().allow_original_cwd,
+            "IPv4 loopback worker endpoints in 127.0.0.0/8 may enter the agent's original cwd"
+        );
+        assert!(
+            ipv6_loopback.vfs.as_ref().unwrap().allow_original_cwd,
+            "IPv6 loopback worker endpoints may enter the agent's original cwd"
+        );
+        assert!(
+            localhost.vfs.as_ref().unwrap().allow_original_cwd,
+            "localhost worker endpoints may enter the agent's original cwd"
+        );
+        assert!(
+            !lan.vfs.as_ref().unwrap().allow_original_cwd,
+            "LAN worker endpoints must stay inside the VFS scratch cwd"
+        );
+        assert!(
+            !invalid.vfs.as_ref().unwrap().allow_original_cwd,
+            "invalid worker endpoints must stay inside the VFS scratch cwd"
+        );
+        assert!(
+            !invalid_port.vfs.as_ref().unwrap().allow_original_cwd,
+            "invalid loopback-looking worker endpoints must stay inside the VFS scratch cwd"
+        );
+        assert!(
+            !opts.vfs.as_ref().unwrap().allow_original_cwd,
+            "worker-specific VFS options must not mutate the base options"
+        );
     }
 
     #[test]

@@ -65,7 +65,24 @@ impl VfsChildCwd {
     }
 }
 
-fn vfs_child_cwd(cmd_cwd: &str, vfs_root: &str, scratch: &Path) -> VfsChildCwd {
+fn vfs_child_cwd(
+    cmd_cwd: &str,
+    vfs_root: &str,
+    scratch: &Path,
+    allow_original_cwd: bool,
+) -> VfsChildCwd {
+    vfs_child_cwd_with_access(cmd_cwd, vfs_root, scratch, allow_original_cwd, |cwd| {
+        std::fs::metadata(cwd).map(|m| m.is_dir()).unwrap_or(false)
+    })
+}
+
+fn vfs_child_cwd_with_access(
+    cmd_cwd: &str,
+    vfs_root: &str,
+    scratch: &Path,
+    allow_original_cwd: bool,
+    can_enter_cwd: impl Fn(&Path) -> bool,
+) -> VfsChildCwd {
     if cmd_cwd.is_empty() {
         return VfsChildCwd::None;
     }
@@ -76,6 +93,9 @@ fn vfs_child_cwd(cmd_cwd: &str, vfs_root: &str, scratch: &Path) -> VfsChildCwd {
     let cwd = Path::new(cmd_cwd);
     let root = Path::new(vfs_root);
     match strip_prefix_case_insensitive(cwd, root) {
+        Some(_) if allow_original_cwd && can_enter_cwd(cwd) => {
+            VfsChildCwd::Original(cwd.to_path_buf())
+        }
         Some(rel) if rel.as_os_str().is_empty() => VfsChildCwd::Scratch(scratch.to_path_buf()),
         Some(rel) if is_safe_relative_child_cwd(&rel) => VfsChildCwd::Scratch(scratch.join(rel)),
         Some(_) => VfsChildCwd::Original(cwd.to_path_buf()),
@@ -804,7 +824,7 @@ async fn build_child(
             .await
             .map_err(|e| setup_err("create trace dir failed", e))?;
     }
-    let child_cwd = vfs_child_cwd(&cmd.cwd, &v.vfs_root, &scratch);
+    let child_cwd = vfs_child_cwd(&cmd.cwd, &v.vfs_root, &scratch, v.allow_original_cwd);
     if let VfsChildCwd::Scratch(path) = &child_cwd {
         match tokio::fs::create_dir_all(path).await {
             Ok(()) => {}
@@ -1115,7 +1135,7 @@ mod tests {
         let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
 
         assert_eq!(
-            vfs_child_cwd(r"C:\src\proj", r"C:\src\proj", scratch),
+            vfs_child_cwd_with_access(r"C:\src\proj", r"C:\src\proj", scratch, false, |_| false),
             VfsChildCwd::Scratch(scratch.to_path_buf())
         );
     }
@@ -1125,8 +1145,56 @@ mod tests {
         let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
 
         assert_eq!(
-            vfs_child_cwd(r"C:\src\proj\sub\dir", r"C:\src\proj", scratch),
+            vfs_child_cwd_with_access(
+                r"C:\src\proj\sub\dir",
+                r"C:\src\proj",
+                scratch,
+                false,
+                |_| false
+            ),
             VfsChildCwd::Scratch(scratch.join(r"sub\dir"))
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_keeps_accessible_original_cwd_under_vfs_root() {
+        let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
+
+        assert_eq!(
+            vfs_child_cwd_with_access(
+                r"C:\src\proj\project",
+                r"C:\src\proj",
+                scratch,
+                true,
+                |_| true
+            ),
+            VfsChildCwd::Original(PathBuf::from(r"C:\src\proj\project"))
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_uses_scratch_for_remote_run_when_original_cwd_disallowed() {
+        let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
+
+        assert_eq!(
+            vfs_child_cwd_with_access(
+                r"C:\src\proj\project",
+                r"C:\src\proj",
+                scratch,
+                false,
+                |_| true
+            ),
+            VfsChildCwd::Scratch(scratch.join("project"))
+        );
+    }
+
+    #[test]
+    fn vfs_child_cwd_keeps_accessible_vfs_root_as_original() {
+        let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
+
+        assert_eq!(
+            vfs_child_cwd_with_access(r"C:\src\proj", r"C:\src\proj", scratch, true, |_| true),
+            VfsChildCwd::Original(PathBuf::from(r"C:\src\proj"))
         );
     }
 
@@ -1135,7 +1203,9 @@ mod tests {
         let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
 
         assert_eq!(
-            vfs_child_cwd(r"C:\SRC\proj\sub", r"c:\src\PROJ", scratch),
+            vfs_child_cwd_with_access(r"C:\SRC\proj\sub", r"c:\src\PROJ", scratch, false, |_| {
+                false
+            }),
             VfsChildCwd::Scratch(scratch.join("sub"))
         );
     }
@@ -1145,7 +1215,13 @@ mod tests {
         let scratch = std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run");
 
         assert_eq!(
-            vfs_child_cwd(r"C:\src\proj\..\outside", r"C:\src\proj", scratch),
+            vfs_child_cwd_with_access(
+                r"C:\src\proj\..\outside",
+                r"C:\src\proj",
+                scratch,
+                false,
+                |_| false
+            ),
             VfsChildCwd::Original(PathBuf::from(r"C:\src\proj\..\outside"))
         );
     }
@@ -1153,10 +1229,12 @@ mod tests {
     #[test]
     fn vfs_child_cwd_leaves_outside_root_unchanged() {
         assert_eq!(
-            vfs_child_cwd(
+            vfs_child_cwd_with_access(
                 r"D:\other",
                 r"C:\src\proj",
-                std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run")
+                std::path::Path::new(r"C:\ProgramData\Sembazuru\scratch\run"),
+                false,
+                |_| false
             ),
             VfsChildCwd::Original(PathBuf::from(r"D:\other"))
         );
@@ -1165,7 +1243,13 @@ mod tests {
     #[test]
     fn vfs_child_cwd_omits_empty_cwd() {
         assert_eq!(
-            vfs_child_cwd("", r"C:\src\proj", std::path::Path::new(r"C:\scratch")),
+            vfs_child_cwd_with_access(
+                "",
+                r"C:\src\proj",
+                std::path::Path::new(r"C:\scratch"),
+                false,
+                |_| false
+            ),
             VfsChildCwd::None
         );
     }

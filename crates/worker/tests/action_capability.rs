@@ -159,6 +159,7 @@ async fn execute_with_tampered_vfs_is_rejected() {
         vfs_root: String::new(),
         trace_dir: String::new(),
         strict: false,
+        allow_original_cwd: false,
     });
 
     let result = service.execute(Request::new(request)).await;

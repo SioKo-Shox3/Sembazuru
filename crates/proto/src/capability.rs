@@ -87,6 +87,7 @@ pub fn vfs_digest(vfs: Option<&crate::v0::VfsExecution>) -> [u8; 32] {
             hash_len_prefixed(&mut hasher, v.vfs_root.as_bytes());
             hash_len_prefixed(&mut hasher, v.trace_dir.as_bytes());
             hasher.update(&[v.strict as u8]);
+            hasher.update(&[v.allow_original_cwd as u8]);
         }
     }
 
@@ -291,6 +292,7 @@ mod tests {
             vfs_root: "C:\\src".to_string(),
             trace_dir: "C:\\trace".to_string(),
             strict: true,
+            allow_original_cwd: false,
         };
 
         assert_ne!(vfs_digest(None), vfs_digest(Some(&v)));
@@ -313,6 +315,13 @@ mod tests {
         let mut changed_strict = v.clone();
         changed_strict.strict = false;
         assert_ne!(vfs_digest(Some(&v)), vfs_digest(Some(&changed_strict)));
+
+        let mut changed_allow_original_cwd = v.clone();
+        changed_allow_original_cwd.allow_original_cwd = true;
+        assert_ne!(
+            vfs_digest(Some(&v)),
+            vfs_digest(Some(&changed_allow_original_cwd))
+        );
     }
 
     #[test]

@@ -471,6 +471,7 @@ async fn run_submission(
             vfs_root: vfs_root.clone(),
             trace_dir: trace_dir.clone(),
             strict: strict_vfs,
+            allow_original_cwd: false,
         }),
     };
 

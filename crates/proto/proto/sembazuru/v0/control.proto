@@ -193,6 +193,10 @@ message VfsExecution {
   // single-machine compiler behavior (fail-open is harmless when the bytes are
   // co-located) — so all M3-M7 gates are unchanged.
   bool strict = 4;
+  // Set by the agent only for same-machine loopback workers so the M6.1
+  // single-machine gate can write outputs to the original cwd; LAN workers stay
+  // in scratch until WriteBack.
+  bool allow_original_cwd = 5;
 }
 
 // Worker-side state machine (§3.2):
