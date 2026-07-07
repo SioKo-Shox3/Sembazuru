@@ -25,7 +25,18 @@ yanked = "deny"
 unmaintained = "workspace"
 # Add an advisory ID here ONLY with a written justification (why it does not affect us
 # / why it cannot yet be upgraded) — never to silence the gate casually.
-ignore = []
+#
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 affect quick-xml < 0.41.0. The only
+# path in this workspace is the Linux desktop stack pulled by eframe/winit:
+# wayland-scanner 0.31.10 and zbus_xml 5.1.1 under accesskit_unix. The shipped
+# Sembazuru product is a Windows MSI and the Windows target graph does not
+# contain quick-xml. A direct lockfile update is blocked by wayland-scanner's
+# quick-xml = ^0.39 requirement; remove these ignores when eframe/winit's Linux
+# stack moves to wayland-scanner/zbus_xml versions that allow quick-xml >= 0.41.
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2

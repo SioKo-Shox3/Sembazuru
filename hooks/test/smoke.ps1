@@ -10,7 +10,8 @@
 #   2. Propagation   - a compile+link run produces a trace for cl.exe AND its
 #                      link.exe child, with no injection-gap warnings.
 #   3. Reproducibility - two runs of the same source yield identical normalized
-#                      input/output sets (`sembazuru-trace diff` exits 0).
+#                      input/output sets after dropping compiler-internal temp
+#                      files whose names are randomized by MSVC/link.
 #   4. clang-cl      - if present, its source file is captured too (clang-cl is
 #                      a first-class target per CLAUDE.md).
 #
@@ -84,6 +85,38 @@ function Export-Graph {
     return $json | ConvertFrom-Json
 }
 
+function Is-Volatile-MsvcTempPath {
+    param([string]$Path)
+    $lower = $Path.ToLowerInvariant()
+    if ($lower -notlike '*\appdata\local\temp\*') { return $false }
+
+    $leaf = [IO.Path]::GetFileName($lower)
+    return ($leaf -match '^_cl_[0-9a-f]+lk$') -or
+        ($leaf -match '^lnk\{[0-9a-f-]+\}\.tmp$')
+}
+
+function Stable-PathSet {
+    param($Items)
+    return @(
+        $Items |
+            ForEach-Object { $_.path.ToLowerInvariant() } |
+            Where-Object { -not (Is-Volatile-MsvcTempPath $_) } |
+            Sort-Object -Unique
+    )
+}
+
+function Compare-PathSets {
+    param([string[]]$A, [string[]]$B)
+    $setA = @{}
+    foreach ($p in $A) { $setA[$p] = $true }
+    $setB = @{}
+    foreach ($p in $B) { $setB[$p] = $true }
+
+    $missing = @($A | Where-Object { -not $setB.ContainsKey($_) })
+    $added = @($B | Where-Object { -not $setA.ContainsKey($_) })
+    return [pscustomobject]@{ Missing = $missing; Added = $added }
+}
+
 $failures = @()
 
 # --- Gate 1 + 2: completeness and child propagation -------------------------
@@ -151,11 +184,18 @@ if (-not $hasExe) {
 # --- Gate 3: reproducibility ------------------------------------------------
 $traceA = Invoke-Traced 'reproA' @('cl', '/nologo', 'main.c') -SrcName 'repro'
 $traceB = Invoke-Traced 'reproB' @('cl', '/nologo', 'main.c') -SrcName 'repro'
-& $TracerExe diff --trace-dir $traceA --trace-dir $traceB | Out-Null
-if ($LASTEXITCODE -ne 0) {
+$graphA = Export-Graph $traceA
+$graphB = Export-Graph $traceB
+$inputDiff = Compare-PathSets (Stable-PathSet $graphA.inputs) (Stable-PathSet $graphB.inputs)
+$outputDiff = Compare-PathSets (Stable-PathSet $graphA.outputs) (Stable-PathSet $graphB.outputs)
+if ($inputDiff.Missing.Count -gt 0 -or $inputDiff.Added.Count -gt 0 -or
+    $outputDiff.Missing.Count -gt 0 -or $outputDiff.Added.Count -gt 0) {
     $failures += 'reproducibility: input/output sets differ between two identical runs'
     Write-Host '--- diff output ---'
-    & $TracerExe diff --trace-dir $traceA --trace-dir $traceB
+    $inputDiff.Missing | ForEach-Object { Write-Host "input  - $_" }
+    $inputDiff.Added | ForEach-Object { Write-Host "input  + $_" }
+    $outputDiff.Missing | ForEach-Object { Write-Host "output - $_" }
+    $outputDiff.Added | ForEach-Object { Write-Host "output + $_" }
 } else {
     Write-Host 'GATE 3 PASS  reproducibility: two runs produced identical input/output sets'
 }
