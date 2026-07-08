@@ -518,6 +518,10 @@ fn verified_tool_side_effect_policy(identity: &ToolchainIdentity) -> SideEffectP
     if let ToolchainIdentity::Content { path, .. } = identity {
         policy.allow_env_block = true;
         policy.allowed_enumerate = normalized_path_and_ancestors(path);
+        policy.allowed_registry.push((
+            "HKLM\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Client".to_string(),
+            "Version".to_string(),
+        ));
     }
     policy
 }
@@ -906,8 +910,12 @@ fn decode_manifest(buf: &[u8]) -> Option<InputManifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use sembazuru_tracer::AccessKind;
+    use sembazuru_tracer::graph::{PathAccess, RegistryAccess};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
     fn tmp(tag: &str) -> PathBuf {
@@ -919,8 +927,24 @@ mod tests {
         p
     }
 
+    fn path_read(path: &Path) -> PathAccess {
+        PathAccess {
+            path: path.to_string_lossy().into_owned(),
+            kinds: BTreeSet::from([AccessKind::Read]),
+            pids: BTreeSet::from([1]),
+        }
+    }
+
+    fn registry_access(key: &str, value: &str) -> RegistryAccess {
+        RegistryAccess {
+            key: key.to_string(),
+            value: value.to_string(),
+            pids: BTreeSet::from([1]),
+        }
+    }
+
     #[test]
-    fn verified_tool_policy_allows_only_content_tool_path_and_ancestors() {
+    fn verified_tool_policy_allows_content_tool_known_side_effects() {
         let identity = ToolchainIdentity::Content {
             digest: Digest::of(b"clang-cl"),
             path: PathBuf::from(r"C:\Program Files\LLVM\bin\clang-cl.exe"),
@@ -929,7 +953,11 @@ mod tests {
         let policy = verified_tool_side_effect_policy(&identity);
 
         assert!(policy.allow_env_block);
-        assert!(policy.allowed_registry.is_empty());
+        let requested_key = "HKLM\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Client";
+        assert_eq!(
+            policy.allowed_registry,
+            vec![(requested_key.to_string(), "Version".to_string())]
+        );
         for path in [
             r"C:\Program Files\LLVM\bin\clang-cl.exe",
             r"C:\Program Files\LLVM\bin",
@@ -1029,6 +1057,32 @@ mod tests {
         assert!(!policy.allow_env_block);
         assert!(policy.allowed_registry.is_empty());
         assert!(policy.allowed_enumerate.is_empty());
+    }
+
+    #[test]
+    fn verified_tool_policy_allows_dotnet_registry_tuple_through_manifest_gate() {
+        let root = tmp("verified-tool-registry-gate");
+        let source = root.join("a.cpp");
+        std::fs::write(&source, b"int main(){return 0;}").unwrap();
+        let root = normalize_for_compare(&root.to_string_lossy());
+        let identity = ToolchainIdentity::Content {
+            digest: Digest::of(b"clang-cl"),
+            path: PathBuf::from(r"C:\Program Files\LLVM\bin\clang-cl.exe"),
+        };
+        let policy = verified_tool_side_effect_policy(&identity);
+        let graph = sembazuru_tracer::DependencyGraph {
+            root_pid: 1,
+            inputs: vec![path_read(&source)],
+            registry: vec![registry_access(
+                "HKLM\\SOFTWARE\\Microsoft\\NET Framework Setup\\NDP\\v4\\Client",
+                "Version",
+            )],
+            ..Default::default()
+        };
+
+        let manifest = action_key::input_manifest_with_policy(&graph, &root, &policy);
+
+        assert!(manifest.cacheable);
     }
 
     #[cfg(windows)]
