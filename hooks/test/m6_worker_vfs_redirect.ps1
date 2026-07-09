@@ -432,8 +432,9 @@ if (-not ($inputPaths -contains $expectedInput)) {
 if (-not ($inputPathText -contains $expectedInputExact)) {
     $failures += "trace did not preserve logical input path spelling ($expectedInputExact)"
 }
-if ($inputPaths | Where-Object { $_.StartsWith($scratchFull) } | Select-Object -First 1) {
-    $failures += 'trace recorded scratch paths as inputs; logical cwd/path preservation regressed'
+$scratchHits = @($inputPathText | Where-Object { $_.ToLowerInvariant().StartsWith($scratchFull) } | Select-Object -First 5)
+if ($scratchHits.Count -gt 0) {
+    $failures += "trace recorded scratch paths as inputs; logical cwd/path preservation regressed: $($scratchHits -join '; ')"
 }
 
 # The verbatim exact probes must record the normal logical DOS path, not the raw
@@ -453,8 +454,9 @@ if ($verbatimInputPaths -contains $verbatimInputRaw) {
 if ($verbatimInputPathText | Where-Object { $_.StartsWith('\\?\') } | Select-Object -First 1) {
     $failures += 'verbatim trace preserved a raw \\?\ path spelling'
 }
-if ($verbatimInputPaths | Where-Object { $_.StartsWith($scratchFull) } | Select-Object -First 1) {
-    $failures += 'verbatim trace recorded scratch paths as inputs; logical cwd/path preservation regressed'
+$verbatimScratchHits = @($verbatimInputPathText | Where-Object { $_.ToLowerInvariant().StartsWith($scratchFull) } | Select-Object -First 5)
+if ($verbatimScratchHits.Count -gt 0) {
+    $failures += "verbatim trace recorded scratch paths as inputs; logical cwd/path preservation regressed: $($verbatimScratchHits -join '; ')"
 }
 
 # Belt-and-suspenders: the per-action scratch tree must NOT linger after the run
