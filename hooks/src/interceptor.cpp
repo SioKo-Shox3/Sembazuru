@@ -300,6 +300,63 @@ bool IsFullyQualifiedPath(const wchar_t* path) {
     return IsSlash(path[0]) && IsSlash(path[1]);
 }
 
+bool HasWin32NamespacePrefix(const wchar_t* path, wchar_t marker) {
+    return path != nullptr && lstrlenW(path) >= 4 && IsSlash(path[0]) &&
+           IsSlash(path[1]) && path[2] == marker && IsSlash(path[3]);
+}
+
+bool IsWin32DeviceNamespacePath(const wchar_t* path) {
+    return HasWin32NamespacePrefix(path, L'.');
+}
+
+bool IsLocalDosVerbatimPath(const wchar_t* path) {
+    if (!HasWin32NamespacePrefix(path, L'?')) {
+        return false;
+    }
+    const wchar_t* normal = path + 4;
+    return lstrlenW(normal) >= 3 && normal[1] == L':' && IsSlash(normal[2]);
+}
+
+bool StripLocalDosVerbatimPath(const wchar_t* path, wchar_t* out, int cap) {
+    if (!IsLocalDosVerbatimPath(path) || out == nullptr || cap <= 0) {
+        return false;
+    }
+    const wchar_t* normal = path + 4;
+    int len = lstrlenW(normal);
+    if (len <= 0 || len >= cap) {
+        return false;
+    }
+    memcpy(out, normal, (static_cast<size_t>(len) + 1) * sizeof(wchar_t));
+    return true;
+}
+
+DWORD FullPathNormalizingLocalDosVerbatim(const wchar_t* path, wchar_t* out,
+                                          int cap) {
+    if (path == nullptr || out == nullptr || cap <= 0 ||
+        IsWin32DeviceNamespacePath(path)) {
+        return 0;
+    }
+    wchar_t stripped[1024];
+    const wchar_t* input = path;
+    if (StripLocalDosVerbatimPath(path, stripped, ARRAYSIZE(stripped))) {
+        input = stripped;
+    }
+    DWORD n = TrueGetFullPathNameW(input, cap, out, nullptr);
+    if (n == 0 || n >= static_cast<DWORD>(cap)) {
+        return n;
+    }
+    wchar_t normal[1024];
+    if (StripLocalDosVerbatimPath(out, normal, ARRAYSIZE(normal))) {
+        int len = lstrlenW(normal);
+        if (len >= cap) {
+            return static_cast<DWORD>(len);
+        }
+        memcpy(out, normal, (static_cast<size_t>(len) + 1) * sizeof(wchar_t));
+        n = static_cast<DWORD>(len);
+    }
+    return n;
+}
+
 bool ComposeUnderVfsCwd(const wchar_t* path, wchar_t* out, int cap) {
     if (g_vfsCwdLen == 0 || path == nullptr || cap <= 0) {
         return false;
@@ -351,13 +408,14 @@ DWORD FullPathForVfsRootCheck(const wchar_t* path, wchar_t* absOut, int absCap) 
     if (g_vfsCwdLen > 0 && !IsFullyQualifiedPath(path)) {
         wchar_t joined[1024];
         if (ComposeUnderVfsCwd(path, joined, 1024)) {
-            DWORD n = TrueGetFullPathNameW(joined, absCap, absOut, nullptr);
+            DWORD n =
+                FullPathNormalizingLocalDosVerbatim(joined, absOut, absCap);
             if (n > 0 && n < static_cast<DWORD>(absCap)) {
                 return n;
             }
         }
     }
-    DWORD n = TrueGetFullPathNameW(path, absCap, absOut, nullptr);
+    DWORD n = FullPathNormalizingLocalDosVerbatim(path, absOut, absCap);
     if (n > 0 && n < static_cast<DWORD>(absCap)) {
         wchar_t actualDisplay[1024];
         memcpy(actualDisplay, absOut,
@@ -527,7 +585,7 @@ bool CanonicalScratchPath(const wchar_t* local, wchar_t* canonOut, int canonCap)
         canonCap <= 0) {
         return false;
     }
-    DWORD cn = TrueGetFullPathNameW(local, canonCap, canonOut, nullptr);
+    DWORD cn = FullPathNormalizingLocalDosVerbatim(local, canonOut, canonCap);
     if (cn == 0 || cn >= static_cast<DWORD>(canonCap)) {
         return false;
     }
@@ -637,7 +695,11 @@ bool VfsMaterializeForProbe(const wchar_t* path, wchar_t* localOut,
 }
 
 bool HasWildcard(const wchar_t* path) {
-    return path != nullptr && wcspbrk(path, L"*?") != nullptr;
+    if (path == nullptr) {
+        return false;
+    }
+    const wchar_t* scan = HasWin32NamespacePrefix(path, L'?') ? path + 4 : path;
+    return wcspbrk(scan, L"*?") != nullptr;
 }
 
 bool VfsFailWildcardEnumeration(const wchar_t* pattern, wchar_t* logicalOut,
