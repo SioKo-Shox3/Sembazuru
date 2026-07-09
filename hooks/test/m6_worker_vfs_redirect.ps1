@@ -206,6 +206,7 @@ $backingRoot = Join-Path $WorkRoot 'backing'
 $scratchRoot = Join-Path $WorkRoot 'scratch'
 $casRoot = Join-Path $WorkRoot 'cas'
 $traceDir = Join-Path $WorkRoot 'trace'
+$miscTraceDir = Join-Path $WorkRoot 'trace-misc'
 $verbatimTraceDir = Join-Path $WorkRoot 'trace-verbatim'
 $smuggledTraceDir = Join-Path $WorkRoot 'smuggled-trace'
 $fakeVfsCwd = Join-Path $WorkRoot 'fake-vfs-cwd'
@@ -214,7 +215,7 @@ $correct = 'hello-from-the-agent-vfs'
 $stale = 'STALE-LOCAL-MUST-NOT-BE-READ'
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $logicalRoot $rel)) | Out-Null
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $backingRoot $rel)) | Out-Null
-foreach ($d in @($scratchRoot, $casRoot, $traceDir, $verbatimTraceDir, $smuggledTraceDir, $fakeVfsCwd)) {
+foreach ($d in @($scratchRoot, $casRoot, $traceDir, $miscTraceDir, $verbatimTraceDir, $smuggledTraceDir, $fakeVfsCwd)) {
     New-Item -ItemType Directory -Force $d | Out-Null
 }
 Set-Content (Join-Path $logicalRoot $rel) $stale -Encoding ascii -NoNewline
@@ -286,47 +287,47 @@ try {
                 Out-String | Write-Host
             $verbatimExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $verbatimTraceDir -- `
                 $probe --find-exact $verbatimInputPath 2>&1 |
                 Out-String | Write-Host
             $verbatimFindExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $verbatimTraceDir -- `
                 $probe --find-exact-exw $verbatimInputPath 2>&1 |
                 Out-String | Write-Host
             $verbatimFindExWExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --write-output 'out.txt' 2>&1 |
                 Out-String | Write-Host
             $outputExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --wildcard-enum 'Src\*.txt' 2>&1 |
                 Out-String | Write-Host
             $wildcardExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --wildcard-enum-a 'Src\*.txt' 2>&1 |
                 Out-String | Write-Host
             $wildcardAExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --wildcard-enum-exw 'Src\*.txt' 2>&1 |
                 Out-String | Write-Host
             $wildcardExWExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --wildcard-enum-exa 'Src\*.txt' 2>&1 |
                 Out-String | Write-Host
             $wildcardExAExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --chdir $logicalSrc 2>&1 |
                 Out-String | Write-Host
             $chdirExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --chdir-a $logicalSrc 2>&1 |
                 Out-String | Write-Host
             $chdirAExit = $LASTEXITCODE
@@ -435,7 +436,7 @@ if ($inputPaths | Where-Object { $_.StartsWith($scratchFull) } | Select-Object -
     $failures += 'trace recorded scratch paths as inputs; logical cwd/path preservation regressed'
 }
 
-# The verbatim-only run must record the normal logical DOS path, not the raw
+# The verbatim exact probes must record the normal logical DOS path, not the raw
 # \\?\ spelling. The normal relative run above would otherwise mask this.
 $verbatimTraceJson = & cargo run -q -p sembazuru-tracer --bin sembazuru-trace -- export --trace-dir $verbatimTraceDir --json |
     ConvertFrom-Json
@@ -451,6 +452,9 @@ if ($verbatimInputPaths -contains $verbatimInputRaw) {
 }
 if ($verbatimInputPathText | Where-Object { $_.StartsWith('\\?\') } | Select-Object -First 1) {
     $failures += 'verbatim trace preserved a raw \\?\ path spelling'
+}
+if ($verbatimInputPaths | Where-Object { $_.StartsWith($scratchFull) } | Select-Object -First 1) {
+    $failures += 'verbatim trace recorded scratch paths as inputs; logical cwd/path preservation regressed'
 }
 
 # Belt-and-suspenders: the per-action scratch tree must NOT linger after the run
