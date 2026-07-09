@@ -13,7 +13,7 @@
     root (target/release + hooks/build/Release); CI overrides them on the command
     line, e.g.:
       dotnet build installer/Package.wixproj -c Release -p:Platform=x64 \
-        -p:SbzVersion=0.0.2 -p:SbzRustTarget=... -p:SbzHooks=...
+        -p:SbzVersion=0.0.3 -p:SbzRustTarget=... -p:SbzHooks=...
     These flow to the .wxs as $(var.RustTarget) / $(var.Hooks) / $(var.Integration)
     / $(var.ProductVersion).
   -->
@@ -21,7 +21,7 @@
     <SbzRustTarget Condition="'$(SbzRustTarget)' == ''">$(MSBuildProjectDirectory)\..\target\release</SbzRustTarget>
     <SbzHooks Condition="'$(SbzHooks)' == ''">$(MSBuildProjectDirectory)\..\hooks\build\Release</SbzHooks>
     <SbzIntegration Condition="'$(SbzIntegration)' == ''">$(MSBuildProjectDirectory)\..\docs\integrations\msbuild</SbzIntegration>
-    <SbzVersion Condition="'$(SbzVersion)' == ''">0.0.2</SbzVersion>
+    <SbzVersion Condition="'$(SbzVersion)' == ''">0.0.3</SbzVersion>
     <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
   </PropertyGroup>
 

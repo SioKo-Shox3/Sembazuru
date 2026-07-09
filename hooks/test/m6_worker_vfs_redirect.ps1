@@ -9,11 +9,11 @@
 # Provenance (same trick as vfs_redirect.ps1): the logical path holds STALE local
 # bytes; the agent (remap) serves DIFFERENT correct bytes from a backing dir. The
 # read is correct ONLY if the worker actually pulled from the agent through the
-# VFS. The probe READS THE FILE BY A RELATIVE PATH from the submitted cwd and
-# compares it to the agent-served content, exiting 0 only on an exact match - so
-# the action's own exit code proves both that the open was redirected (a
-# non-redirected open would read the STALE local bytes) and the provenance (the
-# bytes came from the agent).
+# VFS. The probe reads by relative and verbatim DOS paths and compares the bytes
+# to the agent-served content, exiting 0 only on an exact match - so the action's
+# own exit code proves both that the open was redirected (a non-redirected open
+# would read the STALE local bytes) and the provenance (the bytes came from the
+# agent).
 #
 # Why content, not the scratch file: since M9.2 (deferred #8) the worker removes the
 # per-action hydrated scratch tree once the action completes, to bound a resident
@@ -125,6 +125,21 @@ int wmain(int argc, wchar_t** argv) {
         FindClose(h);
         return 7;
     }
+    if (argc >= 3 && wcscmp(argv[1], L"--find-exact") == 0) {
+        WIN32_FIND_DATAW data;
+        HANDLE h = FindFirstFileW(argv[2], &data);
+        if (h == INVALID_HANDLE_VALUE) return 1;
+        FindClose(h);
+        return 0;
+    }
+    if (argc >= 3 && wcscmp(argv[1], L"--find-exact-exw") == 0) {
+        WIN32_FIND_DATAW data;
+        HANDLE h = FindFirstFileExW(argv[2], FindExInfoStandard, &data,
+                                    FindExSearchNameMatch, nullptr, 0);
+        if (h == INVALID_HANDLE_VALUE) return 1;
+        FindClose(h);
+        return 0;
+    }
     if (argc >= 3 && wcscmp(argv[1], L"--write-output") == 0) {
         HANDLE out = CreateFileW(argv[2], GENERIC_WRITE, 0, nullptr,
                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -134,6 +149,23 @@ int wmain(int argc, wchar_t** argv) {
         BOOL ok = WriteFile(out, bytes, sizeof(bytes) - 1, &written, nullptr);
         CloseHandle(out);
         return ok && written == sizeof(bytes) - 1 ? 0 : 1;
+    }
+    if (argc >= 4 && wcscmp(argv[1], L"--open-exact") == 0) {
+        if (GetFileAttributesW(argv[2]) == INVALID_FILE_ATTRIBUTES) return 6;
+        HANDLE h = CreateFileW(argv[2], GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return 1;
+        char buf[256]; DWORD r = 0;
+        BOOL ok = ReadFile(h, buf, sizeof(buf), &r, nullptr);
+        CloseHandle(h);
+        if (!ok) return 1;
+        char exp[256];
+        int en = WideCharToMultiByte(CP_UTF8, 0, argv[3], -1, exp, sizeof(exp),
+                                     nullptr, nullptr);
+        if (en <= 1) return 2;
+        DWORD elen = (DWORD)(en - 1);
+        if (r != elen) return 3;
+        return memcmp(buf, exp, elen) == 0 ? 0 : 3;
     }
     if (argc < 5) return 2;
     wchar_t cwd[1024];
@@ -174,6 +206,7 @@ $backingRoot = Join-Path $WorkRoot 'backing'
 $scratchRoot = Join-Path $WorkRoot 'scratch'
 $casRoot = Join-Path $WorkRoot 'cas'
 $traceDir = Join-Path $WorkRoot 'trace'
+$verbatimTraceDir = Join-Path $WorkRoot 'trace-verbatim'
 $smuggledTraceDir = Join-Path $WorkRoot 'smuggled-trace'
 $fakeVfsCwd = Join-Path $WorkRoot 'fake-vfs-cwd'
 $rel = 'Src\Input.txt'
@@ -181,7 +214,7 @@ $correct = 'hello-from-the-agent-vfs'
 $stale = 'STALE-LOCAL-MUST-NOT-BE-READ'
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $logicalRoot $rel)) | Out-Null
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $backingRoot $rel)) | Out-Null
-foreach ($d in @($scratchRoot, $casRoot, $traceDir, $smuggledTraceDir, $fakeVfsCwd)) {
+foreach ($d in @($scratchRoot, $casRoot, $traceDir, $verbatimTraceDir, $smuggledTraceDir, $fakeVfsCwd)) {
     New-Item -ItemType Directory -Force $d | Out-Null
 }
 Set-Content (Join-Path $logicalRoot $rel) $stale -Encoding ascii -NoNewline
@@ -205,6 +238,9 @@ $workerProc = Start-Process -FilePath $workerExe -ArgumentList @($workerAddr) `
     -PassThru -WindowStyle Hidden
 
 $exit = 99
+$verbatimExit = 99
+$verbatimFindExit = 99
+$verbatimFindExWExit = 99
 $outputExit = 99
 $wildcardExit = 99
 $wildcardAExit = 99
@@ -229,6 +265,7 @@ try {
     Push-Location $logicalRoot
     try {
         $expectedInputPath = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot $rel))
+        $verbatimInputPath = '\\?\' + $expectedInputPath
         $oldNativeEap = $null
         $hasNativeEap = Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
         if ($hasNativeEap) {
@@ -243,6 +280,21 @@ try {
                 $probe $rel $correct $logicalRoot $expectedInputPath 2>&1 |
                 Out-String | Write-Host
             $exit = $LASTEXITCODE
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $verbatimTraceDir -- `
+                $probe --open-exact $verbatimInputPath $correct 2>&1 |
+                Out-String | Write-Host
+            $verbatimExit = $LASTEXITCODE
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+                $probe --find-exact $verbatimInputPath 2>&1 |
+                Out-String | Write-Host
+            $verbatimFindExit = $LASTEXITCODE
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
+                $probe --find-exact-exw $verbatimInputPath 2>&1 |
+                Out-String | Write-Host
+            $verbatimFindExWExit = $LASTEXITCODE
 
             & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
                 $probe --write-output 'out.txt' 2>&1 |
@@ -321,6 +373,15 @@ switch ($exit) {
     6 { $failures += 'GetFileAttributesW failed before CreateFileW hydrated the VFS input (exit 6)' }
     default { $failures += "the VFS-mode Execute failed (exit=$exit)" }
 }
+if ($verbatimExit -ne 0) {
+    $failures += "VFS Execute with verbatim DOS input failed (exit=$verbatimExit); expected agent-served bytes through the VFS"
+}
+if ($verbatimFindExit -ne 0) {
+    $failures += "FindFirstFileW exact verbatim DOS input failed (exit=$verbatimFindExit); the verbatim prefix must not be treated as a wildcard"
+}
+if ($verbatimFindExWExit -ne 0) {
+    $failures += "FindFirstFileExW exact verbatim DOS input failed (exit=$verbatimFindExWExit); the verbatim prefix must not be treated as a wildcard"
+}
 if ($outputExit -eq 0) {
     $failures += 'a scratch-cwd action that wrote a relative output completed remotely; outputs would be stranded without WriteBack'
 }
@@ -372,6 +433,24 @@ if (-not ($inputPathText -contains $expectedInputExact)) {
 }
 if ($inputPaths | Where-Object { $_.StartsWith($scratchFull) } | Select-Object -First 1) {
     $failures += 'trace recorded scratch paths as inputs; logical cwd/path preservation regressed'
+}
+
+# The verbatim-only run must record the normal logical DOS path, not the raw
+# \\?\ spelling. The normal relative run above would otherwise mask this.
+$verbatimTraceJson = & cargo run -q -p sembazuru-tracer --bin sembazuru-trace -- export --trace-dir $verbatimTraceDir --json |
+    ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { $failures += 'tracer export failed for the verbatim VFS run' }
+$verbatimInputRaw = ('\\?\' + $expectedInputExact).ToLowerInvariant()
+$verbatimInputPathText = @($verbatimTraceJson.inputs | ForEach-Object { $_.path })
+$verbatimInputPaths = @($verbatimTraceJson.inputs | ForEach-Object { $_.path.ToLowerInvariant() })
+if (-not ($verbatimInputPaths -contains $expectedInput)) {
+    $failures += "verbatim trace did not record the normalized logical input path ($expectedInput)"
+}
+if ($verbatimInputPaths -contains $verbatimInputRaw) {
+    $failures += "verbatim trace recorded the raw verbatim input path ($verbatimInputRaw)"
+}
+if ($verbatimInputPathText | Where-Object { $_.StartsWith('\\?\') } | Select-Object -First 1) {
+    $failures += 'verbatim trace preserved a raw \\?\ path spelling'
 }
 
 # Belt-and-suspenders: the per-action scratch tree must NOT linger after the run
