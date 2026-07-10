@@ -152,6 +152,8 @@ int g_vfsActualCwdDisplayLen = 0; // display length for suffix slicing
 // falling through to a local open, and drops kUnvirtMarker so the worker re-runs
 // the action locally. Default false keeps the compiler-compatible fail-open.
 bool g_vfsStrict = false;
+thread_local bool g_vfsInternalIoActive = false;
+
 // Marker dropped in the scratch root when the remote attempt must be abandoned
 // and re-run locally. Strict unsupplied reads and VFS-root wildcard enumeration
 // both use it. Must match `UNVIRT_MARKER` in `crates/worker/src/lib.rs`.
@@ -593,6 +595,103 @@ bool CanonicalScratchPath(const wchar_t* local, wchar_t* canonOut, int canonCap)
     return PathUnderPrefix(canonOut, cl, g_vfsScratch, g_vfsScratchLen);
 }
 
+HANDLE VfsInternalCreateFileW(const wchar_t* local, DWORD access, DWORD share,
+                              LPSECURITY_ATTRIBUTES sa, DWORD disposition,
+                              DWORD flags, HANDLE templ) {
+    bool previous = g_vfsInternalIoActive;
+    HANDLE result = INVALID_HANDLE_VALUE;
+    __try {
+        g_vfsInternalIoActive = true;
+        result =
+            TrueCreateFileW(local, access, share, sa, disposition, flags, templ);
+    } __finally {
+        g_vfsInternalIoActive = previous;
+    }
+    return result;
+}
+
+DWORD VfsInternalGetFileAttributesW(const wchar_t* local) {
+    bool previous = g_vfsInternalIoActive;
+    DWORD result = INVALID_FILE_ATTRIBUTES;
+    __try {
+        g_vfsInternalIoActive = true;
+        result = TrueGetFileAttributesW(local);
+    } __finally {
+        g_vfsInternalIoActive = previous;
+    }
+    return result;
+}
+
+BOOL VfsInternalGetFileAttributesExW(const wchar_t* local,
+                                     GET_FILEEX_INFO_LEVELS level,
+                                     LPVOID info) {
+    bool previous = g_vfsInternalIoActive;
+    BOOL result = FALSE;
+    __try {
+        g_vfsInternalIoActive = true;
+        result = TrueGetFileAttributesExW(local, level, info);
+    } __finally {
+        g_vfsInternalIoActive = previous;
+    }
+    return result;
+}
+
+HANDLE VfsInternalFindFirstFileW(const wchar_t* local,
+                                 LPWIN32_FIND_DATAW data) {
+    bool previous = g_vfsInternalIoActive;
+    HANDLE result = INVALID_HANDLE_VALUE;
+    __try {
+        g_vfsInternalIoActive = true;
+        result = TrueFindFirstFileW(local, data);
+    } __finally {
+        g_vfsInternalIoActive = previous;
+    }
+    return result;
+}
+
+HANDLE VfsInternalFindFirstFileA(const char* local,
+                                 LPWIN32_FIND_DATAA data) {
+    bool previous = g_vfsInternalIoActive;
+    HANDLE result = INVALID_HANDLE_VALUE;
+    __try {
+        g_vfsInternalIoActive = true;
+        result = TrueFindFirstFileA(local, data);
+    } __finally {
+        g_vfsInternalIoActive = previous;
+    }
+    return result;
+}
+
+HANDLE VfsInternalFindFirstFileExW(const wchar_t* local,
+                                   FINDEX_INFO_LEVELS level, LPVOID data,
+                                   FINDEX_SEARCH_OPS op, LPVOID filter,
+                                   DWORD flags) {
+    bool previous = g_vfsInternalIoActive;
+    HANDLE result = INVALID_HANDLE_VALUE;
+    __try {
+        g_vfsInternalIoActive = true;
+        result = TrueFindFirstFileExW(local, level, data, op, filter, flags);
+    } __finally {
+        g_vfsInternalIoActive = previous;
+    }
+    return result;
+}
+
+HANDLE VfsInternalFindFirstFileExA(const char* local,
+                                   FINDEX_INFO_LEVELS level, LPVOID data,
+                                   FINDEX_SEARCH_OPS op, LPVOID filter,
+                                   DWORD flags) {
+    bool previous = g_vfsInternalIoActive;
+    HANDLE result = INVALID_HANDLE_VALUE;
+    __try {
+        g_vfsInternalIoActive = true;
+        result = TrueFindFirstFileExA(local, level, data, op, filter, flags);
+    } __finally {
+        g_vfsInternalIoActive = previous;
+    }
+    return result;
+}
+
 // If VFS mode applies to this read-only open, returns a redirected handle to the
 // hydrated scratch copy. Returns INVALID_HANDLE_VALUE with *handled=false when
 // the open should proceed normally (not vfs mode, not a read, outside root, or -
@@ -652,7 +751,8 @@ HANDLE VfsTryRedirect(const wchar_t* path, DWORD access, DWORD share,
         return committedFailure();  // worker returned an out-of-scratch path
     }
     *handled = true;
-    return TrueCreateFileW(canon, access, share, sa, disposition, flags, templ);
+    return VfsInternalCreateFileW(canon, access, share, sa, disposition, flags,
+                                  templ);
 }
 
 bool VfsMaterializeForProbe(const wchar_t* path, wchar_t* localOut,
@@ -1065,8 +1165,12 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR path, DWORD access, DWORD share,
         // redirected open's own GetLastError across the recording I/O.
         DWORD saved = GetLastError();
         const wchar_t* recordPath = logical[0] != L'\0' ? logical : path;
-        RecordCreateFile(recordPath, -1, access, disposition,
-                         redirected == INVALID_HANDLE_VALUE ? saved : 0);
+        // Internal True* calls may re-enter hooks; restoration makes the outer
+        // logical-path record visible while nested scratch records stay hidden.
+        if (!g_vfsInternalIoActive) {
+            RecordCreateFile(recordPath, -1, access, disposition,
+                             redirected == INVALID_HANDLE_VALUE ? saved : 0);
+        }
         SetLastError(saved);
         return redirected;
     }
@@ -1075,8 +1179,10 @@ HANDLE WINAPI HookedCreateFileW(LPCWSTR path, DWORD access, DWORD share,
     HANDLE h =
         TrueCreateFileW(path, access, share, sa, disposition, flags, templ);
     DWORD saved = GetLastError();
-    RecordCreateFile(path, -1, access, disposition,
-                     h == INVALID_HANDLE_VALUE ? saved : 0);
+    if (!g_vfsInternalIoActive) {
+        RecordCreateFile(path, -1, access, disposition,
+                         h == INVALID_HANDLE_VALUE ? saved : 0);
+    }
     SetLastError(saved);
     return h;
 }
@@ -1103,8 +1209,11 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR path, DWORD access, DWORD share,
                 DWORD saved = GetLastError();
                 const wchar_t* recordPath =
                     logical[0] != L'\0' ? logical : w.get();
-                RecordCreateFile(recordPath, -1, access, disposition,
-                                 redirected == INVALID_HANDLE_VALUE ? saved : 0);
+                if (!g_vfsInternalIoActive) {
+                    RecordCreateFile(
+                        recordPath, -1, access, disposition,
+                        redirected == INVALID_HANDLE_VALUE ? saved : 0);
+                }
                 SetLastError(saved);
                 return redirected;
             }
@@ -1115,8 +1224,10 @@ HANDLE WINAPI HookedCreateFileA(LPCSTR path, DWORD access, DWORD share,
     HANDLE h =
         TrueCreateFileA(path, access, share, sa, disposition, flags, templ);
     DWORD saved = GetLastError();
-    RecordCreateFile(w.get(), w.length(), access, disposition,
-                     h == INVALID_HANDLE_VALUE ? saved : 0);
+    if (!g_vfsInternalIoActive) {
+        RecordCreateFile(w.get(), w.length(), access, disposition,
+                         h == INVALID_HANDLE_VALUE ? saved : 0);
+    }
     SetLastError(saved);
     return h;
 }
@@ -1193,7 +1304,7 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR path) {
     const wchar_t* recordPath = path;
     DWORD attrs = INVALID_FILE_ATTRIBUTES;
     if (VfsMaterializeForProbe(path, local, 1024, logical, 1024, &handled)) {
-        attrs = TrueGetFileAttributesW(local);
+        attrs = VfsInternalGetFileAttributesW(local);
         recordPath = logical;
     } else if (handled) {
         attrs = INVALID_FILE_ATTRIBUTES;
@@ -1202,9 +1313,11 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR path) {
         attrs = TrueGetFileAttributesW(path);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kProbe,
-                  attrs == INVALID_FILE_ATTRIBUTES ? saved : 0, attrs,
-                  recordPath);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kProbe,
+                      attrs == INVALID_FILE_ATTRIBUTES ? saved : 0, attrs,
+                      recordPath);
+    }
     SetLastError(saved);
     return attrs;
 }
@@ -1218,7 +1331,7 @@ DWORD WINAPI HookedGetFileAttributesA(LPCSTR path) {
     DWORD attrs = INVALID_FILE_ATTRIBUTES;
     if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
                                &handled)) {
-        attrs = TrueGetFileAttributesW(local);
+        attrs = VfsInternalGetFileAttributesW(local);
         recordPath = logical;
     } else if (handled) {
         attrs = INVALID_FILE_ATTRIBUTES;
@@ -1227,9 +1340,11 @@ DWORD WINAPI HookedGetFileAttributesA(LPCSTR path) {
         attrs = TrueGetFileAttributesA(path);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kProbe,
-                  attrs == INVALID_FILE_ATTRIBUTES ? saved : 0, attrs,
-                  recordPath, -1);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kProbe,
+                      attrs == INVALID_FILE_ATTRIBUTES ? saved : 0, attrs,
+                      recordPath, -1);
+    }
     SetLastError(saved);
     return attrs;
 }
@@ -1251,7 +1366,7 @@ BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR path,
     const wchar_t* recordPath = path;
     BOOL ok = FALSE;
     if (VfsMaterializeForProbe(path, local, 1024, logical, 1024, &handled)) {
-        ok = TrueGetFileAttributesExW(local, level, info);
+        ok = VfsInternalGetFileAttributesExW(local, level, info);
         recordPath = logical;
     } else if (handled) {
         ok = FALSE;
@@ -1260,8 +1375,10 @@ BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR path,
         ok = TrueGetFileAttributesExW(path, level, info);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kProbe, ok ? 0 : saved,
-                  ExAttrsExtra(ok, level, info), recordPath);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kProbe, ok ? 0 : saved,
+                      ExAttrsExtra(ok, level, info), recordPath);
+    }
     SetLastError(saved);
     return ok;
 }
@@ -1277,7 +1394,7 @@ BOOL WINAPI HookedGetFileAttributesExA(LPCSTR path,
     BOOL ok = FALSE;
     if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
                                &handled)) {
-        ok = TrueGetFileAttributesExW(local, level, info);
+        ok = VfsInternalGetFileAttributesExW(local, level, info);
         recordPath = logical;
     } else if (handled) {
         ok = FALSE;
@@ -1286,8 +1403,10 @@ BOOL WINAPI HookedGetFileAttributesExA(LPCSTR path,
         ok = TrueGetFileAttributesExA(path, level, info);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kProbe, ok ? 0 : saved,
-                  ExAttrsExtra(ok, level, info), recordPath, -1);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kProbe, ok ? 0 : saved,
+                      ExAttrsExtra(ok, level, info), recordPath, -1);
+    }
     SetLastError(saved);
     return ok;
 }
@@ -1303,7 +1422,7 @@ HANDLE WINAPI HookedFindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
         recordPath = logical;
     } else if (VfsMaterializeForProbe(pattern, local, 1024, logical, 1024,
                                       &handled)) {
-        h = TrueFindFirstFileW(local, data);
+        h = VfsInternalFindFirstFileW(local, data);
         recordPath = logical;
     } else if (handled) {
         h = INVALID_HANDLE_VALUE;
@@ -1312,8 +1431,10 @@ HANDLE WINAPI HookedFindFirstFileW(LPCWSTR pattern, LPWIN32_FIND_DATAW data) {
         h = TrueFindFirstFileW(pattern, data);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kEnumerate,
+                      h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath);
+    }
     SetLastError(saved);
     return h;
 }
@@ -1332,7 +1453,7 @@ HANDLE WINAPI HookedFindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
                                       &handled)) {
         char localA[2048];
         if (WideToAnsi(local, localA, ARRAYSIZE(localA), nullptr)) {
-            h = TrueFindFirstFileA(localA, data);
+            h = VfsInternalFindFirstFileA(localA, data);
         }
         recordPath = logical;
     } else if (handled) {
@@ -1342,8 +1463,10 @@ HANDLE WINAPI HookedFindFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
         h = TrueFindFirstFileA(pattern, data);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath, -1);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kEnumerate,
+                      h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath, -1);
+    }
     SetLastError(saved);
     return h;
 }
@@ -1362,7 +1485,7 @@ HANDLE WINAPI HookedFindFirstFileExW(LPCWSTR pattern,
         recordPath = logical;
     } else if (VfsMaterializeForProbe(pattern, local, 1024, logical, 1024,
                                       &handled)) {
-        h = TrueFindFirstFileExW(local, level, data, op, filter, flags);
+        h = VfsInternalFindFirstFileExW(local, level, data, op, filter, flags);
         recordPath = logical;
     } else if (handled) {
         h = INVALID_HANDLE_VALUE;
@@ -1371,8 +1494,10 @@ HANDLE WINAPI HookedFindFirstFileExW(LPCWSTR pattern,
         h = TrueFindFirstFileExW(pattern, level, data, op, filter, flags);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kEnumerate,
+                      h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath);
+    }
     SetLastError(saved);
     return h;
 }
@@ -1393,7 +1518,8 @@ HANDLE WINAPI HookedFindFirstFileExA(LPCSTR pattern, FINDEX_INFO_LEVELS level,
                                       &handled)) {
         char localA[2048];
         if (WideToAnsi(local, localA, ARRAYSIZE(localA), nullptr)) {
-            h = TrueFindFirstFileExA(localA, level, data, op, filter, flags);
+            h = VfsInternalFindFirstFileExA(localA, level, data, op, filter,
+                                            flags);
         }
         recordPath = logical;
     } else if (handled) {
@@ -1403,8 +1529,10 @@ HANDLE WINAPI HookedFindFirstFileExA(LPCSTR pattern, FINDEX_INFO_LEVELS level,
         h = TrueFindFirstFileExA(pattern, level, data, op, filter, flags);
     }
     DWORD saved = GetLastError();
-    trace::Record(trace::kFile, trace::kEnumerate,
-                  h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath, -1);
+    if (!g_vfsInternalIoActive) {
+        trace::Record(trace::kFile, trace::kEnumerate,
+                      h == INVALID_HANDLE_VALUE ? saved : 0, 0, recordPath, -1);
+    }
     SetLastError(saved);
     return h;
 }
