@@ -33,8 +33,16 @@ if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Push-Location $repo
 try {
-    & cargo build -p sembazuru-worker --example vfs_host 2>&1 | Out-String | Write-Host
-    if ($LASTEXITCODE -ne 0) { throw 'vfs_host example build failed' }
+    $savedErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $cargoOutput = & cargo build -p sembazuru-worker --example vfs_host 2>&1 | Out-String
+        $cargoExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorPreference
+    }
+    Write-Host $cargoOutput
+    if ($cargoExitCode -ne 0) { throw "vfs_host example build failed with exit code $cargoExitCode" }
 } finally { Pop-Location }
 $hostExe = Join-Path $repo 'target\debug\examples\vfs_host.exe'
 
