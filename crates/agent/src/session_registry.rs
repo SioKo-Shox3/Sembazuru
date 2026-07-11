@@ -68,24 +68,117 @@ pub struct OutputSpec {
 /// Disambiguates the registry's temp content-store directory within a process.
 static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(test)]
-static PIN_PERSIST_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+#[derive(Clone)]
+struct PinPersistOwner {
+    inner: Arc<PinPersistOwnerInner>,
+}
 
-#[cfg(test)]
-struct PinPersistGuard;
+struct PinPersistOwnerInner {
+    state: StdMutex<PinPersistState>,
+    store_root: PathBuf,
+}
 
-#[cfg(test)]
-impl PinPersistGuard {
-    fn submitted() -> Self {
-        PIN_PERSIST_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
-        Self
+struct PinPersistState {
+    accepting: bool,
+    active: usize,
+    cleanup_started: bool,
+}
+
+struct PinPersistGuard {
+    owner: PinPersistOwner,
+}
+
+impl PinPersistOwner {
+    fn new(store_root: PathBuf) -> Self {
+        Self {
+            inner: Arc::new(PinPersistOwnerInner {
+                state: StdMutex::new(PinPersistState {
+                    accepting: true,
+                    active: 0,
+                    cleanup_started: false,
+                }),
+                store_root,
+            }),
+        }
+    }
+
+    fn register(&self) -> Result<PinPersistGuard, ()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.accepting {
+            return Err(());
+        }
+        state.active = state.active.checked_add(1).ok_or(())?;
+        Ok(PinPersistGuard {
+            owner: self.clone(),
+        })
+    }
+
+    fn close(&self) {
+        let cleanup = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.accepting = false;
+            if state.active == 0 && !state.cleanup_started {
+                state.cleanup_started = true;
+                true
+            } else {
+                false
+            }
+        };
+        if cleanup {
+            self.cleanup();
+        }
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_dir_all(&self.inner.store_root);
+    }
+
+    #[cfg(test)]
+    fn active(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .active
+    }
+
+    #[cfg(test)]
+    fn store_root(&self) -> &Path {
+        &self.inner.store_root
     }
 }
 
-#[cfg(test)]
 impl Drop for PinPersistGuard {
     fn drop(&mut self) {
-        PIN_PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        let cleanup = {
+            let mut state = self
+                .owner
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.active == 0 {
+                return;
+            }
+            state.active -= 1;
+            if !state.accepting && state.active == 0 && !state.cleanup_started {
+                state.cleanup_started = true;
+                true
+            } else {
+                false
+            }
+        };
+        if cleanup {
+            self.owner.cleanup();
+        }
     }
 }
 
@@ -93,11 +186,13 @@ impl Drop for PinPersistGuard {
 /// at first touch. `Arc` so concurrent racers of the same path share one cell.
 type PinCell = Arc<OnceCell<(Digest, u64)>>;
 
-async fn persist_pin_bytes(store: BlobStore, bytes: Vec<u8>) -> Result<Digest, ()> {
-    #[cfg(test)]
-    let guard = PinPersistGuard::submitted();
+async fn persist_pin_bytes(
+    owner: PinPersistOwner,
+    store: BlobStore,
+    bytes: Vec<u8>,
+) -> Result<Digest, ()> {
+    let guard = owner.register()?;
     tokio::task::spawn_blocking(move || {
-        #[cfg(test)]
         let _guard = guard;
         store.put(&bytes)
     })
@@ -188,10 +283,16 @@ pub struct SessionCapability {
     /// behaviour for reads (worker-declared root, any CAS digest readable). It
     /// still has no output specs, so WriteBack ids remain unauthorized.
     enforce: bool,
+    pin_persist_owner: PinPersistOwner,
 }
 
 impl SessionCapability {
-    fn new(root: Option<String>, outputs: HashMap<u32, OutputSpec>, enforce: bool) -> Self {
+    fn new(
+        root: Option<String>,
+        outputs: HashMap<u32, OutputSpec>,
+        enforce: bool,
+        pin_persist_owner: PinPersistOwner,
+    ) -> Self {
         let root_dir = root
             .as_deref()
             .and_then(|path| RootDir::open_root(Path::new(path)).ok());
@@ -207,6 +308,7 @@ impl SessionCapability {
             conns: AtomicUsize::new(0),
             closed: AtomicBool::new(false),
             enforce,
+            pin_persist_owner,
         }
     }
 
@@ -284,7 +386,8 @@ impl SessionCapability {
                     None => tokio::fs::read(&actual).await.map_err(|_| ())?,
                 };
                 let size = bytes.len() as u64;
-                let digest = persist_pin_bytes(store.clone(), bytes).await?;
+                let digest =
+                    persist_pin_bytes(self.pin_persist_owner.clone(), store.clone(), bytes).await?;
                 self.allowed_digests.lock().await.insert(digest.clone());
                 Ok((digest, size))
             })
@@ -696,7 +799,7 @@ impl Drop for ConnGuard {
 /// file server (which `get`s by the Hello's session id).
 pub struct SessionRegistry {
     store: BlobStore,
-    store_root: PathBuf,
+    pin_persist_owner: PinPersistOwner,
     sessions: Mutex<HashMap<String, Arc<SessionCapability>>>,
 }
 
@@ -706,9 +809,10 @@ impl SessionRegistry {
         let seq = STORE_SEQ.fetch_add(1, Ordering::Relaxed);
         let store_root =
             std::env::temp_dir().join(format!("sbz-agent-cas.{}.{seq}", std::process::id()));
+        let store = BlobStore::open(&store_root)?;
         Ok(SessionRegistry {
-            store: BlobStore::open(&store_root)?,
-            store_root,
+            store,
+            pin_persist_owner: PinPersistOwner::new(store_root),
             sessions: Mutex::new(HashMap::new()),
         })
     }
@@ -733,7 +837,12 @@ impl SessionRegistry {
             .into_iter()
             .map(|spec| (spec.id, spec))
             .collect::<HashMap<_, _>>();
-        let cap = Arc::new(SessionCapability::new(root, outputs, true));
+        let cap = Arc::new(SessionCapability::new(
+            root,
+            outputs,
+            true,
+            self.pin_persist_owner.clone(),
+        ));
         self.sessions.lock().await.insert(session_id, cap.clone());
         cap
     }
@@ -778,8 +887,13 @@ impl SessionRegistry {
     /// WriteBack ids are still rejected unless a caller explicitly created a bound
     /// session with specs. Each connection gets its own pins (connection-local),
     /// which is at worst tighter than the old shared pin map and never staler.
-    pub fn legacy_capability(root: Option<String>) -> Arc<SessionCapability> {
-        Arc::new(SessionCapability::new(root, HashMap::new(), false))
+    pub fn legacy_capability(&self, root: Option<String>) -> Arc<SessionCapability> {
+        Arc::new(SessionCapability::new(
+            root,
+            HashMap::new(),
+            false,
+            self.pin_persist_owner.clone(),
+        ))
     }
 
     /// Reaps bound sessions older than `ttl` that have no live connection — a
@@ -816,7 +930,7 @@ impl Drop for SessionRegistry {
         // Scrub the shared temp content store. Best-effort: a leaked temp dir is
         // not a correctness problem, so a failure here is ignored (this is a
         // destructor), matching the old per-server `Session` drop.
-        let _ = std::fs::remove_dir_all(&self.store_root);
+        self.pin_persist_owner.close();
     }
 }
 
@@ -1483,10 +1597,15 @@ mod tests {
             let expected = Digest::of(&bytes);
             let cap = reg.create("pin-blocking".into(), None, Vec::new()).await;
 
-            let sentinel = reg.store_root.join("cas").join(".lifecycle.lock");
+            let sentinel = reg
+                .pin_persist_owner
+                .store_root()
+                .join("cas")
+                .join(".lifecycle.lock");
             let (locked_tx, locked_rx) = std::sync::mpsc::channel();
             let (observed_tx, observed_rx) = std::sync::mpsc::channel();
             let (foreground_tx, foreground_rx) = std::sync::mpsc::channel();
+            let pin_persist_owner = cap.pin_persist_owner.clone();
             let lock_thread = std::thread::spawn(move || {
                 let sentinel = std::fs::OpenOptions::new()
                     .read(true)
@@ -1498,7 +1617,7 @@ mod tests {
 
                 let deadline = Instant::now() + Duration::from_secs(3);
                 let observed = loop {
-                    if PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire) == 1 {
+                    if pin_persist_owner.active() == 1 {
                         break true;
                     }
                     if Instant::now() >= deadline {
@@ -1560,7 +1679,7 @@ mod tests {
                 Some(bytes.as_slice())
             );
             assert!(cap.digest_visible(&digest).await);
-            assert_eq!(PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire), 0);
+            assert_eq!(cap.pin_persist_owner.active(), 0);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -1584,7 +1703,12 @@ mod tests {
             let sentinel = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(reg.store_root.join("cas").join(".lifecycle.lock"))
+                .open(
+                    reg.pin_persist_owner
+                        .store_root()
+                        .join("cas")
+                        .join(".lifecycle.lock"),
+                )
                 .unwrap();
             sentinel.lock().unwrap();
             let pin_cap = Arc::clone(&cap);
@@ -1595,7 +1719,7 @@ mod tests {
                     async move { pin_cap.pin(&pin_store, "cancelled.h", pin_actual).await },
                 );
             tokio::time::timeout(Duration::from_secs(5), async {
-                while PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire) == 0 {
+                while cap.pin_persist_owner.active() == 0 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -1610,7 +1734,7 @@ mod tests {
             );
             sentinel.unlock().unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
-                while PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire) != 0 {
+                while cap.pin_persist_owner.active() != 0 {
                     tokio::task::yield_now().await;
                 }
             })
@@ -1626,6 +1750,186 @@ mod tests {
             assert!(cap.digest_visible(&digest).await);
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[test]
+    fn pin_persist_observation_is_isolated_between_registries() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let reg_a = SessionRegistry::new().unwrap();
+            let reg_b = SessionRegistry::new().unwrap();
+            let dir = tmp("pin-owner-isolation");
+            let actual_a = dir.join("a.h");
+            let actual_b = dir.join("b.h");
+            std::fs::write(&actual_a, b"registry-a").unwrap();
+            std::fs::write(&actual_b, b"registry-b").unwrap();
+            let cap_a = reg_a.create("A".into(), None, Vec::new()).await;
+            let cap_b = reg_b.create("B".into(), None, Vec::new()).await;
+
+            let sentinel_a = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(
+                    reg_a
+                        .pin_persist_owner
+                        .store_root()
+                        .join("cas")
+                        .join(".lifecycle.lock"),
+                )
+                .unwrap();
+            let sentinel_b = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(
+                    reg_b
+                        .pin_persist_owner
+                        .store_root()
+                        .join("cas")
+                        .join(".lifecycle.lock"),
+                )
+                .unwrap();
+            sentinel_a.lock().unwrap();
+            sentinel_b.lock().unwrap();
+
+            let pin_a_cap = Arc::clone(&cap_a);
+            let store_a = reg_a.store().clone();
+            let pin_a = tokio::spawn(async move { pin_a_cap.pin(&store_a, "a.h", actual_a).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while cap_a.pin_persist_owner.active() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("registry A must report its queued persist");
+            assert_eq!(cap_b.pin_persist_owner.active(), 0);
+
+            let pin_b_cap = Arc::clone(&cap_b);
+            let store_b = reg_b.store().clone();
+            let pin_b = tokio::spawn(async move { pin_b_cap.pin(&store_b, "b.h", actual_b).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while cap_b.pin_persist_owner.active() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("registry B must report only its own queued persist");
+            assert_eq!(cap_a.pin_persist_owner.active(), 1);
+
+            sentinel_a.unlock().unwrap();
+            sentinel_b.unlock().unwrap();
+            assert!(pin_a.await.unwrap().is_some());
+            assert!(pin_b.await.unwrap().is_some());
+            assert_eq!(cap_a.pin_persist_owner.active(), 0);
+            assert_eq!(cap_b.pin_persist_owner.active(), 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn registry_drop_defers_cleanup_until_cancelled_persist_drains() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let reg = SessionRegistry::new().unwrap();
+            let store_root = reg.pin_persist_owner.store_root().to_path_buf();
+            let held_store = reg.store().clone();
+            let dir = tmp("pin-owner-drop-race");
+            let actual = dir.join("drop.h");
+            std::fs::write(&actual, vec![0x4d; 400_000]).unwrap();
+            let cap = reg.create("drop-race".into(), None, Vec::new()).await;
+
+            let sentinel_path = store_root.join("cas").join(".lifecycle.lock");
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let lock_thread = std::thread::spawn(move || {
+                let sentinel = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(sentinel_path)
+                    .unwrap();
+                sentinel.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                sentinel.unlock().unwrap();
+            });
+            locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let pin_cap = Arc::clone(&cap);
+            let pin_store = held_store.clone();
+            let pin = tokio::spawn(async move { pin_cap.pin(&pin_store, "drop.h", actual).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while cap.pin_persist_owner.active() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("persist must be registered before registry drop");
+            pin.abort();
+            assert!(pin.await.unwrap_err().is_cancelled());
+
+            drop(reg);
+            assert!(
+                store_root.exists(),
+                "active persistence must defer registry cleanup"
+            );
+            release_tx.send(()).unwrap();
+            lock_thread.join().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while store_root.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("last persist guard must clean the closed registry store");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !store_root.exists(),
+                "a detached persist must not recreate the cleaned store"
+            );
+            drop(held_store);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[tokio::test]
+    async fn registry_close_rejects_new_pin_persist_without_acl_grant() {
+        let reg = SessionRegistry::new().unwrap();
+        let store = reg.store().clone();
+        let dir = tmp("pin-owner-closed");
+        let actual = dir.join("closed.h");
+        let bytes = b"closed registry";
+        std::fs::write(&actual, bytes).unwrap();
+        let digest = Digest::of(bytes);
+        let cap = reg.create("closed".into(), None, Vec::new()).await;
+
+        drop(reg);
+        assert!(cap.pin(&store, "closed.h", actual).await.is_none());
+        assert!(!cap.digest_visible(&digest).await);
+        assert_eq!(cap.pin_persist_owner.active(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pin_persist_owner_starts_cleanup_only_once() {
+        let store_root = tmp("pin-owner-clean-once");
+        let owner = PinPersistOwner::new(store_root.clone());
+        owner.close();
+        assert!(!store_root.exists());
+
+        std::fs::create_dir_all(&store_root).unwrap();
+        owner.close();
+        assert!(
+            store_root.exists(),
+            "cleanup_started must prevent a second destructive cleanup"
+        );
+        let _ = std::fs::remove_dir_all(&store_root);
     }
 
     #[tokio::test]
@@ -1658,7 +1962,7 @@ mod tests {
         );
 
         // A legacy session has no ACL: any present digest is visible.
-        let legacy = SessionRegistry::legacy_capability(None);
+        let legacy = reg.legacy_capability(None);
         assert!(legacy.digest_visible(&d_theirs).await);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1677,22 +1981,32 @@ mod tests {
                 max_size: DEFAULT_OUTPUT_MAX_BYTES,
             },
         );
-        let bound = SessionCapability::new(root_str(Path::new("c:\\proj")), outs, true);
+        let reg = SessionRegistry::new().unwrap();
+        let bound = SessionCapability::new(
+            root_str(Path::new("c:\\proj")),
+            outs,
+            true,
+            reg.pin_persist_owner.clone(),
+        );
         let spec = bound.output_spec(0).expect("declared output allowed");
         assert_eq!(spec.final_path, PathBuf::from("c:\\proj\\obj\\a.obj"));
         assert_eq!(spec.max_size, DEFAULT_OUTPUT_MAX_BYTES);
         assert!(bound.output_spec(1).is_none(), "unknown id is refused");
 
         // No declared outputs → no WriteBack authority, even within root.
-        let bound_no_decl =
-            SessionCapability::new(root_str(Path::new("c:\\proj")), HashMap::new(), true);
+        let bound_no_decl = SessionCapability::new(
+            root_str(Path::new("c:\\proj")),
+            HashMap::new(),
+            true,
+            reg.pin_persist_owner.clone(),
+        );
         assert!(
             bound_no_decl.output_spec(0).is_none(),
             "no id is valid when nothing is declared (SEC-003)"
         );
 
         // Legacy has no output specs, so WriteBack ids are not authorized there.
-        let legacy = SessionRegistry::legacy_capability(None);
+        let legacy = reg.legacy_capability(None);
         assert!(legacy.output_spec(0).is_none());
     }
 

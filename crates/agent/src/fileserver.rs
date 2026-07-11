@@ -385,7 +385,7 @@ async fn resolve_session(
     // so neither check alone is assumed to be the sole guard.
     if session_id.is_empty() {
         if legacy_sessions_enabled {
-            Ok(SessionRegistry::legacy_capability(worker_root))
+            Ok(registry.legacy_capability(worker_root))
         } else {
             Err("session id required")
         }
