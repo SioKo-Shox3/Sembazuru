@@ -3,7 +3,7 @@
 ## 測定対象
 
 - 測定日: 2026-07-12 (Asia/Tokyo)
-- Prefetch 再測定対象 commit: `67662e32aa483a9caa044258ff36bb652d1763ec`
+- Prefetch 再測定対象 commit: `63afb94290066dd000e8b80456a3550570b949b6`
 - CI: **not run**。この記録はローカル Windows host の実測であり、CI の結果ではない。
 
 今回のreview-fixではStep 2だけを上記commitで再測定した。Step 1とStep 3は既存の測定記録を保持し、Step 4とStep 5は次フェーズでnative artifactを用意して再実行するため、現在のblockerをそのまま記録する。
@@ -76,18 +76,18 @@ cargo test --workspace
 powershell -NoProfile -File hooks/test/prefetch_bench.ps1
 ```
 
-条件は各 concurrency 40 sample、512 path x 64 KiB、simulated RTT 2 ms。production `for_each_prefetch_bounded` と generic `hydrate` を通し、prefetch 中に末尾の未warm pathを foreground hydrate した。parser は JSON 4行、property集合、整数3指標の正の十進整数raw tokenとu64 range、latency 4指標の有限正数、concurrency集合、`peak_tasks <= concurrency`、全case同一transfer bytesを検証してexit `0`。外部依存のないself-testは`powershell.exe`と`pwsh`の両方で通過した。
+条件は各 concurrency 40 sample、512 path x 64 KiB、simulated RTT 2 ms。production `for_each_prefetch_bounded` と generic `hydrate` を通し、prefetch 中に末尾の未warm pathを foreground hydrate した。parser は大文字小文字を区別する固定7 property・固定順序・固定delimiterのcanonical schemaへ4行をanchored matchし、named captureから整数3指標の正の十進整数tokenとu64 range、latency 4指標のJSON number grammar・有限正数、concurrency集合、`peak_tasks <= concurrency`、全case同一transfer bytesを検証してexit `0`。Unicode escapeによるkey、重複、case-only key、nested/extra propertyはschema不一致として拒否する。外部依存のないself-testは`powershell.exe`と`pwsh`の両方で通過した。
 
 `peak_tasks`は同時に実行中だったprefetch callback数の最大値である。`transfer_bytes`はbenchmarkが`ServerStats::content_bytes()`へ加算したsimulated content bytesであり、OSやnetwork I/Oの実測値ではない。
 
 ```text
-PREFETCH_BENCH {"concurrency":8,"prefetch_p50_ms":245.794,"prefetch_p95_ms":248.813,"foreground_p50_ms":3.270,"foreground_p95_ms":4.026,"peak_tasks":8,"transfer_bytes":33554432}
-PREFETCH_BENCH {"concurrency":16,"prefetch_p50_ms":122.263,"prefetch_p95_ms":125.344,"foreground_p50_ms":3.356,"foreground_p95_ms":4.011,"peak_tasks":16,"transfer_bytes":33554432}
-PREFETCH_BENCH {"concurrency":32,"prefetch_p50_ms":61.287,"prefetch_p95_ms":63.203,"foreground_p50_ms":3.283,"foreground_p95_ms":4.156,"peak_tasks":32,"transfer_bytes":33554432}
-PREFETCH_BENCH {"concurrency":64,"prefetch_p50_ms":30.576,"prefetch_p95_ms":32.385,"foreground_p50_ms":3.134,"foreground_p95_ms":4.066,"peak_tasks":64,"transfer_bytes":33554432}
+PREFETCH_BENCH {"concurrency":8,"prefetch_p50_ms":246.039,"prefetch_p95_ms":249.226,"foreground_p50_ms":3.563,"foreground_p95_ms":4.607,"peak_tasks":8,"transfer_bytes":33554432}
+PREFETCH_BENCH {"concurrency":16,"prefetch_p50_ms":122.302,"prefetch_p95_ms":124.770,"foreground_p50_ms":3.419,"foreground_p95_ms":4.519,"peak_tasks":16,"transfer_bytes":33554432}
+PREFETCH_BENCH {"concurrency":32,"prefetch_p50_ms":61.219,"prefetch_p95_ms":62.513,"foreground_p50_ms":3.534,"foreground_p95_ms":4.378,"peak_tasks":32,"transfer_bytes":33554432}
+PREFETCH_BENCH {"concurrency":64,"prefetch_p50_ms":30.404,"prefetch_p95_ms":31.987,"foreground_p50_ms":3.232,"foreground_p95_ms":3.999,"peak_tasks":64,"transfer_bytes":33554432}
 ```
 
-production 採用値は `32`。本 workload ではprefetch p50/p95が`61.287 / 63.203 ms`、foreground p50/p95が`3.283 / 4.156 ms`、peak taskが`32`、simulated transferが`33554432` bytesだった。
+production 採用値は `32`。本 workload ではprefetch p50/p95が`61.219 / 62.513 ms`、foreground p50/p95が`3.534 / 4.378 ms`、peak taskが`32`、simulated transferが`33554432` bytesだった。
 
 ### Step 3: CAS range / production file server
 
