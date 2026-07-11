@@ -399,8 +399,7 @@ impl FileClient {
     /// `Read`, verifying the assembled bytes against the digest. For the cache
     /// path: probe first, then fetch only on a miss.
     pub async fn fetch_by_digest(&self, digest: &Digest, size: u64) -> io::Result<Vec<u8>> {
-        let size = size as usize;
-        let mut bytes = Vec::with_capacity(size);
+        let (mut bytes, size) = content_buffer(Vec::new(), size)?;
         let digest_str = digest.canonical();
         while bytes.len() < size {
             let want = READ_CHUNK.min((size - bytes.len()) as u32);
@@ -427,8 +426,7 @@ impl FileClient {
         }
         let digest = Digest::parse(&open.digest_hex)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad digest: {e}")))?;
-        let size = open.size as usize;
-        let mut bytes = open.first_chunk;
+        let (mut bytes, size) = content_buffer(open.first_chunk, open.size)?;
         let digest_str = open.digest_hex;
         while bytes.len() < size {
             let want = READ_CHUNK.min((size - bytes.len()) as u32);
@@ -444,6 +442,24 @@ impl FileClient {
         verify(&bytes, &digest)?;
         Ok(Some((bytes, digest)))
     }
+}
+
+fn content_buffer(mut initial: Vec<u8>, declared_size: u64) -> io::Result<(Vec<u8>, usize)> {
+    let size = usize::try_from(declared_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("content size {declared_size} exceeds this worker's address space"),
+        )
+    })?;
+    initial
+        .try_reserve_exact(size.saturating_sub(initial.len()))
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("content size {declared_size} cannot be buffered safely: {error}"),
+            )
+        })?;
+    Ok((initial, size))
 }
 
 /// Integrity check: the assembled bytes must hash to the digest the agent
@@ -523,6 +539,88 @@ mod tests {
             }
         });
         addr
+    }
+
+    async fn start_no_read_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut sock = accept_test_handshake(listener).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_frame(&mut sock))
+                    .await
+                    .is_err(),
+                "oversized content must be rejected before a Read request is sent"
+            );
+        });
+        (addr, server)
+    }
+
+    async fn start_oversized_open_server(
+        size: u64,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut sock = accept_test_handshake(listener).await;
+            let (header, payload) = read_frame(&mut sock).await.unwrap();
+            let request = OpenReadRequest::decode(&payload).unwrap();
+            assert_eq!(header.op, OpCode::OpenRead);
+            assert!(request.want_inline);
+            let response = OpenReadResponse {
+                exists: true,
+                size,
+                digest_hex: Digest::of(b"").canonical(),
+                first_chunk: Vec::new(),
+            }
+            .encode();
+            write_frame(
+                &mut sock,
+                FrameHeader {
+                    request_id: header.request_id,
+                    op: OpCode::OpenRead,
+                    is_response: true,
+                },
+                &response,
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), read_frame(&mut sock))
+                    .await
+                    .is_err(),
+                "oversized content must be rejected before a Read request is sent"
+            );
+        });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn fetch_by_digest_rejects_unbufferable_size_before_read() {
+        let (addr, server) = start_no_read_server().await;
+        let client = FileClient::connect(addr).await.unwrap();
+
+        let error = client
+            .fetch_by_digest(&Digest::of(b""), u64::MAX)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("content size"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_unbufferable_size_before_read() {
+        let (addr, server) = start_oversized_open_server(u64::MAX).await;
+        let client = FileClient::connect(addr).await.unwrap();
+
+        let error = client.fetch(r"c:\src\oversized.h").await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("content size"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

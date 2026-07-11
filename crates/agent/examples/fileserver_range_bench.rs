@@ -99,7 +99,7 @@ async fn run() -> io::Result<()> {
     eprintln!("fileserver_range_bench: skipping Windows ReadTransferCount threshold");
 
     println!(
-        "size_mib={SIZE_MIB} mode=fileserver-fetch median_ms={elapsed_ms:.2} read_transfer_bytes={read_transfer_bytes} peak_working_set_bytes={peak_working_set_bytes}"
+        "size_mib={SIZE_MIB} mode=fileserver-fetch elapsed_ms={elapsed_ms:.2} read_transfer_bytes={read_transfer_bytes} peak_working_set_bytes={peak_working_set_bytes}"
     );
     server.abort();
     Ok(())
