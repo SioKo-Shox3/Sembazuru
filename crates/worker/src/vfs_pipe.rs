@@ -2211,6 +2211,9 @@ mod tests {
         };
 
         let (prefetch_elapsed, foreground_elapsed) = tokio::join!(prefetch, foreground);
+        // Benchmark-only metrics: `peak_tasks` is the maximum number of prefetch
+        // callbacks executing concurrently. `transfer_bytes` is simulated content
+        // added to ServerStats, not bytes measured from OS or network I/O.
         let peak_tasks = peak.load(Ordering::SeqCst);
         let transfer_bytes = stats.content_bytes();
         assert_eq!(transfer_bytes, BENCH_PATH_COUNT as u64 * BENCH_PATH_BYTES);
