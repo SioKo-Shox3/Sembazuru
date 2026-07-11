@@ -441,7 +441,9 @@ impl AgentCache {
             .inputs
             .into_iter()
             .filter(|entry| entry.kind == InputKind::Content)
-            .filter_map(|entry| crate::fileserver::normalize_requested(&entry.absolute))
+            .filter_map(|entry| {
+                crate::fileserver::normalize_prefetch_path(&entry.absolute, normalized_vfs_root)
+            })
             .filter(|path| crate::fileserver::path_in_scope(path, normalized_vfs_root))
             .filter(|path| seen.insert(path.clone()))
             .take(MAX_PREDICTED_PATHS)
@@ -1944,6 +1946,67 @@ mod tests {
             predicted[MAX_PREDICTED_PATHS - 1],
             format!("c:\\src\\include\\h{}.h", MAX_PREDICTED_PATHS - 1)
         );
+    }
+
+    fn predicted_paths_for_absolute(
+        tag: &str,
+        absolute: &str,
+        normalized_vfs_root: Option<&str>,
+    ) -> Vec<String> {
+        let root = tmp(tag);
+        let cache = AgentCache::open(&root).unwrap();
+        let weak = cache.weak_key(&["clang-cl".into(), "/c".into(), tag.into()], &[], "");
+        let manifest = InputManifest {
+            inputs: vec![InputEntry {
+                logical: "src\\in.h".into(),
+                absolute: absolute.into(),
+                kind: InputKind::Content,
+            }],
+            cmds: vec![],
+            cacheable: true,
+        };
+        cache
+            .cache
+            .put_manifest(&weak, &encode_manifest(&manifest))
+            .unwrap();
+
+        cache.predicted_paths(&weak, normalized_vfs_root).unwrap()
+    }
+
+    #[test]
+    fn predicted_paths_allow_short_alias_in_declared_root_prefix() {
+        let predicted = predicted_paths_for_absolute(
+            "predict-root-alias",
+            "C:\\Users\\<user>\\Documents\\Sembazuru\\project\\src\\in.h",
+            Some("c:\\users\\kingka~1\\documents\\sembazuru\\project"),
+        );
+
+        assert_eq!(
+            predicted,
+            vec!["c:\\users\\kingka~1\\documents\\sembazuru\\project\\src\\in.h"]
+        );
+    }
+
+    #[test]
+    fn predicted_paths_reject_short_alias_in_root_relative_suffix() {
+        let predicted = predicted_paths_for_absolute(
+            "predict-suffix-alias",
+            "C:\\project\\PROGRA~1\\in.h",
+            Some("c:\\project"),
+        );
+
+        assert!(predicted.is_empty());
+    }
+
+    #[test]
+    fn predicted_paths_unscoped_reject_ambiguous_short_alias() {
+        let predicted = predicted_paths_for_absolute(
+            "predict-unscoped-alias",
+            "C:\\Users\\<user>\\project\\src\\in.h",
+            None,
+        );
+
+        assert!(predicted.is_empty());
     }
 
     fn assert_tail_content_survives(prefix_kind: InputKind, tag: &str) {

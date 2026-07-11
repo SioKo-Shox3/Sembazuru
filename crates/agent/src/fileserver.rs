@@ -429,6 +429,14 @@ pub fn normalize_requested(path: &str) -> Option<String> {
 }
 
 pub(crate) fn normalize_declared_output(path: &str, root: Option<&str>) -> Option<String> {
+    normalize_scoped_requested(path, root)
+}
+
+pub(crate) fn normalize_prefetch_path(path: &str, root: Option<&str>) -> Option<String> {
+    normalize_scoped_requested(path, root)
+}
+
+fn normalize_scoped_requested(path: &str, root: Option<&str>) -> Option<String> {
     let Some(root) = root else {
         return normalize_requested(path);
     };
