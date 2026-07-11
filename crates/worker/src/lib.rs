@@ -44,7 +44,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
-use crate::vfs_pipe::{MaterializationTracker, serve_vfs_with_prefetch_ready_tracked};
+use crate::vfs_pipe::{ActionVfsServer, start_action_vfs};
 
 /// Disambiguates per-action VFS pipe/scratch names within a worker process.
 static EXEC_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -688,17 +688,21 @@ async fn run_action(
     }
 }
 
-struct ActionVfsServer {
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
-    materializations: MaterializationTracker,
+async fn create_trace_dir_or_cleanup_scratch(
+    trace_dir: &Path,
+    scratch: &Path,
+) -> Result<(), String> {
+    if let Err(error) = tokio::fs::create_dir_all(trace_dir).await {
+        let _ = tokio::fs::remove_dir_all(scratch).await;
+        return Err(setup_err("create trace dir failed", error));
+    }
+    Ok(())
 }
 
-impl ActionVfsServer {
-    async fn shutdown(self) {
-        self.task.abort();
-        let _ = self.task.await;
-        self.materializations.wait_idle().await;
-    }
+async fn stop_unassigned_launcher(child: &mut tokio::process::Child, vfs_server: ActionVfsServer) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    vfs_server.shutdown().await;
 }
 
 /// Builds the child process for an action. Plain mode spawns the command
@@ -813,9 +817,7 @@ async fn build_child(
         .await
         .map_err(|e| setup_err("create scratch dir failed", e))?;
     if !v.trace_dir.is_empty() {
-        tokio::fs::create_dir_all(&v.trace_dir)
-            .await
-            .map_err(|e| setup_err("create trace dir failed", e))?;
+        create_trace_dir_or_cleanup_scratch(Path::new(&v.trace_dir), &scratch_for_cleanup).await?;
     }
     let child_cwd = vfs_child_cwd(&cmd.cwd, &v.vfs_root, &scratch);
     if let VfsChildCwd::Scratch(path) = &child_cwd {
@@ -832,41 +834,31 @@ async fn build_child(
     // Start the pipe server and WAIT for readiness before launching, so the
     // compiler cannot dial the pipe before it exists (Plan risk 1). A create
     // failure drops `ready_tx`, so `ready_rx.await` errors and we fail closed.
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let cas = cfg.cas_root.clone();
     let auth_token = cfg.cluster_token.clone().unwrap_or_default();
-    let pipe_for_task = pipe_name.clone();
-    let materializations = MaterializationTracker::default();
-    let materializations_for_task = materializations.clone();
     // Declare the action's input root so the agent scopes file supply to it
     // (M7.1): the worker only legitimately reads under vfs_root (the hook
     // redirects exactly that subtree), so a request outside it is illegitimate.
     let vfs_root = v.vfs_root.clone();
-    let pipe_task = tokio::spawn(async move {
-        serve_vfs_with_prefetch_ready_tracked(
-            &pipe_for_task,
-            agent_addr,
-            scratch,
-            cas,
-            Duration::ZERO,
-            predicted_paths,
-            ready_tx,
-            vfs_root,
-            session_id,
-            auth_token,
-            materializations_for_task,
-        )
-        .await
-    });
-    let vfs_server = ActionVfsServer {
-        task: pipe_task,
-        materializations,
+    let vfs_server = match start_action_vfs(
+        pipe_name.clone(),
+        agent_addr,
+        scratch,
+        cas,
+        Duration::ZERO,
+        predicted_paths,
+        vfs_root,
+        session_id,
+        auth_token,
+    )
+    .await
+    {
+        Ok(server) => server,
+        Err(_) => {
+            let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
+            return Err("VFS pipe server failed to start".to_string());
+        }
     };
-    if ready_rx.await.is_err() {
-        vfs_server.shutdown().await;
-        let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
-        return Err("VFS pipe server failed to start".to_string());
-    }
 
     // Inject the DLL via launcher.exe. Env is set EXPLICITLY (env_clear first):
     // launcher.cpp passes no env block, so the compiler inherits the launcher's
@@ -918,7 +910,7 @@ async fn build_child(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.kill_on_drop(true);
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
             vfs_server.shutdown().await;
@@ -940,9 +932,9 @@ async fn build_child(
     }) {
         Ok(j) => j,
         Err(e) => {
-            vfs_server.shutdown().await;
-            let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
-            // `child` drops here; kill_on_drop terminates at least the launcher.
+            stop_unassigned_launcher(&mut child, vfs_server).await;
+            // Assignment never established process-tree ownership. Preserve the
+            // scratch tree because an unowned grandchild cannot be disproved.
             return Err(setup_err("job object setup failed", e));
         }
     };
@@ -1191,44 +1183,130 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore]
+    fn job_assignment_failure_child_fixture() {
+        let ready = std::env::var_os("SEMBAZURU_TEST_CHILD_READY")
+            .expect("fixture requires a readiness marker path");
+        std::fs::write(ready, b"ready").expect("fixture should publish readiness");
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
     #[tokio::test]
-    async fn stopping_vfs_pipe_waits_until_the_task_is_dropped() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn job_assignment_failure_reaps_launcher_and_vfs_but_preserves_scratch() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sembazuru-job-assignment-failure-{}-{}",
+            std::process::id(),
+            EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch fixture should be created");
+        let sentinel = scratch.join("sentinel");
+        std::fs::write(&sentinel, b"keep").expect("scratch sentinel should be created");
+        let child_ready = scratch.join("child-ready");
+        let cas = scratch.with_extension("cas");
+        let pipe_name = format!(
+            "sbz-job-failure-{}-{}",
+            std::process::id(),
+            EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
 
-        struct ActiveGuard(Arc<AtomicUsize>);
+        let mut command = tokio::process::Command::new(
+            std::env::current_exe().expect("test executable should be available"),
+        );
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "tests::job_assignment_failure_child_fixture",
+            ])
+            .env("SEMBAZURU_TEST_CHILD_READY", &child_ready)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = command.spawn().expect("fixture child should start");
 
-        impl Drop for ActiveGuard {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !child_ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }
+        })
+        .await
+        .expect("fixture child should publish readiness");
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should be readable")
+                .is_none(),
+            "fixture child should still be running"
+        );
 
-        let active = Arc::new(AtomicUsize::new(0));
-        let writes = Arc::new(AtomicUsize::new(0));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-        let active_for_task = Arc::clone(&active);
-        let writes_for_task = Arc::clone(&writes);
-        let task = tokio::spawn(async move {
-            active_for_task.fetch_add(1, Ordering::SeqCst);
-            let _active_guard = ActiveGuard(active_for_task);
-            let _ = started_tx.send(());
-            let _ = release_rx.await;
-            writes_for_task.fetch_add(1, Ordering::SeqCst);
-            std::io::Result::Ok(())
-        });
-        started_rx.await.expect("pipe task should start");
+        let vfs_server = start_action_vfs(
+            pipe_name.clone(),
+            "127.0.0.1:1".parse().unwrap(),
+            scratch.clone(),
+            cas.clone(),
+            Duration::ZERO,
+            Vec::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+        .await
+        .expect("production VFS owner should start");
 
-        ActionVfsServer {
-            task,
-            materializations: MaterializationTracker::default(),
-        }
-        .shutdown()
-        .await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stop_unassigned_launcher(&mut child, vfs_server),
+        )
+        .await
+        .expect("job-assignment cleanup should not hang");
 
-        assert_eq!(active.load(Ordering::SeqCst), 0);
-        let _ = release_tx.send(());
-        tokio::task::yield_now().await;
-        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        assert!(
+            child
+                .try_wait()
+                .expect("child status should be readable")
+                .is_some(),
+            "helper must reap the launcher before returning"
+        );
+        let full_pipe_name = format!(r"\\.\pipe\{pipe_name}");
+        assert!(
+            tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&full_pipe_name)
+                .is_err(),
+            "production VFS owner must be shut down before helper returns"
+        );
+        assert_eq!(
+            std::fs::read(&sentinel).expect("scratch sentinel must be preserved"),
+            b"keep"
+        );
+        std::fs::remove_dir_all(&scratch).expect("fixture scratch should be removable");
+        std::fs::remove_dir_all(&cas).expect("fixture CAS should be removable");
+    }
+
+    #[tokio::test]
+    async fn trace_directory_failure_removes_new_scratch_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "sembazuru-trace-setup-failure-{}-{}",
+            std::process::id(),
+            EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("fixture root should be created");
+        let blocking_file = root.join("not-a-directory");
+        std::fs::write(&blocking_file, b"file").expect("blocking file should be created");
+        let trace_dir = blocking_file.join("trace");
+        let scratch = root.join("scratch");
+        std::fs::create_dir_all(&scratch).expect("scratch should exist before trace setup");
+
+        let error = create_trace_dir_or_cleanup_scratch(&trace_dir, &scratch)
+            .await
+            .expect_err("trace setup through a file must fail");
+
+        assert!(error.contains("create trace dir failed"));
+        assert!(
+            !scratch.exists(),
+            "trace setup failure must remove the scratch tree created earlier"
+        );
+        std::fs::remove_dir_all(&root).expect("fixture root should be removable");
     }
 }

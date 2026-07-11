@@ -51,7 +51,7 @@ const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 const PREFETCH_CONCURRENCY: usize = 32;
 
 #[derive(Clone, Default)]
-pub(crate) struct MaterializationTracker {
+struct MaterializationTracker {
     inner: Arc<MaterializationTrackerInner>,
 }
 
@@ -72,7 +72,7 @@ impl Drop for MaterializationGuard {
 }
 
 impl MaterializationTracker {
-    pub(crate) fn spawn_blocking<F, T>(&self, operation: F) -> tokio::task::JoinHandle<T>
+    fn spawn_blocking<F, T>(&self, operation: F) -> tokio::task::JoinHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -85,7 +85,7 @@ impl MaterializationTracker {
         })
     }
 
-    pub(crate) async fn wait_idle(&self) {
+    async fn wait_idle(&self) {
         loop {
             if self.inner.active.load(AtomicOrdering::Acquire) == 0 {
                 return;
@@ -96,6 +96,24 @@ impl MaterializationTracker {
             }
             notified.await;
         }
+    }
+}
+
+/// Owns one action's VFS serve task and every blocking materialization it
+/// started. Callers that remove the action scratch tree must retain this handle
+/// and consume it with [`ActionVfsServer::shutdown`] before cleanup.
+pub struct ActionVfsServer {
+    task: tokio::task::JoinHandle<io::Result<()>>,
+    materializations: MaterializationTracker,
+}
+
+impl ActionVfsServer {
+    /// Stops the pipe task, synchronously drops its warm/client futures, then
+    /// waits for already-running blocking filesystem work to finish.
+    pub async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        self.materializations.wait_idle().await;
     }
 }
 
@@ -311,8 +329,56 @@ pub async fn serve_vfs_with_prefetch_ready(
     .await
 }
 
+/// Starts an action-owned VFS server and returns only after its first pipe
+/// instance is dialable. A caller that later cleans the supplied scratch tree
+/// must call [`ActionVfsServer::shutdown`] first.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn serve_vfs_with_prefetch_ready_tracked(
+pub async fn start_action_vfs(
+    pipe_name: String,
+    agent_addr: SocketAddr,
+    scratch_root: PathBuf,
+    cas_root: PathBuf,
+    rtt: Duration,
+    predicted_paths: Vec<String>,
+    vfs_root: String,
+    session_id: String,
+    auth_token: String,
+) -> io::Result<ActionVfsServer> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let materializations = MaterializationTracker::default();
+    let task_materializations = materializations.clone();
+    let task = tokio::spawn(async move {
+        serve_vfs_with_prefetch_ready_tracked(
+            &pipe_name,
+            agent_addr,
+            scratch_root,
+            cas_root,
+            rtt,
+            predicted_paths,
+            ready_tx,
+            vfs_root,
+            session_id,
+            auth_token,
+            task_materializations,
+        )
+        .await
+    });
+    let server = ActionVfsServer {
+        task,
+        materializations,
+    };
+    if ready_rx.await.is_err() {
+        server.shutdown().await;
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "VFS pipe server failed to start",
+        ));
+    }
+    Ok(server)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_vfs_with_prefetch_ready_tracked(
     pipe_name: &str,
     agent_addr: SocketAddr,
     scratch_root: PathBuf,
@@ -768,18 +834,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_waits_for_detached_blocking_materialization_before_cleanup() {
+    async fn action_vfs_server_shutdown_drains_real_blocking_io_before_cleanup() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
         let scratch = temp("blocking-drain");
         std::fs::remove_dir_all(&scratch).unwrap();
         let local = scratch.join("nested").join("header.h");
         let local_for_job = local.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (outer_dropped_tx, outer_dropped_rx) = tokio::sync::oneshot::channel();
         let tracker = MaterializationTracker::default();
 
-        let hydrate_tracker = tracker.clone();
-        let hydrate_task = tokio::spawn(async move {
-            hydrate_tracker
+        let outer_tracker = tracker.clone();
+        let outer_task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(Some(outer_dropped_tx));
+            outer_tracker
                 .spawn_blocking(move || {
                     let _ = started_tx.send(());
                     release_rx.recv().unwrap();
@@ -787,22 +865,27 @@ mod tests {
                     std::fs::write(local_for_job, b"tracked materialization")
                 })
                 .await
+                .expect("blocking materialization should join")?;
+            Ok(())
         });
 
         started_rx
             .await
             .expect("blocking materialization should start");
-        let shutdown_tracker = tracker.clone();
-        let mut shutdown = tokio::spawn(async move {
-            hydrate_task.abort();
-            let _ = hydrate_task.await;
-            shutdown_tracker.wait_idle().await;
+        let server = ActionVfsServer {
+            task: outer_task,
+            materializations: tracker,
+        };
+        let shutdown = tokio::spawn(async move {
+            server.shutdown().await;
         });
 
+        outer_dropped_rx
+            .await
+            .expect("shutdown must synchronously drop the outer serve future");
+        tokio::task::yield_now().await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
-                .await
-                .is_err(),
+            !shutdown.is_finished(),
             "shutdown must remain pending while the detached blocking job is parked"
         );
 
