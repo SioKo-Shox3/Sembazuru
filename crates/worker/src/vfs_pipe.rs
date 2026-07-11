@@ -31,12 +31,12 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use sembazuru_cas::BlobStore;
+use sembazuru_cas::{BlobStore, CasError};
 use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -100,6 +100,17 @@ impl MaterializationTracker {
     }
 }
 
+async fn run_tracked_blocking<F, T>(
+    tracker: &MaterializationTracker,
+    operation: F,
+) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tracker.spawn_blocking(operation).await
+}
+
 /// Owns one action's VFS serve task and every blocking materialization it
 /// started.
 ///
@@ -142,8 +153,8 @@ struct VfsState {
     scratch_root: PathBuf,
     /// Logical path → materialized scratch path, for this session.
     hydrated: Mutex<HashMap<String, String>>,
-    /// Normalized logical path -> action-lifetime single-flight gate.
-    hydrating: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Normalized logical path -> current in-flight hydration generation.
+    hydrating: StdMutex<HashMap<String, Weak<HydrationFlight>>>,
     /// Content-addressed store, persisting across builds: a blob seen once is
     /// never re-fetched.
     cas: BlobStore,
@@ -256,13 +267,64 @@ fn hydration_key(path: &str) -> String {
     path.replace('/', "\\").to_lowercase()
 }
 
-async fn hydration_gate(state: &VfsState, key: &str) -> Arc<Mutex<()>> {
-    let mut gates = state.hydrating.lock().await;
-    Arc::clone(
-        gates
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(()))),
-    )
+struct HydrationFlight {
+    result: OnceCell<(u8, String)>,
+}
+
+struct HydrationLease<'a> {
+    key: String,
+    flight: Arc<HydrationFlight>,
+    registry: &'a StdMutex<HashMap<String, Weak<HydrationFlight>>>,
+}
+
+fn lock_hydration_registry(
+    registry: &StdMutex<HashMap<String, Weak<HydrationFlight>>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, Weak<HydrationFlight>>> {
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl<'a> HydrationLease<'a> {
+    fn join(registry: &'a StdMutex<HashMap<String, Weak<HydrationFlight>>>, key: String) -> Self {
+        let flight = {
+            let mut flights = lock_hydration_registry(registry);
+            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
+                flight
+            } else {
+                let flight = Arc::new(HydrationFlight {
+                    result: OnceCell::new(),
+                });
+                flights.insert(key.clone(), Arc::downgrade(&flight));
+                flight
+            }
+        };
+        Self {
+            key,
+            flight,
+            registry,
+        }
+    }
+
+    async fn get_or_init<F, Fut>(&self, operation: F) -> (u8, String)
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = (u8, String)>,
+    {
+        self.flight.result.get_or_init(operation).await.clone()
+    }
+}
+
+impl Drop for HydrationLease<'_> {
+    fn drop(&mut self) {
+        let mut flights = lock_hydration_registry(self.registry);
+        let is_current = flights
+            .get(&self.key)
+            .is_some_and(|registered| Weak::ptr_eq(registered, &Arc::downgrade(&self.flight)));
+        if is_current && Arc::strong_count(&self.flight) == 1 {
+            flights.remove(&self.key);
+        }
+    }
 }
 
 fn hydrate_temp_path(final_path: &Path) -> PathBuf {
@@ -488,7 +550,7 @@ async fn serve_vfs_with_prefetch_ready_tracked(
     let state = Arc::new(VfsState {
         scratch_root,
         hydrated: Mutex::new(HashMap::new()),
-        hydrating: Mutex::new(HashMap::new()),
+        hydrating: StdMutex::new(HashMap::new()),
         cas: BlobStore::open(cas_root)?,
         agent_addr,
         rtt,
@@ -577,17 +639,20 @@ where
     if let Some(local) = state.hydrated.lock().await.get(&key).cloned() {
         return (STATUS_OK, local);
     }
-    let gate = hydration_gate(state, &key).await;
-    let _guard = gate.lock().await;
-    if let Some(local) = state.hydrated.lock().await.get(&key).cloned() {
-        return (STATUS_OK, local);
-    }
+    let lease = HydrationLease::join(&state.hydrating, key.clone());
+    lease
+        .get_or_init(|| async {
+            if let Some(local) = state.hydrated.lock().await.get(&key).cloned() {
+                return (STATUS_OK, local);
+            }
 
-    let result = operation().await;
-    if result.0 == STATUS_OK {
-        state.hydrated.lock().await.insert(key, result.1.clone());
-    }
-    result
+            let result = operation().await;
+            if result.0 == STATUS_OK {
+                state.hydrated.lock().await.insert(key, result.1.clone());
+            }
+            result
+        })
+        .await
 }
 
 async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
@@ -605,28 +670,41 @@ async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
         Err(_) => return (STATUS_ERROR, String::new()),
     };
 
-    // Local cache hit → no content crosses the network. Verify on the way out
-    // of the store so on-disk corruption can't feed the compiler bad bytes.
-    let bytes = match state.cas.get_verified(&digest) {
-        Ok(Some(b)) => b,
-        _ => {
-            // Miss (or corrupt): fetch from the agent, verify, and store.
+    // Local cache hit → no content crosses the network. Both whole-blob read and
+    // digest verification are blocking work, so keep them off Tokio's workers.
+    let cas_for_read = state.cas.clone();
+    let digest_for_read = digest.clone();
+    let cached = run_tracked_blocking(&state.materializations, move || {
+        cas_for_read.get_verified(&digest_for_read)
+    })
+    .await;
+    let (bytes, store_fetched) = match cached {
+        Ok(Ok(Some(bytes))) => (bytes, false),
+        Ok(Ok(None)) | Ok(Err(CasError::Corrupt { .. })) => {
+            // Miss (or corrupt): fetch from the agent, then repair the local CAS.
             let fetched = match client.fetch_by_digest(&digest, size).await {
-                Ok(b) => b,
+                Ok(bytes) => bytes,
                 Err(_) => return (STATUS_ERROR, String::new()),
             };
-            if state.cas.put_verified(&fetched, &digest).is_err() {
-                return (STATUS_ERROR, String::new());
-            }
-            fetched
+            (fetched, true)
         }
+        Ok(Err(_)) | Err(_) => return (STATUS_ERROR, String::new()),
     };
 
     let local = scratch_mirror(&state.scratch_root, path);
     let local_for_write = local.clone();
-    let materialize = state
-        .materializations
-        .spawn_blocking(move || atomic_publish(&local_for_write, |file| file.write_all(&bytes)));
+    let cas_for_write = state.cas.clone();
+    let digest_for_write = digest.clone();
+    let materialize = run_tracked_blocking(&state.materializations, move || {
+        if store_fetched
+            && cas_for_write
+                .put_verified(&bytes, &digest_for_write)
+                .is_err()
+        {
+            return Err(io::Error::other("CAS rejected fetched hydrate bytes"));
+        }
+        atomic_publish(&local_for_write, |file| file.write_all(&bytes))
+    });
     if materialize.await.map_or(true, |result| result.is_err()) {
         return (STATUS_ERROR, String::new());
     }
@@ -717,7 +795,7 @@ mod tests {
         VfsState {
             scratch_root: temp("gate-scratch"),
             hydrated: Mutex::new(HashMap::new()),
-            hydrating: Mutex::new(HashMap::new()),
+            hydrating: StdMutex::new(HashMap::new()),
             cas: BlobStore::open(temp("gate-cas")).unwrap(),
             agent_addr: "127.0.0.1:0".parse().unwrap(),
             rtt: Duration::ZERO,
@@ -730,12 +808,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_key_gate_stays_single_flight_across_failed_waiters() {
+    async fn same_key_failure_is_shared_then_a_later_caller_retries() {
         let state = Arc::new(test_state());
         let start = Arc::new(tokio::sync::Barrier::new(33));
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let entries = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
         let mut tasks = Vec::new();
         for i in 0..32 {
             let state = Arc::clone(&state);
@@ -743,6 +822,7 @@ mod tests {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
             let entries = Arc::clone(&entries);
+            let release = Arc::clone(&release);
             tasks.push(tokio::spawn(async move {
                 start.wait().await;
                 let path = if i % 2 == 0 {
@@ -753,25 +833,292 @@ mod tests {
                 let active_for_op = Arc::clone(&active);
                 let peak_for_op = Arc::clone(&peak);
                 let entries_for_op = Arc::clone(&entries);
-                let result = hydrate(path, &state, || async move {
-                    entries_for_op.fetch_add(1, Ordering::SeqCst);
+                hydrate(path, &state, || async move {
+                    let attempt = entries_for_op.fetch_add(1, Ordering::SeqCst) + 1;
                     let now = active_for_op.fetch_add(1, Ordering::SeqCst) + 1;
                     peak_for_op.fetch_max(now, Ordering::SeqCst);
-                    tokio::task::yield_now().await;
+                    if attempt == 1 {
+                        release.notified().await;
+                    }
                     active_for_op.fetch_sub(1, Ordering::SeqCst);
-                    (STATUS_ERROR, String::new())
+                    (STATUS_ERROR, format!("attempt-{attempt}"))
                 })
-                .await;
-                assert_eq!(result.0, STATUS_ERROR);
+                .await
             }));
         }
         start.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let joined = {
+                    let flights = lock_hydration_registry(&state.hydrating);
+                    flights
+                        .get(&hydration_key(r"c:\src\shared.h"))
+                        .is_some_and(|flight| Weak::strong_count(flight) == 32)
+                };
+                if joined {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all same-key callers must join one failure generation");
+        release.notify_one();
+        let mut results = Vec::new();
         for task in tasks {
-            task.await.unwrap();
+            results.push(task.await.unwrap());
         }
         assert_eq!(peak.load(Ordering::SeqCst), 1);
-        assert_eq!(entries.load(Ordering::SeqCst), 32);
-        assert_eq!(state.hydrating.lock().await.len(), 1);
+        assert_eq!(entries.load(Ordering::SeqCst), 1);
+        assert!(results.iter().all(|result| result == &results[0]));
+        assert_eq!(results[0], (STATUS_ERROR, "attempt-1".to_string()));
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
+
+        let entries_for_retry = Arc::clone(&entries);
+        let retry = hydrate("c:\\src\\shared.h", &state, || async move {
+            let attempt = entries_for_retry.fetch_add(1, Ordering::SeqCst) + 1;
+            (STATUS_ERROR, format!("attempt-{attempt}"))
+        })
+        .await;
+        assert_eq!(retry, (STATUS_ERROR, "attempt-2".to_string()));
+        assert_eq!(entries.load(Ordering::SeqCst), 2);
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn same_key_success_runs_once_and_later_callers_use_the_cache() {
+        let state = Arc::new(test_state());
+        let start = Arc::new(tokio::sync::Barrier::new(17));
+        let entries = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let state = Arc::clone(&state);
+            let start = Arc::clone(&start);
+            let entries = Arc::clone(&entries);
+            let release = Arc::clone(&release);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                hydrate(r"c:\src\success.h", &state, || async move {
+                    let attempt = entries.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt == 1 {
+                        release.notified().await;
+                    }
+                    (STATUS_OK, r"c:\scratch\success.h".to_string())
+                })
+                .await
+            }));
+        }
+        start.wait().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let joined = {
+                    let flights = lock_hydration_registry(&state.hydrating);
+                    flights
+                        .get(&hydration_key(r"c:\src\success.h"))
+                        .is_some_and(|flight| Weak::strong_count(flight) == 16)
+                };
+                if joined {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all same-key callers must join one success generation");
+        release.notify_one();
+        for task in tasks {
+            assert_eq!(
+                task.await.unwrap(),
+                (STATUS_OK, r"c:\scratch\success.h".to_string())
+            );
+        }
+        assert_eq!(entries.load(Ordering::SeqCst), 1);
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
+
+        let cached = hydrate(r"C:/SRC/SUCCESS.H", &state, || async {
+            panic!("the hydrated cache must bypass a new operation")
+        })
+        .await;
+        assert_eq!(cached, (STATUS_OK, r"c:\scratch\success.h".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cancelled_initializer_hands_the_flight_to_a_waiter() {
+        let state = Arc::new(test_state());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            hydrate(r"c:\src\cancel.h", &first_state, || async move {
+                let _ = entered_tx.send(());
+                std::future::pending::<(u8, String)>().await
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+
+        let second_state = Arc::clone(&state);
+        let second = tokio::spawn(async move {
+            hydrate(r"C:/SRC/CANCEL.H", &second_state, || async {
+                (STATUS_ERROR, "handoff-after-cancel".to_string())
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let joined = {
+                    let flights = lock_hydration_registry(&state.hydrating);
+                    Weak::strong_count(
+                        flights
+                            .get(&hydration_key(r"c:\src\cancel.h"))
+                            .expect("the active flight must be registered"),
+                    ) >= 2
+                };
+                if joined {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancellation waiter must join the active flight");
+
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let result = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("a cancelled initializer must not strand its waiter")
+            .unwrap();
+        assert_eq!(result, (STATUS_ERROR, "handoff-after-cancel".to_string()));
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn uniquely_owned_cancelled_flight_is_removed() {
+        let state = Arc::new(test_state());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            hydrate(r"c:\src\unique-cancel.h", &first_state, || async move {
+                let _ = entered_tx.send(());
+                std::future::pending::<(u8, String)>().await
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn panicking_initializer_hands_the_flight_to_a_waiter() {
+        let state = Arc::new(test_state());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            hydrate(r"c:\src\panic.h", &first_state, || async move {
+                let _ = entered_tx.send(());
+                let _ = panic_rx.await;
+                panic!("injected hydrate initializer panic")
+            })
+            .await
+        });
+        entered_rx.await.unwrap();
+
+        let second_state = Arc::clone(&state);
+        let second = tokio::spawn(async move {
+            hydrate(r"C:/SRC/PANIC.H", &second_state, || async {
+                (STATUS_ERROR, "handoff-after-panic".to_string())
+            })
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let joined = {
+                    let flights = lock_hydration_registry(&state.hydrating);
+                    Weak::strong_count(
+                        flights
+                            .get(&hydration_key(r"c:\src\panic.h"))
+                            .expect("the active flight must be registered"),
+                    ) >= 2
+                };
+                if joined {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the panic waiter must join the active flight");
+
+        panic_tx.send(()).unwrap();
+        assert!(first.await.unwrap_err().is_panic());
+        let result = tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("a panicking initializer must not strand its waiter")
+            .unwrap();
+        assert_eq!(result, (STATUS_ERROR, "handoff-after-panic".to_string()));
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tracked_cas_work_does_not_block_an_unrelated_hydrate() {
+        let state = Arc::new(test_state());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let first_state = Arc::clone(&state);
+        let first = tokio::spawn(async move {
+            let tracker = first_state.materializations.clone();
+            hydrate(r"c:\src\blocking-cas.h", &first_state, || async move {
+                run_tracked_blocking(&tracker, move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv().unwrap();
+                })
+                .await
+                .unwrap();
+                (STATUS_ERROR, "blocking-cas-complete".to_string())
+            })
+            .await
+        });
+        started_rx
+            .await
+            .expect("the tracked CAS-equivalent operation must start");
+
+        let second = hydrate(r"c:\src\unrelated.h", &state, || async {
+            (STATUS_OK, r"c:\scratch\unrelated.h".to_string())
+        });
+        let result = tokio::time::timeout(Duration::from_millis(100), second)
+            .await
+            .expect("blocking CAS work on path A must not stop path B");
+        assert_eq!(result, (STATUS_OK, r"c:\scratch\unrelated.h".to_string()));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            first.await.unwrap(),
+            (STATUS_ERROR, "blocking-cas-complete".to_string())
+        );
+        state.materializations.wait_idle().await;
+    }
+
+    #[tokio::test]
+    async fn poisoned_flight_registry_recovers_and_cleans_up() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let state = test_state();
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = state.hydrating.lock().unwrap();
+            panic!("inject registry poison")
+        }));
+        assert!(poisoned.is_err());
+
+        let result = hydrate(r"c:\src\after-poison.h", &state, || async {
+            (STATUS_ERROR, "recovered".to_string())
+        })
+        .await;
+        assert_eq!(result, (STATUS_ERROR, "recovered".to_string()));
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
     }
 
     #[test]
@@ -958,7 +1305,7 @@ mod tests {
         let state = VfsState {
             scratch_root,
             hydrated: Mutex::new(HashMap::new()),
-            hydrating: Mutex::new(HashMap::new()),
+            hydrating: StdMutex::new(HashMap::new()),
             cas: BlobStore::open(temp("midstream-truncate-cas")).unwrap(),
             agent_addr,
             rtt: Duration::ZERO,
@@ -1125,7 +1472,7 @@ mod tests {
         let state = Arc::new(VfsState {
             scratch_root: temp("scratch"),
             hydrated: Mutex::new(HashMap::new()),
-            hydrating: Mutex::new(HashMap::new()),
+            hydrating: StdMutex::new(HashMap::new()),
             cas: BlobStore::open(temp("cas")).unwrap(),
             agent_addr: addr,
             rtt: Duration::ZERO,
@@ -1416,7 +1763,7 @@ mod tests {
         let state = Arc::new(VfsState {
             scratch_root: scratch_root.clone(),
             hydrated: Mutex::new(HashMap::new()),
-            hydrating: Mutex::new(HashMap::new()),
+            hydrating: StdMutex::new(HashMap::new()),
             cas: BlobStore::open(&cas_root).unwrap(),
             agent_addr: "127.0.0.1:0".parse().unwrap(),
             rtt: BENCH_RTT,
