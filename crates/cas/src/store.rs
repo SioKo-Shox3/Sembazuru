@@ -21,9 +21,13 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Digest, DigestError};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 
 /// Monotonic counter making temp filenames unique within this process; combined
 /// with the pid it is unique across processes sharing one store, so concurrent
@@ -76,8 +80,9 @@ impl From<io::Error> for CasError {
 /// A content-addressed blob store rooted at a directory.
 #[derive(Clone)]
 pub struct BlobStore {
+    #[cfg(test)]
     cas_root: PathBuf,
-    lifecycle_lock_path: PathBuf,
+    cas_dir: Arc<Dir>,
 }
 
 struct LifecycleLock {
@@ -97,7 +102,10 @@ enum StoreEntryKind {
 }
 
 struct StoreEntry {
+    #[cfg(test)]
     path: PathBuf,
+    dir: Arc<Dir>,
+    name: std::ffi::OsString,
     size: u64,
     mtime: std::time::SystemTime,
     kind: StoreEntryKind,
@@ -107,30 +115,29 @@ impl BlobStore {
     /// Opens (creating if needed) a store under `root`. Blobs live in
     /// `root/cas/`; the action cache (M4.3) will use `root/ac/` alongside.
     pub fn open(root: impl AsRef<Path>) -> io::Result<BlobStore> {
-        let cas_root = root.as_ref().join("cas");
-        std::fs::create_dir_all(&cas_root)?;
-        let lifecycle_lock_path = cas_root.join(LIFECYCLE_LOCK_NAME);
-        drop(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lifecycle_lock_path)?,
-        );
-        Ok(BlobStore {
-            cas_root,
-            lifecycle_lock_path,
-        })
+        std::fs::create_dir_all(root.as_ref())?;
+        let root_dir = Dir::open_ambient_dir(root.as_ref(), ambient_authority())?;
+        match root_dir.create_dir("cas") {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        let cas_dir = Arc::new(root_dir.open_dir_nofollow("cas")?);
+        let store = BlobStore {
+            #[cfg(test)]
+            cas_root: root.as_ref().join("cas"),
+            cas_dir,
+        };
+        drop(store.open_lifecycle_lock()?);
+        Ok(store)
     }
 
     fn open_lifecycle_lock(&self) -> io::Result<File> {
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.lifecycle_lock_path)
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        self.cas_dir
+            .open_with(LIFECYCLE_LOCK_NAME, &options)
+            .map(cap_std::fs::File::into_std)
     }
 
     fn lock_shared_lifecycle(&self) -> io::Result<LifecycleLock> {
@@ -147,6 +154,7 @@ impl BlobStore {
 
     /// The final on-disk path for a digest. Safe because `digest.hex()` is
     /// validated lowercase hex of fixed length (no separators, no `..`).
+    #[cfg(test)]
     fn blob_path(&self, digest: &Digest) -> PathBuf {
         let hex = digest.hex();
         self.cas_root
@@ -155,20 +163,32 @@ impl BlobStore {
             .join(hex)
     }
 
+    fn shard_rel_and_name(&self, digest: &Digest) -> (PathBuf, String) {
+        let hex = digest.hex();
+        (
+            PathBuf::from(algo_dir(digest)).join(&hex[0..2]),
+            hex.to_owned(),
+        )
+    }
+
+    fn open_shard(&self, digest: &Digest, create: bool) -> io::Result<Option<Arc<Dir>>> {
+        let (shard_rel, _) = self.shard_rel_and_name(digest);
+        if create {
+            self.cas_dir.create_dir_all(&shard_rel)?;
+        }
+        match self.cas_dir.open_dir_nofollow(&shard_rel) {
+            Ok(dir) => Ok(Some(Arc::new(dir))),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Stores `bytes`, returning their digest. Idempotent: if the content is
     /// already present, no write happens (content addressing means an existing
     /// blob at this digest has identical bytes).
     pub fn put(&self, bytes: &[u8]) -> io::Result<Digest> {
         let digest = Digest::of(bytes);
-        let path = self.blob_path(&digest);
-        if path.exists() {
-            return Ok(digest);
-        }
-        let _lifecycle = self.lock_shared_lifecycle()?;
-        if path.exists() {
-            return Ok(digest);
-        }
-        write_atomic(&path, bytes)?;
+        self.store_digest_known(bytes, &digest)?;
         Ok(digest)
     }
 
@@ -184,14 +204,7 @@ impl BlobStore {
                 actual,
             });
         }
-        let path = self.blob_path(&actual);
-        if path.exists() {
-            return Ok(actual);
-        }
-        let _lifecycle = self.lock_shared_lifecycle()?;
-        if !path.exists() {
-            write_atomic(&path, bytes)?;
-        }
+        self.store_digest_known(bytes, &actual)?;
         Ok(actual)
     }
 
@@ -208,37 +221,136 @@ impl BlobStore {
             });
         }
 
+        self.store_digest_known(bytes, &actual)?;
+        Ok(actual)
+    }
+
+    fn store_digest_known(&self, bytes: &[u8], digest: &Digest) -> io::Result<()> {
         let _repair_guard = REPAIR_CRITICAL_SECTION
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _lifecycle = self.lock_shared_lifecycle()?;
-        match self.get_verified(claimed) {
-            Ok(Some(_)) => return Ok(actual),
-            Ok(None) | Err(CasError::Corrupt { .. }) => {}
-            Err(error) => return Err(error),
-        }
-
-        let final_path = self.blob_path(claimed);
-        let mut temp = write_temp_sibling(&final_path, bytes)?;
-        temp.close();
-        let replace_error = match replace_atomic(temp.path(), &final_path) {
-            Ok(()) => {
-                temp.mark_moved();
-                None
+        match self.get_verified(digest) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(CasError::Corrupt { .. }) | Err(CasError::Io(_)) => {
+                self.remove_blob_entry(digest)?;
             }
-            Err(error) => Some(error),
-        };
-
-        match self.get_verified(claimed) {
-            Ok(Some(_)) => Ok(actual),
-            Ok(None) => Err(CasError::Io(replace_error.unwrap_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "repaired CAS blob disappeared before verification",
-                )
-            }))),
-            Err(error) => Err(replace_error.map_or(error, CasError::Io)),
+            Err(error) => return Err(io::Error::other(error)),
         }
+        self.publish_cas_blob(bytes, digest)
+    }
+
+    fn remove_blob_entry(&self, digest: &Digest) -> io::Result<()> {
+        let Some(shard) = self.open_shard(digest, false)? else {
+            return Ok(());
+        };
+        let (_, name) = self.shard_rel_and_name(digest);
+        match shard.remove_file(&name) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn publish_cas_blob(&self, bytes: &[u8], digest: &Digest) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.publish_cas_blob_impl(bytes, digest, None)
+        }
+        #[cfg(not(test))]
+        {
+            self.publish_cas_blob_impl(bytes, digest)
+        }
+    }
+
+    #[cfg(test)]
+    fn publish_cas_blob_with_hooks<Before, After>(
+        &self,
+        bytes: &[u8],
+        digest: &Digest,
+        mut before_publish: Before,
+        mut after_publish: After,
+    ) -> io::Result<()>
+    where
+        Before: FnMut(&Path) -> io::Result<()>,
+        After: FnMut(&Path) -> io::Result<()>,
+    {
+        let mut hooks = PublishTestHooks {
+            before_publish: &mut before_publish,
+            after_publish: &mut after_publish,
+        };
+        self.publish_cas_blob_impl(bytes, digest, Some(&mut hooks))
+    }
+
+    fn publish_cas_blob_impl(
+        &self,
+        bytes: &[u8],
+        digest: &Digest,
+        #[cfg(test)] mut hooks: Option<&mut PublishTestHooks<'_>>,
+    ) -> io::Result<()> {
+        use std::io::Write;
+
+        let shard = self.open_shard(digest, true)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "CAS shard disappeared after creation",
+            )
+        })?;
+        let (_, final_name) = self.shard_rel_and_name(digest);
+        let mut temp = loop {
+            let sequence = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let temp_name = format!(".tmp.{}.{sequence}", process::id());
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            options.follow(FollowSymlinks::No);
+            match shard.open_with(&temp_name, &options) {
+                Ok(file) => break SecureCasTemp::new(Arc::clone(&shard), temp_name, file)?,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        temp.file_mut().write_all(bytes)?;
+        temp.file_mut().flush()?;
+        let expected = temp.snapshot();
+        if secure_file_snapshot(temp.file_mut())? != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "CAS temp identity changed while writing",
+            ));
+        }
+        temp.close();
+
+        #[cfg(test)]
+        if let Some(hooks) = hooks.as_mut() {
+            (hooks.before_publish)(&self.blob_path(digest).with_file_name(temp.name()))?;
+        }
+
+        verify_secure_file(&shard, temp.name(), Some(expected), digest)?;
+        match shard.rename(temp.name(), &shard, &final_name) {
+            Ok(()) => temp.mark_moved(),
+            Err(rename_error) => {
+                if verify_secure_file(&shard, &final_name, None, digest).is_ok() {
+                    return Ok(());
+                }
+                let _ = shard.remove_file(&final_name);
+                return Err(rename_error);
+            }
+        }
+
+        #[cfg(test)]
+        if let Some(hooks) = hooks.as_mut()
+            && let Err(error) = (hooks.after_publish)(&self.blob_path(digest))
+        {
+            let _ = shard.remove_file(&final_name);
+            return Err(error);
+        }
+
+        if let Err(error) = verify_secure_file(&shard, &final_name, Some(expected), digest) {
+            let _ = shard.remove_file(&final_name);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Reads a blob's bytes, or `None` if absent. Does not re-verify (the hot
@@ -272,7 +384,11 @@ impl BlobStore {
     }
 
     fn open_blob_read(&self, digest: &Digest) -> io::Result<Option<File>> {
-        match open_read_only(&self.blob_path(digest)) {
+        let Some(shard) = self.open_shard(digest, false)? else {
+            return Ok(None);
+        };
+        let (_, name) = self.shard_rel_and_name(digest);
+        match open_secure_file(&shard, &name) {
             Ok(file) => Ok(Some(file)),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
@@ -295,7 +411,7 @@ impl BlobStore {
 
     /// Whether a blob is present.
     pub fn has(&self, digest: &Digest) -> bool {
-        self.blob_path(digest).exists()
+        self.open_blob_read(digest).is_ok_and(|file| file.is_some())
     }
 
     /// Presence of many digests in one call, in request order — the local side
@@ -340,7 +456,7 @@ impl BlobStore {
             if total <= max_bytes {
                 break;
             }
-            match std::fs::remove_file(&entry.path) {
+            match entry.dir.remove_file(&entry.name) {
                 Ok(()) => {
                     total = total.saturating_sub(entry.size);
                     freed = freed.saturating_add(entry.size);
@@ -356,47 +472,233 @@ impl BlobStore {
     /// temp siblings. mtime falls back to the epoch so eviction sorting is total.
     fn list_entries(&self) -> io::Result<Vec<StoreEntry>> {
         let mut out = Vec::new();
-        // cas/<algo>/<shard>/<blob>: walk exactly three levels.
-        for algo in read_dir_some(&self.cas_root)? {
-            if algo.file_name().and_then(|name| name.to_str()) != Some("blake3")
-                || !is_real_directory(&algo)
+        let algo_name = "blake3";
+        let algo_dir = match self.cas_dir.open_dir_nofollow(algo_name) {
+            Ok(dir) => Arc::new(dir),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(error),
+        };
+        for shard_entry in algo_dir.read_dir(".")? {
+            let shard_entry = shard_entry?;
+            let shard_name_os = shard_entry.file_name();
+            let Some(shard_name) = shard_name_os.to_str() else {
+                continue;
+            };
+            if !is_lower_hex(shard_name, 2)
+                || !shard_entry.file_type().is_ok_and(|kind| kind.is_dir())
             {
                 continue;
             }
-            for shard in read_dir_some(&algo)? {
-                let Some(shard_name) = shard.file_name().and_then(|name| name.to_str()) else {
+            let shard_dir = match algo_dir.open_dir_nofollow(shard_name) {
+                Ok(dir) => Arc::new(dir),
+                Err(_) => continue,
+            };
+            for entry in shard_dir.read_dir(".")? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(name_str) = name.to_str() else {
                     continue;
                 };
-                if !is_lower_hex(shard_name, 2) || !is_real_directory(&shard) {
+                let kind = if is_lower_hex(name_str, 64) && name_str.starts_with(shard_name) {
+                    StoreEntryKind::Blob
+                } else if is_canonical_temp_name(name_str) {
+                    StoreEntryKind::Temp
+                } else {
                     continue;
-                }
-                for path in read_dir_some(&shard)? {
-                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                        continue;
-                    };
-                    let kind = if is_lower_hex(name, 64) && name.starts_with(shard_name) {
-                        StoreEntryKind::Blob
-                    } else if is_canonical_temp_name(name) {
-                        StoreEntryKind::Temp
-                    } else {
-                        continue;
-                    };
-                    let md = match std::fs::symlink_metadata(&path) {
-                        Ok(md) if md.file_type().is_file() => md,
-                        _ => continue,
-                    };
-                    let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    out.push(StoreEntry {
-                        path,
-                        size: md.len(),
-                        mtime,
-                        kind,
-                    });
-                }
+                };
+                let file = match open_secure_file(&shard_dir, name_str) {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+                let metadata = file.metadata()?;
+                let mtime = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+                out.push(StoreEntry {
+                    #[cfg(test)]
+                    path: self.cas_root.join(algo_name).join(shard_name).join(&name),
+                    dir: Arc::clone(&shard_dir),
+                    name,
+                    size: metadata.len(),
+                    mtime,
+                    kind,
+                });
             }
         }
         Ok(out)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecureFileSnapshot {
+    identity: SecureFileIdentity,
+    link_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SecureFileIdentity {
+    volume: u64,
+    index: u128,
+}
+
+#[cfg(test)]
+struct PublishTestHooks<'a> {
+    before_publish: &'a mut dyn FnMut(&Path) -> io::Result<()>,
+    after_publish: &'a mut dyn FnMut(&Path) -> io::Result<()>,
+}
+
+struct SecureCasTemp {
+    dir: Arc<Dir>,
+    name: String,
+    file: Option<File>,
+    snapshot: SecureFileSnapshot,
+    moved: bool,
+}
+
+impl SecureCasTemp {
+    fn new(dir: Arc<Dir>, name: String, file: cap_std::fs::File) -> io::Result<Self> {
+        let file = file.into_std();
+        let snapshot = secure_file_snapshot(&file)?;
+        Ok(Self {
+            dir,
+            name,
+            file: Some(file),
+            snapshot,
+            moved: false,
+        })
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("CAS temp file is still open")
+    }
+
+    fn snapshot(&self) -> SecureFileSnapshot {
+        self.snapshot
+    }
+
+    fn close(&mut self) {
+        drop(self.file.take());
+    }
+
+    fn mark_moved(&mut self) {
+        self.moved = true;
+    }
+}
+
+impl Drop for SecureCasTemp {
+    fn drop(&mut self) {
+        self.close();
+        if !self.moved {
+            let _ = self.dir.remove_file(&self.name);
+        }
+    }
+}
+
+fn open_secure_file(dir: &Dir, name: &str) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = dir.open_with(name, &options)?.into_std();
+    secure_file_snapshot(&file)?;
+    Ok(file)
+}
+
+fn verify_secure_file(
+    dir: &Dir,
+    name: &str,
+    expected: Option<SecureFileSnapshot>,
+    digest: &Digest,
+) -> io::Result<()> {
+    let mut file = open_secure_file(dir, name)?;
+    let actual = secure_file_snapshot(&file)?;
+    if expected.is_some_and(|expected| actual != expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "CAS file identity changed during publish",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if &Digest::of(&bytes) != digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CAS file digest does not match its address",
+        ));
+    }
+    Ok(())
+}
+
+fn secure_file_snapshot(file: &File) -> io::Result<SecureFileSnapshot> {
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "CAS entry is not a regular file",
+        ));
+    }
+    let snapshot = platform_secure_file_snapshot(file)?;
+    if snapshot.link_count != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "CAS entry has an unexpected hardlink count",
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[cfg(windows)]
+fn platform_secure_file_snapshot(file: &File) -> io::Result<SecureFileSnapshot> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let ok = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(SecureFileSnapshot {
+        identity: SecureFileIdentity {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            index: (u128::from(information.nFileIndexHigh) << 32)
+                | u128::from(information.nFileIndexLow),
+        },
+        link_count: u64::from(information.nNumberOfLinks),
+    })
+}
+
+#[cfg(unix)]
+fn platform_secure_file_snapshot(file: &File) -> io::Result<SecureFileSnapshot> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(SecureFileSnapshot {
+        identity: SecureFileIdentity {
+            volume: metadata.dev(),
+            index: u128::from(metadata.ino()),
+        },
+        link_count: metadata.nlink(),
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn platform_secure_file_snapshot(_file: &File) -> io::Result<SecureFileSnapshot> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stable CAS file identity is unsupported on this platform",
+    ))
 }
 
 fn is_canonical_temp_name(name: &str) -> bool {
@@ -419,33 +721,11 @@ where
         && value.parse::<T>().is_ok()
 }
 
-fn is_real_directory(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
-}
-
 fn is_lower_hex(value: &str, expected_len: usize) -> bool {
     value.len() == expected_len
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn open_read_only(path: &Path) -> io::Result<File> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-
-        std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-            .open(path)
-    }
-
-    #[cfg(not(windows))]
-    {
-        File::open(path)
-    }
 }
 
 fn read_range_from<R: Read + Seek>(reader: &mut R, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -476,6 +756,7 @@ fn algo_dir(digest: &Digest) -> &'static str {
 
 /// Lists a directory's entries as paths; an absent directory yields an empty
 /// list (the store may not have created every shard yet).
+#[cfg(test)]
 fn read_dir_some(dir: &Path) -> io::Result<Vec<PathBuf>> {
     match std::fs::read_dir(dir) {
         Ok(rd) => {
@@ -566,44 +847,6 @@ where
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-    }
-}
-
-fn replace_atomic(source: &Path, final_path: &Path) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-        };
-
-        let source = source
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let final_path = final_path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect::<Vec<_>>();
-        let result = unsafe {
-            MoveFileExW(
-                source.as_ptr(),
-                final_path.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if result == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(source, final_path)
     }
 }
 
@@ -785,6 +1028,118 @@ mod tests {
     }
 
     #[test]
+    fn put_repairs_a_corrupt_existing_digest_entry() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"put must not trust existence";
+        let digest = store.put(bytes).unwrap();
+        std::fs::write(store.blob_path(&digest), b"corrupt").unwrap();
+
+        assert_eq!(store.put(bytes).unwrap(), digest);
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&bytes[..])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn put_verified_repairs_a_corrupt_existing_digest_entry() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"verified put must not trust existence";
+        let digest = store.put(bytes).unwrap();
+        std::fs::write(store.blob_path(&digest), b"corrupt").unwrap();
+
+        assert_eq!(store.put_verified(bytes, &digest).unwrap(), digest);
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&bytes[..])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn hardlink_blob_is_not_present_or_readable() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"external hardlink bytes";
+        let digest = Digest::of(bytes);
+        let final_path = store.blob_path(&digest);
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        let external = root.join("external-hardlink-peer");
+        std::fs::write(&external, bytes).unwrap();
+        std::fs::hard_link(&external, &final_path).unwrap();
+
+        assert!(!store.has(&digest));
+        assert!(store.get_range(&digest, 0, bytes.len()).is_err());
+        assert_eq!(std::fs::read(&external).unwrap(), bytes);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn symlink_blob_is_not_present_or_readable_when_supported() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"external symlink bytes";
+        let digest = Digest::of(bytes);
+        let final_path = store.blob_path(&digest);
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        let external = root.join("external-symlink-target");
+        std::fs::write(&external, bytes).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&external, &final_path);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&external, &final_path);
+        if let Err(error) = linked {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                std::fs::remove_dir_all(&root).ok();
+                return;
+            }
+            panic!("failed to create test symlink: {error}");
+        }
+
+        assert!(!store.has(&digest));
+        assert!(store.get_range(&digest, 0, bytes.len()).is_err());
+        assert_eq!(std::fs::read(&external).unwrap(), bytes);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parent_junction_escape_is_not_readable_when_supported() {
+        use std::process::{Command, Stdio};
+
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"junction escape bytes";
+        let digest = Digest::of(bytes);
+        let outside_algo = root.join("outside-algo");
+        let outside_blob = outside_algo.join(&digest.hex()[0..2]).join(digest.hex());
+        std::fs::create_dir_all(outside_blob.parent().unwrap()).unwrap();
+        std::fs::write(&outside_blob, bytes).unwrap();
+        let junction = store.cas_root.join("blake3");
+        let status = Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&outside_algo)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        if !status.success() {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        assert!(store.get_range(&digest, 0, bytes.len()).is_err());
+        assert_eq!(std::fs::read(&outside_blob).unwrap(), bytes);
+        std::fs::remove_dir(&junction).unwrap();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn get_verified_detects_tampering() {
         let root = tmp_root();
         let store = BlobStore::open(&root).unwrap();
@@ -841,6 +1196,131 @@ mod tests {
         assert_eq!(
             store.get_verified(&digest).unwrap().as_deref(),
             Some(&correct[..])
+        );
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn publish_rejects_temp_swapped_to_a_hardlink() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"secure publish hardlink swap";
+        let digest = Digest::of(bytes);
+        let external = root.join("publish-hardlink-peer");
+        std::fs::write(&external, b"external peer stays unchanged").unwrap();
+
+        let result = store.publish_cas_blob_with_hooks(
+            bytes,
+            &digest,
+            |temp| {
+                std::fs::remove_file(temp)?;
+                std::fs::hard_link(&external, temp)
+            },
+            |_| Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(!store.blob_path(&digest).exists());
+        assert_eq!(
+            std::fs::read(&external).unwrap(),
+            b"external peer stays unchanged"
+        );
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn publish_rejects_temp_swapped_to_a_different_regular_file() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"secure publish regular swap";
+        let digest = Digest::of(bytes);
+
+        let result = store.publish_cas_blob_with_hooks(
+            bytes,
+            &digest,
+            |temp| {
+                std::fs::remove_file(temp)?;
+                std::fs::write(temp, b"different file object")
+            },
+            |_| Ok(()),
+        );
+
+        assert!(result.is_err());
+        assert!(!store.blob_path(&digest).exists());
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn publish_rejects_temp_swapped_to_a_symlink_when_supported() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"secure publish symlink swap";
+        let digest = Digest::of(bytes);
+        let external = root.join("publish-symlink-target");
+        std::fs::write(&external, b"external symlink target stays unchanged").unwrap();
+        let mut unsupported = false;
+
+        let result = store.publish_cas_blob_with_hooks(
+            bytes,
+            &digest,
+            |temp| {
+                std::fs::remove_file(temp)?;
+                #[cfg(windows)]
+                let linked = std::os::windows::fs::symlink_file(&external, temp);
+                #[cfg(unix)]
+                let linked = std::os::unix::fs::symlink(&external, temp);
+                match linked {
+                    Err(error) if cfg!(windows) && error.raw_os_error() == Some(1314) => {
+                        unsupported = true;
+                        Err(error)
+                    }
+                    result => result,
+                }
+            },
+            |_| Ok(()),
+        );
+        if unsupported {
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+
+        assert!(result.is_err());
+        assert!(!store.blob_path(&digest).exists());
+        assert_eq!(
+            std::fs::read(&external).unwrap(),
+            b"external symlink target stays unchanged"
+        );
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn post_publish_identity_failure_removes_only_the_final_entry() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let bytes = b"secure post-publish verification";
+        let digest = Digest::of(bytes);
+        let external = root.join("post-publish-hardlink-peer");
+        std::fs::write(&external, b"peer must not be mutated").unwrap();
+
+        let result = store.publish_cas_blob_with_hooks(
+            bytes,
+            &digest,
+            |_| Ok(()),
+            |final_path| {
+                std::fs::remove_file(final_path)?;
+                std::fs::hard_link(&external, final_path)
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!store.blob_path(&digest).exists());
+        assert_eq!(
+            std::fs::read(&external).unwrap(),
+            b"peer must not be mutated"
         );
         assert!(hydrate_temp_siblings(&store, &digest).is_empty());
         std::fs::remove_dir_all(&root).ok();
@@ -1106,16 +1586,20 @@ mod tests {
         let linked_temp = std::os::unix::fs::symlink(&outside, &temp_symlink);
 
         let listed = store.list_entries().unwrap();
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 1);
         assert!(listed.iter().any(|entry| entry.path == legitimate));
-        assert!(listed.iter().any(|entry| entry.path == hardlink));
-        assert_eq!(store.total_size().unwrap(), 109);
-        assert_eq!(store.evict_to(0).unwrap(), 109);
+        assert!(!store.has(&hardlink_digest));
+        assert_eq!(store.total_size().unwrap(), 3);
+        assert_eq!(store.evict_to(0).unwrap(), 3);
         assert!(
             temp.exists(),
             "temporary-looking files are not eviction targets"
         );
         assert!(malformed_temps.iter().all(|path| path.exists()));
+        assert!(
+            hardlink.exists(),
+            "invalid hardlink entries are not CAS eviction targets"
+        );
         assert_eq!(std::fs::read(&hardlink_target).unwrap(), vec![0u8; 106]);
         assert_eq!(std::fs::read(&outside).unwrap(), vec![0u8; 105]);
         if linked.is_ok() {
