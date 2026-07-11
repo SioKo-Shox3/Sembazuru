@@ -149,6 +149,8 @@ impl PinPersistOwner {
 
     /// Linearizes a synchronous publication commit against [`Self::close`]. The
     /// closure must not await; the owner-state lock stays held for its duration.
+    /// Lock order is `owner.state -> allowed_digests`; never acquire owner state
+    /// while holding `allowed_digests`.
     fn commit_if_accepting<T>(&self, commit: impl FnOnce() -> T) -> Result<T, ()> {
         let state = self
             .inner
