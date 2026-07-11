@@ -76,6 +76,14 @@ struct PinPersistOwner {
 struct PinPersistOwnerInner {
     state: StdMutex<PinPersistState>,
     store_root: PathBuf,
+    #[cfg(test)]
+    before_publish_hook: StdMutex<Option<PinPublishHook>>,
+}
+
+#[cfg(test)]
+struct PinPublishHook {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 struct PinPersistState {
@@ -98,6 +106,8 @@ impl PinPersistOwner {
                     cleanup_started: false,
                 }),
                 store_root,
+                #[cfg(test)]
+                before_publish_hook: StdMutex::new(None),
             }),
         }
     }
@@ -154,6 +164,34 @@ impl PinPersistOwner {
     fn store_root(&self) -> &Path {
         &self.inner.store_root
     }
+
+    #[cfg(test)]
+    fn install_before_publish_hook(
+        &self,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self
+            .inner
+            .before_publish_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(PinPublishHook { reached, release });
+    }
+
+    #[cfg(test)]
+    async fn wait_before_publish(&self) {
+        let hook = self
+            .inner
+            .before_publish_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            let _ = hook.reached.send(());
+            let _ = hook.release.await;
+        }
+    }
 }
 
 impl Drop for PinPersistGuard {
@@ -182,23 +220,48 @@ impl Drop for PinPersistGuard {
     }
 }
 
-/// The single-flight cell for one pinned path: yields the `(digest, size)` frozen
-/// at first touch. `Arc` so concurrent racers of the same path share one cell.
-type PinCell = Arc<OnceCell<(Digest, u64)>>;
+/// The single-flight result for one pinned path. The publish guard crosses the
+/// blocking CAS write and remains armed until the result is both ACL-authorized
+/// and installed in the [`OnceCell`]. It is then taken exactly once by whichever
+/// caller first observes the published value.
+struct PinnedValue {
+    digest: Digest,
+    size: u64,
+    publish_guard: StdMutex<Option<PinPersistGuard>>,
+}
+
+impl PinnedValue {
+    fn new(digest: Digest, size: u64, publish_guard: PinPersistGuard) -> Self {
+        Self {
+            digest,
+            size,
+            publish_guard: StdMutex::new(Some(publish_guard)),
+        }
+    }
+
+    fn release_publish_guard(&self) {
+        let guard = self
+            .publish_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(guard);
+    }
+}
+
+/// `Arc` so concurrent racers of the same path share one publication cell.
+type PinCell = Arc<OnceCell<PinnedValue>>;
 
 async fn persist_pin_bytes(
     owner: PinPersistOwner,
     store: BlobStore,
     bytes: Vec<u8>,
-) -> Result<Digest, ()> {
+) -> Result<(Digest, PinPersistGuard), ()> {
     let guard = owner.register()?;
-    tokio::task::spawn_blocking(move || {
-        let _guard = guard;
-        store.put(&bytes)
-    })
-    .await
-    .map_err(|_| ())?
-    .map_err(|_| ())
+    let (result, guard) = tokio::task::spawn_blocking(move || (store.put(&bytes), guard))
+        .await
+        .map_err(|_| ())?;
+    Ok((result.map_err(|_| ())?, guard))
 }
 
 /// A newly-created staging sibling and the parent directory capability that
@@ -379,20 +442,26 @@ impl SessionCapability {
                 .or_insert_with(|| Arc::new(OnceCell::new()))
                 .clone()
         };
-        let res: Result<&(Digest, u64), ()> = cell
+        let res: Result<&PinnedValue, ()> = cell
             .get_or_try_init(|| async move {
                 let bytes = match root_read {
                     Some((root_dir, rel)) => read_root_file(root_dir, rel).await.map_err(|_| ())?,
                     None => tokio::fs::read(&actual).await.map_err(|_| ())?,
                 };
                 let size = bytes.len() as u64;
-                let digest =
+                let (digest, publish_guard) =
                     persist_pin_bytes(self.pin_persist_owner.clone(), store.clone(), bytes).await?;
+                let value = PinnedValue::new(digest.clone(), size, publish_guard);
+                #[cfg(test)]
+                self.pin_persist_owner.wait_before_publish().await;
                 self.allowed_digests.lock().await.insert(digest.clone());
-                Ok((digest, size))
+                Ok(value)
             })
             .await;
-        res.ok().map(|(d, s)| (d.clone(), *s))
+        res.ok().map(|value| {
+            value.release_publish_guard();
+            (value.digest.clone(), value.size)
+        })
     }
 
     /// Whether `digest` may be served/probed on this session. A legacy session
@@ -1894,6 +1963,84 @@ mod tests {
                 "a detached persist must not recreate the cleaned store"
             );
             drop(held_store);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn registry_drop_keeps_store_until_pin_persist_result_is_published() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let reg = SessionRegistry::new().unwrap();
+            let store_root = reg.pin_persist_owner.store_root().to_path_buf();
+            let store = reg.store().clone();
+            let dir = tmp("pin-publish-drop-race");
+            let actual = dir.join("publish.h");
+            let bytes = vec![0x73; 400_000];
+            std::fs::write(&actual, &bytes).unwrap();
+            let expected = Digest::of(&bytes);
+            let cap = reg.create("publish-race".into(), None, Vec::new()).await;
+
+            let sentinel = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(store_root.join("cas").join(".lifecycle.lock"))
+                .unwrap();
+            sentinel.lock().unwrap();
+            let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            cap.pin_persist_owner
+                .install_before_publish_hook(reached_tx, release_rx);
+
+            let pin_cap = Arc::clone(&cap);
+            let pin_store = store.clone();
+            let pin =
+                tokio::spawn(async move { pin_cap.pin(&pin_store, "publish.h", actual).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while cap.pin_persist_owner.active() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("persist must be registered before registry drop");
+
+            drop(reg);
+            assert!(store_root.exists());
+            sentinel.unlock().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), reached_rx)
+                .await
+                .expect("pin initializer must reach the pre-publish barrier")
+                .expect("pin initializer must signal the pre-publish barrier");
+            assert!(
+                store_root.exists(),
+                "store cleanup must wait until ACL and OnceCell publication complete"
+            );
+            release_tx.send(()).unwrap();
+
+            let result = pin
+                .await
+                .unwrap()
+                .expect("a non-cancelled pin must publish its result after registry close");
+            assert_eq!(result, (expected.clone(), bytes.len() as u64));
+            assert!(cap.digest_visible(&expected).await);
+            assert_eq!(
+                cap.pin(&store, "publish.h", PathBuf::from("missing-after-publish"))
+                    .await,
+                Some(result),
+                "the successful result must be frozen in the OnceCell"
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while store_root.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("store cleanup must run after result publication releases its guard");
+            drop(store);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
