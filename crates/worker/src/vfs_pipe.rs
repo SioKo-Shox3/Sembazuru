@@ -100,20 +100,37 @@ impl MaterializationTracker {
 }
 
 /// Owns one action's VFS serve task and every blocking materialization it
-/// started. Callers that remove the action scratch tree must retain this handle
-/// and consume it with [`ActionVfsServer::shutdown`] before cleanup.
+/// started.
+///
+/// Dropping this handle stops new work by aborting the serve task, but cannot
+/// asynchronously wait for blocking materializations. Callers that remove the
+/// action scratch tree must retain this handle and await
+/// [`ActionVfsServer::shutdown`] before cleanup; only `shutdown` guarantees that
+/// already-running blocking work has drained.
+#[must_use = "retain the VFS owner and await shutdown before cleaning its scratch tree"]
 pub struct ActionVfsServer {
-    task: tokio::task::JoinHandle<io::Result<()>>,
+    task: Option<tokio::task::JoinHandle<io::Result<()>>>,
     materializations: MaterializationTracker,
 }
 
 impl ActionVfsServer {
     /// Stops the pipe task, synchronously drops its warm/client futures, then
     /// waits for already-running blocking filesystem work to finish.
-    pub async fn shutdown(self) {
-        self.task.abort();
-        let _ = self.task.await;
+    /// Scratch cleanup is safe only after this future returns.
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         self.materializations.wait_idle().await;
+    }
+}
+
+impl Drop for ActionVfsServer {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -344,10 +361,7 @@ pub async fn start_action_vfs(
     session_id: String,
     auth_token: String,
 ) -> io::Result<ActionVfsServer> {
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let materializations = MaterializationTracker::default();
-    let task_materializations = materializations.clone();
-    let task = tokio::spawn(async move {
+    start_action_vfs_owner(move |materializations, ready_tx| async move {
         serve_vfs_with_prefetch_ready_tracked(
             &pipe_name,
             agent_addr,
@@ -359,12 +373,24 @@ pub async fn start_action_vfs(
             vfs_root,
             session_id,
             auth_token,
-            task_materializations,
+            materializations,
         )
         .await
-    });
+    })
+    .await
+}
+
+async fn start_action_vfs_owner<Start, Serve>(start: Start) -> io::Result<ActionVfsServer>
+where
+    Start: FnOnce(MaterializationTracker, tokio::sync::oneshot::Sender<()>) -> Serve,
+    Serve: Future<Output = io::Result<()>> + Send + 'static,
+{
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let materializations = MaterializationTracker::default();
+    let task_materializations = materializations.clone();
+    let task = tokio::spawn(start(task_materializations, ready_tx));
     let server = ActionVfsServer {
-        task,
+        task: Some(task),
         materializations,
     };
     if ready_rx.await.is_err() {
@@ -573,6 +599,16 @@ mod tests {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     struct HydrateActivityGuard(Arc<AtomicUsize>);
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 
     impl Drop for HydrateActivityGuard {
         fn drop(&mut self) {
@@ -835,16 +871,6 @@ mod tests {
 
     #[tokio::test]
     async fn action_vfs_server_shutdown_drains_real_blocking_io_before_cleanup() {
-        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
-
-        impl Drop for DropSignal {
-            fn drop(&mut self) {
-                if let Some(tx) = self.0.take() {
-                    let _ = tx.send(());
-                }
-            }
-        }
-
         let scratch = temp("blocking-drain");
         std::fs::remove_dir_all(&scratch).unwrap();
         let local = scratch.join("nested").join("header.h");
@@ -852,30 +878,26 @@ mod tests {
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
         let (outer_dropped_tx, outer_dropped_rx) = tokio::sync::oneshot::channel();
-        let tracker = MaterializationTracker::default();
-
-        let outer_tracker = tracker.clone();
-        let outer_task = tokio::spawn(async move {
+        let server = start_action_vfs_owner(move |tracker, ready| async move {
             let _drop_signal = DropSignal(Some(outer_dropped_tx));
-            outer_tracker
-                .spawn_blocking(move || {
-                    let _ = started_tx.send(());
-                    release_rx.recv().unwrap();
-                    std::fs::create_dir_all(local_for_job.parent().unwrap())?;
-                    std::fs::write(local_for_job, b"tracked materialization")
-                })
+            let materialize = tracker.spawn_blocking(move || {
+                let _ = started_tx.send(());
+                release_rx.recv().unwrap();
+                std::fs::create_dir_all(local_for_job.parent().unwrap())?;
+                std::fs::write(local_for_job, b"tracked materialization")
+            });
+            let _ = ready.send(());
+            materialize
                 .await
                 .expect("blocking materialization should join")?;
             Ok(())
-        });
+        })
+        .await
+        .expect("owner factory should report ready");
 
         started_rx
             .await
             .expect("blocking materialization should start");
-        let server = ActionVfsServer {
-            task: outer_task,
-            materializations: tracker,
-        };
         let shutdown = tokio::spawn(async move {
             server.shutdown().await;
         });
@@ -897,6 +919,25 @@ mod tests {
             !scratch.exists(),
             "no blocking writer may recreate scratch after shutdown returns"
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_action_vfs_server_aborts_outer_task() {
+        let (outer_dropped_tx, outer_dropped_rx) = tokio::sync::oneshot::channel();
+        let server = start_action_vfs_owner(move |_tracker, ready| async move {
+            let _drop_signal = DropSignal(Some(outer_dropped_tx));
+            let _ = ready.send(());
+            std::future::pending::<io::Result<()>>().await
+        })
+        .await
+        .expect("owner factory should report ready");
+
+        drop(server);
+
+        tokio::time::timeout(Duration::from_secs(5), outer_dropped_rx)
+            .await
+            .expect("dropping the owner must abort its outer task")
+            .expect("outer task should publish its drop signal");
     }
 
     #[test]
