@@ -68,9 +68,43 @@ pub struct OutputSpec {
 /// Disambiguates the registry's temp content-store directory within a process.
 static STORE_SEQ: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static PIN_PERSIST_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+struct PinPersistGuard;
+
+#[cfg(test)]
+impl PinPersistGuard {
+    fn submitted() -> Self {
+        PIN_PERSIST_IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for PinPersistGuard {
+    fn drop(&mut self) {
+        PIN_PERSIST_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// The single-flight cell for one pinned path: yields the `(digest, size)` frozen
 /// at first touch. `Arc` so concurrent racers of the same path share one cell.
 type PinCell = Arc<OnceCell<(Digest, u64)>>;
+
+async fn persist_pin_bytes(store: BlobStore, bytes: Vec<u8>) -> Result<Digest, ()> {
+    #[cfg(test)]
+    let guard = PinPersistGuard::submitted();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _guard = guard;
+        store.put(&bytes)
+    })
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
+}
 
 /// A newly-created staging sibling and the parent directory capability that
 /// contains it.
@@ -250,7 +284,7 @@ impl SessionCapability {
                     None => tokio::fs::read(&actual).await.map_err(|_| ())?,
                 };
                 let size = bytes.len() as u64;
-                let digest = store.put(&bytes).map_err(|_| ())?;
+                let digest = persist_pin_bytes(store.clone(), bytes).await?;
                 self.allowed_digests.lock().await.insert(digest.clone());
                 Ok((digest, size))
             })
@@ -1431,6 +1465,167 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn production_pin_persist_queues_off_runtime_while_sentinel_is_exclusive() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let reg = SessionRegistry::new().unwrap();
+            let dir = tmp("pin-blocking-persist");
+            let actual = dir.join("queued.h");
+            let bytes = vec![0x6b; 1_000_000];
+            std::fs::write(&actual, &bytes).unwrap();
+            let expected = Digest::of(&bytes);
+            let cap = reg.create("pin-blocking".into(), None, Vec::new()).await;
+
+            let sentinel = reg.store_root.join("cas").join(".lifecycle.lock");
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let (foreground_tx, foreground_rx) = std::sync::mpsc::channel();
+            let lock_thread = std::thread::spawn(move || {
+                let sentinel = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(sentinel)
+                    .unwrap();
+                sentinel.lock().unwrap();
+                locked_tx.send(()).unwrap();
+
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let observed = loop {
+                    if PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire) == 1 {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::yield_now();
+                };
+                observed_tx.send(observed).unwrap();
+                let foreground_received = observed
+                    && foreground_rx.recv_timeout(Duration::from_secs(3)).is_ok();
+                sentinel.unlock().unwrap();
+                (observed, foreground_received)
+            });
+            locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            let pin_cap = Arc::clone(&cap);
+            let pin_store = reg.store().clone();
+            let pin_actual = actual.clone();
+            let pin = tokio::spawn(async move {
+                pin_cap
+                    .pin(&pin_store, "queued.h", pin_actual)
+                    .await
+            });
+            let observed = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match observed_rx.try_recv() {
+                        Ok(observed) => break observed,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => panic!("pin observation channel failed: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("external lock thread must finish its bounded queue observation");
+            assert!(
+                observed,
+                "production pin persistence must queue a blocking job before waiting on CAS"
+            );
+
+            let foreground = tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                foreground_tx.send(()).unwrap();
+            });
+            foreground.await.unwrap();
+            let (thread_observed, foreground_received) = lock_thread.join().unwrap();
+            assert!(thread_observed);
+            assert!(
+                foreground_received,
+                "current-thread runtime must execute unrelated async work while CAS persistence waits"
+            );
+
+            let (digest, size) = pin.await.unwrap().expect("pin should complete after unlock");
+            assert_eq!(digest, expected);
+            assert_eq!(size, bytes.len() as u64);
+            assert_eq!(
+                reg.store().get_verified(&digest).unwrap().as_deref(),
+                Some(bytes.as_slice())
+            );
+            assert!(cap.digest_visible(&digest).await);
+            assert_eq!(PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire), 0);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn cancelled_pin_persist_does_not_freeze_cell_or_grant_acl() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let reg = SessionRegistry::new().unwrap();
+            let dir = tmp("pin-cancel-persist");
+            let actual = dir.join("cancelled.h");
+            let bytes = vec![0x2a; 300_000];
+            std::fs::write(&actual, &bytes).unwrap();
+            let expected = Digest::of(&bytes);
+            let cap = reg.create("pin-cancel".into(), None, Vec::new()).await;
+
+            let sentinel = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(reg.store_root.join("cas").join(".lifecycle.lock"))
+                .unwrap();
+            sentinel.lock().unwrap();
+            let pin_cap = Arc::clone(&cap);
+            let pin_store = reg.store().clone();
+            let pin_actual = actual.clone();
+            let pin =
+                tokio::spawn(
+                    async move { pin_cap.pin(&pin_store, "cancelled.h", pin_actual).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("production pin persistence must enter the blocking pool");
+
+            pin.abort();
+            assert!(pin.await.unwrap_err().is_cancelled());
+            assert!(
+                !cap.digest_visible(&expected).await,
+                "a cancelled initializer must not grant digest visibility"
+            );
+            sentinel.unlock().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while PIN_PERSIST_IN_FLIGHT.load(Ordering::Acquire) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled pin's blocking persistence must still drain");
+
+            let (digest, size) = cap
+                .pin(reg.store(), "cancelled.h", actual)
+                .await
+                .expect("a later caller must retry the cancelled generation");
+            assert_eq!(digest, expected);
+            assert_eq!(size, bytes.len() as u64);
+            assert!(cap.digest_visible(&digest).await);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[tokio::test]
