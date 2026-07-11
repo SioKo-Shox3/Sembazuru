@@ -968,7 +968,7 @@ windows-sys = { version = "0.59", features = [
 ```
 
 ```text
-size_mib=64 mode=fileserver-fetch median_ms=42.00 read_transfer_bytes=67108864 peak_working_set_bytes=134217728
+size_mib=64 mode=fileserver-fetch elapsed_ms=42.00 read_transfer_bytes=67108864 peak_working_set_bytes=134217728
 ```
 
 Windowsで`read_transfer_bytes <= blob_size * 2`をassertするため、現行の全blob-per-chunk実装ではRED、range接続後だけGREENになる。非Windowsではexact bytes/digestだけをassertしI/O counter thresholdはskip理由付きで表示する。CAS単体benchはrange API自体、file-server benchはproduction接続を別々に反証する。
