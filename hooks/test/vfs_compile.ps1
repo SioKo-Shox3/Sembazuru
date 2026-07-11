@@ -36,6 +36,8 @@ try {
     $savedErrorPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
+        # Windows PowerShell 5 wraps native stderr as ErrorRecord; stringify it to avoid
+        # replaying verbose NativeCommandError metadata. LASTEXITCODE remains authoritative.
         $cargoOutput = @(& cargo build -p sembazuru-worker --example vfs_host 2>&1 | ForEach-Object { "$_" })
         $cargoExitCode = $LASTEXITCODE
     } finally {

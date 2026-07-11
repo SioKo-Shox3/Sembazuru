@@ -181,7 +181,7 @@ VFS COMPILE GATE PASS (remote compile under the read VFS; clang-cl byte-identica
 
 PowerShell 7の`vfs_compile.ps1 -RequireClangCl`回帰もexit `0`で、同じobject hashと`VFS COMPILE GATE PASS`を確認した。
 
-determinismはMSVCの2 outputがbyte-for-byteで再現し、clang-clも異なるbuild directory間でbyte-identicalとなった。clang-clではbuild root差によるinput-set warningを明示したが、gate対象のoutput bytesは一致した。
+Windows PowerShell 5実測では、determinismはMSVCの2 outputがbyte-for-byteで再現し、clang-clも異なるbuild directory間でbyte-identicalとなった。clang-clではbuild root差によるinput-set warningを明示したが、gate対象のoutput bytesは一致した。
 
 ```text
 DETERMINISM OK: 2 output(s) reproduce (no unexplained differences)
