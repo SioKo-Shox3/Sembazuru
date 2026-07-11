@@ -26,6 +26,7 @@ name = "exec_vfs"
 sembazuru-agent = { path = "../agent" }
 
 [dependencies]
+futures-util = "0.3"
 sembazuru-proto = { path = "../proto" }
 sembazuru-dataplane = { path = "../dataplane", features = ["tokio"] }
 sembazuru-tracer = { path = "../tracer" }

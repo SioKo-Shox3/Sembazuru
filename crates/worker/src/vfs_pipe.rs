@@ -27,12 +27,14 @@
 //! scrubbed (M3.3 owns output fencing/cleanup).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use sembazuru_cas::BlobStore;
 use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,6 +47,7 @@ const STATUS_OK: u8 = 0;
 const STATUS_NOT_FOUND: u8 = 1;
 const STATUS_ERROR: u8 = 2;
 const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
+const PREFETCH_CONCURRENCY: usize = 32;
 
 /// Shared state for the VFS server: the per-session path→scratch cache (so a
 /// re-open is a pipe round-trip with no work), the cross-build content store, and
@@ -102,22 +105,44 @@ impl VfsState {
     /// predicted files warm in roughly one round-trip's wall time instead of N.
     /// Best-effort: a path that fails to warm is simply hydrated for real later.
     async fn prefetch_warm(self: &Arc<Self>, paths: &[String]) {
-        let mut tasks = Vec::with_capacity(paths.len().min(MAX_PREDICTED_PATHS));
-        for p in bounded_prefetch_paths(paths) {
-            let state = Arc::clone(self);
-            let p = p.clone();
-            tasks.push(tokio::spawn(async move {
-                let _ = hydrate(&p, &state).await;
-            }));
-        }
-        for t in tasks {
-            let _ = t.await;
-        }
+        let paths = bounded_prefetch_paths(paths).cloned().collect::<Vec<_>>();
+        let state = Arc::clone(self);
+        for_each_prefetch_bounded(paths, PREFETCH_CONCURRENCY, move |path| {
+            let state = Arc::clone(&state);
+            async move {
+                let _ = hydrate(&path, &state).await;
+            }
+        })
+        .await;
     }
 }
 
 fn bounded_prefetch_paths(paths: &[String]) -> impl Iterator<Item = &String> {
     paths.iter().take(MAX_PREDICTED_PATHS)
+}
+
+async fn for_each_prefetch_bounded<I, F, Fut>(paths: I, limit: usize, f: F)
+where
+    I: IntoIterator<Item = String>,
+    F: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let mut paths = paths.into_iter();
+    let mut tasks = FuturesUnordered::new();
+    for _ in 0..limit.max(1) {
+        let Some(path) = paths.next() else {
+            break;
+        };
+        let f = f.clone();
+        tasks.push(f(path));
+    }
+    while tasks.next().await.is_some() {
+        let Some(path) = paths.next() else {
+            continue;
+        };
+        let f = f.clone();
+        tasks.push(f(path));
+    }
 }
 
 /// Maps an agent-side logical path to its location in the scratch tree by
@@ -234,32 +259,51 @@ pub async fn serve_vfs_with_prefetch_ready(
         client: OnceCell::new(),
     });
 
-    // Warm predicted inputs ahead of process I/O, concurrently with serving.
-    if !predicted_paths.is_empty() {
-        let warm = Arc::clone(&state);
-        tokio::spawn(async move {
-            warm.prefetch_warm(&predicted_paths).await;
-        });
-    }
-
     // Create the first instance synchronously, THEN signal readiness: once
     // `create()` returns the pipe is in the namespace and a client dial will
     // connect (or wait), never miss. Only after this do we let the caller launch.
-    let mut server = ServerOptions::new()
+    let server = ServerOptions::new()
         .first_pipe_instance(true)
         .create(&full)?;
     let _ = ready.send(());
 
-    loop {
-        server.connect().await?;
-        let connected = server;
-        // Pre-create the next instance so a client never races a missing pipe.
-        server = ServerOptions::new().create(&full)?;
+    // Keep warm and connected-client work inside this future so cancelling the
+    // pipe server synchronously drops every in-flight hydrate.
+    let warm_state = Arc::clone(&state);
+    let warm = warm_state.prefetch_warm(&predicted_paths);
+    serve_pipe_with_owned_futures(&full, server, warm, move |connected| {
+        handle_client(connected, Arc::clone(&state))
+    })
+    .await
+}
 
-        let state = state.clone();
-        tokio::spawn(async move {
-            let _ = handle_client(connected, state).await;
-        });
+async fn serve_pipe_with_owned_futures<Warm, Handle, Client>(
+    full: &str,
+    mut server: NamedPipeServer,
+    warm: Warm,
+    mut handle_client: Handle,
+) -> io::Result<()>
+where
+    Warm: Future<Output = ()>,
+    Handle: FnMut(NamedPipeServer) -> Client,
+    Client: Future<Output = io::Result<()>>,
+{
+    let mut warm_done = false;
+    tokio::pin!(warm);
+    let mut clients = FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            () = &mut warm, if !warm_done => warm_done = true,
+            result = server.connect() => {
+                result?;
+                let connected = server;
+                // Pre-create immediately so a client never races a missing pipe.
+                server = ServerOptions::new().create(full)?;
+                clients.push(handle_client(connected));
+            }
+            Some(_result) = clients.next(), if !clients.is_empty() => {}
+        }
     }
 }
 
@@ -372,11 +416,20 @@ async fn write_response(pipe: &mut NamedPipeServer, status: u8, local: &str) -> 
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use sembazuru_agent::fileserver::ServerStats;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    struct HydrateActivityGuard(Arc<AtomicUsize>);
+
+    impl Drop for HydrateActivityGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
     fn temp(tag: &str) -> PathBuf {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
@@ -490,6 +543,143 @@ mod tests {
             after_warm,
             "opens after prefetch transfer zero additional content"
         );
+    }
+
+    #[tokio::test]
+    async fn prefetch_peak_concurrency_never_exceeds_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let paths = (0..200).map(|i| format!("c:\\proj\\h{i}.h"));
+
+        for_each_prefetch_bounded(paths, 32, {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let completed = Arc::clone(&completed);
+            move |_| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let completed = Arc::clone(&completed);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(completed.load(Ordering::SeqCst), 200);
+        assert!(peak.load(Ordering::SeqCst) <= 32);
+    }
+
+    #[tokio::test]
+    async fn prefetch_zero_limit_still_processes_every_path() {
+        let completed = Arc::new(AtomicUsize::new(0));
+        let paths = (0..5).map(|i| format!("c:\\proj\\zero-limit-{i}.h"));
+
+        for_each_prefetch_bounded(paths, 0, {
+            let completed = Arc::clone(&completed);
+            move |_| {
+                let completed = Arc::clone(&completed);
+                async move {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(completed.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn dropping_pipe_future_drops_all_warm_futures_before_return() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let warm = for_each_prefetch_bounded((0..64).map(|i| format!("warm-{i}")), 32, {
+            let active = Arc::clone(&active);
+            let writes = Arc::clone(&writes);
+            let release = Arc::clone(&release);
+            let started_tx = started_tx.clone();
+            move |_| {
+                let active = Arc::clone(&active);
+                let writes = Arc::clone(&writes);
+                let release = Arc::clone(&release);
+                let started_tx = started_tx.clone();
+                async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = HydrateActivityGuard(active);
+                    started_tx.send(()).unwrap();
+                    release.notified().await;
+                    writes.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+
+        let name = format!(
+            "sbz-owned-futures-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let full = format!(r"\\.\pipe\{name}");
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&full)
+            .unwrap();
+
+        let client_active = Arc::clone(&active);
+        let client_writes = Arc::clone(&writes);
+        let client_release = Arc::clone(&release);
+        let client_started = started_tx.clone();
+        let serve_full = full.clone();
+        let outer = tokio::spawn(async move {
+            serve_pipe_with_owned_futures(&serve_full, server, warm, move |pipe| {
+                let active = Arc::clone(&client_active);
+                let writes = Arc::clone(&client_writes);
+                let release = Arc::clone(&client_release);
+                let started_tx = client_started.clone();
+                async move {
+                    let _pipe = pipe;
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = HydrateActivityGuard(active);
+                    started_tx.send(()).unwrap();
+                    release.notified().await;
+                    writes.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .await
+        });
+
+        let _client = ClientOptions::new().open(&full).unwrap();
+        for _ in 0..33 {
+            tokio::time::timeout(Duration::from_secs(5), started_rx.recv())
+                .await
+                .expect("warm and connected-client hydrate futures should start")
+                .expect("pipe future should retain the start sender");
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 33);
+
+        outer.abort();
+        let aborted = outer.await.unwrap_err();
+        assert!(aborted.is_cancelled());
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "abort + await must synchronously drop every owned hydrate future"
+        );
+
+        let writes_after_abort = writes.load(Ordering::SeqCst);
+        release.notify_waiters();
+        tokio::task::yield_now().await;
+        assert_eq!(writes.load(Ordering::SeqCst), writes_after_abort);
     }
 
     #[test]
