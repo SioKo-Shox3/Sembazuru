@@ -289,7 +289,9 @@ impl<'a> HydrationLease<'a> {
     fn join(registry: &'a StdMutex<HashMap<String, Weak<HydrationFlight>>>, key: String) -> Self {
         let flight = {
             let mut flights = lock_hydration_registry(registry);
-            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
+            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade).filter(
+                |flight| !matches!(flight.result.get(), Some((status, _)) if *status != STATUS_OK),
+            ) {
                 flight
             } else {
                 let flight = Arc::new(HydrationFlight {
@@ -656,6 +658,18 @@ where
 }
 
 async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
+    enum CacheRead {
+        Hit(Vec<u8>),
+        Missing,
+        Corrupt,
+    }
+
+    enum CacheWrite {
+        None,
+        Put,
+        Repair,
+    }
+
     // Reuse the session's pooled connection (dialed once); a clone shares the
     // one socket and multiplexes with other in-flight hydrates.
     let client = match state.client().await {
@@ -678,17 +692,31 @@ async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
         cas_for_read.get_verified(&digest_for_read)
     })
     .await;
-    let (bytes, store_fetched) = match cached {
-        Ok(Ok(Some(bytes))) => (bytes, false),
-        Ok(Ok(None)) | Ok(Err(CasError::Corrupt { .. })) => {
-            // Miss (or corrupt): fetch from the agent, then repair the local CAS.
+    let cache_read = match cached {
+        Ok(Ok(Some(bytes))) => CacheRead::Hit(bytes),
+        Ok(Ok(None)) => CacheRead::Missing,
+        Ok(Err(CasError::Corrupt { .. })) => CacheRead::Corrupt,
+        Ok(Err(_)) | Err(_) => return (STATUS_ERROR, String::new()),
+    };
+    let repair = matches!(&cache_read, CacheRead::Corrupt);
+    let (bytes, cache_write) = match cache_read {
+        CacheRead::Hit(bytes) => (bytes, CacheWrite::None),
+        CacheRead::Missing | CacheRead::Corrupt => {
+            // Miss (or corrupt): fetch from the agent, then persist or repair the
+            // local CAS before publishing scratch.
             let fetched = match client.fetch_by_digest(&digest, size).await {
                 Ok(bytes) => bytes,
                 Err(_) => return (STATUS_ERROR, String::new()),
             };
-            (fetched, true)
+            (
+                fetched,
+                if repair {
+                    CacheWrite::Repair
+                } else {
+                    CacheWrite::Put
+                },
+            )
         }
-        Ok(Err(_)) | Err(_) => return (STATUS_ERROR, String::new()),
     };
 
     let local = scratch_mirror(&state.scratch_root, path);
@@ -696,12 +724,24 @@ async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
     let cas_for_write = state.cas.clone();
     let digest_for_write = digest.clone();
     let materialize = run_tracked_blocking(&state.materializations, move || {
-        if store_fetched
-            && cas_for_write
-                .put_verified(&bytes, &digest_for_write)
-                .is_err()
-        {
-            return Err(io::Error::other("CAS rejected fetched hydrate bytes"));
+        let persisted = match cache_write {
+            CacheWrite::None => Ok(digest_for_write.clone()),
+            CacheWrite::Put => cas_for_write.put_verified(&bytes, &digest_for_write),
+            CacheWrite::Repair => cas_for_write.repair_verified(&bytes, &digest_for_write),
+        };
+        if let Err(error) = persisted {
+            match error {
+                CasError::DigestMismatch { .. } | CasError::Digest(_) => {
+                    return Err(io::Error::other(format!(
+                        "CAS rejected fetched hydrate bytes: {error}"
+                    )));
+                }
+                // Persistence is an optimization. Sharing conflicts, transient
+                // I/O, or a still-corrupt cache must not turn verified agent
+                // bytes into a failed hydrate; publish scratch and let a later
+                // action fetch again.
+                CasError::Io(_) | CasError::Corrupt { .. } => {}
+            }
         }
         atomic_publish(&local_for_write, |file| file.write_all(&bytes))
     });
@@ -886,6 +926,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_caller_starts_a_new_generation_while_failed_flight_is_still_alive() {
+        let state = Arc::new(test_state());
+        let key = hydration_key(r"c:\src\late-failure.h");
+        let old_lease = HydrationLease::join(&state.hydrating, key.clone());
+        let operations = Arc::new(AtomicUsize::new(0));
+
+        let first_operations = Arc::clone(&operations);
+        let first = hydrate(r"c:\src\late-failure.h", &state, || async move {
+            first_operations.fetch_add(1, Ordering::SeqCst);
+            (STATUS_ERROR, "first-generation".to_string())
+        })
+        .await;
+        assert_eq!(first, (STATUS_ERROR, "first-generation".to_string()));
+        assert_eq!(operations.load(Ordering::SeqCst), 1);
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let late_state = Arc::clone(&state);
+        let late_operations = Arc::clone(&operations);
+        let late = tokio::spawn(async move {
+            hydrate(r"C:/SRC/LATE-FAILURE.H", &late_state, || async move {
+                late_operations.fetch_add(1, Ordering::SeqCst);
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                (STATUS_ERROR, "second-generation".to_string())
+            })
+            .await
+        });
+        entered_rx
+            .await
+            .expect("a late caller must initialize a new failure generation");
+        assert_eq!(operations.load(Ordering::SeqCst), 2);
+
+        drop(old_lease);
+        assert_eq!(
+            lock_hydration_registry(&state.hydrating).len(),
+            1,
+            "dropping the old generation must not remove the new entry"
+        );
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            late.await.unwrap(),
+            (STATUS_ERROR, "second-generation".to_string())
+        );
+        assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
+    }
+
+    #[tokio::test]
     async fn same_key_success_runs_once_and_later_callers_use_the_cache() {
         let state = Arc::new(test_state());
         let start = Arc::new(tokio::sync::Barrier::new(17));
@@ -1063,43 +1151,82 @@ mod tests {
         assert_eq!(lock_hydration_registry(&state.hydrating).len(), 0);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn tracked_cas_work_does_not_block_an_unrelated_hydrate() {
-        let state = Arc::new(test_state());
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-        let first_state = Arc::clone(&state);
-        let first = tokio::spawn(async move {
-            let tracker = first_state.materializations.clone();
-            hydrate(r"c:\src\blocking-cas.h", &first_state, || async move {
-                run_tracked_blocking(&tracker, move || {
-                    let _ = started_tx.send(());
-                    release_rx.recv().unwrap();
-                })
-                .await
-                .unwrap();
-                (STATUS_ERROR, "blocking-cas-complete".to_string())
+    #[test]
+    fn production_cas_read_queues_off_runtime_and_does_not_block_an_unrelated_hydrate() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let source = temp("production-blocking-source");
+            let logical_path = source.join("cas-hit.h");
+            let body = vec![0x71; 300_000];
+            std::fs::write(&logical_path, &body).unwrap();
+            let logical = logical_path.to_string_lossy().into_owned();
+
+            let cas = BlobStore::open(temp("production-blocking-cas")).unwrap();
+            let digest = cas.put(&body).unwrap();
+            let (agent_addr, server) = start_scripted_hydrate_server(
+                logical.clone(),
+                digest,
+                body.len() as u64,
+                Vec::new(),
+            )
+            .await;
+            let state = Arc::new(VfsState {
+                scratch_root: temp("production-blocking-scratch"),
+                hydrated: Mutex::new(HashMap::new()),
+                hydrating: StdMutex::new(HashMap::new()),
+                cas,
+                agent_addr,
+                rtt: Duration::ZERO,
+                auth_token: String::new(),
+                session_root: String::new(),
+                session_id: String::new(),
+                client: OnceCell::new(),
+                materializations: MaterializationTracker::default(),
+            });
+
+            let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            let occupied = state.materializations.spawn_blocking(move || {
+                let _ = occupied_tx.send(());
+                release_rx.recv().unwrap();
+            });
+            occupied_rx.await.unwrap();
+
+            let actual_state = Arc::clone(&state);
+            let actual_logical = logical.clone();
+            let actual =
+                tokio::spawn(async move { hydrate_uncached(&actual_logical, &actual_state).await });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if state.materializations.inner.active.load(Ordering::Acquire) == 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
             })
             .await
-        });
-        started_rx
-            .await
-            .expect("the tracked CAS-equivalent operation must start");
+            .expect("production CAS get_verified must queue on the blocking pool");
 
-        let second = hydrate(r"c:\src\unrelated.h", &state, || async {
-            (STATUS_OK, r"c:\scratch\unrelated.h".to_string())
-        });
-        let result = tokio::time::timeout(Duration::from_millis(100), second)
-            .await
-            .expect("blocking CAS work on path A must not stop path B");
-        assert_eq!(result, (STATUS_OK, r"c:\scratch\unrelated.h".to_string()));
+            let unrelated = hydrate(r"c:\src\unrelated.h", &state, || async {
+                (STATUS_OK, r"c:\scratch\unrelated.h".to_string())
+            });
+            let result = tokio::time::timeout(Duration::from_millis(100), unrelated)
+                .await
+                .expect("queued CAS work on path A must not stop path B");
+            assert_eq!(result, (STATUS_OK, r"c:\scratch\unrelated.h".to_string()));
 
-        release_tx.send(()).unwrap();
-        assert_eq!(
-            first.await.unwrap(),
-            (STATUS_ERROR, "blocking-cas-complete".to_string())
-        );
-        state.materializations.wait_idle().await;
+            release_tx.send(()).unwrap();
+            occupied.await.unwrap();
+            let (status, local) = actual.await.unwrap();
+            assert_eq!(status, STATUS_OK);
+            assert_eq!(std::fs::read(local).unwrap(), body);
+            state.materializations.wait_idle().await;
+            server.await.unwrap();
+        });
     }
 
     #[tokio::test]
@@ -1323,6 +1450,158 @@ mod tests {
         assert!(!final_path.exists());
         assert_no_hydrate_temps(final_path.parent().unwrap());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn corrupt_cas_is_repaired_across_aliases_and_reused_by_the_next_action() {
+        let source = temp("repair-source");
+        let body = vec![0x5a; 700_000];
+        let mut aliases = Vec::new();
+        for index in 0..4 {
+            let path = source.join(format!("alias-{index}.h"));
+            std::fs::write(&path, &body).unwrap();
+            aliases.push(path.to_string_lossy().into_owned());
+        }
+
+        let stats = Arc::new(ServerStats::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent_addr = listener.local_addr().unwrap();
+        let served_stats = Arc::clone(&stats);
+        tokio::spawn(async move {
+            let _ =
+                sembazuru_agent::fileserver::serve_files_with_stats(listener, served_stats).await;
+        });
+
+        let cas_root = temp("repair-cas");
+        let cas = BlobStore::open(&cas_root).unwrap();
+        let digest = cas.put(&body).unwrap();
+        let corrupt_path = cas_root
+            .join("cas")
+            .join("blake3")
+            .join(&digest.hex()[..2])
+            .join(digest.hex());
+        std::fs::write(&corrupt_path, b"corrupt worker cache").unwrap();
+
+        let state = Arc::new(VfsState {
+            scratch_root: temp("repair-action-one-scratch"),
+            hydrated: Mutex::new(HashMap::new()),
+            hydrating: StdMutex::new(HashMap::new()),
+            cas: BlobStore::open(&cas_root).unwrap(),
+            agent_addr,
+            rtt: Duration::ZERO,
+            auth_token: String::new(),
+            session_root: String::new(),
+            session_id: String::new(),
+            client: OnceCell::new(),
+            materializations: MaterializationTracker::default(),
+        });
+        let first = hydrate_uncached(&aliases[0], &state);
+        let second = hydrate_uncached(&aliases[1], &state);
+        let third = hydrate_uncached(&aliases[2], &state);
+        let results = tokio::join!(first, second, third);
+        for (status, local) in [results.0, results.1, results.2] {
+            assert_eq!(status, STATUS_OK);
+            assert_eq!(std::fs::read(local).unwrap(), body);
+        }
+        assert_eq!(
+            cas.get_verified(&digest).unwrap().as_deref(),
+            Some(body.as_slice())
+        );
+        assert!(
+            std::fs::read_dir(corrupt_path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".tmp.")))
+        );
+
+        let before_next_action = stats.content_bytes();
+        let next_state = VfsState {
+            scratch_root: temp("repair-action-two-scratch"),
+            hydrated: Mutex::new(HashMap::new()),
+            hydrating: StdMutex::new(HashMap::new()),
+            cas: BlobStore::open(&cas_root).unwrap(),
+            agent_addr,
+            rtt: Duration::ZERO,
+            auth_token: String::new(),
+            session_root: String::new(),
+            session_id: String::new(),
+            client: OnceCell::new(),
+            materializations: MaterializationTracker::default(),
+        };
+        let (status, local) = hydrate_uncached(&aliases[3], &next_state).await;
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(std::fs::read(local).unwrap(), body);
+        assert_eq!(stats.content_bytes(), before_next_action);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn sharing_conflict_in_cas_repair_does_not_fail_current_hydrate() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let source = temp("repair-sharing-source");
+        let logical_path = source.join("sharing-conflict.h");
+        let body = vec![0x3d; 300_000];
+        std::fs::write(&logical_path, &body).unwrap();
+        let logical = logical_path.to_string_lossy().into_owned();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = sembazuru_agent::fileserver::serve_files(listener).await;
+        });
+
+        let cas_root = temp("repair-sharing-cas");
+        let cas = BlobStore::open(&cas_root).unwrap();
+        let digest = cas.put(&body).unwrap();
+        let corrupt_path = cas_root
+            .join("cas")
+            .join("blake3")
+            .join(&digest.hex()[..2])
+            .join(digest.hex());
+        std::fs::write(&corrupt_path, b"corrupt but reader-held").unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&corrupt_path)
+            .unwrap();
+
+        let state = VfsState {
+            scratch_root: temp("repair-sharing-scratch"),
+            hydrated: Mutex::new(HashMap::new()),
+            hydrating: StdMutex::new(HashMap::new()),
+            cas,
+            agent_addr,
+            rtt: Duration::ZERO,
+            auth_token: String::new(),
+            session_root: String::new(),
+            session_id: String::new(),
+            client: OnceCell::new(),
+            materializations: MaterializationTracker::default(),
+        };
+        let (status, local) = hydrate_uncached(&logical, &state).await;
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(std::fs::read(local).unwrap(), body);
+        assert!(matches!(
+            state.cas.get_verified(&digest).unwrap_err(),
+            CasError::Corrupt { .. }
+        ));
+        assert!(
+            std::fs::read_dir(corrupt_path.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".tmp.")))
+        );
+        drop(reader);
     }
 
     async fn test_pipe_hydrate(full_pipe: &str, logical: &str) -> (u8, String) {

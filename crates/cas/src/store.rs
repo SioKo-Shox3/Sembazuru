@@ -29,6 +29,7 @@ use crate::{Digest, DigestError};
 /// with the pid it is unique across processes sharing one store, so concurrent
 /// puts of the same blob never collide on their temp files.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+static REPAIR_CRITICAL_SECTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Errors from store operations.
 #[derive(Debug)]
@@ -126,6 +127,51 @@ impl BlobStore {
             write_atomic(&path, bytes)?;
         }
         Ok(actual)
+    }
+
+    /// Replaces a corrupt blob with digest-verified bytes without exposing a
+    /// partially written final path. Unlike [`BlobStore::put_verified`], this
+    /// operation deliberately replaces an existing entry and verifies the
+    /// resulting final path before reporting success.
+    pub fn repair_verified(&self, bytes: &[u8], claimed: &Digest) -> Result<Digest, CasError> {
+        let actual = Digest::of(bytes);
+        if &actual != claimed {
+            return Err(CasError::DigestMismatch {
+                claimed: claimed.clone(),
+                actual,
+            });
+        }
+
+        let _repair_guard = REPAIR_CRITICAL_SECTION
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match self.get_verified(claimed) {
+            Ok(Some(_)) => return Ok(actual),
+            Ok(None) | Err(CasError::Corrupt { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        let final_path = self.blob_path(claimed);
+        let mut temp = write_temp_sibling(&final_path, bytes)?;
+        temp.close();
+        let replace_error = match replace_atomic(temp.path(), &final_path) {
+            Ok(()) => {
+                temp.mark_moved();
+                None
+            }
+            Err(error) => Some(error),
+        };
+
+        match self.get_verified(claimed) {
+            Ok(Some(_)) => Ok(actual),
+            Ok(None) => Err(CasError::Io(replace_error.unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "repaired CAS blob disappeared before verification",
+                )
+            }))),
+            Err(error) => Err(replace_error.map_or(error, CasError::Io)),
+        }
     }
 
     /// Reads a blob's bytes, or `None` if absent. Does not re-verify (the hot
@@ -240,10 +286,27 @@ impl BlobStore {
         let mut out = Vec::new();
         // cas/<algo>/<shard>/<blob>: walk exactly three levels.
         for algo in read_dir_some(&self.cas_root)? {
+            if algo.file_name().and_then(|name| name.to_str()) != Some("blake3")
+                || !is_real_directory(&algo)
+            {
+                continue;
+            }
             for shard in read_dir_some(&algo)? {
+                let Some(shard_name) = shard.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !is_lower_hex(shard_name, 2) || !is_real_directory(&shard) {
+                    continue;
+                }
                 for blob in read_dir_some(&shard)? {
-                    let md = match std::fs::metadata(&blob) {
-                        Ok(md) if md.is_file() => md,
+                    let Some(blob_name) = blob.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    if !is_lower_hex(blob_name, 64) || !blob_name.starts_with(shard_name) {
+                        continue;
+                    }
+                    let md = match std::fs::symlink_metadata(&blob) {
+                        Ok(md) if md.file_type().is_file() => md,
                         _ => continue,
                     };
                     let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
@@ -253,6 +316,17 @@ impl BlobStore {
         }
         Ok(out)
     }
+}
+
+fn is_real_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn open_read_only(path: &Path) -> io::Result<File> {
@@ -320,7 +394,45 @@ fn read_dir_some(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// atomic within a volume, and the temp is a sibling so it is same-volume).
 /// Shared with the action cache, which is keyed (not content-addressed) but
 /// needs the same crash- and reader-safe publish.
-pub(crate) fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
+struct AtomicTemp {
+    path: PathBuf,
+    file: Option<File>,
+    moved: bool,
+}
+
+impl AtomicTemp {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn close(&mut self) {
+        drop(self.file.take());
+    }
+
+    fn mark_moved(&mut self) {
+        self.moved = true;
+    }
+}
+
+impl Drop for AtomicTemp {
+    fn drop(&mut self) {
+        self.close();
+        if !self.moved {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn write_temp_sibling(final_path: &Path, bytes: &[u8]) -> io::Result<AtomicTemp> {
+    use std::io::Write;
+
+    write_temp_sibling_with(final_path, |file| file.write_all(bytes))
+}
+
+fn write_temp_sibling_with<F>(final_path: &Path, operation: F) -> io::Result<AtomicTemp>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
     let parent = final_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "blob path has no parent"))?;
@@ -333,7 +445,7 @@ pub(crate) fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
     // open an existing path, so a planted target makes us fail (and retry with
     // the next seq) rather than write through it. The pid+seq makes a genuine
     // collision effectively impossible; the retry loop is belt-and-suspenders.
-    let tmp = loop {
+    loop {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".tmp.{}.{seq}", process::id()));
         match std::fs::OpenOptions::new()
@@ -341,21 +453,70 @@ pub(crate) fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
             .create_new(true)
             .open(&candidate)
         {
-            Ok(mut f) => {
-                use std::io::Write;
-                f.write_all(bytes)?;
-                break candidate;
+            Ok(file) => {
+                let mut temp = AtomicTemp {
+                    path: candidate,
+                    file: Some(file),
+                    moved: false,
+                };
+                operation(temp.file.as_mut().unwrap())?;
+                return Ok(temp);
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
-    };
-    match std::fs::rename(&tmp, final_path) {
-        Ok(()) => Ok(()),
+    }
+}
+
+fn replace_atomic(source: &Path, final_path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+
+        let source = source
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let final_path = final_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let result = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                final_path.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if result == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(source, final_path)
+    }
+}
+
+pub(crate) fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut temp = write_temp_sibling(final_path, bytes)?;
+    temp.close();
+    match std::fs::rename(temp.path(), final_path) {
+        Ok(()) => {
+            temp.mark_moved();
+            Ok(())
+        }
         Err(e) => {
             // Lost the race (another writer published the same content) or a
             // real failure: drop our temp either way and report the error.
-            let _ = std::fs::remove_file(&tmp);
             if final_path.exists() {
                 Ok(()) // same content is now present; idempotent success
             } else {
@@ -533,6 +694,312 @@ mod tests {
             store.get_verified(&d).unwrap_err(),
             CasError::Corrupt { .. }
         ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn hydrate_temp_siblings(store: &BlobStore, digest: &Digest) -> Vec<PathBuf> {
+        let parent = store.blob_path(digest).parent().unwrap().to_path_buf();
+        read_dir_some(&parent)
+            .unwrap()
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(".tmp."))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn repair_verified_replaces_corrupt_blob_without_temp_residue() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let correct = b"verified repair bytes";
+        let digest = store.put(correct).unwrap();
+        std::fs::write(store.blob_path(&digest), b"corrupt").unwrap();
+
+        assert_eq!(store.repair_verified(correct, &digest).unwrap(), digest);
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&correct[..])
+        );
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repair_verified_creates_a_missing_blob() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let correct = b"verified missing repair";
+        let digest = Digest::of(correct);
+        assert!(!store.has(&digest));
+
+        assert_eq!(store.repair_verified(correct, &digest).unwrap(), digest);
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&correct[..])
+        );
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn temp_writer_error_removes_partial_sibling() {
+        use std::io::Write;
+
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = Digest::of(b"temp writer error");
+        let final_path = store.blob_path(&digest);
+        let result = write_temp_sibling_with(&final_path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected temp write error"))
+        });
+        assert!(result.is_err());
+        assert!(!final_path.exists());
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn temp_writer_panic_removes_partial_sibling() {
+        use std::io::Write;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = Digest::of(b"temp writer panic");
+        let final_path = store.blob_path(&digest);
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = write_temp_sibling_with(&final_path, |file| {
+                file.write_all(b"partial")?;
+                panic!("injected temp write panic")
+            });
+        }));
+        assert!(panic.is_err());
+        assert!(!final_path.exists());
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repair_verified_rejects_mismatch_without_touching_existing_blob() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = store.put(b"claimed bytes").unwrap();
+        let path = store.blob_path(&digest);
+        std::fs::write(&path, b"existing corrupt bytes").unwrap();
+
+        let error = store
+            .repair_verified(b"different repair bytes", &digest)
+            .unwrap_err();
+        assert!(matches!(error, CasError::DigestMismatch { .. }));
+        assert_eq!(std::fs::read(path).unwrap(), b"existing corrupt bytes");
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repair_verified_does_not_tear_an_open_reader() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let correct = b"correct after reader closes";
+        let digest = store.put(correct).unwrap();
+        std::fs::write(store.blob_path(&digest), b"old corrupt bytes").unwrap();
+        let mut reader = store.open_blob_read(&digest).unwrap().unwrap();
+
+        assert!(store.repair_verified(correct, &digest).is_err());
+        let mut observed = Vec::new();
+        reader.read_to_end(&mut observed).unwrap();
+        assert_eq!(observed, b"old corrupt bytes");
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+
+        drop(reader);
+        store.repair_verified(correct, &digest).unwrap();
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&correct[..])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_repairs_converge_to_verified_bytes() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let correct = b"one convergent repair".to_vec();
+        let digest = store.put(&correct).unwrap();
+        for round in 0..16 {
+            std::fs::write(store.blob_path(&digest), format!("corrupt round {round}")).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(9));
+            let mut threads = Vec::new();
+            for index in 0..8 {
+                let store = if index % 2 == 0 {
+                    store.clone()
+                } else {
+                    BlobStore::open(&root).unwrap()
+                };
+                let digest = digest.clone();
+                let correct = correct.clone();
+                let start = std::sync::Arc::clone(&start);
+                threads.push(std::thread::spawn(move || {
+                    start.wait();
+                    store.repair_verified(&correct, &digest)
+                }));
+            }
+            start.wait();
+            let mut results = Vec::new();
+            for thread in threads {
+                results.push(thread.join().unwrap());
+            }
+            assert!(
+                results.iter().all(Result::is_ok),
+                "all concurrent repairs should observe the verified final blob in round {round}: {results:?}"
+            );
+        }
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(correct.as_slice())
+        );
+        assert!(hydrate_temp_siblings(&store, &digest).is_empty());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn poisoned_repair_serialization_recovers() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = REPAIR_CRITICAL_SECTION.lock().unwrap();
+            panic!("inject repair mutex poison")
+        }));
+        assert!(poisoned.is_err());
+
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let correct = b"repair after poison";
+        let digest = store.put(correct).unwrap();
+        std::fs::write(store.blob_path(&digest), b"corrupt").unwrap();
+        assert_eq!(store.repair_verified(correct, &digest).unwrap(), digest);
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&correct[..])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repair_verified_replaces_only_the_hardlink_entry() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let correct = b"hardlink repair bytes";
+        let digest = Digest::of(correct);
+        let final_path = store.blob_path(&digest);
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        let outside = root.join("outside-hardlink-target");
+        std::fs::write(&outside, b"hardlink target must stay corrupt").unwrap();
+        std::fs::hard_link(&outside, &final_path).unwrap();
+
+        store.repair_verified(correct, &digest).unwrap();
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"hardlink target must stay corrupt"
+        );
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&correct[..])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repair_verified_replaces_only_the_symlink_entry_when_supported() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let correct = b"symlink repair bytes";
+        let digest = Digest::of(correct);
+        let final_path = store.blob_path(&digest);
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        let outside = root.join("outside-symlink-target");
+        std::fs::write(&outside, b"symlink target must stay corrupt").unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &final_path);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &final_path);
+        if let Err(error) = linked {
+            #[cfg(windows)]
+            if error.raw_os_error() == Some(1314) {
+                std::fs::remove_dir_all(&root).ok();
+                return;
+            }
+            panic!("failed to create test symlink: {error}");
+        }
+
+        store.repair_verified(correct, &digest).unwrap();
+        assert_eq!(
+            std::fs::read(&outside).unwrap(),
+            b"symlink target must stay corrupt"
+        );
+        assert_eq!(
+            store.get_verified(&digest).unwrap().as_deref(),
+            Some(&correct[..])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn blob_listing_ignores_temp_malformed_unknown_and_symlink_entries() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = store.put(b"abc").unwrap();
+        let legitimate = store.blob_path(&digest);
+        let shard = legitimate.parent().unwrap();
+        let temp = shard.join(".tmp.attacker.1");
+        std::fs::write(&temp, vec![0u8; 101]).unwrap();
+        std::fs::write(shard.join("A".repeat(64)), vec![0u8; 102]).unwrap();
+        std::fs::write(shard.join(format!("ff{}", "0".repeat(62))), vec![0u8; 103]).unwrap();
+        let unknown = store
+            .cas_root
+            .join("unknown")
+            .join("00")
+            .join("0".repeat(64));
+        std::fs::create_dir_all(unknown.parent().unwrap()).unwrap();
+        std::fs::write(&unknown, vec![0u8; 104]).unwrap();
+
+        let hardlink_digest = Digest::of(b"hardlink listing entry");
+        let hardlink = store.blob_path(&hardlink_digest);
+        std::fs::create_dir_all(hardlink.parent().unwrap()).unwrap();
+        let hardlink_target = root.join("outside-listing-hardlink-target");
+        std::fs::write(&hardlink_target, vec![0u8; 106]).unwrap();
+        std::fs::hard_link(&hardlink_target, &hardlink).unwrap();
+
+        let symlink_digest = Digest::of(b"symlink listing entry");
+        let symlink = store.blob_path(&symlink_digest);
+        std::fs::create_dir_all(symlink.parent().unwrap()).unwrap();
+        let outside = root.join("outside-listing-target");
+        std::fs::write(&outside, vec![0u8; 105]).unwrap();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &symlink);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &symlink);
+
+        let listed = store.list_blobs().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|entry| entry.0 == legitimate));
+        assert!(listed.iter().any(|entry| entry.0 == hardlink));
+        assert_eq!(store.total_size().unwrap(), 109);
+        assert_eq!(store.evict_to(0).unwrap(), 109);
+        assert!(
+            temp.exists(),
+            "temporary-looking files are not eviction targets"
+        );
+        assert_eq!(std::fs::read(&hardlink_target).unwrap(), vec![0u8; 106]);
+        assert_eq!(std::fs::read(&outside).unwrap(), vec![0u8; 105]);
+        if linked.is_ok() {
+            assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
