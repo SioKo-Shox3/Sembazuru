@@ -51,6 +51,14 @@ const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 const PREFETCH_CONCURRENCY: usize = 32;
 static HYDRATE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy)]
+enum BlockingWorkKind {
+    CasVerifiedRead,
+    CasPersistAndScratchPublish,
+    #[cfg(test)]
+    TestBlocker,
+}
+
 #[derive(Clone, Default)]
 struct MaterializationTracker {
     inner: Arc<MaterializationTrackerInner>,
@@ -60,26 +68,67 @@ struct MaterializationTracker {
 struct MaterializationTrackerInner {
     active: AtomicUsize,
     idle: Notify,
+    #[cfg(test)]
+    cas_verified_reads: AtomicUsize,
+    #[cfg(test)]
+    cas_persist_and_scratch_publishes: AtomicUsize,
+    #[cfg(test)]
+    test_blockers: AtomicUsize,
 }
 
-struct MaterializationGuard(Arc<MaterializationTrackerInner>);
+struct MaterializationGuard {
+    inner: Arc<MaterializationTrackerInner>,
+    #[cfg(test)]
+    kind: BlockingWorkKind,
+}
 
 impl Drop for MaterializationGuard {
     fn drop(&mut self) {
-        if self.0.active.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
-            self.0.idle.notify_one();
+        #[cfg(test)]
+        self.inner
+            .kind_counter(self.kind)
+            .fetch_sub(1, AtomicOrdering::AcqRel);
+        if self.inner.active.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+            self.inner.idle.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
+impl MaterializationTrackerInner {
+    fn kind_counter(&self, kind: BlockingWorkKind) -> &AtomicUsize {
+        match kind {
+            BlockingWorkKind::CasVerifiedRead => &self.cas_verified_reads,
+            BlockingWorkKind::CasPersistAndScratchPublish => {
+                &self.cas_persist_and_scratch_publishes
+            }
+            BlockingWorkKind::TestBlocker => &self.test_blockers,
         }
     }
 }
 
 impl MaterializationTracker {
-    fn spawn_blocking<F, T>(&self, operation: F) -> tokio::task::JoinHandle<T>
+    fn spawn_blocking<F, T>(
+        &self,
+        kind: BlockingWorkKind,
+        operation: F,
+    ) -> tokio::task::JoinHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
         self.inner.active.fetch_add(1, AtomicOrdering::AcqRel);
-        let guard = MaterializationGuard(Arc::clone(&self.inner));
+        #[cfg(test)]
+        self.inner
+            .kind_counter(kind)
+            .fetch_add(1, AtomicOrdering::AcqRel);
+        #[cfg(not(test))]
+        let _ = kind;
+        let guard = MaterializationGuard {
+            inner: Arc::clone(&self.inner),
+            #[cfg(test)]
+            kind,
+        };
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
             operation()
@@ -98,17 +147,23 @@ impl MaterializationTracker {
             notified.await;
         }
     }
+
+    #[cfg(test)]
+    fn in_flight(&self, kind: BlockingWorkKind) -> usize {
+        self.inner.kind_counter(kind).load(AtomicOrdering::Acquire)
+    }
 }
 
 async fn run_tracked_blocking<F, T>(
     tracker: &MaterializationTracker,
+    kind: BlockingWorkKind,
     operation: F,
 ) -> Result<T, tokio::task::JoinError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tracker.spawn_blocking(operation).await
+    tracker.spawn_blocking(kind, operation).await
 }
 
 /// Owns one action's VFS serve task and every blocking materialization it
@@ -688,9 +743,11 @@ async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
     // digest verification are blocking work, so keep them off Tokio's workers.
     let cas_for_read = state.cas.clone();
     let digest_for_read = digest.clone();
-    let cached = run_tracked_blocking(&state.materializations, move || {
-        cas_for_read.get_verified(&digest_for_read)
-    })
+    let cached = run_tracked_blocking(
+        &state.materializations,
+        BlockingWorkKind::CasVerifiedRead,
+        move || cas_for_read.get_verified(&digest_for_read),
+    )
     .await;
     let cache_read = match cached {
         Ok(Ok(Some(bytes))) => CacheRead::Hit(bytes),
@@ -723,28 +780,32 @@ async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
     let local_for_write = local.clone();
     let cas_for_write = state.cas.clone();
     let digest_for_write = digest.clone();
-    let materialize = run_tracked_blocking(&state.materializations, move || {
-        let persisted = match cache_write {
-            CacheWrite::None => Ok(digest_for_write.clone()),
-            CacheWrite::Put => cas_for_write.put_verified(&bytes, &digest_for_write),
-            CacheWrite::Repair => cas_for_write.repair_verified(&bytes, &digest_for_write),
-        };
-        if let Err(error) = persisted {
-            match error {
-                CasError::DigestMismatch { .. } | CasError::Digest(_) => {
-                    return Err(io::Error::other(format!(
-                        "CAS rejected fetched hydrate bytes: {error}"
-                    )));
+    let materialize = run_tracked_blocking(
+        &state.materializations,
+        BlockingWorkKind::CasPersistAndScratchPublish,
+        move || {
+            let persisted = match cache_write {
+                CacheWrite::None => Ok(digest_for_write.clone()),
+                CacheWrite::Put => cas_for_write.put_verified(&bytes, &digest_for_write),
+                CacheWrite::Repair => cas_for_write.repair_verified(&bytes, &digest_for_write),
+            };
+            if let Err(error) = persisted {
+                match error {
+                    CasError::DigestMismatch { .. } | CasError::Digest(_) => {
+                        return Err(io::Error::other(format!(
+                            "CAS rejected fetched hydrate bytes: {error}"
+                        )));
+                    }
+                    // Persistence is an optimization. Sharing conflicts, transient
+                    // I/O, or a still-corrupt cache must not turn verified agent
+                    // bytes into a failed hydrate; publish scratch and let a later
+                    // action fetch again.
+                    CasError::Io(_) | CasError::Corrupt { .. } => {}
                 }
-                // Persistence is an optimization. Sharing conflicts, transient
-                // I/O, or a still-corrupt cache must not turn verified agent
-                // bytes into a failed hydrate; publish scratch and let a later
-                // action fetch again.
-                CasError::Io(_) | CasError::Corrupt { .. } => {}
             }
-        }
-        atomic_publish(&local_for_write, |file| file.write_all(&bytes))
-    });
+            atomic_publish(&local_for_write, |file| file.write_all(&bytes))
+        },
+    );
     if materialize.await.map_or(true, |result| result.is_err()) {
         return (STATUS_ERROR, String::new());
     }
@@ -1190,10 +1251,13 @@ mod tests {
 
             let (occupied_tx, occupied_rx) = tokio::sync::oneshot::channel();
             let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-            let occupied = state.materializations.spawn_blocking(move || {
-                let _ = occupied_tx.send(());
-                release_rx.recv().unwrap();
-            });
+            let occupied =
+                state
+                    .materializations
+                    .spawn_blocking(BlockingWorkKind::TestBlocker, move || {
+                        let _ = occupied_tx.send(());
+                        release_rx.recv().unwrap();
+                    });
             occupied_rx.await.unwrap();
 
             let actual_state = Arc::clone(&state);
@@ -1202,7 +1266,16 @@ mod tests {
                 tokio::spawn(async move { hydrate_uncached(&actual_logical, &actual_state).await });
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if state.materializations.inner.active.load(Ordering::Acquire) == 2 {
+                    if state
+                        .materializations
+                        .in_flight(BlockingWorkKind::CasVerifiedRead)
+                        == 1
+                        && state.materializations.inner.active.load(Ordering::Acquire) == 2
+                        && state
+                            .materializations
+                            .in_flight(BlockingWorkKind::CasPersistAndScratchPublish)
+                            == 0
+                    {
                         break;
                     }
                     tokio::task::yield_now().await;
@@ -1225,8 +1298,51 @@ mod tests {
             assert_eq!(status, STATUS_OK);
             assert_eq!(std::fs::read(local).unwrap(), body);
             state.materializations.wait_idle().await;
+            assert_eq!(
+                state
+                    .materializations
+                    .in_flight(BlockingWorkKind::CasVerifiedRead),
+                0
+            );
+            assert_eq!(
+                state
+                    .materializations
+                    .in_flight(BlockingWorkKind::CasPersistAndScratchPublish),
+                0
+            );
             server.await.unwrap();
         });
+    }
+
+    #[tokio::test]
+    async fn blocking_work_kind_bookkeeping_tracks_submit_through_drop() {
+        let tracker = MaterializationTracker::default();
+        let (release_read_tx, release_read_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_publish_tx, release_publish_rx) = std::sync::mpsc::sync_channel(0);
+        let read = tracker.spawn_blocking(BlockingWorkKind::CasVerifiedRead, move || {
+            release_read_rx.recv().unwrap();
+        });
+        let publish =
+            tracker.spawn_blocking(BlockingWorkKind::CasPersistAndScratchPublish, move || {
+                release_publish_rx.recv().unwrap();
+            });
+
+        assert_eq!(tracker.in_flight(BlockingWorkKind::CasVerifiedRead), 1);
+        assert_eq!(
+            tracker.in_flight(BlockingWorkKind::CasPersistAndScratchPublish),
+            1
+        );
+        assert_eq!(tracker.in_flight(BlockingWorkKind::TestBlocker), 0);
+
+        release_read_tx.send(()).unwrap();
+        release_publish_tx.send(()).unwrap();
+        read.await.unwrap();
+        publish.await.unwrap();
+        assert_eq!(tracker.in_flight(BlockingWorkKind::CasVerifiedRead), 0);
+        assert_eq!(
+            tracker.in_flight(BlockingWorkKind::CasPersistAndScratchPublish),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1932,7 +2048,7 @@ mod tests {
         let (outer_dropped_tx, outer_dropped_rx) = tokio::sync::oneshot::channel();
         let server = start_action_vfs_owner(move |tracker, ready| async move {
             let _drop_signal = DropSignal(Some(outer_dropped_tx));
-            let materialize = tracker.spawn_blocking(move || {
+            let materialize = tracker.spawn_blocking(BlockingWorkKind::TestBlocker, move || {
                 let _ = started_tx.send(());
                 release_rx.recv().unwrap();
                 std::fs::create_dir_all(local_for_job.parent().unwrap())?;

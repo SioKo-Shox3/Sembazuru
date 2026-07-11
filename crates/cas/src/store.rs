@@ -30,6 +30,7 @@ use crate::{Digest, DigestError};
 /// puts of the same blob never collide on their temp files.
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 static REPAIR_CRITICAL_SECTION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+const LIFECYCLE_LOCK_NAME: &str = ".lifecycle.lock";
 
 /// Errors from store operations.
 #[derive(Debug)]
@@ -76,6 +77,30 @@ impl From<io::Error> for CasError {
 #[derive(Clone)]
 pub struct BlobStore {
     cas_root: PathBuf,
+    lifecycle_lock_path: PathBuf,
+}
+
+struct LifecycleLock {
+    file: File,
+}
+
+impl Drop for LifecycleLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum StoreEntryKind {
+    Temp,
+    Blob,
+}
+
+struct StoreEntry {
+    path: PathBuf,
+    size: u64,
+    mtime: std::time::SystemTime,
+    kind: StoreEntryKind,
 }
 
 impl BlobStore {
@@ -84,7 +109,40 @@ impl BlobStore {
     pub fn open(root: impl AsRef<Path>) -> io::Result<BlobStore> {
         let cas_root = root.as_ref().join("cas");
         std::fs::create_dir_all(&cas_root)?;
-        Ok(BlobStore { cas_root })
+        let lifecycle_lock_path = cas_root.join(LIFECYCLE_LOCK_NAME);
+        drop(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lifecycle_lock_path)?,
+        );
+        Ok(BlobStore {
+            cas_root,
+            lifecycle_lock_path,
+        })
+    }
+
+    fn open_lifecycle_lock(&self) -> io::Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lifecycle_lock_path)
+    }
+
+    fn lock_shared_lifecycle(&self) -> io::Result<LifecycleLock> {
+        let file = self.open_lifecycle_lock()?;
+        file.lock_shared()?;
+        Ok(LifecycleLock { file })
+    }
+
+    fn lock_exclusive_lifecycle(&self) -> io::Result<LifecycleLock> {
+        let file = self.open_lifecycle_lock()?;
+        file.lock()?;
+        Ok(LifecycleLock { file })
     }
 
     /// The final on-disk path for a digest. Safe because `digest.hex()` is
@@ -106,6 +164,10 @@ impl BlobStore {
         if path.exists() {
             return Ok(digest);
         }
+        let _lifecycle = self.lock_shared_lifecycle()?;
+        if path.exists() {
+            return Ok(digest);
+        }
         write_atomic(&path, bytes)?;
         Ok(digest)
     }
@@ -123,6 +185,10 @@ impl BlobStore {
             });
         }
         let path = self.blob_path(&actual);
+        if path.exists() {
+            return Ok(actual);
+        }
+        let _lifecycle = self.lock_shared_lifecycle()?;
         if !path.exists() {
             write_atomic(&path, bytes)?;
         }
@@ -145,6 +211,7 @@ impl BlobStore {
         let _repair_guard = REPAIR_CRITICAL_SECTION
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lifecycle = self.lock_shared_lifecycle()?;
         match self.get_verified(claimed) {
             Ok(Some(_)) => return Ok(actual),
             Ok(None) | Err(CasError::Corrupt { .. }) => {}
@@ -238,11 +305,13 @@ impl BlobStore {
         digests.iter().map(|d| self.has(d)).collect()
     }
 
-    /// Total bytes occupied by stored blobs.
+    /// Instantaneous total bytes occupied by blobs and canonical temp siblings.
+    /// Writers intentionally share the lifecycle lock, so this measurement does
+    /// not lock: an in-progress temp may grow while metadata is sampled.
     pub fn total_size(&self) -> io::Result<u64> {
         let mut total = 0u64;
-        for (_, size, _) in self.list_blobs()? {
-            total += size;
+        for entry in self.list_entries()? {
+            total = total.saturating_add(entry.size);
         }
         Ok(total)
     }
@@ -256,22 +325,25 @@ impl BlobStore {
     /// delete fails and the blob is skipped rather than aborting eviction, so a
     /// concurrent read is never torn.
     pub fn evict_to(&self, max_bytes: u64) -> io::Result<u64> {
-        let mut blobs = self.list_blobs()?;
-        let mut total: u64 = blobs.iter().map(|(_, s, _)| *s).sum();
+        let _lifecycle = self.lock_exclusive_lifecycle()?;
+        let mut entries = self.list_entries()?;
+        let mut total = entries
+            .iter()
+            .fold(0u64, |sum, entry| sum.saturating_add(entry.size));
         if total <= max_bytes {
             return Ok(0);
         }
-        // Oldest first.
-        blobs.sort_by_key(|(_, _, mtime)| *mtime);
+        // Reclaim abandoned temps before blobs, oldest first within each kind.
+        entries.sort_by_key(|entry| (entry.kind, entry.mtime));
         let mut freed = 0u64;
-        for (path, size, _) in blobs {
+        for entry in entries {
             if total <= max_bytes {
                 break;
             }
-            match std::fs::remove_file(&path) {
+            match std::fs::remove_file(&entry.path) {
                 Ok(()) => {
-                    total -= size;
-                    freed += size;
+                    total = total.saturating_sub(entry.size);
+                    freed = freed.saturating_add(entry.size);
                 }
                 // In use (open read) or already gone: skip, never tear a reader.
                 Err(_) => continue,
@@ -280,9 +352,9 @@ impl BlobStore {
         Ok(freed)
     }
 
-    /// Walks the store, yielding `(path, size, mtime)` for every blob file.
-    /// mtime falls back to the UNIX epoch when unavailable so sorting is total.
-    fn list_blobs(&self) -> io::Result<Vec<(PathBuf, u64, std::time::SystemTime)>> {
+    /// Walks valid algorithm shards, yielding canonical blobs and recoverable
+    /// temp siblings. mtime falls back to the epoch so eviction sorting is total.
+    fn list_entries(&self) -> io::Result<Vec<StoreEntry>> {
         let mut out = Vec::new();
         // cas/<algo>/<shard>/<blob>: walk exactly three levels.
         for algo in read_dir_some(&self.cas_root)? {
@@ -298,24 +370,53 @@ impl BlobStore {
                 if !is_lower_hex(shard_name, 2) || !is_real_directory(&shard) {
                     continue;
                 }
-                for blob in read_dir_some(&shard)? {
-                    let Some(blob_name) = blob.file_name().and_then(|name| name.to_str()) else {
+                for path in read_dir_some(&shard)? {
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                         continue;
                     };
-                    if !is_lower_hex(blob_name, 64) || !blob_name.starts_with(shard_name) {
+                    let kind = if is_lower_hex(name, 64) && name.starts_with(shard_name) {
+                        StoreEntryKind::Blob
+                    } else if is_canonical_temp_name(name) {
+                        StoreEntryKind::Temp
+                    } else {
                         continue;
-                    }
-                    let md = match std::fs::symlink_metadata(&blob) {
+                    };
+                    let md = match std::fs::symlink_metadata(&path) {
                         Ok(md) if md.file_type().is_file() => md,
                         _ => continue,
                     };
                     let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    out.push((blob, md.len(), mtime));
+                    out.push(StoreEntry {
+                        path,
+                        size: md.len(),
+                        mtime,
+                        kind,
+                    });
                 }
             }
         }
         Ok(out)
     }
+}
+
+fn is_canonical_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(".tmp.") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(pid), Some(sequence), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    is_canonical_decimal::<u32>(pid) && is_canonical_decimal::<u64>(sequence)
+}
+
+fn is_canonical_decimal<T>(value: &str) -> bool
+where
+    T: std::str::FromStr,
+{
+    !(value.is_empty() || value.len() > 1 && value.starts_with('0'))
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.parse::<T>().is_ok()
 }
 
 fn is_real_directory(path: &Path) -> bool {
@@ -530,6 +631,7 @@ pub(crate) fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
+    use std::time::Duration;
 
     struct CountingReader {
         inner: std::io::Cursor<Vec<u8>>,
@@ -950,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_listing_ignores_temp_malformed_unknown_and_symlink_entries() {
+    fn listing_ignores_malformed_unknown_and_symlink_entries() {
         let root = tmp_root();
         let store = BlobStore::open(&root).unwrap();
         let digest = store.put(b"abc").unwrap();
@@ -958,6 +1060,19 @@ mod tests {
         let shard = legitimate.parent().unwrap();
         let temp = shard.join(".tmp.attacker.1");
         std::fs::write(&temp, vec![0u8; 101]).unwrap();
+        let malformed_temps = [
+            ".tmp.01.2",
+            ".tmp.1.02",
+            ".tmp.1.2.3",
+            ".tmp.4294967296.1",
+            ".tmp.1.18446744073709551616",
+            ".tmp..1",
+            ".tmp.1.",
+        ]
+        .map(|name| shard.join(name));
+        for malformed in &malformed_temps {
+            std::fs::write(malformed, vec![0u8; 101]).unwrap();
+        }
         std::fs::write(shard.join("A".repeat(64)), vec![0u8; 102]).unwrap();
         std::fs::write(shard.join(format!("ff{}", "0".repeat(62))), vec![0u8; 103]).unwrap();
         let unknown = store
@@ -984,22 +1099,213 @@ mod tests {
         let linked = std::os::windows::fs::symlink_file(&outside, &symlink);
         #[cfg(unix)]
         let linked = std::os::unix::fs::symlink(&outside, &symlink);
+        let temp_symlink = shard.join(".tmp.1.2");
+        #[cfg(windows)]
+        let linked_temp = std::os::windows::fs::symlink_file(&outside, &temp_symlink);
+        #[cfg(unix)]
+        let linked_temp = std::os::unix::fs::symlink(&outside, &temp_symlink);
 
-        let listed = store.list_blobs().unwrap();
+        let listed = store.list_entries().unwrap();
         assert_eq!(listed.len(), 2);
-        assert!(listed.iter().any(|entry| entry.0 == legitimate));
-        assert!(listed.iter().any(|entry| entry.0 == hardlink));
+        assert!(listed.iter().any(|entry| entry.path == legitimate));
+        assert!(listed.iter().any(|entry| entry.path == hardlink));
         assert_eq!(store.total_size().unwrap(), 109);
         assert_eq!(store.evict_to(0).unwrap(), 109);
         assert!(
             temp.exists(),
             "temporary-looking files are not eviction targets"
         );
+        assert!(malformed_temps.iter().all(|path| path.exists()));
         assert_eq!(std::fs::read(&hardlink_target).unwrap(), vec![0u8; 106]);
         assert_eq!(std::fs::read(&outside).unwrap(), vec![0u8; 105]);
         if linked.is_ok() {
             assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
         }
+        if linked_temp.is_ok() {
+            assert!(
+                temp_symlink
+                    .symlink_metadata()
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn crash_shaped_valid_temp_is_counted_and_evicted() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let shard = store.cas_root.join("blake3").join("aa");
+        std::fs::create_dir_all(&shard).unwrap();
+        let stale = shard.join(".tmp.123.456");
+        std::fs::write(&stale, vec![0u8; 64]).unwrap();
+
+        assert_eq!(store.total_size().unwrap(), 64);
+        assert_eq!(store.evict_to(0).unwrap(), 64);
+        assert!(!stale.exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn eviction_reclaims_temp_before_blob() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = store.put(&[0u8; 100]).unwrap();
+        let stale = store.blob_path(&digest).parent().unwrap().join(".tmp.7.8");
+        std::fs::write(&stale, vec![0u8; 10]).unwrap();
+
+        assert_eq!(store.total_size().unwrap(), 110);
+        assert_eq!(store.evict_to(100).unwrap(), 10);
+        assert!(!stale.exists());
+        assert!(store.has(&digest));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn eviction_waits_for_a_shared_writer_lifecycle_lock() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = store.put(b"eviction lock blob").unwrap();
+        let writer_lock = store.lock_shared_lifecycle().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let evicting_store = store.clone();
+        let evictor = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = evicting_store.evict_to(0);
+            finished_tx.send(result).unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        let probe = store.open_lifecycle_lock().unwrap();
+        assert!(
+            probe.try_lock().is_err(),
+            "exclusive eviction lock must conflict with a live shared writer"
+        );
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(store.has(&digest));
+
+        drop(writer_lock);
+        assert_eq!(
+            finished_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            18
+        );
+        evictor.join().unwrap();
+        assert!(!store.has(&digest));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn two_shared_writer_locks_do_not_serialize_each_other() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let first = store.lock_shared_lifecycle().unwrap();
+        let second_store = store.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let lock = second_store.lock_shared_lifecycle().unwrap();
+            acquired_tx.send(()).unwrap();
+            lock
+        });
+
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a second shared writer lock must acquire while the first is held");
+        drop(first);
+        drop(second.join().unwrap());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn writer_waits_for_an_exclusive_eviction_lifecycle_lock() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let eviction_lock = store.lock_exclusive_lifecycle().unwrap();
+        let writer_store = store.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            finished_tx
+                .send(writer_store.put(b"blocked writer"))
+                .unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        let probe = store.open_lifecycle_lock().unwrap();
+        assert!(
+            probe.try_lock_shared().is_err(),
+            "shared writer lock must conflict with a live exclusive eviction"
+        );
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        drop(eviction_lock);
+        let digest = finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            store.get(&digest).unwrap().as_deref(),
+            Some(&b"blocked writer"[..])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    #[ignore]
+    fn lifecycle_crash_child_fixture() {
+        let root = std::env::var_os("SEMBAZURU_CAS_CRASH_ROOT")
+            .expect("crash fixture requires a CAS root");
+        let store = BlobStore::open(root).unwrap();
+        let _lock = store.lock_shared_lifecycle().unwrap();
+        let digest = Digest::of(b"crash temp payload");
+        let _temp = write_temp_sibling(&store.blob_path(&digest), b"crash temp payload").unwrap();
+        process::exit(0);
+    }
+
+    #[test]
+    fn crashed_writer_releases_os_lock_and_leaves_reclaimable_temp() {
+        use std::process::{Command, Stdio};
+
+        let root = tmp_root();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "store::tests::lifecycle_crash_child_fixture",
+            ])
+            .env("SEMBAZURU_CAS_CRASH_ROOT", &root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let store = BlobStore::open(&root).unwrap();
+        assert_eq!(store.total_size().unwrap(), 18);
+        assert_eq!(store.evict_to(0).unwrap(), 18);
+        assert_eq!(store.total_size().unwrap(), 0);
         std::fs::remove_dir_all(&root).ok();
     }
 
