@@ -32,6 +32,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -39,7 +40,7 @@ use sembazuru_cas::BlobStore;
 use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell};
 
 use crate::fileclient::FileClient;
 
@@ -48,6 +49,55 @@ const STATUS_NOT_FOUND: u8 = 1;
 const STATUS_ERROR: u8 = 2;
 const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 const PREFETCH_CONCURRENCY: usize = 32;
+
+#[derive(Clone, Default)]
+pub(crate) struct MaterializationTracker {
+    inner: Arc<MaterializationTrackerInner>,
+}
+
+#[derive(Default)]
+struct MaterializationTrackerInner {
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+struct MaterializationGuard(Arc<MaterializationTrackerInner>);
+
+impl Drop for MaterializationGuard {
+    fn drop(&mut self) {
+        if self.0.active.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+            self.0.idle.notify_one();
+        }
+    }
+}
+
+impl MaterializationTracker {
+    pub(crate) fn spawn_blocking<F, T>(&self, operation: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.inner.active.fetch_add(1, AtomicOrdering::AcqRel);
+        let guard = MaterializationGuard(Arc::clone(&self.inner));
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            operation()
+        })
+    }
+
+    pub(crate) async fn wait_idle(&self) {
+        loop {
+            if self.inner.active.load(AtomicOrdering::Acquire) == 0 {
+                return;
+            }
+            let notified = self.inner.idle.notified();
+            if self.inner.active.load(AtomicOrdering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// Shared state for the VFS server: the per-session path→scratch cache (so a
 /// re-open is a pipe round-trip with no work), the cross-build content store, and
@@ -79,6 +129,7 @@ struct VfsState {
     /// hydrate. `OnceCell::get_or_try_init` retries if the first dial fails, so a
     /// worker that starts before the agent is listening recovers on a later open.
     client: OnceCell<FileClient>,
+    materializations: MaterializationTracker,
 }
 
 impl VfsState {
@@ -244,6 +295,36 @@ pub async fn serve_vfs_with_prefetch_ready(
     session_id: String,
     auth_token: String,
 ) -> io::Result<()> {
+    serve_vfs_with_prefetch_ready_tracked(
+        pipe_name,
+        agent_addr,
+        scratch_root,
+        cas_root,
+        rtt,
+        predicted_paths,
+        ready,
+        vfs_root,
+        session_id,
+        auth_token,
+        MaterializationTracker::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_vfs_with_prefetch_ready_tracked(
+    pipe_name: &str,
+    agent_addr: SocketAddr,
+    scratch_root: PathBuf,
+    cas_root: PathBuf,
+    rtt: Duration,
+    predicted_paths: Vec<String>,
+    ready: tokio::sync::oneshot::Sender<()>,
+    vfs_root: String,
+    session_id: String,
+    auth_token: String,
+    materializations: MaterializationTracker,
+) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     let state = Arc::new(VfsState {
         scratch_root,
@@ -257,6 +338,7 @@ pub async fn serve_vfs_with_prefetch_ready(
         // Agent-minted session id (ADR 0013); empty on the wrapper/legacy path.
         session_id,
         client: OnceCell::new(),
+        materializations,
     });
 
     // Create the first instance synchronously, THEN signal readiness: once
@@ -363,12 +445,14 @@ async fn hydrate(path: &str, state: &VfsState) -> (u8, String) {
     };
 
     let local = scratch_mirror(&state.scratch_root, path);
-    if let Some(parent) = local.parent()
-        && tokio::fs::create_dir_all(parent).await.is_err()
-    {
-        return (STATUS_ERROR, String::new());
-    }
-    if tokio::fs::write(&local, &bytes).await.is_err() {
+    let local_for_write = local.clone();
+    let materialize = state.materializations.spawn_blocking(move || {
+        if let Some(parent) = local_for_write.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&local_for_write, &bytes)
+    });
+    if materialize.await.map_or(true, |result| result.is_err()) {
         return (STATUS_ERROR, String::new());
     }
     let local_str = local.to_string_lossy().into_owned();
@@ -521,6 +605,7 @@ mod tests {
             session_root: String::new(), // unscoped harness
             session_id: String::new(),   // no agent-minted session (legacy path)
             client: OnceCell::new(),
+            materializations: MaterializationTracker::default(),
         });
 
         // Warm all predicted paths. Content is pulled once here.
@@ -680,6 +765,55 @@ mod tests {
         release.notify_waiters();
         tokio::task::yield_now().await;
         assert_eq!(writes.load(Ordering::SeqCst), writes_after_abort);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_detached_blocking_materialization_before_cleanup() {
+        let scratch = temp("blocking-drain");
+        std::fs::remove_dir_all(&scratch).unwrap();
+        let local = scratch.join("nested").join("header.h");
+        let local_for_job = local.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let tracker = MaterializationTracker::default();
+
+        let hydrate_tracker = tracker.clone();
+        let hydrate_task = tokio::spawn(async move {
+            hydrate_tracker
+                .spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    release_rx.recv().unwrap();
+                    std::fs::create_dir_all(local_for_job.parent().unwrap())?;
+                    std::fs::write(local_for_job, b"tracked materialization")
+                })
+                .await
+        });
+
+        started_rx
+            .await
+            .expect("blocking materialization should start");
+        let shutdown_tracker = tracker.clone();
+        let mut shutdown = tokio::spawn(async move {
+            hydrate_task.abort();
+            let _ = hydrate_task.await;
+            shutdown_tracker.wait_idle().await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must remain pending while the detached blocking job is parked"
+        );
+
+        release_tx.send(()).unwrap();
+        shutdown.await.unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), b"tracked materialization");
+        std::fs::remove_dir_all(&scratch).unwrap();
+        assert!(
+            !scratch.exists(),
+            "no blocking writer may recreate scratch after shutdown returns"
+        );
     }
 
     #[test]

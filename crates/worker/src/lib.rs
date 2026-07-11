@@ -44,7 +44,7 @@ use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
 
-use crate::vfs_pipe::serve_vfs_with_prefetch_ready;
+use crate::vfs_pipe::{MaterializationTracker, serve_vfs_with_prefetch_ready_tracked};
 
 /// Disambiguates per-action VFS pipe/scratch names within a worker process.
 static EXEC_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -545,11 +545,11 @@ async fn run_action(
     };
 
     let start = Instant::now();
-    // For VFS mode, `pipe_task` keeps the per-action pipe server alive for the
+    // For VFS mode, `vfs_server` keeps the per-action pipe server alive for the
     // run; `job` is the process-tree kill handle; `scratch_dir` is the hydrated
     // input tree to remove after the run (deferred #8 / M9.2). All are cleaned up
     // after the child exits.
-    let (mut child, pipe_task, job, unvirt_marker, unsafe_output_marker, scratch_dir) =
+    let (mut child, vfs_server, job, unvirt_marker, unsafe_output_marker, scratch_dir) =
         match build_child(&cmd, vfs_plan, predicted_paths, session_id).await {
             Ok(parts) => parts,
             Err(detail) => {
@@ -653,8 +653,8 @@ async fn run_action(
     // Stop the per-action VFS pipe server (if any). The serve loop runs forever
     // by design, so it must be aborted once the action is done or it leaks one
     // task (and one listening pipe instance) per action.
-    if let Some(t) = pipe_task {
-        stop_vfs_pipe_task(t).await;
+    if let Some(server) = vfs_server {
+        server.shutdown().await;
     }
     // Drop the Job Object handle (removing the last Arc): closing it kills any
     // process still in the job — so a normal completion reaps stragglers and a
@@ -688,9 +688,17 @@ async fn run_action(
     }
 }
 
-async fn stop_vfs_pipe_task(task: tokio::task::JoinHandle<std::io::Result<()>>) {
-    task.abort();
-    let _ = task.await;
+struct ActionVfsServer {
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    materializations: MaterializationTracker,
+}
+
+impl ActionVfsServer {
+    async fn shutdown(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        self.materializations.wait_idle().await;
+    }
 }
 
 /// Builds the child process for an action. Plain mode spawns the command
@@ -709,7 +717,7 @@ async fn build_child(
 ) -> Result<
     (
         tokio::process::Child,
-        Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+        Option<ActionVfsServer>,
         Option<JobObject>,
         // VFS local-rerun marker path to check after exit; `None` in plain mode.
         Option<std::path::PathBuf>,
@@ -828,12 +836,14 @@ async fn build_child(
     let cas = cfg.cas_root.clone();
     let auth_token = cfg.cluster_token.clone().unwrap_or_default();
     let pipe_for_task = pipe_name.clone();
+    let materializations = MaterializationTracker::default();
+    let materializations_for_task = materializations.clone();
     // Declare the action's input root so the agent scopes file supply to it
     // (M7.1): the worker only legitimately reads under vfs_root (the hook
     // redirects exactly that subtree), so a request outside it is illegitimate.
     let vfs_root = v.vfs_root.clone();
     let pipe_task = tokio::spawn(async move {
-        serve_vfs_with_prefetch_ready(
+        serve_vfs_with_prefetch_ready_tracked(
             &pipe_for_task,
             agent_addr,
             scratch,
@@ -844,11 +854,17 @@ async fn build_child(
             vfs_root,
             session_id,
             auth_token,
+            materializations_for_task,
         )
         .await
     });
+    let vfs_server = ActionVfsServer {
+        task: pipe_task,
+        materializations,
+    };
     if ready_rx.await.is_err() {
-        stop_vfs_pipe_task(pipe_task).await;
+        vfs_server.shutdown().await;
+        let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
         return Err("VFS pipe server failed to start".to_string());
     }
 
@@ -905,7 +921,7 @@ async fn build_child(
     let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            stop_vfs_pipe_task(pipe_task).await;
+            vfs_server.shutdown().await;
             let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
             return Err(setup_err("launcher spawn failed", e));
         }
@@ -924,7 +940,7 @@ async fn build_child(
     }) {
         Ok(j) => j,
         Err(e) => {
-            stop_vfs_pipe_task(pipe_task).await;
+            vfs_server.shutdown().await;
             let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
             // `child` drops here; kill_on_drop terminates at least the launcher.
             return Err(setup_err("job object setup failed", e));
@@ -932,7 +948,7 @@ async fn build_child(
     };
     Ok((
         child,
-        Some(pipe_task),
+        Some(vfs_server),
         Some(job),
         unvirt_marker,
         unsafe_output_marker,
@@ -1203,7 +1219,12 @@ mod tests {
         });
         started_rx.await.expect("pipe task should start");
 
-        stop_vfs_pipe_task(task).await;
+        ActionVfsServer {
+            task,
+            materializations: MaterializationTracker::default(),
+        }
+        .shutdown()
+        .await;
 
         assert_eq!(active.load(Ordering::SeqCst), 0);
         let _ = release_tx.send(());
