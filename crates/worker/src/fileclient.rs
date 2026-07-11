@@ -402,7 +402,7 @@ impl FileClient {
         let (mut bytes, size) = content_buffer(Vec::new(), size)?;
         let digest_str = digest.canonical();
         while bytes.len() < size {
-            let want = READ_CHUNK.min((size - bytes.len()) as u32);
+            let want = read_request_len(size - bytes.len());
             let chunk = self.read(&digest_str, bytes.len() as u64, want).await?;
             if chunk.bytes.is_empty() {
                 return Err(io::Error::new(
@@ -429,7 +429,7 @@ impl FileClient {
         let (mut bytes, size) = content_buffer(open.first_chunk, open.size)?;
         let digest_str = open.digest_hex;
         while bytes.len() < size {
-            let want = READ_CHUNK.min((size - bytes.len()) as u32);
+            let want = read_request_len(size - bytes.len());
             let chunk = self.read(&digest_str, bytes.len() as u64, want).await?;
             if chunk.bytes.is_empty() {
                 return Err(io::Error::new(
@@ -442,6 +442,10 @@ impl FileClient {
         verify(&bytes, &digest)?;
         Ok(Some((bytes, digest)))
     }
+}
+
+fn read_request_len(remaining: usize) -> u32 {
+    remaining.min(READ_CHUNK as usize) as u32
 }
 
 fn content_buffer(mut initial: Vec<u8>, declared_size: u64) -> io::Result<(Vec<u8>, usize)> {
@@ -486,6 +490,15 @@ mod tests {
     use sembazuru_dataplane::ops::{HelloResponse, StatEntry};
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn read_request_len_clamps_before_u32_conversion() {
+        assert_eq!(read_request_len(1usize << 32), READ_CHUNK);
+        assert_eq!(read_request_len((1usize << 32) + 5), READ_CHUNK);
+        assert_eq!(read_request_len(READ_CHUNK as usize), READ_CHUNK);
+        assert_eq!(read_request_len(3), 3);
+    }
 
     async fn accept_test_handshake(listener: TcpListener) -> TcpStream {
         let (mut sock, _) = listener.accept().await.unwrap();
