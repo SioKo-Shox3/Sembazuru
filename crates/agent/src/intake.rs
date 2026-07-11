@@ -38,7 +38,6 @@ use crate::session_registry::{
 };
 use crate::status::Metrics;
 use crate::{ExecOptions, ExecuteError, Execution, LocalFallbackReason, run_local};
-use sembazuru_proto::quotas::MAX_PREDICTED_PATHS;
 
 /// Per-action options the launcher hands to the daemon alongside the command
 /// (the non-command fields of [`SubmitActionRequest`]). Bundled so adding a knob
@@ -422,33 +421,6 @@ async fn run_submission(
         }
     }
 
-    // Prior build's inputs to warm ahead of process I/O (M5.4 prefetch).
-    let mut predicted_paths = match (&ctx.cache, &weak) {
-        (Some(cache), Some(weak)) => {
-            let cache = cache.clone();
-            let weak = weak.clone();
-            tokio::task::spawn_blocking(move || cache.predicted_paths(&weak))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default()
-        }
-        _ => Vec::new(),
-    };
-    predicted_paths.truncate(MAX_PREDICTED_PATHS);
-
-    // Per-action trace dir (only needed when recording to the cache). The worker
-    // points the injected DLL's trace at it; on a single machine the daemon reads
-    // it back to build the input manifest (VfsExecution.trace_dir is single-
-    // machine-only, see control.proto).
-    let trace_dir = if ctx.cache.is_some() {
-        let d = ctx.scratch_root.join(format!("trace-{n}"));
-        let _ = tokio::fs::create_dir_all(&d).await;
-        d.to_string_lossy().into_owned()
-    } else {
-        String::new()
-    };
-
     // The declared input root scopes the worker's reads (M8.3); empty = cwd, the
     // compiler default (the project tree is the cwd). An arbitrary process may
     // read above its cwd, so the integration can declare a broader root. Single-
@@ -463,6 +435,33 @@ async fn run_submission(
         input_root.clone()
     };
     let normalized_vfs_root = crate::fileserver::normalize_root(&vfs_root);
+
+    // Prior build's inputs to warm ahead of process I/O (M5.4 prefetch).
+    let predicted_paths = match (&ctx.cache, &weak) {
+        (Some(cache), Some(weak)) => {
+            let cache = cache.clone();
+            let weak = weak.clone();
+            let root = normalized_vfs_root.clone();
+            tokio::task::spawn_blocking(move || cache.predicted_paths(&weak, root.as_deref()))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    // Per-action trace dir (only needed when recording to the cache). The worker
+    // points the injected DLL's trace at it; on a single machine the daemon reads
+    // it back to build the input manifest (VfsExecution.trace_dir is single-
+    // machine-only, see control.proto).
+    let trace_dir = if ctx.cache.is_some() {
+        let d = ctx.scratch_root.join(format!("trace-{n}"));
+        let _ = tokio::fs::create_dir_all(&d).await;
+        d.to_string_lossy().into_owned()
+    } else {
+        String::new()
+    };
 
     let opts = ExecOptions {
         predicted_paths,

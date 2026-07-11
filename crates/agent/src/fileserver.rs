@@ -520,7 +520,7 @@ fn is_short_name_alias_component(component: &str) -> bool {
 /// normalize (non-absolute, UNC, `\\?\`, drive-escaping) is OUT of scope (fail
 /// closed). 8.3-like components are allowed only in the already-declared root
 /// prefix; the root-relative suffix still rejects them fail-closed.
-fn path_in_scope(requested: &str, root: Option<&str>) -> bool {
+pub(crate) fn path_in_scope(requested: &str, root: Option<&str>) -> bool {
     let Some(root) = root else {
         return true;
     };
