@@ -494,6 +494,75 @@ mod tests {
         sock
     }
 
+    async fn start_scripted_read_server(
+        responses: Vec<(u64, u32, Vec<u8>)>,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut sock = accept_test_handshake(listener).await;
+            for (expected_offset, expected_len, bytes) in responses {
+                let (header, payload) = read_frame(&mut sock).await.unwrap();
+                let request = ReadRequest::decode(&payload).unwrap();
+                assert_eq!(header.op, OpCode::Read);
+                assert_eq!(request.offset, expected_offset);
+                assert_eq!(request.len, expected_len);
+                let response = ReadResponse { bytes }.encode();
+                write_frame(
+                    &mut sock,
+                    FrameHeader {
+                        request_id: header.request_id,
+                        op: OpCode::Read,
+                        is_response: true,
+                    },
+                    &response,
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn fetch_by_digest_rejects_blob_removed_between_ranges() {
+        let body = vec![0x41; READ_CHUNK as usize + 17];
+        let digest = Digest::of(&body);
+        let addr = start_scripted_read_server(vec![
+            (0, READ_CHUNK, body[..READ_CHUNK as usize].to_vec()),
+            (READ_CHUNK as u64, 17, Vec::new()),
+        ])
+        .await;
+        let client = FileClient::connect(addr).await.unwrap();
+
+        let error = client
+            .fetch_by_digest(&digest, body.len() as u64)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn fetch_by_digest_rejects_blob_changed_between_ranges() {
+        let body = vec![0x41; READ_CHUNK as usize + 17];
+        let digest = Digest::of(&body);
+        let addr = start_scripted_read_server(vec![
+            (0, READ_CHUNK, body[..READ_CHUNK as usize].to_vec()),
+            (READ_CHUNK as u64, 17, vec![0x42; 17]),
+        ])
+        .await;
+        let client = FileClient::connect(addr).await.unwrap();
+
+        let error = client
+            .fetch_by_digest(&digest, body.len() as u64)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[tokio::test]
     async fn fileclient_in_flight_requests_are_bounded() {
         const TEST_MAX_IN_FLIGHT: usize = 2;

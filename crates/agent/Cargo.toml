@@ -53,6 +53,10 @@ getrandom = "0.3"
 # Windows Service support for `sembazuru-daemon --service` (M9.3b). Windows-only;
 # the daemon's plain-CLI mode has no service dependency.
 windows-service = "0.7"
+windows-sys = { version = "0.59", features = [
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 sembazuru-worker = { path = "../worker" }

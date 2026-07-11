@@ -89,6 +89,7 @@ struct ConnShared {
 }
 
 const INLINE_CHUNK: usize = 64 * 1024;
+const MAX_READ_CHUNK: usize = 256 * 1024;
 
 /// Resolves a requested (agent-side logical) path to the actual file to read.
 #[derive(Clone)]
@@ -1090,10 +1091,11 @@ async fn open_read(
     // Inline the first chunk only if asked. A worker-local-cache client sends
     // `want_inline = false` so a cache hit transfers no content at all.
     let first_chunk = if req.want_inline {
-        match store.get(&digest) {
-            Ok(Some(bytes)) => bytes[..bytes.len().min(INLINE_CHUNK)].to_vec(),
-            _ => vec![],
-        }
+        get_range_blocking(store, &digest, 0, INLINE_CHUNK)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default()
     } else {
         vec![]
     };
@@ -1106,6 +1108,19 @@ async fn open_read(
         digest_hex: digest.canonical(),
         first_chunk,
     }
+}
+
+async fn get_range_blocking(
+    store: &BlobStore,
+    digest: &Digest,
+    offset: u64,
+    len: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let store = store.clone();
+    let digest = digest.clone();
+    tokio::task::spawn_blocking(move || store.get_range(&digest, offset, len))
+        .await
+        .map_err(io::Error::other)?
 }
 
 /// Serves a ranged read from the *pinned* blob in the store (not a fresh disk
@@ -1125,13 +1140,14 @@ async fn read_range(
     if !cap.digest_visible(&digest).await {
         return ReadResponse { bytes: vec![] };
     }
-    let bytes = match store.get(&digest) {
-        Ok(Some(b)) => b,
-        _ => return ReadResponse { bytes: vec![] }, // unknown/absent digest
-    };
-    let start = (req.offset as usize).min(bytes.len());
-    let end = start.saturating_add(req.len as usize).min(bytes.len());
-    let out = bytes[start..end].to_vec();
+    let len = usize::try_from(req.len)
+        .unwrap_or(usize::MAX)
+        .min(MAX_READ_CHUNK);
+    let out = get_range_blocking(store, &digest, req.offset, len)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
     stats.read_ops.fetch_add(1, Ordering::Relaxed);
     stats
         .read_bytes

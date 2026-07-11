@@ -673,6 +673,13 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use sembazuru_agent::fileserver::ServerStats;
+    use sembazuru_cas::Digest;
+    use sembazuru_dataplane::async_io::{read_frame, write_frame};
+    use sembazuru_dataplane::ops::{
+        HelloResponse, OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse,
+    };
+    use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+    use tokio::net::{TcpListener, TcpStream};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -844,6 +851,130 @@ mod tests {
             leftovers.is_empty(),
             "temporary files remained: {leftovers:?}"
         );
+    }
+
+    async fn accept_scripted_handshake(listener: TcpListener) -> TcpStream {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let (header, _) = read_frame(&mut sock).await.unwrap();
+        let response = HelloResponse {
+            ok: true,
+            detail: String::new(),
+        }
+        .encode();
+        write_frame(
+            &mut sock,
+            FrameHeader {
+                request_id: header.request_id,
+                op: OpCode::Hello,
+                is_response: true,
+            },
+            &response,
+        )
+        .await
+        .unwrap();
+        sock.flush().await.unwrap();
+        sock
+    }
+
+    async fn start_scripted_hydrate_server(
+        expected_path: String,
+        digest: Digest,
+        size: u64,
+        responses: Vec<(u64, u32, Vec<u8>)>,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut sock = accept_scripted_handshake(listener).await;
+            let (header, payload) = read_frame(&mut sock).await.unwrap();
+            let request = OpenReadRequest::decode(&payload).unwrap();
+            assert_eq!(header.op, OpCode::OpenRead);
+            assert_eq!(request.path, expected_path);
+            assert!(!request.want_inline);
+            let response = OpenReadResponse {
+                exists: true,
+                size,
+                digest_hex: digest.canonical(),
+                first_chunk: Vec::new(),
+            }
+            .encode();
+            write_frame(
+                &mut sock,
+                FrameHeader {
+                    request_id: header.request_id,
+                    op: OpCode::OpenRead,
+                    is_response: true,
+                },
+                &response,
+            )
+            .await
+            .unwrap();
+            sock.flush().await.unwrap();
+
+            for (expected_offset, expected_len, bytes) in responses {
+                let (header, payload) = read_frame(&mut sock).await.unwrap();
+                let request = ReadRequest::decode(&payload).unwrap();
+                assert_eq!(header.op, OpCode::Read);
+                assert_eq!(request.offset, expected_offset);
+                assert_eq!(request.len, expected_len);
+                let response = ReadResponse { bytes }.encode();
+                write_frame(
+                    &mut sock,
+                    FrameHeader {
+                        request_id: header.request_id,
+                        op: OpCode::Read,
+                        is_response: true,
+                    },
+                    &response,
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn hydrate_does_not_publish_scratch_after_midstream_truncate() {
+        const READ_CHUNK: u32 = 256 * 1024;
+        let path = r"c:\src\truncated.h";
+        let body = vec![0x41; READ_CHUNK as usize + 17];
+        let digest = Digest::of(&body);
+        let (agent_addr, server) = start_scripted_hydrate_server(
+            path.to_string(),
+            digest,
+            body.len() as u64,
+            vec![
+                (0, READ_CHUNK, body[..READ_CHUNK as usize].to_vec()),
+                (READ_CHUNK as u64, 17, Vec::new()),
+            ],
+        )
+        .await;
+        let scratch_root = temp("midstream-truncate-scratch");
+        let final_path = scratch_mirror(&scratch_root, path);
+        std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
+        let state = VfsState {
+            scratch_root,
+            hydrated: Mutex::new(HashMap::new()),
+            hydrating: Mutex::new(HashMap::new()),
+            cas: BlobStore::open(temp("midstream-truncate-cas")).unwrap(),
+            agent_addr,
+            rtt: Duration::ZERO,
+            auth_token: String::new(),
+            session_root: String::new(),
+            session_id: String::new(),
+            client: OnceCell::new(),
+            materializations: MaterializationTracker::default(),
+        };
+
+        let (status, local) = hydrate_uncached(path, &state).await;
+
+        assert_eq!(status, STATUS_ERROR);
+        assert!(local.is_empty());
+        assert!(!final_path.exists());
+        assert_no_hydrate_temps(final_path.parent().unwrap());
+        server.await.unwrap();
     }
 
     async fn test_pipe_hydrate(full_pipe: &str, logical: &str) -> (u8, String) {

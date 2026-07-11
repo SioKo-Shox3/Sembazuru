@@ -3892,6 +3892,7 @@ dependencies = [
  "toml",
  "tonic",
  "windows-service",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
