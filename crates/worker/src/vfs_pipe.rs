@@ -28,11 +28,11 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -49,6 +49,7 @@ const STATUS_NOT_FOUND: u8 = 1;
 const STATUS_ERROR: u8 = 2;
 const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 const PREFETCH_CONCURRENCY: usize = 32;
+static HYDRATE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Default)]
 struct MaterializationTracker {
@@ -141,6 +142,8 @@ struct VfsState {
     scratch_root: PathBuf,
     /// Logical path → materialized scratch path, for this session.
     hydrated: Mutex<HashMap<String, String>>,
+    /// Normalized logical path -> action-lifetime single-flight gate.
+    hydrating: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Content-addressed store, persisting across builds: a blob seen once is
     /// never re-fetched.
     cas: BlobStore,
@@ -196,7 +199,7 @@ impl VfsState {
         for_each_prefetch_bounded(paths, PREFETCH_CONCURRENCY, move |path| {
             let state = Arc::clone(&state);
             async move {
-                let _ = hydrate(&path, &state).await;
+                let _ = hydrate(&path, &state, || hydrate_uncached(&path, &state)).await;
             }
         })
         .await;
@@ -247,6 +250,50 @@ fn scratch_mirror(scratch_root: &Path, logical: &str) -> PathBuf {
     }
     let rel = rel.trim_start_matches('\\');
     scratch_root.join(rel)
+}
+
+fn hydration_key(path: &str) -> String {
+    path.replace('/', "\\").to_lowercase()
+}
+
+async fn hydration_gate(state: &VfsState, key: &str) -> Arc<Mutex<()>> {
+    let mut gates = state.hydrating.lock().await;
+    Arc::clone(
+        gates
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+fn hydrate_temp_path(final_path: &Path) -> PathBuf {
+    let id = HYDRATE_TEMP_ID.fetch_add(1, AtomicOrdering::Relaxed);
+    let mut name = final_path.as_os_str().to_os_string();
+    name.push(format!(".sbz-tmp-{}-{id}", std::process::id()));
+    PathBuf::from(name)
+}
+
+fn atomic_publish<F>(final_path: &Path, operation: F) -> io::Result<()>
+where
+    F: FnOnce(&mut std::fs::File) -> io::Result<()>,
+{
+    if let Some(parent) = final_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp_path = hydrate_temp_path(final_path);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        operation(&mut file)?;
+        file.flush()?;
+        drop(file);
+        std::fs::rename(&temp_path, final_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Serves the VFS pipe until an unrecoverable error. `pipe_name` is the bare
@@ -421,6 +468,7 @@ async fn serve_vfs_with_prefetch_ready_tracked(
     let state = Arc::new(VfsState {
         scratch_root,
         hydrated: Mutex::new(HashMap::new()),
+        hydrating: Mutex::new(HashMap::new()),
         cas: BlobStore::open(cas_root)?,
         agent_addr,
         rtt,
@@ -495,16 +543,34 @@ async fn handle_client(mut pipe: NamedPipeServer, state: Arc<VfsState>) -> io::R
             Err(e) => return Err(e),
         };
 
-        let (status, local) = hydrate(&path, &state).await;
+        let (status, local) = hydrate(&path, &state, || hydrate_uncached(&path, &state)).await;
         write_response(&mut pipe, status, &local).await?;
     }
 }
 
-async fn hydrate(path: &str, state: &VfsState) -> (u8, String) {
-    if let Some(local) = state.hydrated.lock().await.get(path) {
-        return (STATUS_OK, local.clone());
+async fn hydrate<F, Fut>(path: &str, state: &VfsState, operation: F) -> (u8, String)
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = (u8, String)>,
+{
+    let key = hydration_key(path);
+    if let Some(local) = state.hydrated.lock().await.get(&key).cloned() {
+        return (STATUS_OK, local);
+    }
+    let gate = hydration_gate(state, &key).await;
+    let _guard = gate.lock().await;
+    if let Some(local) = state.hydrated.lock().await.get(&key).cloned() {
+        return (STATUS_OK, local);
     }
 
+    let result = operation().await;
+    if result.0 == STATUS_OK {
+        state.hydrated.lock().await.insert(key, result.1.clone());
+    }
+    result
+}
+
+async fn hydrate_uncached(path: &str, state: &VfsState) -> (u8, String) {
     // Reuse the session's pooled connection (dialed once); a clone shares the
     // one socket and multiplexes with other in-flight hydrates.
     let client = match state.client().await {
@@ -538,21 +604,13 @@ async fn hydrate(path: &str, state: &VfsState) -> (u8, String) {
 
     let local = scratch_mirror(&state.scratch_root, path);
     let local_for_write = local.clone();
-    let materialize = state.materializations.spawn_blocking(move || {
-        if let Some(parent) = local_for_write.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&local_for_write, &bytes)
-    });
+    let materialize = state
+        .materializations
+        .spawn_blocking(move || atomic_publish(&local_for_write, |file| file.write_all(&bytes)));
     if materialize.await.map_or(true, |result| result.is_err()) {
         return (STATUS_ERROR, String::new());
     }
     let local_str = local.to_string_lossy().into_owned();
-    state
-        .hydrated
-        .lock()
-        .await
-        .insert(path.to_string(), local_str.clone());
     (STATUS_OK, local_str)
 }
 
@@ -625,6 +683,199 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn test_state() -> VfsState {
+        VfsState {
+            scratch_root: temp("gate-scratch"),
+            hydrated: Mutex::new(HashMap::new()),
+            hydrating: Mutex::new(HashMap::new()),
+            cas: BlobStore::open(temp("gate-cas")).unwrap(),
+            agent_addr: "127.0.0.1:0".parse().unwrap(),
+            rtt: Duration::ZERO,
+            auth_token: String::new(),
+            session_root: String::new(),
+            session_id: String::new(),
+            client: OnceCell::new(),
+            materializations: MaterializationTracker::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_key_gate_stays_single_flight_across_failed_waiters() {
+        let state = Arc::new(test_state());
+        let start = Arc::new(tokio::sync::Barrier::new(33));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let entries = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let state = Arc::clone(&state);
+            let start = Arc::clone(&start);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let entries = Arc::clone(&entries);
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                let path = if i % 2 == 0 {
+                    "C:/SRC/Shared.H"
+                } else {
+                    "c:\\src\\shared.h"
+                };
+                let active_for_op = Arc::clone(&active);
+                let peak_for_op = Arc::clone(&peak);
+                let entries_for_op = Arc::clone(&entries);
+                let result = hydrate(path, &state, || async move {
+                    entries_for_op.fetch_add(1, Ordering::SeqCst);
+                    let now = active_for_op.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak_for_op.fetch_max(now, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    active_for_op.fetch_sub(1, Ordering::SeqCst);
+                    (STATUS_ERROR, String::new())
+                })
+                .await;
+                assert_eq!(result.0, STATUS_ERROR);
+            }));
+        }
+        start.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(entries.load(Ordering::SeqCst), 32);
+        assert_eq!(state.hydrating.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn hydration_key_normalizes_case_and_separators() {
+        assert_eq!(
+            hydration_key("C:/SRC/Shared.H"),
+            hydration_key("c:\\src\\shared.h")
+        );
+    }
+
+    #[test]
+    fn atomic_publish_operation_failure_removes_temp_without_final() {
+        use std::io::Write;
+
+        let root = temp("atomic-operation-failure");
+        let final_path = root.join("nested").join("shared.h");
+        let result = atomic_publish(&final_path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected write failure"))
+        });
+
+        assert!(result.is_err());
+        assert!(
+            !final_path.exists(),
+            "partial final file must not be visible"
+        );
+        assert_no_hydrate_temps(final_path.parent().unwrap());
+    }
+
+    #[test]
+    fn atomic_publish_rename_failure_removes_temp_without_replacing_final() {
+        let root = temp("atomic-rename-failure");
+        let final_path = root.join("shared.h");
+        std::fs::create_dir(&final_path).unwrap();
+
+        let result = atomic_publish(&final_path, |file| {
+            use std::io::Write;
+            file.write_all(b"complete")
+        });
+
+        assert!(result.is_err());
+        assert!(
+            final_path.is_dir(),
+            "failed rename must not replace final path"
+        );
+        assert_no_hydrate_temps(&root);
+    }
+
+    fn assert_no_hydrate_temps(root: &Path) {
+        let leftovers = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().contains(".sbz-tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files remained: {leftovers:?}"
+        );
+    }
+
+    async fn test_pipe_hydrate(full_pipe: &str, logical: &str) -> (u8, String) {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let mut client = ClientOptions::new().open(full_pipe).unwrap();
+        let payload = logical.as_bytes();
+        client
+            .write_all(&(payload.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        client.write_all(payload).await.unwrap();
+        client.flush().await.unwrap();
+        let mut len = [0u8; 4];
+        client.read_exact(&mut len).await.unwrap();
+        let mut response = vec![0u8; u32::from_le_bytes(len) as usize];
+        client.read_exact(&mut response).await.unwrap();
+        (
+            response[0],
+            String::from_utf8(response[1..].to_vec()).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn action_vfs_warms_received_hint_before_foreground_open() {
+        let source = temp("owned-warm-source");
+        let logical_path = source.join("received-hint.h");
+        let body = vec![0x3c; 700_000];
+        std::fs::write(&logical_path, &body).unwrap();
+        let logical = logical_path.to_string_lossy().into_owned();
+
+        let stats = Arc::new(ServerStats::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served_stats = Arc::clone(&stats);
+        tokio::spawn(async move {
+            let _ =
+                sembazuru_agent::fileserver::serve_files_with_stats(listener, served_stats).await;
+        });
+
+        let pipe_name = format!(
+            "sbz-owned-warm-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let full_pipe = format!(r"\\.\pipe\{pipe_name}");
+        let server = start_action_vfs(
+            pipe_name,
+            addr,
+            temp("owned-warm-scratch"),
+            temp("owned-warm-cas"),
+            Duration::ZERO,
+            vec![logical.clone()],
+            String::new(),
+            String::new(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.content_bytes() != body.len() as u64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let after_warm = stats.content_bytes();
+
+        let (status, local) = test_pipe_hydrate(&full_pipe, &logical).await;
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(std::fs::read(local).unwrap(), body);
+        assert_eq!(stats.content_bytes(), after_warm);
+        server.shutdown().await;
     }
 
     /// M6.1 (Plan risk 1): the readiness signal fires only after the first pipe
@@ -700,6 +951,7 @@ mod tests {
         let state = Arc::new(VfsState {
             scratch_root: temp("scratch"),
             hydrated: Mutex::new(HashMap::new()),
+            hydrating: Mutex::new(HashMap::new()),
             cas: BlobStore::open(temp("cas")).unwrap(),
             agent_addr: addr,
             rtt: Duration::ZERO,
@@ -721,7 +973,7 @@ mod tests {
         // The compiler's opens now hit the warm session cache: each hydrate
         // returns OK and transfers NO further content.
         for path in &paths {
-            let (status, local) = hydrate(path, &state).await;
+            let (status, local) = hydrate(path, &state, || hydrate_uncached(path, &state)).await;
             assert_eq!(status, STATUS_OK, "warmed path hydrates as a hit");
             assert!(!local.is_empty());
         }
