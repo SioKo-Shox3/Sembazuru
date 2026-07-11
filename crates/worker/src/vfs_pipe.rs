@@ -272,6 +272,21 @@ fn hydrate_temp_path(final_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+struct AtomicPublishTemp {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    committed: bool,
+}
+
+impl Drop for AtomicPublishTemp {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn atomic_publish<F>(final_path: &Path, operation: F) -> io::Result<()>
 where
     F: FnOnce(&mut std::fs::File) -> io::Result<()>,
@@ -280,20 +295,25 @@ where
         std::fs::create_dir_all(parent)?;
     }
     let temp_path = hydrate_temp_path(final_path);
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)?;
-        operation(&mut file)?;
-        file.flush()?;
-        drop(file);
-        std::fs::rename(&temp_path, final_path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
+    let mut temp = AtomicPublishTemp {
+        path: temp_path,
+        file: Some(file),
+        committed: false,
+    };
+
+    operation(temp.file.as_mut().expect("open atomic publish file"))?;
+    temp.file
+        .as_mut()
+        .expect("open atomic publish file")
+        .flush()?;
+    drop(temp.file.take());
+    std::fs::rename(&temp.path, final_path)?;
+    temp.committed = true;
+    Ok(())
 }
 
 /// Serves the VFS pipe until an unrecoverable error. `pipe_name` is the bare
@@ -766,6 +786,28 @@ mod tests {
         });
 
         assert!(result.is_err());
+        assert!(
+            !final_path.exists(),
+            "partial final file must not be visible"
+        );
+        assert_no_hydrate_temps(final_path.parent().unwrap());
+    }
+
+    #[test]
+    fn atomic_publish_operation_panic_removes_temp_without_final() {
+        use std::io::Write;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let root = temp("atomic-operation-panic");
+        let final_path = root.join("nested").join("shared.h");
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            atomic_publish(&final_path, |file| {
+                file.write_all(b"partial")?;
+                panic!("injected operation panic");
+            })
+        }));
+
+        assert!(panic.is_err());
         assert!(
             !final_path.exists(),
             "partial final file must not be visible"
