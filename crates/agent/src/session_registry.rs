@@ -147,6 +147,20 @@ impl PinPersistOwner {
         }
     }
 
+    /// Linearizes a synchronous publication commit against [`Self::close`]. The
+    /// closure must not await; the owner-state lock stays held for its duration.
+    fn commit_if_accepting<T>(&self, commit: impl FnOnce() -> T) -> Result<T, ()> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.accepting {
+            return Err(());
+        }
+        Ok(commit())
+    }
+
     fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.inner.store_root);
     }
@@ -222,12 +236,13 @@ impl Drop for PinPersistGuard {
 
 /// The single-flight result for one pinned path. The publish guard crosses the
 /// blocking CAS write and remains armed until the result is both ACL-authorized
-/// and installed in the [`OnceCell`]. It is then taken exactly once by whichever
-/// caller first observes the published value.
+/// and installed in the [`OnceCell`], then keeps the backing store alive for the
+/// published cell's lifetime. A rejected or cancelled initializer drops its
+/// unpublished value and releases the guard without freezing a result.
 struct PinnedValue {
     digest: Digest,
     size: u64,
-    publish_guard: StdMutex<Option<PinPersistGuard>>,
+    _publish_guard: PinPersistGuard,
 }
 
 impl PinnedValue {
@@ -235,17 +250,8 @@ impl PinnedValue {
         Self {
             digest,
             size,
-            publish_guard: StdMutex::new(Some(publish_guard)),
+            _publish_guard: publish_guard,
         }
-    }
-
-    fn release_publish_guard(&self) {
-        let guard = self
-            .publish_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        drop(guard);
     }
 }
 
@@ -328,7 +334,7 @@ pub struct SessionCapability {
     /// Digests this session has legitimately pinned. For a bound session, `Read`
     /// and `Has` are gated to this set, so a digest learned out-of-band (e.g. from
     /// another session) cannot be fetched/probed here.
-    allowed_digests: Mutex<HashSet<Digest>>,
+    allowed_digests: StdMutex<HashSet<Digest>>,
     /// Output id → in-progress streamed WriteBack, per session.
     writebacks: Mutex<HashMap<u32, WritebackState>>,
     /// Output id → fully streamed and digest-verified output waiting for the
@@ -364,7 +370,7 @@ impl SessionCapability {
             root_dir,
             outputs,
             pinned: Mutex::new(HashMap::new()),
-            allowed_digests: Mutex::new(HashSet::new()),
+            allowed_digests: StdMutex::new(HashSet::new()),
             writebacks: Mutex::new(HashMap::new()),
             staged: Mutex::new(HashMap::new()),
             created: Instant::now(),
@@ -454,14 +460,16 @@ impl SessionCapability {
                 let value = PinnedValue::new(digest.clone(), size, publish_guard);
                 #[cfg(test)]
                 self.pin_persist_owner.wait_before_publish().await;
-                self.allowed_digests.lock().await.insert(digest.clone());
+                self.pin_persist_owner.commit_if_accepting(|| {
+                    self.allowed_digests
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(digest);
+                })?;
                 Ok(value)
             })
             .await;
-        res.ok().map(|value| {
-            value.release_publish_guard();
-            (value.digest.clone(), value.size)
-        })
+        res.ok().map(|value| (value.digest.clone(), value.size))
     }
 
     /// Whether `digest` may be served/probed on this session. A legacy session
@@ -469,7 +477,12 @@ impl SessionCapability {
     /// session allows only digests it has itself pinned (closing the cross-session
     /// digest oracle — SEC-004 / PROTO-001).
     pub async fn digest_visible(&self, digest: &Digest) -> bool {
-        !self.enforce || self.allowed_digests.lock().await.contains(digest)
+        !self.enforce
+            || self
+                .allowed_digests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(digest)
     }
 
     /// Returns the agent-authoritative output spec for `output_id`, if this
@@ -1748,7 +1761,11 @@ mod tests {
                 Some(bytes.as_slice())
             );
             assert!(cap.digest_visible(&digest).await);
-            assert_eq!(cap.pin_persist_owner.active(), 0);
+            assert_eq!(
+                cap.pin_persist_owner.active(),
+                1,
+                "a published value retains its store ownership for the capability lifetime"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -1892,8 +1909,8 @@ mod tests {
             sentinel_b.unlock().unwrap();
             assert!(pin_a.await.unwrap().is_some());
             assert!(pin_b.await.unwrap().is_some());
-            assert_eq!(cap_a.pin_persist_owner.active(), 0);
-            assert_eq!(cap_b.pin_persist_owner.active(), 0);
+            assert_eq!(cap_a.pin_persist_owner.active(), 1);
+            assert_eq!(cap_b.pin_persist_owner.active(), 1);
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -1968,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_drop_keeps_store_until_pin_persist_result_is_published() {
+    fn registry_drop_rejects_pin_persist_result_before_publication() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .max_blocking_threads(1)
@@ -1998,6 +2015,7 @@ mod tests {
 
             let pin_cap = Arc::clone(&cap);
             let pin_store = store.clone();
+            let retry_actual = actual.clone();
             let pin =
                 tokio::spawn(async move { pin_cap.pin(&pin_store, "publish.h", actual).await });
             tokio::time::timeout(Duration::from_secs(5), async {
@@ -2021,17 +2039,14 @@ mod tests {
             );
             release_tx.send(()).unwrap();
 
-            let result = pin
-                .await
-                .unwrap()
-                .expect("a non-cancelled pin must publish its result after registry close");
-            assert_eq!(result, (expected.clone(), bytes.len() as u64));
-            assert!(cap.digest_visible(&expected).await);
             assert_eq!(
-                cap.pin(&store, "publish.h", PathBuf::from("missing-after-publish"))
-                    .await,
-                Some(result),
-                "the successful result must be frozen in the OnceCell"
+                pin.await.unwrap(),
+                None,
+                "a pin whose registry closed before publication must fail"
+            );
+            assert!(
+                !cap.digest_visible(&expected).await,
+                "a rejected publication must not grant digest visibility"
             );
             tokio::time::timeout(Duration::from_secs(5), async {
                 while store_root.exists() {
@@ -2039,10 +2054,60 @@ mod tests {
                 }
             })
             .await
-            .expect("store cleanup must run after result publication releases its guard");
+            .expect("store cleanup must run after rejected publication drops its guard");
+            assert_eq!(
+                cap.pin(&store, "publish.h", retry_actual).await,
+                None,
+                "the closed owner must reject a retry instead of freezing a successful value"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                !store_root.exists(),
+                "a retry through the closed capability must not recreate the CAS root"
+            );
             drop(store);
             let _ = std::fs::remove_dir_all(&dir);
         });
+    }
+
+    #[tokio::test]
+    async fn successful_pin_keeps_store_until_capability_drop() {
+        let reg = SessionRegistry::new().unwrap();
+        let store_root = reg.pin_persist_owner.store_root().to_path_buf();
+        let store = reg.store().clone();
+        let dir = tmp("pin-success-lifetime");
+        let actual = dir.join("success.h");
+        let bytes = b"published while registry is accepting";
+        std::fs::write(&actual, bytes).unwrap();
+        let expected = Digest::of(bytes);
+        let cap = reg
+            .create("success-lifetime".into(), None, Vec::new())
+            .await;
+
+        assert_eq!(
+            cap.pin(&store, "success.h", actual).await,
+            Some((expected.clone(), bytes.len() as u64))
+        );
+        drop(reg);
+        assert!(
+            store_root.exists(),
+            "a published cell must retain the store while its capability is alive"
+        );
+        assert!(
+            store.has(&expected),
+            "a successful pin must remain readable for the capability lifetime"
+        );
+
+        drop(cap);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store_root.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the last capability must release the publish guard");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
