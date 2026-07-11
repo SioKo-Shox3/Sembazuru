@@ -671,6 +671,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::Instant;
 
     use sembazuru_agent::fileserver::ServerStats;
     use sembazuru_cas::Digest;
@@ -1378,5 +1379,141 @@ mod tests {
             bounded[MAX_PREDICTED_PATHS - 1].as_str(),
             format!("c:\\src\\h{}.h", MAX_PREDICTED_PATHS - 1)
         );
+    }
+
+    const BENCH_PATH_COUNT: usize = 512;
+    const BENCH_PATH_BYTES: u64 = 64 * 1024;
+    const BENCH_SAMPLES: usize = 40;
+    const BENCH_RTT: Duration = Duration::from_millis(2);
+
+    async fn benchmark_hydrate(
+        path: String,
+        state: Arc<VfsState>,
+        stats: Arc<ServerStats>,
+        task_counters: Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+    ) {
+        let returned_path = path.clone();
+        let result = hydrate(&path, &state, || async move {
+            let _activity = task_counters.map(|(active, peak)| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                HydrateActivityGuard(active)
+            });
+            tokio::time::sleep(BENCH_RTT).await;
+            stats.read_ops.fetch_add(1, Ordering::Relaxed);
+            stats
+                .read_bytes
+                .fetch_add(BENCH_PATH_BYTES, Ordering::Relaxed);
+            (STATUS_OK, returned_path)
+        })
+        .await;
+        assert_eq!(result.0, STATUS_OK);
+    }
+
+    async fn prefetch_benchmark_sample(limit: usize) -> (Duration, Duration, usize, u64) {
+        let scratch_root = temp("benchmark-scratch");
+        let cas_root = temp("benchmark-cas");
+        let state = Arc::new(VfsState {
+            scratch_root: scratch_root.clone(),
+            hydrated: Mutex::new(HashMap::new()),
+            hydrating: Mutex::new(HashMap::new()),
+            cas: BlobStore::open(&cas_root).unwrap(),
+            agent_addr: "127.0.0.1:0".parse().unwrap(),
+            rtt: BENCH_RTT,
+            auth_token: String::new(),
+            session_root: String::new(),
+            session_id: String::new(),
+            client: OnceCell::new(),
+            materializations: MaterializationTracker::default(),
+        });
+        let stats = Arc::new(ServerStats::default());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let paths = (0..BENCH_PATH_COUNT)
+            .map(|index| format!(r"c:\bench\header-{index}.h"))
+            .collect::<Vec<_>>();
+        let foreground_path = paths.last().unwrap().clone();
+
+        let prefetch = {
+            let state = Arc::clone(&state);
+            let stats = Arc::clone(&stats);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            async move {
+                let started = Instant::now();
+                for_each_prefetch_bounded(paths, limit, move |path| {
+                    let state = Arc::clone(&state);
+                    let stats = Arc::clone(&stats);
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    async move {
+                        benchmark_hydrate(path, state, stats, Some((active, peak))).await;
+                    }
+                })
+                .await;
+                started.elapsed()
+            }
+        };
+        let foreground = {
+            let state = Arc::clone(&state);
+            let stats = Arc::clone(&stats);
+            let active = Arc::clone(&active);
+            async move {
+                while active.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                let started = Instant::now();
+                benchmark_hydrate(foreground_path, state, stats, None).await;
+                started.elapsed()
+            }
+        };
+
+        let (prefetch_elapsed, foreground_elapsed) = tokio::join!(prefetch, foreground);
+        let peak_tasks = peak.load(Ordering::SeqCst);
+        let transfer_bytes = stats.content_bytes();
+        assert_eq!(transfer_bytes, BENCH_PATH_COUNT as u64 * BENCH_PATH_BYTES);
+        assert!(peak_tasks <= limit);
+
+        drop(state);
+        std::fs::remove_dir_all(scratch_root).unwrap();
+        std::fs::remove_dir_all(cas_root).unwrap();
+        (
+            prefetch_elapsed,
+            foreground_elapsed,
+            peak_tasks,
+            transfer_bytes,
+        )
+    }
+
+    fn benchmark_percentile_ms(samples: &mut [Duration], percentile: usize) -> f64 {
+        samples.sort_unstable();
+        let rank = (samples.len() * percentile).div_ceil(100).max(1);
+        samples[rank - 1].as_secs_f64() * 1000.0
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual prefetch concurrency measurement"]
+    async fn prefetch_concurrency_benchmark() {
+        for concurrency in [8, 16, 32, 64] {
+            let mut prefetch_samples = Vec::with_capacity(BENCH_SAMPLES);
+            let mut foreground_samples = Vec::with_capacity(BENCH_SAMPLES);
+            let mut peak_tasks = 0;
+            let mut transfer_bytes = 0;
+            for _ in 0..BENCH_SAMPLES {
+                let (prefetch, foreground, peak, transferred) =
+                    prefetch_benchmark_sample(concurrency).await;
+                prefetch_samples.push(prefetch);
+                foreground_samples.push(foreground);
+                peak_tasks = peak_tasks.max(peak);
+                transfer_bytes = transferred;
+            }
+            let prefetch_p50_ms = benchmark_percentile_ms(&mut prefetch_samples, 50);
+            let prefetch_p95_ms = benchmark_percentile_ms(&mut prefetch_samples, 95);
+            let foreground_p50_ms = benchmark_percentile_ms(&mut foreground_samples, 50);
+            let foreground_p95_ms = benchmark_percentile_ms(&mut foreground_samples, 95);
+            println!(
+                "PREFETCH_BENCH {{\"concurrency\":{concurrency},\"prefetch_p50_ms\":{prefetch_p50_ms:.3},\"prefetch_p95_ms\":{prefetch_p95_ms:.3},\"foreground_p50_ms\":{foreground_p50_ms:.3},\"foreground_p95_ms\":{foreground_p95_ms:.3},\"peak_tasks\":{peak_tasks},\"transfer_bytes\":{transfer_bytes}}}"
+            );
+        }
     }
 }
