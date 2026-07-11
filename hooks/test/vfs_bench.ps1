@@ -34,12 +34,12 @@ try {
     $savedErrorPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        $cargoOutput = & cargo build -p sembazuru-worker --example vfs_host 2>&1 | Out-String
+        $cargoOutput = @(& cargo build -p sembazuru-worker --example vfs_host 2>&1 | ForEach-Object { "$_" })
         $cargoExitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $savedErrorPreference
     }
-    Write-Host $cargoOutput
+    Write-Host ($cargoOutput -join [Environment]::NewLine)
     if ($cargoExitCode -ne 0) { throw "vfs_host build failed with exit code $cargoExitCode" }
 } finally { Pop-Location }
 $hostExe = Join-Path $repo 'target\debug\examples\vfs_host.exe'
