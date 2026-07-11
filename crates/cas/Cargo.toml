@@ -12,6 +12,13 @@ publish.workspace = true
 # in docs/decisions/0003-cas-hash-and-chunking.md). CC0 OR Apache-2.0.
 blake3 = "1"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 # Measurement-only dependencies for the `hash_bench` example (M4.0), kept so the
 # ADR's numbers stay reproducible: it compares blake3 against `sha2` (SHA-NI)
 # and the tracer's std-only hand-rolled SHA-256. These do not enter the library.

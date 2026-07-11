@@ -17,7 +17,8 @@
 //! onto the final path, so a reader never sees a half-written blob and a crash
 //! mid-write leaves only a stray temp, never a corrupt blob at a valid digest.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -71,6 +72,7 @@ impl From<io::Error> for CasError {
 }
 
 /// A content-addressed blob store rooted at a directory.
+#[derive(Clone)]
 pub struct BlobStore {
     cas_root: PathBuf,
 }
@@ -129,19 +131,38 @@ impl BlobStore {
     /// Reads a blob's bytes, or `None` if absent. Does not re-verify (the hot
     /// path); use [`BlobStore::get_verified`] where tamper detection is wanted.
     ///
-    /// INVARIANT (relied on by [`BlobStore::evict_to`]): this reads via
-    /// `std::fs::read`, a short-lived open→read→close with no
-    /// `FILE_SHARE_DELETE`. That is what makes a concurrent eviction's
-    /// `remove_file` *fail* (and skip the blob) rather than delete bytes out
-    /// from under a reader. If this is ever changed to a streaming or
-    /// memory-mapped read, the no-torn-read guarantee changes with it — a
-    /// mapped blob deleted mid-read can fault the process — so revisit eviction
-    /// (e.g. copy-then-serve, or refcount) before doing so.
+    /// INVARIANT (relied on by [`BlobStore::evict_to`]): the read handle does not
+    /// grant `FILE_SHARE_DELETE` on Windows. A concurrent eviction's
+    /// `remove_file` therefore fails (and skips the blob) until this whole-blob
+    /// read closes its handle, rather than deleting bytes out from under it.
     pub fn get(&self, digest: &Digest) -> io::Result<Option<Vec<u8>>> {
-        match std::fs::read(self.blob_path(digest)) {
-            Ok(b) => Ok(Some(b)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        let Some(mut file) = self.open_blob_read(digest)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
+
+    /// Reads at most `len` bytes starting at `offset`, or `None` if absent.
+    /// Offsets at or beyond EOF return an empty byte vector.
+    pub fn get_range(
+        &self,
+        digest: &Digest,
+        offset: u64,
+        len: usize,
+    ) -> io::Result<Option<Vec<u8>>> {
+        let Some(mut file) = self.open_blob_read(digest)? else {
+            return Ok(None);
+        };
+        read_range_from(&mut file, offset, len).map(Some)
+    }
+
+    fn open_blob_read(&self, digest: &Digest) -> io::Result<Option<File>> {
+        match open_read_only(&self.blob_path(digest)) {
+            Ok(file) => Ok(Some(file)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
@@ -234,6 +255,42 @@ impl BlobStore {
     }
 }
 
+fn open_read_only(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+    }
+
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
+fn read_range_from<R: Read + Seek>(reader: &mut R, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let end = reader.seek(SeekFrom::End(0))?;
+    if offset >= end {
+        return Ok(Vec::new());
+    }
+
+    reader.seek(SeekFrom::Start(offset))?;
+    let requested = u64::try_from(len).unwrap_or(u64::MAX);
+    let limit = requested.min(end - offset);
+    let mut bytes = Vec::new();
+    reader.take(limit).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// The per-algorithm subdirectory name. Kept as a free function so the layout is
 /// defined in one place.
 fn algo_dir(digest: &Digest) -> &'static str {
@@ -311,6 +368,45 @@ pub(crate) fn write_atomic(final_path: &Path, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    struct CountingReader {
+        inner: std::io::Cursor<Vec<u8>>,
+        bytes_requested: usize,
+        max_request: usize,
+    }
+
+    impl CountingReader {
+        fn new(bytes: Vec<u8>) -> Self {
+            Self {
+                inner: std::io::Cursor::new(bytes),
+                bytes_requested: 0,
+                max_request: 0,
+            }
+        }
+
+        fn bytes_requested(&self) -> usize {
+            self.bytes_requested
+        }
+
+        fn max_request(&self) -> usize {
+            self.max_request
+        }
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.bytes_requested += buf.len();
+            self.max_request = self.max_request.max(buf.len());
+            self.inner.read(buf)
+        }
+    }
+
+    impl Seek for CountingReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
 
     fn tmp_root() -> PathBuf {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -324,7 +420,7 @@ mod tests {
         let root = tmp_root();
         let store = BlobStore::open(&root).unwrap();
         let d1 = store.put(b"some content").unwrap();
-        let d2 = store.put(b"some content").unwrap();
+        let d2 = store.clone().put(b"some content").unwrap();
         assert_eq!(d1, d2); // content-addressed: same bytes, same digest
         assert!(store.has(&d1));
         assert_eq!(
@@ -342,6 +438,67 @@ mod tests {
         assert!(!store.has(&absent));
         assert!(store.get(&absent).unwrap().is_none());
         assert!(store.get_verified(&absent).unwrap().is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn get_range_covers_zero_middle_eof_exact_eof_missing_and_beyond() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = store.put(b"0123456789").unwrap();
+
+        assert_eq!(store.get_range(&digest, 0, 0).unwrap(), Some(vec![]));
+        assert_eq!(
+            store.get_range(&digest, 3, 4).unwrap(),
+            Some(b"3456".to_vec())
+        );
+        assert_eq!(
+            store.get_range(&digest, 8, 8).unwrap(),
+            Some(b"89".to_vec())
+        );
+        assert_eq!(store.get_range(&digest, 10, 1).unwrap(), Some(vec![]));
+        assert_eq!(store.get_range(&digest, 11, 1).unwrap(), Some(vec![]));
+        assert_eq!(
+            store.get_range(&Digest::of(b"missing"), 0, 4).unwrap(),
+            None
+        );
+        assert_eq!(
+            store.get_range(&digest, 1, usize::MAX).unwrap(),
+            Some(b"123456789".to_vec())
+        );
+        assert_eq!(
+            store.get_range(&digest, u64::MAX, usize::MAX).unwrap(),
+            Some(vec![])
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn counting_reader_never_reads_beyond_requested_range() {
+        let mut reader = CountingReader::new(vec![0x11; 1024 * 1024]);
+        let bytes = read_range_from(&mut reader, 128, 4096).unwrap();
+        assert_eq!(bytes.len(), 4096);
+        assert_eq!(reader.bytes_requested(), 4096);
+        assert!(reader.max_request() <= 4096);
+
+        let mut short_reader = CountingReader::new(b"tiny".to_vec());
+        let bytes = read_range_from(&mut short_reader, 1, usize::MAX).unwrap();
+        assert_eq!(bytes, b"iny");
+        assert_eq!(short_reader.bytes_requested(), 3);
+        assert!(short_reader.max_request() <= 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn open_reader_blocks_eviction_until_drop() {
+        let root = tmp_root();
+        let store = BlobStore::open(&root).unwrap();
+        let digest = store.put(b"pinned").unwrap();
+        let path = store.blob_path(&digest);
+        let file = store.open_blob_read(&digest).unwrap().unwrap();
+        assert!(std::fs::remove_file(&path).is_err());
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir_all(&root).ok();
     }
 
