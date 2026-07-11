@@ -6,54 +6,56 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $prefix = 'PREFETCH_BENCH '
-$expectedProperties = @(
-    'concurrency',
-    'prefetch_p50_ms',
-    'prefetch_p95_ms',
-    'foreground_p50_ms',
-    'foreground_p95_ms',
-    'peak_tasks',
-    'transfer_bytes'
+$jsonNumberToken = '-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?'
+$canonicalRowPattern = (
+    '\A\{"concurrency":(?<concurrency>[1-9][0-9]*),' +
+    '"prefetch_p50_ms":(?<prefetch_p50_ms>' + $jsonNumberToken + '),' +
+    '"prefetch_p95_ms":(?<prefetch_p95_ms>' + $jsonNumberToken + '),' +
+    '"foreground_p50_ms":(?<foreground_p50_ms>' + $jsonNumberToken + '),' +
+    '"foreground_p95_ms":(?<foreground_p95_ms>' + $jsonNumberToken + '),' +
+    '"peak_tasks":(?<peak_tasks>[1-9][0-9]*),' +
+    '"transfer_bytes":(?<transfer_bytes>[1-9][0-9]*)\}\z'
 )
-$integerMetrics = @('concurrency', 'peak_tasks', 'transfer_bytes')
-$latencyMetrics = @('prefetch_p50_ms', 'prefetch_p95_ms', 'foreground_p50_ms', 'foreground_p95_ms')
 $expectedConcurrency = [decimal[]]@(8, 16, 32, 64)
 
-function Get-PositiveIntegerToken {
+function ConvertTo-U64Decimal {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Json,
+        [string]$Token,
         [Parameter(Mandatory = $true)]
         [string]$Name
     )
 
-    $escapedName = [regex]::Escape($Name)
-    # Benchmark rows are flat objects. The negative lookbehind prevents an
-    # escaped property-looking string value from being counted as a real key.
-    $pattern = '(?<!\\)"' + $escapedName + '"\s*:\s*(?<token>[^,}\s]+)'
-    $matches = [regex]::Matches(
-        $Json,
-        $pattern,
-        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
-    )
-    if ($matches.Count -ne 1) {
-        throw "integer property $Name must appear exactly once, got $($matches.Count)"
-    }
-
-    $token = $matches[0].Groups['token'].Value
-    if ($token -cnotmatch '^[1-9][0-9]*$') {
-        throw "metric $Name must use a positive decimal integer JSON token, got '$token'"
-    }
-
     $value = [decimal]0
     $parsed = [decimal]::TryParse(
-        $token,
+        $Token,
         [System.Globalization.NumberStyles]::None,
         [System.Globalization.CultureInfo]::InvariantCulture,
         [ref]$value
     )
     if (-not $parsed -or $value -gt [decimal][uint64]::MaxValue) {
-        throw "metric $Name is outside the u64 range: '$token'"
+        throw "metric $Name is outside the u64 range: '$Token'"
+    }
+    return $value
+}
+
+function ConvertTo-PositiveFiniteDouble {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Token,
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $value = [double]0
+    $parsed = [double]::TryParse(
+        $Token,
+        [System.Globalization.NumberStyles]::Float,
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [ref]$value
+    )
+    if (-not $parsed -or $value -le 0 -or [double]::IsNaN($value) -or [double]::IsInfinity($value)) {
+        throw "metric $Name must be a finite positive JSON number, got '$Token'"
     }
     return $value
 }
@@ -74,38 +76,24 @@ function ConvertFrom-PrefetchBenchRows {
             throw "invalid PREFETCH_BENCH prefix: $raw"
         }
         $json = $raw.Substring($prefix.Length)
-        try {
-            $row = $json | ConvertFrom-Json
-        } catch {
-            throw "invalid PREFETCH_BENCH JSON: $json ($($_.Exception.Message))"
+        $match = [regex]::Match(
+            $json,
+            $canonicalRowPattern,
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+        )
+        if (-not $match.Success) {
+            throw "PREFETCH_BENCH row does not match the canonical 7-property schema: $json"
         }
 
-        $properties = @($row.PSObject.Properties.Name | Sort-Object)
-        $propertyDiff = @(Compare-Object ($expectedProperties | Sort-Object) $properties)
-        if ($propertyDiff.Count -ne 0) {
-            throw "unexpected PREFETCH_BENCH properties: $($properties -join ',')"
+        $row = [pscustomobject][ordered]@{
+            concurrency = ConvertTo-U64Decimal -Token $match.Groups['concurrency'].Value -Name 'concurrency'
+            prefetch_p50_ms = ConvertTo-PositiveFiniteDouble -Token $match.Groups['prefetch_p50_ms'].Value -Name 'prefetch_p50_ms'
+            prefetch_p95_ms = ConvertTo-PositiveFiniteDouble -Token $match.Groups['prefetch_p95_ms'].Value -Name 'prefetch_p95_ms'
+            foreground_p50_ms = ConvertTo-PositiveFiniteDouble -Token $match.Groups['foreground_p50_ms'].Value -Name 'foreground_p50_ms'
+            foreground_p95_ms = ConvertTo-PositiveFiniteDouble -Token $match.Groups['foreground_p95_ms'].Value -Name 'foreground_p95_ms'
+            peak_tasks = ConvertTo-U64Decimal -Token $match.Groups['peak_tasks'].Value -Name 'peak_tasks'
+            transfer_bytes = ConvertTo-U64Decimal -Token $match.Groups['transfer_bytes'].Value -Name 'transfer_bytes'
         }
-
-        foreach ($name in $integerMetrics) {
-            $row.$name = Get-PositiveIntegerToken -Json $json -Name $name
-        }
-
-        foreach ($name in $latencyMetrics) {
-            $value = $row.$name
-            if ($value -isnot [ValueType] -or $value -is [bool]) {
-                $typeName = if ($null -eq $value) { 'null' } else { $value.GetType().FullName }
-                throw "metric $name must be a numeric JSON value, got '$value' ($typeName)"
-            }
-            try {
-                $number = [Convert]::ToDouble($value, [System.Globalization.CultureInfo]::InvariantCulture)
-            } catch {
-                throw "metric $name must be convertible to a finite number, got '$value'"
-            }
-            if ($number -le 0 -or [double]::IsNaN($number) -or [double]::IsInfinity($number)) {
-                throw "metric $name must be a finite positive number, got '$value'"
-            }
-        }
-
         if ($row.peak_tasks -gt $row.concurrency) {
             throw "peak_tasks $($row.peak_tasks) exceeds concurrency $($row.concurrency)"
         }
@@ -167,6 +155,35 @@ function Invoke-PrefetchBenchSelfTest {
     )
     Assert-PrefetchRowsAccepted -Name 'valid rows' -Rows $validRows
 
+    $reviewCases = @()
+    $case = @($validRows)
+    $case[0] = $case[0].Replace('"concurrency":8,', '"concurrency":8,"\u0063oncurrency":9,')
+    $reviewCases += [pscustomobject]@{ Name = 'unicode escaped semantic duplicate'; Rows = [string[]]$case }
+
+    $case = @($validRows)
+    $case[0] = $case[0].Replace(
+        '"prefetch_p50_ms":1.0,',
+        '"prefetch_p50_ms":1.0,"prefetch_p50_ms":2.0,'
+    )
+    $reviewCases += [pscustomobject]@{ Name = 'literal latency duplicate'; Rows = [string[]]$case }
+
+    $case = @($validRows)
+    $case[0] = $case[0].Replace('"prefetch_p50_ms":1.0', '"PREFETCH_P50_MS":1.0')
+    $reviewCases += [pscustomobject]@{ Name = 'case-only latency key'; Rows = [string[]]$case }
+
+    $acceptedReviewCases = @()
+    foreach ($reviewCase in $reviewCases) {
+        try {
+            $null = @(ConvertFrom-PrefetchBenchRows -RawRows $reviewCase.Rows)
+            $acceptedReviewCases += $reviewCase.Name
+        } catch {
+            # Expected: every review regression case must be rejected.
+        }
+    }
+    if ($acceptedReviewCases.Count -ne 0) {
+        throw "self-test accepted invalid review rows: $($acceptedReviewCases -join ', ')"
+    }
+
     $case = @($validRows)
     $case[0] = $case[0].Replace('"concurrency":8', '"concurrency":8.0')
     Assert-PrefetchRowsRejected -Name 'integer encoded as 8.0' -Rows $case
@@ -191,15 +208,36 @@ function Invoke-PrefetchBenchSelfTest {
     $case[0] = $case[0].Replace('"concurrency":8,', '"concurrency":8,"concurrency":8,')
     Assert-PrefetchRowsRejected -Name 'duplicate integer property' -Rows $case
 
-    $propertyLookalike = '{"note":"\"concurrency\":999","concurrency":8}'
-    $lookalikeValue = Get-PositiveIntegerToken -Json $propertyLookalike -Name 'concurrency'
-    if ($lookalikeValue -ne [decimal]8) {
-        throw "self-test 'escaped property lookalike' expected 8, got $lookalikeValue"
-    }
+    $case = @($validRows)
+    $case[0] = $case[0].Replace('"prefetch_p50_ms":1.0', '"prefetch_p50_ms":"\"concurrency\":999"')
+    Assert-PrefetchRowsRejected -Name 'escaped property lookalike value' -Rows $case
+
+    $case = @($validRows)
+    $case[0] = $case[0].Replace('"prefetch_p50_ms":1.0', '"prefetch_p50_ms":{"value":1.0}')
+    Assert-PrefetchRowsRejected -Name 'nested latency value' -Rows $case
+
+    $case = @($validRows)
+    $case[0] = $case[0].Replace(
+        '{"concurrency":8,"prefetch_p50_ms":1.0,',
+        '{"prefetch_p50_ms":1.0,"concurrency":8,'
+    )
+    Assert-PrefetchRowsRejected -Name 'reordered properties' -Rows $case
+
+    $case = @($validRows)
+    $case[0] = $case[0].Replace('"prefetch_p50_ms":1.0', '"prefetch_p50_ms":1e2')
+    Assert-PrefetchRowsAccepted -Name 'latency exponent JSON number' -Rows $case
 
     $case = @($validRows)
     $case[0] = $case[0].Replace('"prefetch_p50_ms":1.0', '"prefetch_p50_ms":1e309')
     Assert-PrefetchRowsRejected -Name 'infinite-equivalent latency' -Rows $case
+
+    $case = @($validRows)
+    $case[0] = $case[0].Replace('"prefetch_p50_ms":1.0', '"prefetch_p50_ms":Infinity')
+    Assert-PrefetchRowsRejected -Name 'Infinity latency literal' -Rows $case
+
+    $case = @($validRows)
+    $case[0] = $case[0].Replace('"prefetch_p50_ms":1.0', '"prefetch_p50_ms":NaN')
+    Assert-PrefetchRowsRejected -Name 'NaN latency literal' -Rows $case
 
     $case = @($validRows)
     $case[0] = $case[0].Replace('"foreground_p50_ms":1.2', '"foreground_p50_ms":0')
