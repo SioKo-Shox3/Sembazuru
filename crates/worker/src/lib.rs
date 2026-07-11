@@ -654,7 +654,7 @@ async fn run_action(
     // by design, so it must be aborted once the action is done or it leaks one
     // task (and one listening pipe instance) per action.
     if let Some(t) = pipe_task {
-        t.abort();
+        stop_vfs_pipe_task(t).await;
     }
     // Drop the Job Object handle (removing the last Arc): closing it kills any
     // process still in the job — so a normal completion reaps stragglers and a
@@ -688,11 +688,16 @@ async fn run_action(
     }
 }
 
+async fn stop_vfs_pipe_task(task: tokio::task::JoinHandle<std::io::Result<()>>) {
+    task.abort();
+    let _ = task.await;
+}
+
 /// Builds the child process for an action. Plain mode spawns the command
 /// directly (M5 scale path) and returns `(child, None)`. VFS mode (M6.1) starts
 /// a per-action pipe server, waits for it to be dialable, then spawns the
 /// compiler through `launcher.exe` (DLL injection) with an explicit environment;
-/// it returns the pipe-server task so the caller can abort it after the run. On
+/// it returns the pipe-server task so the caller can stop it after the run. On
 /// any setup failure it returns a human-readable detail for a FAILED event.
 async fn build_child(
     cmd: &Command,
@@ -843,7 +848,7 @@ async fn build_child(
         .await
     });
     if ready_rx.await.is_err() {
-        pipe_task.abort();
+        stop_vfs_pipe_task(pipe_task).await;
         return Err("VFS pipe server failed to start".to_string());
     }
 
@@ -900,7 +905,7 @@ async fn build_child(
     let child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            pipe_task.abort();
+            stop_vfs_pipe_task(pipe_task).await;
             let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
             return Err(setup_err("launcher spawn failed", e));
         }
@@ -919,7 +924,7 @@ async fn build_child(
     }) {
         Ok(j) => j,
         Err(e) => {
-            pipe_task.abort();
+            stop_vfs_pipe_task(pipe_task).await;
             let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
             // `child` drops here; kill_on_drop terminates at least the launcher.
             return Err(setup_err("job object setup failed", e));
@@ -1168,5 +1173,41 @@ mod tests {
             vfs_child_cwd("", r"C:\src\proj", std::path::Path::new(r"C:\scratch")),
             VfsChildCwd::None
         );
+    }
+
+    #[tokio::test]
+    async fn stopping_vfs_pipe_waits_until_the_task_is_dropped() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ActiveGuard(Arc<AtomicUsize>);
+
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let active_for_task = Arc::clone(&active);
+        let writes_for_task = Arc::clone(&writes);
+        let task = tokio::spawn(async move {
+            active_for_task.fetch_add(1, Ordering::SeqCst);
+            let _active_guard = ActiveGuard(active_for_task);
+            let _ = started_tx.send(());
+            let _ = release_rx.await;
+            writes_for_task.fetch_add(1, Ordering::SeqCst);
+            std::io::Result::Ok(())
+        });
+        started_rx.await.expect("pipe task should start");
+
+        stop_vfs_pipe_task(task).await;
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        let _ = release_tx.send(());
+        tokio::task::yield_now().await;
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
     }
 }
