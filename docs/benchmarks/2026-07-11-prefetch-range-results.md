@@ -4,9 +4,10 @@
 
 - 測定日: 2026-07-12 (Asia/Tokyo)
 - Prefetch 再測定対象 commit: `63afb94290066dd000e8b80456a3550570b949b6`
+- Native gate 再測定対象 commit: `00cb47f75b114b82c5ba760a5b5fe425e5b89782`
 - CI: **not run**。この記録はローカル Windows host の実測であり、CI の結果ではない。
 
-今回のreview-fixではStep 2だけを上記commitで再測定した。Step 1とStep 3は既存の測定記録を保持し、Step 4とStep 5は次フェーズでnative artifactを用意して再実行するため、現在のblockerをそのまま記録する。
+今回のreview-fixではStep 2をPrefetch再測定対象commit、Step 4とStep 5をNative gate再測定対象commitで実行した。Step 1とStep 3は既存の測定記録を保持しており、今回の再実行結果ではない。
 
 ## Host / CPU / storage
 
@@ -53,10 +54,31 @@ release: 1.96.0
 LLVM version: 22.1.2
 ```
 
-- `Get-Command cl`: **NOT FOUND ON PATH**
-- `Get-Command clang-cl`: **NOT FOUND ON PATH**
+Native gateでは`C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat -arch=x64 -host_arch=x64`を読み込み、LLVM binをPATHの先頭へ追加した。
 
-したがって、この shell は VS developer shell ではなく、clang-cl 必須 gate を実行できる toolchain 条件を満たしていない。
+- `cl.exe`: `C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\HostX64\x64\cl.exe`、MSVC `19.44.35215` for x64
+- `clang-cl.exe`: `C:\Program Files\LLVM\bin\clang-cl.exe`、clang `22.1.7`、target `x86_64-pc-windows-msvc`
+- `ninja.exe`: `C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe`、version `1.12.1`
+
+### Native Release artifact prerequisites
+
+最初に次のVisual Studio generatorを試したが、CompilerId中に604秒でtimeoutした。残ったowned process treeはcmake → MSBuild `CompilerIdCXX.vcxproj` → HostX86/x64 `cl.exe`であり、PIDとcommand lineを確認してから停止した。
+
+```powershell
+cmake -S hooks -B hooks/build -G 'Visual Studio 17 2022' -A x64
+```
+
+分離した`msbuild CompilerIdCXX.vcxproj /p:Configuration=Debug /p:Platform=x64 /v:minimal /nologo`も64秒でtimeoutした一方、同じresponse fileをHostX86 `cl.exe`へ直接渡したcompileは2.4秒、exit `0`だった。このためcompilerやargumentの失敗ではなく、このhostのMSBuild経路停止と切り分けた。これらのtimeoutはPASSとして扱わない。
+
+成功したartifact生成はNinjaへ方式変更した次のcommandである。
+
+```powershell
+cmake -S hooks -B hooks/build/Release -G Ninja "-DCMAKE_MAKE_PROGRAM=C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl.exe
+cmake --build hooks/build/Release --config Release
+cargo build --locked -p sembazuru-tracer --release
+```
+
+configureは1.5秒、MSVC `19.44`を検出してexit `0`。Ninja buildは13/13 targetを生成してexit `0`、tracer buildも1.54秒でexit `0`だった。生成物は`launcher.exe` 36864 bytes、`sbz_interceptor64.dll` 77312 bytes、`sembazuru-trace.exe` 487424 bytes。
 
 ## 実行 command と結果
 
@@ -118,13 +140,27 @@ exact bytes と digest、および Windows の `read_transfer_bytes <= blob_size
 powershell -NoProfile -File hooks/test/vfs_bench.ps1 -Runs 5
 ```
 
-exit `1`、**未確認**。blocker:
+修正前の`09c5d2d5d5cd10fe57a60e12fbe2b88c1df48a89`では、VS2022 x64環境、LLVM PATH、Release artifactsを用意してもWindows PowerShell 5でexit `1`となり、gate数値へ到達しなかった。代表raw:
 
 ```text
-missing: C:\Users\<user>\Documents\Sembazuru-speed-monitor\hooks\test\..\build\Release\launcher.exe
+cargo.exe :     Compiling sembazuru-worker v0.0.3 (...)
+At ...\hooks\test\vfs_bench.ps1:34 char:5
++     & cargo build -p sembazuru-worker --example vfs_host 2>&1 | Out-S...
+CategoryInfo          : NotSpecified: (...) [cargo.exe], RemoteException
+FullyQualifiedErrorId : NativeCommandError
 ```
 
-このため RTT delta と catastrophic slowdown assertion は実行されておらず、PASS として扱わない。
+Cargoが非zeroで失敗したのではなく、Windows PowerShell 5が`$ErrorActionPreference = 'Stop'`下で正常なCargo進捗stderrをterminating errorとして扱ったのが原因である。Cargo build区間だけpreferenceを保存・緩和し、出力と直後のexit codeを捕捉し、`finally`で復元する修正後、Native gate再測定対象commitでexit `0`:
+
+```text
+local           :    53.4 ms
+vfs  (0 ms RTT) :    97.6 ms
+vfs  (1 ms RTT) :   104.9 ms
+RTT delta       :     7.3 ms
+VFS BENCH GATE PASS (round-trip latency does not break the compile; speed within bounds)
+```
+
+したがってRTT deltaとcatastrophic slowdown assertionはともにPASS。PowerShell 7回帰もexit `0`で、`local 70.6 ms`、`vfs 0 ms 92.2 ms`、`vfs 1 ms 103.4 ms`、RTT delta `11.2 ms`、`VFS BENCH GATE PASS`だった。
 
 ### Step 5: clang-cl byte determinism gate
 
@@ -133,10 +169,24 @@ powershell -NoProfile -File hooks/test/vfs_compile.ps1 -RequireClangCl
 powershell -NoProfile -File hooks/test/determinism.ps1 -RequireClangCl
 ```
 
-両 command とも exit `1`、**未確認**。どちらも最初の blocker は次の CMake artifact 不足だった。
+Native gate再測定対象commit上のWindows PowerShell 5で両commandともexit `0`。
 
 ```text
-missing build artifact: C:\Users\<user>\Documents\Sembazuru-speed-monitor\hooks\test\..\build\Release\launcher.exe
+=== cl under VFS (mechanism) ===
+GATE PASS  cl: object produced under VFS and source hydrated via the agent
+=== clang-cl under VFS (byte-identity) ===
+GATE PASS  clang-cl: remote .obj is byte-identical to local (7B0BB4B7B92D8760090F250BE4CCD6D4D9A1EAABC2452CC038FF262C31607A7D)
+VFS COMPILE GATE PASS (remote compile under the read VFS; clang-cl byte-identical to local)
 ```
 
-加えて `cl` と `clang-cl` はこの shell の PATH 上に無い。したがって byte-identical output gate は実行されておらず、determinism は PASS ではない。VS developer shell で Release の `launcher.exe` と `sbz_interceptor64.dll` を生成した後、上記3 command（Step 4の1本とStep 5の2本）を再実行する必要がある。
+PowerShell 7の`vfs_compile.ps1 -RequireClangCl`回帰もexit `0`で、同じobject hashと`VFS COMPILE GATE PASS`を確認した。
+
+determinismはMSVCの2 outputがbyte-for-byteで再現し、clang-clも異なるbuild directory間でbyte-identicalとなった。clang-clではbuild root差によるinput-set warningを明示したが、gate対象のoutput bytesは一致した。
+
+```text
+DETERMINISM OK: 2 output(s) reproduce (no unexplained differences)
+GATE PASS  msvc: corpus reproduces byte-for-byte (or normalized-equal)
+DETERMINISM OK: 2 output(s) reproduce (no unexplained differences) (input-set differed — see warning above)
+GATE PASS  clang-cl: byte-identical across different build directories
+DETERMINISM HARNESS PASS (M2: representative C++ TUs reproduce output bytes)
+```
