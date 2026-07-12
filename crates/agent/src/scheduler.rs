@@ -23,11 +23,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sembazuru_proto::{capability, v0::Command};
+use sembazuru_proto::{
+    capability,
+    v0::{ActionState, Command},
+};
 
+use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind, display_name};
 use crate::coordination::{WorkerEntry, WorkerTable};
 use crate::{
-    ExecOptions, ExecuteError, Execution, LocalFallbackReason, execute_on_channel_with, run_local,
+    ActionObserver, ExecOptions, ExecuteError, Execution, LocalFallbackReason,
+    execute_on_channel_with_observer, run_local,
 };
 
 /// Upper bound on a worker's self-reported `cpu_count` when used for load
@@ -122,6 +127,12 @@ pub struct Scheduler {
     channels: Arc<Mutex<HashMap<String, tonic::transport::Channel>>>,
     remote_budget: Duration,
     cluster_token: Option<String>,
+    tracker: ActionTracker,
+}
+
+pub(crate) struct ObservedExecution {
+    pub execution: Execution,
+    pub next_attempt_no: u32,
 }
 
 /// Increments a worker's in-flight count for the lifetime of a remote attempt,
@@ -153,11 +164,21 @@ impl Scheduler {
     }
 
     pub fn with_cluster_token(table: WorkerTable, cluster_token: Option<String>) -> Self {
-        Self::with_remote_budget_and_cluster_token(table, DEFAULT_REMOTE_BUDGET, cluster_token)
+        Self::with_remote_budget_and_cluster_token_and_tracker(
+            table,
+            DEFAULT_REMOTE_BUDGET,
+            cluster_token,
+            ActionTracker::default(),
+        )
     }
 
     pub fn with_remote_budget(table: WorkerTable, remote_budget: Duration) -> Self {
-        Self::with_remote_budget_and_cluster_token(table, remote_budget, None)
+        Self::with_remote_budget_and_cluster_token_and_tracker(
+            table,
+            remote_budget,
+            None,
+            ActionTracker::default(),
+        )
     }
 
     pub fn with_remote_budget_and_cluster_token(
@@ -165,12 +186,27 @@ impl Scheduler {
         remote_budget: Duration,
         cluster_token: Option<String>,
     ) -> Self {
+        Self::with_remote_budget_and_cluster_token_and_tracker(
+            table,
+            remote_budget,
+            cluster_token,
+            ActionTracker::default(),
+        )
+    }
+
+    pub fn with_remote_budget_and_cluster_token_and_tracker(
+        table: WorkerTable,
+        remote_budget: Duration,
+        cluster_token: Option<String>,
+        tracker: ActionTracker,
+    ) -> Self {
         Self {
             table,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             channels: Arc::new(Mutex::new(HashMap::new())),
             remote_budget,
             cluster_token,
+            tracker,
         }
     }
 
@@ -449,6 +485,21 @@ impl Scheduler {
         session_id: String,
         opts: ExecOptions,
     ) -> Execution {
+        let display = display_name(&command);
+        self.dispatch_observed(command, action_id, session_id, opts, display)
+            .await
+            .execution
+    }
+
+    pub(crate) async fn dispatch_observed(
+        &self,
+        command: Command,
+        action_id: String,
+        session_id: String,
+        opts: ExecOptions,
+        display: String,
+    ) -> ObservedExecution {
+        let mut attempt_no = 0_u32;
         // Route-away screen (M8.2, ADR 0007 §a①). A process that bypasses the
         // user-mode hooks — the msys2/Cygwin runtime issues direct NT syscalls
         // (BuildXL #680), or an operator put it on the denylist — cannot be
@@ -457,10 +508,31 @@ impl Scheduler {
         // intercepted, so the only safe move is to run it locally from the start
         // (non-negotiable #2). Correctness over the lost distribution.
         if let Some(why) = route_away_reason(&command) {
+            let mut attempt = self.tracker.begin_attempt_lease(
+                &action_id,
+                attempt_no,
+                "local",
+                ExecutionKind::Local,
+                &display,
+            );
+            if let Some(lease) = &attempt {
+                lease.transition(ActivityState::Running);
+            }
             let exit_code = run_local(&command).await.unwrap_or(-1);
-            return Execution::LocalFallback {
-                exit_code,
-                reason: LocalFallbackReason::RouteAway(why),
+            if let Some(lease) = &mut attempt {
+                lease.finish(if exit_code == 0 {
+                    ActivityState::Completed
+                } else {
+                    ActivityState::Failed
+                });
+            }
+            attempt_no = attempt_no.saturating_add(1);
+            return ObservedExecution {
+                execution: Execution::LocalFallback {
+                    exit_code,
+                    reason: LocalFallbackReason::RouteAway(why),
+                },
+                next_attempt_no: attempt_no,
             };
         }
 
@@ -473,9 +545,20 @@ impl Scheduler {
         // duration of the attempt and frees it on the next iteration / on return.
         while let Some((w, guard)) = self.pick_and_reserve(key, &tried) {
             tried.insert(w.worker_id.clone());
+            let mut tracked = self.tracker.begin_attempt_lease(
+                &action_id,
+                attempt_no,
+                &w.worker_id,
+                ExecutionKind::Remote,
+                &display,
+            );
             let channel = match self.channel_for(&w.execution_endpoint) {
                 Ok(c) => c,
                 Err(e) => {
+                    if let Some(lease) = &mut tracked {
+                        lease.finish(ActivityState::Interrupted);
+                    }
+                    attempt_no = attempt_no.saturating_add(1);
                     reason = LocalFallbackReason::RemoteExhausted(format!(
                         "worker {} unreachable: {e}",
                         w.worker_id
@@ -488,45 +571,95 @@ impl Scheduler {
                 self.mint_action_capability(&w, &command, &action_id, &session_id, &opts);
             let attempt = tokio::time::timeout(
                 self.remote_budget,
-                execute_on_channel_with(
+                execute_on_channel_with_observer(
                     channel,
                     command.clone(),
                     action_id.clone(),
                     session_id.clone(),
                     opts.clone(),
                     action_capability,
+                    tracked.as_ref().map(|lease| {
+                        ActionObserver::new(self.tracker.clone(), lease.key().clone())
+                    }),
                 ),
             )
             .await;
             match attempt {
                 Ok(Ok(outcome)) if outcome.exit_code.is_some() => {
-                    return Execution::Remote(outcome);
+                    if let Some(lease) = &mut tracked {
+                        lease.finish(if outcome.exit_code == Some(0) {
+                            ActivityState::Completed
+                        } else {
+                            ActivityState::Failed
+                        });
+                    }
+                    attempt_no = attempt_no.saturating_add(1);
+                    return ObservedExecution {
+                        execution: Execution::Remote(outcome),
+                        next_attempt_no: attempt_no,
+                    };
                 }
-                Ok(Ok(_)) => {
+                Ok(Ok(outcome)) => {
+                    if let Some(lease) = &mut tracked {
+                        let terminal = if outcome.states.contains(&(ActionState::Failed as i32)) {
+                            ActivityState::Failed
+                        } else {
+                            ActivityState::Interrupted
+                        };
+                        lease.finish(terminal);
+                    }
                     reason = LocalFallbackReason::RemoteExhausted(format!(
                         "worker {} did not complete the action",
                         w.worker_id
                     ));
                 }
                 Ok(Err(e)) => {
+                    if let Some(lease) = &mut tracked {
+                        lease.finish(ActivityState::Interrupted);
+                    }
                     reason = LocalFallbackReason::RemoteExhausted(format!(
                         "worker {} failed: {e}",
                         w.worker_id
                     ));
                 }
                 Err(_) => {
+                    if let Some(lease) = &mut tracked {
+                        lease.finish(ActivityState::Interrupted);
+                    }
                     reason = LocalFallbackReason::RemoteExhausted(format!(
                         "worker {} exceeded latency budget",
                         w.worker_id
                     ));
                 }
             }
+            attempt_no = attempt_no.saturating_add(1);
             drop(guard); // release the reservation before trying the next worker
         }
 
         // Every remote path is exhausted: run locally so the build still finishes.
+        let mut tracked = self.tracker.begin_attempt_lease(
+            &action_id,
+            attempt_no,
+            "local",
+            ExecutionKind::Fallback,
+            &display,
+        );
+        if let Some(lease) = &tracked {
+            lease.transition(ActivityState::Running);
+        }
         let exit_code = run_local(&command).await.unwrap_or(-1);
-        Execution::LocalFallback { exit_code, reason }
+        if let Some(lease) = &mut tracked {
+            lease.finish(if exit_code == 0 {
+                ActivityState::Completed
+            } else {
+                ActivityState::Failed
+            });
+        }
+        attempt_no = attempt_no.saturating_add(1);
+        ObservedExecution {
+            execution: Execution::LocalFallback { exit_code, reason },
+            next_attempt_no: attempt_no,
+        }
     }
 }
 
@@ -582,6 +715,22 @@ fn route_away_reason(command: &Command) -> Option<String> {
 type RuntimeVerdictCache = Mutex<HashMap<(String, u64, u64), Option<&'static str>>>;
 static RUNTIME_VERDICTS: std::sync::LazyLock<RuntimeVerdictCache> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+pub(crate) fn prime_bypass_runtime_none(path: &str) -> std::io::Result<()> {
+    let meta = std::fs::metadata(path)?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    let key = (path.to_string(), meta.len(), mtime);
+    RUNTIME_VERDICTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, None);
+    Ok(())
+}
 
 /// The hook-bypassing runtime DLL `path` is linked against, if any (memoized).
 /// Returns `None` if the file cannot be read (bare PATH-resolved name,
@@ -696,6 +845,23 @@ mod tests {
         assert_eq!(bypass_runtime_of("c:\\nope\\missing-xyz.exe"), None);
         let _ = std::fs::remove_file(&msys);
         let _ = std::fs::remove_file(&clean);
+    }
+
+    #[test]
+    fn test_cache_prime_none_overrides_only_the_exact_metadata_key() {
+        let target = tmp_file("prime-target", b"MZ\0msys-2.0.dll\0");
+        let other = tmp_file("prime-other", b"MZ\0cygwin1.dll\0");
+        let target_path = target.to_str().unwrap();
+        let other_path = other.to_str().unwrap();
+
+        assert_eq!(bypass_runtime_of(target_path), Some("msys-2.0.dll"));
+        assert_eq!(bypass_runtime_of(other_path), Some("cygwin1.dll"));
+        prime_bypass_runtime_none(target_path).unwrap();
+        assert_eq!(bypass_runtime_of(target_path), None);
+        assert_eq!(bypass_runtime_of(other_path), Some("cygwin1.dll"));
+
+        let _ = std::fs::remove_file(target);
+        let _ = std::fs::remove_file(other);
     }
 
     #[test]

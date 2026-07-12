@@ -13,8 +13,10 @@
 //! ([`TokenAction`]) is the only channel a token value travels through.
 
 use sembazuru_proto::v0::{
-    CacheStatus, ExecBreakdown, FileServerStatus, GetConfigResponse, GetStatusResponse,
-    SetConfigRequest, SetConfigResponse, TriggerEvictionResponse, WorkerStatus,
+    ActionActivity, ActivityExecutionKind as ProtoActivityKind,
+    ActivityState as ProtoActivityStatus, CacheStatus, ExecBreakdown, FileServerStatus,
+    GetConfigResponse, GetStatusResponse, SetConfigRequest, SetConfigResponse,
+    TriggerEvictionResponse, WorkerStatus,
 };
 
 /// What the dashboard knows about the daemon connection at a given moment. The
@@ -37,11 +39,45 @@ pub enum ConnectionState {
 #[derive(Clone, Debug, Default)]
 pub struct DashboardModel {
     pub workers: Vec<WorkerRow>,
+    pub activities: Vec<ActivityRow>,
     pub cache: CacheModel,
     pub exec: ExecModel,
     pub fileserver: FileServerModel,
     pub in_flight: u32,
     pub auth_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityRow {
+    pub activity_id: String,
+    pub attempt_no: u32,
+    pub worker_id: String,
+    pub kind: ActivityKind,
+    pub display_name: String,
+    pub status: ActivityStatus,
+    pub lane_index: u32,
+    pub started_age_ms: u64,
+    pub finished_age_ms: Option<u64>,
+    pub duration_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityKind {
+    Remote,
+    Local,
+    Fallback,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityStatus {
+    Queued,
+    Preparing,
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+    Unknown,
 }
 
 /// One connected worker as a table row.
@@ -244,11 +280,42 @@ impl ConfigEdit {
 pub fn map_dashboard(resp: GetStatusResponse) -> DashboardModel {
     DashboardModel {
         workers: resp.workers.into_iter().map(map_worker).collect(),
+        activities: resp.activities.into_iter().map(map_activity).collect(),
         cache: map_cache(resp.cache),
         exec: map_exec(resp.exec),
         fileserver: map_fileserver(resp.fileserver),
         in_flight: resp.in_flight,
         auth_enabled: resp.auth_enabled,
+    }
+}
+
+fn map_activity(activity: ActionActivity) -> ActivityRow {
+    let kind = match ProtoActivityKind::try_from(activity.execution_kind) {
+        Ok(ProtoActivityKind::Remote) => ActivityKind::Remote,
+        Ok(ProtoActivityKind::Local) => ActivityKind::Local,
+        Ok(ProtoActivityKind::Fallback) => ActivityKind::Fallback,
+        Ok(ProtoActivityKind::Unspecified) | Err(_) => ActivityKind::Unknown,
+    };
+    let status = match ProtoActivityStatus::try_from(activity.state) {
+        Ok(ProtoActivityStatus::Queued) => ActivityStatus::Queued,
+        Ok(ProtoActivityStatus::Preparing) => ActivityStatus::Preparing,
+        Ok(ProtoActivityStatus::Running) => ActivityStatus::Running,
+        Ok(ProtoActivityStatus::Completed) => ActivityStatus::Completed,
+        Ok(ProtoActivityStatus::Failed) => ActivityStatus::Failed,
+        Ok(ProtoActivityStatus::Interrupted) => ActivityStatus::Interrupted,
+        Ok(ProtoActivityStatus::Unknown) | Err(_) => ActivityStatus::Unknown,
+    };
+    ActivityRow {
+        activity_id: activity.activity_id,
+        attempt_no: activity.attempt_no,
+        worker_id: activity.worker_id,
+        kind,
+        display_name: activity.display_name,
+        status,
+        lane_index: activity.lane_index,
+        started_age_ms: activity.started_age_ms,
+        finished_age_ms: activity.finished_age_ms,
+        duration_us: activity.duration_us,
     }
 }
 

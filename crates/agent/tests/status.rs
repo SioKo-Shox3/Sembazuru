@@ -82,6 +82,7 @@ async fn start_intake_and_status(table: WorkerTable, auth_enabled: bool) -> (Str
         cache: None,
         cache_max_bytes: None,
         metrics,
+        tracker: sembazuru_agent::action_tracker::ActionTracker::default(),
         auth_enabled,
         config_path: std::env::temp_dir().join("sbz-status-test-unused.toml"),
         admin_enabled: false, // get_status tests don't mutate; default-off is fine

@@ -470,6 +470,36 @@ message FileServerStatus {
   uint64 inline_bytes = 3;   // content bytes inlined in OpenRead first chunks
 }
 
+enum ActivityExecutionKind {
+  ACTIVITY_EXECUTION_KIND_UNSPECIFIED = 0;
+  ACTIVITY_EXECUTION_KIND_REMOTE = 1;
+  ACTIVITY_EXECUTION_KIND_LOCAL = 2;
+  ACTIVITY_EXECUTION_KIND_FALLBACK = 3;
+}
+
+enum ActivityState {
+  ACTIVITY_STATE_UNKNOWN = 0;
+  ACTIVITY_STATE_QUEUED = 1;
+  ACTIVITY_STATE_PREPARING = 2;
+  ACTIVITY_STATE_RUNNING = 3;
+  ACTIVITY_STATE_COMPLETED = 4;
+  ACTIVITY_STATE_FAILED = 5;
+  ACTIVITY_STATE_INTERRUPTED = 6;
+}
+
+message ActionActivity {
+  string activity_id = 1;
+  uint32 attempt_no = 2;
+  string worker_id = 3;
+  ActivityExecutionKind execution_kind = 4;
+  string display_name = 5;
+  ActivityState state = 6;
+  uint32 lane_index = 7;
+  uint64 started_age_ms = 8;
+  optional uint64 finished_age_ms = 9;
+  uint64 duration_us = 10;
+}
+
 message GetStatusResponse {
   repeated WorkerStatus workers = 1;
   CacheStatus cache = 2;
@@ -477,4 +507,5 @@ message GetStatusResponse {
   ExecBreakdown exec = 4;
   FileServerStatus fileserver = 5;
   bool auth_enabled = 6;      // the daemon requires a cluster token (ADR 0006)
+  repeated ActionActivity activities = 7;
 }

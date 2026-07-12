@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use sembazuru_agent::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::scheduler::{BuildAction, Scheduler};
 use sembazuru_agent::{ExecOptions, Execution};
@@ -60,6 +61,192 @@ fn cmd(argv: &[&str]) -> Command {
         env: Default::default(),
         cwd: String::new(),
     }
+}
+
+async fn unavailable_endpoint() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn scheduler_records_retry_and_fallback_as_distinct_attempts() {
+    let tracker = ActionTracker::default();
+    let w1 = unavailable_endpoint().await;
+    let w2 = unavailable_endpoint().await;
+    let table = table_with(&[("w1", &w1, 1), ("w2", &w2, 1)]);
+    let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
+        table,
+        Duration::from_secs(1),
+        None,
+        tracker.clone(),
+    );
+    let result = scheduler
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "0"]),
+            "a".into(),
+            "session".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    assert!(matches!(result, Execution::LocalFallback { .. }));
+    let mut attempts = tracker.snapshot();
+    attempts.sort_by_key(|attempt| attempt.key.attempt_no);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].execution_kind, ExecutionKind::Remote);
+    assert_eq!(attempts[1].execution_kind, ExecutionKind::Remote);
+    assert_eq!(attempts[2].execution_kind, ExecutionKind::Fallback);
+    assert!(attempts.iter().all(|attempt| attempt.state.is_terminal()));
+}
+
+#[tokio::test]
+async fn remote_nonzero_exit_is_failed_not_completed() {
+    let tracker = ActionTracker::default();
+    let (worker, _) = start_worker().await;
+    let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
+        table_with(&[("w1", &worker, 1)]),
+        Duration::from_secs(1),
+        None,
+        tracker.clone(),
+    );
+    let result = scheduler
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "4"]),
+            "nonzero".into(),
+            "session".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    assert!(matches!(result, Execution::Remote(_)));
+    let attempt = tracker
+        .snapshot()
+        .into_iter()
+        .find(|attempt| attempt.key.action_id == "nonzero")
+        .unwrap();
+    assert_eq!(attempt.state, ActivityState::Failed);
+}
+
+#[tokio::test]
+async fn worker_stream_exposes_running_before_remote_completion() {
+    let tracker = ActionTracker::default();
+    let (worker, _) = start_worker().await;
+    let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
+        table_with(&[("w1", &worker, 1)]),
+        Duration::from_secs(5),
+        None,
+        tracker.clone(),
+    );
+    let run = tokio::spawn(async move {
+        scheduler
+            .dispatch(
+                cmd(&["cmd", "/c", "ping -n 3 127.0.0.1 >nul"]),
+                "running".into(),
+                "session".into(),
+                ExecOptions::default(),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tracker
+                .snapshot()
+                .iter()
+                .any(|attempt| attempt.state == ActivityState::Running)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker Running event was not observed before completion");
+    assert!(matches!(run.await.unwrap(), Execution::Remote(_)));
+    assert_eq!(tracker.snapshot()[0].state, ActivityState::Completed);
+}
+
+#[tokio::test]
+async fn tracker_capacity_never_changes_fallback_execution() {
+    let tracker = ActionTracker::default();
+    for index in 0..sembazuru_agent::action_tracker::MAX_ACTIVITY_ATTEMPTS {
+        assert!(
+            tracker
+                .begin_attempt(
+                    &format!("active-{index}"),
+                    0,
+                    "busy",
+                    ExecutionKind::Remote,
+                    "unit.cpp",
+                )
+                .is_some()
+        );
+    }
+    let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
+        WorkerTable::new(Duration::from_secs(60)),
+        Duration::from_secs(1),
+        None,
+        tracker.clone(),
+    );
+    let result = scheduler
+        .dispatch(
+            cmd(&["cmd", "/c", "exit", "0"]),
+            "overflow".into(),
+            "session".into(),
+            ExecOptions::default(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Execution::LocalFallback { exit_code: 0, .. }
+    ));
+    assert_eq!(
+        tracker.snapshot().len(),
+        sembazuru_agent::action_tracker::MAX_ACTIVITY_ATTEMPTS
+    );
+}
+
+#[tokio::test]
+async fn cancelled_dispatch_interrupts_its_tracked_attempt() {
+    let tracker = ActionTracker::default();
+    let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
+        WorkerTable::new(Duration::from_secs(60)),
+        Duration::from_secs(1),
+        None,
+        tracker.clone(),
+    );
+    let dispatch = tokio::spawn(async move {
+        scheduler
+            .dispatch(
+                cmd(&["cmd", "/c", "ping -n 30 127.0.0.1 >nul"]),
+                "cancelled".into(),
+                "session".into(),
+                ExecOptions::default(),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if tracker
+                .snapshot()
+                .iter()
+                .any(|attempt| attempt.state == ActivityState::Running)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("local fallback did not reach Running");
+
+    dispatch.abort();
+    assert!(dispatch.await.unwrap_err().is_cancelled());
+    let snapshot = tracker.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].state, ActivityState::Interrupted);
+    assert!(snapshot[0].finished_age.is_some());
 }
 
 #[tokio::test]

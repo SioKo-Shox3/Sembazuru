@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use sembazuru_agent::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::intake::{SubmitOptions, serve_intake, submit_to_daemon};
 use sembazuru_agent::scheduler::Scheduler;
@@ -105,7 +106,13 @@ async fn intake_completes_via_local_fallback_with_no_workers() {
     // No workers: the daemon's scheduler must still complete the action locally
     // (DESIGN.md §2) and mirror its exit code — the launcher sees a clean exit,
     // not an error.
-    let scheduler = Scheduler::new(WorkerTable::new(Duration::from_secs(60)));
+    let tracker = ActionTracker::default();
+    let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
+        WorkerTable::new(Duration::from_secs(60)),
+        Duration::from_secs(1),
+        None,
+        tracker.clone(),
+    );
     let endpoint = start_intake(scheduler).await;
 
     let (code, _note) = submit_to_daemon(
@@ -119,6 +126,11 @@ async fn intake_completes_via_local_fallback_with_no_workers() {
         code, 3,
         "local fallback ran the command and mirrored its exit"
     );
+    let attempts = tracker.snapshot();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].execution_kind, ExecutionKind::Fallback);
+    assert_eq!(attempts[0].state, ActivityState::Failed);
+    assert_eq!(attempts[0].display_name, "cmd");
 }
 
 #[tokio::test]

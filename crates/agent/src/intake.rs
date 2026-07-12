@@ -12,6 +12,7 @@
 //! root) is safe here precisely because it never leaves the machine — the
 //! launcher already has the command on its argv.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,12 +33,111 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 
 use crate::action_cache::{AgentCache, CacheLookup};
+use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind, display_name};
 use crate::scheduler::Scheduler;
 use crate::session_registry::{
-    DEFAULT_OUTPUT_MAX_BYTES, OutputSpec, SessionCapability, SessionRegistry,
+    DEFAULT_OUTPUT_MAX_BYTES, DaemonTaskScope, OutputSpec, SessionCapability, SessionRegistry,
+    SubmissionDeadline, SubmissionPhase,
 };
 use crate::status::Metrics;
 use crate::{ExecOptions, ExecuteError, Execution, LocalFallbackReason, run_local};
+
+#[cfg(test)]
+struct SubmissionBarrier {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+struct SubmissionDropSignal(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(test)]
+impl Drop for SubmissionDropSignal {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_SUBMISSION_BARRIER: std::cell::RefCell<Option<SubmissionBarrier>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static NEXT_SUBMISSION_DEADLINE: std::cell::RefCell<
+        Option<tokio::sync::oneshot::Sender<Arc<SubmissionDeadline>>>
+    > = const { std::cell::RefCell::new(None) };
+    static PANIC_NEXT_SUBMISSION_AFTER_CREATE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn install_next_submission_barrier(barrier: SubmissionBarrier) {
+    NEXT_SUBMISSION_BARRIER.with(|slot| {
+        assert!(slot.borrow_mut().replace(barrier).is_none());
+    });
+}
+
+#[cfg(test)]
+fn observe_next_submission_deadline(sender: tokio::sync::oneshot::Sender<Arc<SubmissionDeadline>>) {
+    NEXT_SUBMISSION_DEADLINE.with(|slot| {
+        assert!(slot.borrow_mut().replace(sender).is_none());
+    });
+}
+
+#[cfg(test)]
+async fn wait_at_submission_barrier() {
+    let barrier = NEXT_SUBMISSION_BARRIER.with(|slot| slot.borrow_mut().take());
+    if let Some(barrier) = barrier {
+        let _drop_signal = SubmissionDropSignal(barrier.dropped);
+        let _ = barrier.reached.send(());
+        let _ = barrier.release.await;
+    }
+}
+
+async fn hold_eof_until_submission_is_safe<F>(
+    deadline: Arc<SubmissionDeadline>,
+    inner: F,
+    _eof_lease: mpsc::Sender<Result<SubmitActionEvent, Status>>,
+) where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let mut inner = tokio::spawn(inner);
+    let force = deadline.force_token();
+    let inner_failed = tokio::select! {
+        biased;
+        result = &mut inner => result.is_err(),
+        _ = force.cancelled() => {
+            if deadline.try_abort_no_child() {
+                inner.abort();
+                inner.await.is_err()
+            } else {
+                inner.await.is_err()
+            }
+        }
+    };
+    if inner_failed && deadline.phase() == SubmissionPhase::Idle {
+        let _ = deadline.try_abort_no_child();
+    }
+    wait_for_safe_submission_terminal(&deadline).await;
+}
+
+async fn wait_for_safe_submission_terminal(deadline: &SubmissionDeadline) {
+    loop {
+        match deadline.phase() {
+            SubmissionPhase::Idle
+            | SubmissionPhase::NaturalReaped
+            | SubmissionPhase::RetrySafeReaped
+            | SubmissionPhase::ForcedReaped
+            | SubmissionPhase::AbortedNoChild => return,
+            SubmissionPhase::ForceFailed => std::future::pending::<()>().await,
+            SubmissionPhase::SettingUp | SubmissionPhase::Active | SubmissionPhase::Terminating => {
+                let _ = deadline.wait_terminal().await;
+            }
+        }
+    }
+}
 
 /// Per-action options the launcher hands to the daemon alongside the command
 /// (the non-command fields of [`SubmitActionRequest`]). Bundled so adding a knob
@@ -126,6 +226,8 @@ pub struct IntakeService {
     /// remote/local/fallback exec breakdown, and the in-flight gauge here. The
     /// daemon hands the same `Arc` to the Status service via [`Self::metrics`].
     metrics: Arc<Metrics>,
+    task_scope: Option<DaemonTaskScope>,
+    tracker: ActionTracker,
 }
 
 /// Mints an unpredictable 128-bit data-plane session id as 32 lowercase hex
@@ -148,6 +250,8 @@ impl IntakeService {
             seq: Arc::new(AtomicU64::new(0)),
             vfs: None,
             metrics: Arc::new(Metrics::default()),
+            task_scope: None,
+            tracker: ActionTracker::default(),
         }
     }
 
@@ -159,6 +263,35 @@ impl IntakeService {
             seq: Arc::new(AtomicU64::new(0)),
             vfs: Some(Arc::new(ctx)),
             metrics: Arc::new(Metrics::default()),
+            task_scope: None,
+            tracker: ActionTracker::default(),
+        }
+    }
+
+    /// Production daemon constructor: submission tasks share the daemon's owned
+    /// descendant scope with file-supply connections and requests.
+    #[allow(dead_code)] // Backward-compatible internal wrapper for existing callers.
+    pub(crate) fn with_vfs_tracked(
+        scheduler: Scheduler,
+        ctx: IntakeVfsContext,
+        task_scope: DaemonTaskScope,
+    ) -> Self {
+        Self::with_vfs_tracked_and_tracker(scheduler, ctx, task_scope, ActionTracker::default())
+    }
+
+    pub(crate) fn with_vfs_tracked_and_tracker(
+        scheduler: Scheduler,
+        ctx: IntakeVfsContext,
+        task_scope: DaemonTaskScope,
+        tracker: ActionTracker,
+    ) -> Self {
+        Self {
+            scheduler,
+            seq: Arc::new(AtomicU64::new(0)),
+            vfs: Some(Arc::new(ctx)),
+            metrics: Arc::new(Metrics::default()),
+            task_scope: Some(task_scope),
+            tracker,
         }
     }
 
@@ -195,10 +328,12 @@ impl LocalIntake for IntakeService {
         let session_id = mint_session_id();
 
         let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(run_submission(
+        let eof_lease = tx.clone();
+        let submission = run_submission(
             self.scheduler.clone(),
             self.vfs.clone(),
             self.metrics.clone(),
+            self.tracker.clone(),
             command,
             req.declared_outputs,
             req.non_deterministic,
@@ -208,7 +343,25 @@ impl LocalIntake for IntakeService {
             session_id,
             n,
             tx,
-        ));
+        );
+        if let Some(scope) = &self.task_scope {
+            let deadline = Arc::new(SubmissionDeadline::new());
+            #[cfg(test)]
+            if let Some(observer) = NEXT_SUBMISSION_DEADLINE.with(|slot| slot.borrow_mut().take()) {
+                let _ = observer.send(Arc::clone(&deadline));
+            }
+            let wrapped = hold_eof_until_submission_is_safe(
+                Arc::clone(&deadline),
+                crate::with_submission_deadline(Arc::clone(&deadline), submission),
+                eof_lease,
+            );
+            if !scope.spawn_drain(deadline, wrapped) {
+                return Err(Status::unavailable("daemon is shutting down"));
+            }
+        } else {
+            drop(eof_lease);
+            tokio::spawn(submission);
+        }
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -285,6 +438,10 @@ async fn publish_remote_or_fallback(
     outcome: Execution,
     cap: &SessionCapability,
     fallback_command: &Command,
+    tracker: &ActionTracker,
+    action_id: &str,
+    attempt_no: u32,
+    display: &str,
 ) -> Execution {
     if let Execution::Remote(o) = &outcome
         && o.exit_code == Some(0)
@@ -292,7 +449,24 @@ async fn publish_remote_or_fallback(
     {
         eprintln!("sembazuru-agent: publishing staged outputs failed: {e}");
         let detail = format!("remote writeback publish failed: {e}");
+        let mut tracked = tracker.begin_attempt_lease(
+            action_id,
+            attempt_no,
+            "local",
+            ExecutionKind::Fallback,
+            display,
+        );
+        if let Some(lease) = &tracked {
+            lease.transition(ActivityState::Running);
+        }
         let exit_code = run_local(fallback_command).await.unwrap_or(-1);
+        if let Some(lease) = &mut tracked {
+            lease.finish(if exit_code == 0 {
+                ActivityState::Completed
+            } else {
+                ActivityState::Failed
+            });
+        }
         return Execution::LocalFallback {
             exit_code,
             reason: LocalFallbackReason::RemoteExhausted(detail),
@@ -310,6 +484,7 @@ async fn run_submission(
     scheduler: Scheduler,
     vfs: Option<Arc<IntakeVfsContext>>,
     metrics: Arc<Metrics>,
+    tracker: ActionTracker,
     command: Command,
     declared_outputs: Vec<String>,
     non_deterministic: bool,
@@ -323,14 +498,21 @@ async fn run_submission(
     // Counts this action toward the in-flight gauge until it terminates — every
     // return path below (cache hit, plain dispatch, VFS dispatch) drops it (M9.1).
     let _in_flight = metrics.in_flight_guard();
+    let display = display_name(&command);
 
     let Some(ctx) = vfs else {
         // Plain dispatch (M6.0 / tests): no VFS config, no cache.
-        let outcome = scheduler
-            .dispatch(command, action_id, session_id, ExecOptions::default())
+        let observed = scheduler
+            .dispatch_observed(
+                command,
+                action_id,
+                session_id,
+                ExecOptions::default(),
+                display,
+            )
             .await;
-        metrics.record_outcome(&outcome);
-        emit_outcome(&tx, outcome).await;
+        metrics.record_outcome(&observed.execution);
+        emit_outcome(&tx, observed.execution).await;
         return;
     };
 
@@ -483,10 +665,22 @@ async fn run_submission(
         .registry
         .create(session_id.clone(), normalized_vfs_root, outputs)
         .await;
+    #[cfg(test)]
+    wait_at_submission_barrier().await;
+    #[cfg(test)]
+    if PANIC_NEXT_SUBMISSION_AFTER_CREATE.with(|panic| panic.replace(false)) {
+        panic!("injected submission panic after session create");
+    }
 
     let fallback_command = command.clone();
-    let outcome = scheduler
-        .dispatch(command, action_id, session_id.clone(), opts)
+    let observed = scheduler
+        .dispatch_observed(
+            command,
+            action_id.clone(),
+            session_id.clone(),
+            opts,
+            display.clone(),
+        )
         .await;
 
     // dispatch() returns only after the worker's terminal Execute event (after
@@ -496,7 +690,16 @@ async fn run_submission(
     // WriteBack cannot race cache record/publish, the ADD-001 closed gate
     // rejects any late detached read, and the idle sweeper stays a crash backstop.
     ctx.registry.finish(&session_id).await;
-    let outcome = publish_remote_or_fallback(outcome, &cap, &fallback_command).await;
+    let outcome = publish_remote_or_fallback(
+        observed.execution,
+        &cap,
+        &fallback_command,
+        &tracker,
+        &action_id,
+        observed.next_attempt_no,
+        &display,
+    )
+    .await;
     cap.discard_staged().await;
 
     // Record a successful remote run so the next identical build hits. Needs the
@@ -575,6 +778,14 @@ async fn run_submission(
     }
 
     metrics.record_outcome(&outcome);
+    if crate::current_submission_deadline().is_some_and(|deadline| {
+        !matches!(
+            deadline.phase(),
+            SubmissionPhase::Idle | SubmissionPhase::NaturalReaped
+        )
+    }) {
+        return;
+    }
     emit_outcome(&tx, outcome).await;
 }
 
@@ -716,6 +927,21 @@ pub async fn serve_intake_service(
     Ok(())
 }
 
+pub(crate) async fn serve_intake_service_with_shutdown(
+    listener: TcpListener,
+    service: IntakeService,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sembazuru_proto::v0::local_intake_server::LocalIntakeServer;
+
+    let incoming = TcpListenerStream::new(listener);
+    tonic::transport::Server::builder()
+        .add_service(LocalIntakeServer::new(service))
+        .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
+        .await?;
+    Ok(())
+}
+
 /// Launcher side: submit `command` to the daemon at `endpoint` and return the
 /// exit code plus the daemon's terminal state note ("remote", "cache hit", or
 /// "local fallback: …") once the stream closes. A transport/RPC error here is
@@ -766,23 +992,381 @@ pub async fn submit_to_daemon(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use super::{
-        IntakeService, LocalIntakeTransport, SubmitOptions, declared_output_specs,
-        is_verified_tool, mint_session_id, publish_remote_or_fallback, resolve_loopback_intake,
+        IntakeService, IntakeVfsContext, LocalIntakeTransport, SubmissionBarrier, SubmitOptions,
+        declared_output_specs, hold_eof_until_submission_is_safe, install_next_submission_barrier,
+        is_verified_tool, mint_session_id, observe_next_submission_deadline,
+        publish_remote_or_fallback, resolve_loopback_intake, serve_intake_service_with_shutdown,
         should_record_cache, submit_to_daemon, worker_tool_matches,
     };
     use crate::Execution;
+    use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
     use crate::coordination::WorkerTable;
     use crate::scheduler::Scheduler;
-    use crate::session_registry::{SessionRegistry, StagingTemp, create_staging_temp};
+    use crate::session_registry::{
+        DaemonTaskScope, SessionRegistry, StagingTemp, SubmissionDeadline, SubmissionPhase,
+        create_staging_temp,
+    };
     use crate::status::Metrics;
     use sembazuru_cas::Digest;
     use sembazuru_cas::toolchain::ToolchainIdentity;
-    use sembazuru_proto::v0::{ActionState, Command};
+    use sembazuru_proto::v0::local_intake_server::LocalIntake;
+    use sembazuru_proto::v0::submit_action_event::Event;
+    use sembazuru_proto::v0::{ActionState, Command, SubmitActionRequest};
     use tokio::net::TcpListener;
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn outer_eof_lease_waits_after_inner_ok_until_natural_reaped() {
+        let deadline = Arc::new(SubmissionDeadline::new());
+        assert!(deadline.try_begin_setup());
+        assert!(deadline.publish_active());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let gate_deadline = Arc::clone(&deadline);
+        let gate = tokio::spawn(async move {
+            hold_eof_until_submission_is_safe(gate_deadline, async {}, tx).await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "inner Ok released EOF while the local process was still Active"
+        );
+        assert!(deadline.publish_natural_reaped());
+        gate.await.unwrap();
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn outer_eof_lease_never_releases_after_force_failed() {
+        let deadline = Arc::new(SubmissionDeadline::new());
+        assert!(deadline.try_begin_setup());
+        assert!(deadline.publish_force_failed());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let gate_deadline = Arc::clone(&deadline);
+        let gate = tokio::spawn(async move {
+            hold_eof_until_submission_is_safe(gate_deadline, async {}, tx).await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "ForceFailed released EOF and allowed an unsafe retry"
+        );
+        gate.abort();
+        assert!(gate.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn tracked_intake_drains_live_submission_and_rejects_late_submit() {
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        let scope = DaemonTaskScope::new();
+        let scheduler = Scheduler::new(WorkerTable::new(Duration::from_secs(60)));
+        let service = IntakeService::with_vfs_tracked(
+            scheduler,
+            IntakeVfsContext {
+                agent_fileserver: "127.0.0.1:1".into(),
+                cache: None,
+                scratch_root: std::env::temp_dir(),
+                registry: Arc::clone(&registry),
+            },
+            scope.clone(),
+        );
+        let request = || SubmitActionRequest {
+            command: Some(Command {
+                argv: vec!["cmd".into(), "/c".into(), "exit".into(), "0".into()],
+                env: Default::default(),
+                cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+            }),
+            declared_outputs: Vec::new(),
+            non_deterministic: false,
+            strict_vfs: false,
+            input_root: String::new(),
+        };
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        install_next_submission_barrier(SubmissionBarrier {
+            reached: reached_tx,
+            release: release_rx,
+            dropped: Arc::clone(&dropped),
+        });
+
+        let response = LocalIntake::submit_action(&service, tonic::Request::new(request()))
+            .await
+            .expect("tracked intake must accept a live submission");
+        let mut stream = response.into_inner();
+        reached_rx
+            .await
+            .expect("submission did not reach its post-create barrier");
+        assert_eq!(registry.session_count().await, 1);
+
+        scope.begin_shutdown();
+        scope.wait_cancel().await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "begin_shutdown must not drop a drain-mode submission"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), scope.wait_drain())
+                .await
+                .is_err(),
+            "drain completed before the live submission was released"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.next())
+                .await
+                .is_err(),
+            "client stream completed before the live submission was released"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), scope.wait_drain())
+            .await
+            .expect("task scope did not drain the released submission");
+        let mut exit_code = None;
+        while let Some(event) = stream.next().await {
+            if let Some(Event::Exit(exit)) = event.unwrap().event {
+                exit_code = Some(exit.exit_code);
+            }
+        }
+        registry.shutdown_sessions().await;
+        assert_eq!(registry.session_count().await, 0);
+        assert_eq!(registry.active_pin_count(), 0);
+
+        let late = LocalIntake::submit_action(&service, tonic::Request::new(request())).await;
+        registry.shutdown_sessions().await;
+        let cleanup_registry = Arc::clone(&registry);
+        tokio::task::spawn_blocking(move || cleanup_registry.shutdown_cleanup_blocking())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "released submission did not finish"
+        );
+        assert_eq!(
+            exit_code,
+            Some(0),
+            "natural drain must preserve the real Exit"
+        );
+        let error = late.expect_err("closed task scope must reject a late submission");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert_eq!(registry.session_count().await, 0);
+        assert_eq!(registry.active_pin_count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn submission_panic_publishes_aborted_no_child_before_client_eof() {
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        let scope = DaemonTaskScope::new();
+        let service = IntakeService::with_vfs_tracked(
+            Scheduler::new(WorkerTable::new(Duration::from_secs(60))),
+            IntakeVfsContext {
+                agent_fileserver: "127.0.0.1:1".into(),
+                cache: None,
+                scratch_root: std::env::temp_dir(),
+                registry: Arc::clone(&registry),
+            },
+            scope.clone(),
+        );
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        observe_next_submission_deadline(deadline_tx);
+        super::PANIC_NEXT_SUBMISSION_AFTER_CREATE.with(|panic| panic.set(true));
+        let response = LocalIntake::submit_action(
+            &service,
+            tonic::Request::new(SubmitActionRequest {
+                command: Some(Command {
+                    argv: vec!["cmd".into(), "/c".into(), "exit".into(), "0".into()],
+                    env: Default::default(),
+                    cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                }),
+                declared_outputs: Vec::new(),
+                non_deterministic: false,
+                strict_vfs: false,
+                input_root: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let deadline = deadline_rx.await.unwrap();
+        let mut stream = response.into_inner();
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await {
+                events.push(event.unwrap());
+            }
+            events
+        })
+        .await
+        .expect("panic did not produce a retry-safe EOF");
+
+        assert!(events.is_empty(), "panic path must not publish a fake Exit");
+        assert_eq!(deadline.phase(), SubmissionPhase::AbortedNoChild);
+        scope.begin_shutdown();
+        scope.wait_drain().await;
+        registry.shutdown_sessions().await;
+        let cleanup_registry = Arc::clone(&registry);
+        tokio::task::spawn_blocking(move || cleanup_registry.shutdown_cleanup_blocking())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn job_creation_failure_has_retry_safe_eof_without_fake_exit() {
+        let _guard = crate::LOCAL_JOB_TEST_LOCK.lock().await;
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        let scope = DaemonTaskScope::new();
+        let service = IntakeService::with_vfs_tracked(
+            Scheduler::new(WorkerTable::new(Duration::from_secs(60))),
+            IntakeVfsContext {
+                agent_fileserver: "127.0.0.1:1".into(),
+                cache: None,
+                scratch_root: std::env::temp_dir(),
+                registry: Arc::clone(&registry),
+            },
+            scope.clone(),
+        );
+        let (deadline_tx, deadline_rx) = tokio::sync::oneshot::channel();
+        observe_next_submission_deadline(deadline_tx);
+        let mut command = Command {
+            argv: vec!["cmd".into(), "/c".into(), "exit".into(), "0".into()],
+            env: Default::default(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        };
+        let control = crate::local_job::TestGuardianControl::bind(&mut command).unwrap();
+        control.install(5);
+        let response = LocalIntake::submit_action(
+            &service,
+            tonic::Request::new(SubmitActionRequest {
+                command: Some(command),
+                declared_outputs: Vec::new(),
+                non_deterministic: false,
+                strict_vfs: false,
+                input_root: String::new(),
+            }),
+        )
+        .await
+        .unwrap();
+        let deadline = deadline_rx.await.unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            response.into_inner().collect::<Vec<_>>().await
+        })
+        .await
+        .expect("Job creation failure did not reach retry-safe EOF");
+
+        assert!(
+            events.is_empty(),
+            "Job creation failure published fake events"
+        );
+        assert_eq!(deadline.phase(), SubmissionPhase::RetrySafeReaped);
+        scope.begin_shutdown();
+        scope.wait_drain().await;
+        registry.shutdown_sessions().await;
+        let cleanup_registry = Arc::clone(&registry);
+        tokio::task::spawn_blocking(move || cleanup_registry.shutdown_cleanup_blocking())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_intake_shutdown_drains_existing_rpc_before_server_join() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        let scope = DaemonTaskScope::new();
+        let service = IntakeService::with_vfs_tracked(
+            Scheduler::new(WorkerTable::new(Duration::from_secs(60))),
+            IntakeVfsContext {
+                agent_fileserver: "127.0.0.1:1".into(),
+                cache: None,
+                scratch_root: std::env::temp_dir(),
+                registry: Arc::clone(&registry),
+            },
+            scope.clone(),
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let mut server = tokio::spawn(async move {
+            serve_intake_service_with_shutdown(listener, service, server_shutdown)
+                .await
+                .unwrap();
+        });
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        install_next_submission_barrier(SubmissionBarrier {
+            reached: reached_tx,
+            release: release_rx,
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let transport = LocalIntakeTransport::LoopbackTcp(addr);
+        let mut client = transport.connect().await.unwrap();
+        let mut stream = client
+            .submit_action(SubmitActionRequest {
+                command: Some(Command {
+                    argv: vec!["cmd".into(), "/c".into(), "exit".into(), "0".into()],
+                    env: Default::default(),
+                    cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                }),
+                declared_outputs: Vec::new(),
+                non_deterministic: false,
+                strict_vfs: false,
+                input_root: String::new(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        reached_rx.await.unwrap();
+
+        scope.begin_shutdown();
+        shutdown.cancel();
+        scope.wait_cancel().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut server)
+                .await
+                .is_err(),
+            "LocalIntake root returned before its accepted RPC completed"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.next())
+                .await
+                .is_err(),
+            "client stream completed before the submission was released"
+        );
+        release_tx.send(()).unwrap();
+        scope.wait_drain().await;
+        let mut exit = None;
+        while let Some(event) = stream.next().await {
+            if let Some(Event::Exit(status)) = event.unwrap().event {
+                exit = Some(status.exit_code);
+            }
+        }
+        drop((stream, client));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("graceful LocalIntake root did not join")
+            .unwrap();
+        assert_eq!(exit, Some(0));
+
+        registry.shutdown_sessions().await;
+        let cleanup_registry = Arc::clone(&registry);
+        tokio::task::spawn_blocking(move || cleanup_registry.shutdown_cleanup_blocking())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[test]
     fn verified_tool_profile_matches_compilers_only() {
@@ -1077,6 +1661,17 @@ mod tests {
             env: Default::default(),
             cwd: String::new(),
         };
+        let tracker = ActionTracker::default();
+        let remote = tracker
+            .begin_attempt(
+                "publish-fallback",
+                0,
+                "w1",
+                ExecutionKind::Remote,
+                "main.cpp",
+            )
+            .unwrap();
+        tracker.finish(&remote, ActivityState::Completed);
         let outcome = publish_remote_or_fallback(
             Execution::Remote(crate::ActionOutcome {
                 states: vec![ActionState::Completed as i32],
@@ -1085,6 +1680,10 @@ mod tests {
             }),
             &cap,
             &fallback_cmd,
+            &tracker,
+            "publish-fallback",
+            1,
+            "main.cpp",
         )
         .await;
 
@@ -1101,6 +1700,14 @@ mod tests {
             std::fs::read_to_string(&final_path).unwrap().trim(),
             "fallback"
         );
+        let mut attempts = tracker.snapshot();
+        attempts.sort_by_key(|attempt| attempt.key.attempt_no);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].execution_kind, ExecutionKind::Remote);
+        assert_eq!(attempts[1].execution_kind, ExecutionKind::Fallback);
+        assert_eq!(attempts[0].display_name, "main.cpp");
+        assert_eq!(attempts[1].display_name, "main.cpp");
+        assert!(attempts.iter().all(|attempt| attempt.state.is_terminal()));
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);

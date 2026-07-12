@@ -36,6 +36,7 @@ async fn start_status_with_config_admin(config_path: std::path::PathBuf, admin: 
         cache: None,
         cache_max_bytes: None,
         metrics: Arc::new(Metrics::default()),
+        tracker: sembazuru_agent::action_tracker::ActionTracker::default(),
         auth_enabled: false,
         config_path,
         admin_enabled: admin, // ADR 0016: mutating Status RPCs are opt-in

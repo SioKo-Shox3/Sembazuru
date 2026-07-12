@@ -55,7 +55,8 @@ impl ServerStats {
 
 use crate::rootdir::{FileSnapshot, RootDir, file_snapshot};
 use crate::session_registry::{
-    SessionCapability, SessionRegistry, WritebackState, create_staging_temp, remove_root_file,
+    DaemonTaskScope, SessionCapability, SessionRegistry, WritebackState, create_staging_temp,
+    remove_root_file,
 };
 use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use sembazuru_dataplane::async_io::{read_frame, read_frame_with_body_guard, write_frame};
@@ -76,6 +77,12 @@ pub const MAX_DATA_PLANE_IN_FLIGHT_REQUESTS: usize = 256;
 struct QuotaLimits {
     max_unauthenticated_handshakes: usize,
     max_data_plane_in_flight_requests: usize,
+}
+
+#[derive(Clone)]
+struct ServerTaskMode {
+    legacy_sessions_enabled: bool,
+    task_scope: Option<DaemonTaskScope>,
 }
 
 #[derive(Clone)]
@@ -182,6 +189,34 @@ pub async fn serve_files_with_stats_token(
     .await
 }
 
+/// Production daemon entry point. Every accepted connection and pipelined
+/// request is owned by the supplied daemon task scope.
+pub(crate) async fn serve_files_with_stats_token_tracked(
+    listener: TcpListener,
+    stats: Arc<ServerStats>,
+    expected_token: Option<String>,
+    registry: Arc<SessionRegistry>,
+    legacy_sessions_enabled: bool,
+    task_scope: DaemonTaskScope,
+) -> io::Result<()> {
+    serve_with_map_and_quotas(
+        listener,
+        PathMap::Identity,
+        stats,
+        expected_token,
+        registry,
+        ServerTaskMode {
+            legacy_sessions_enabled,
+            task_scope: Some(task_scope),
+        },
+        QuotaLimits {
+            max_unauthenticated_handshakes: MAX_UNAUTHENTICATED_HANDSHAKES,
+            max_data_plane_in_flight_requests: MAX_DATA_PLANE_IN_FLIGHT_REQUESTS,
+        },
+    )
+    .await
+}
+
 /// Serves with paths under `logical_root` remapped to `backing_root`. For tests
 /// that need agent-served bytes to differ from the local original. Auth disabled.
 pub async fn serve_files_remap(
@@ -218,7 +253,10 @@ async fn serve_with_map(
         stats,
         expected_token,
         registry,
-        legacy_sessions_enabled,
+        ServerTaskMode {
+            legacy_sessions_enabled,
+            task_scope: None,
+        },
         QuotaLimits {
             max_unauthenticated_handshakes: MAX_UNAUTHENTICATED_HANDSHAKES,
             max_data_plane_in_flight_requests: MAX_DATA_PLANE_IN_FLIGHT_REQUESTS,
@@ -233,7 +271,7 @@ async fn serve_with_map_and_quotas(
     stats: Arc<ServerStats>,
     expected_token: Option<String>,
     registry: Arc<SessionRegistry>,
-    legacy_sessions_enabled: bool,
+    mode: ServerTaskMode,
     quotas: QuotaLimits,
 ) -> io::Result<()> {
     let handshake_slots = Arc::new(Semaphore::new(quotas.max_unauthenticated_handshakes));
@@ -242,7 +280,7 @@ async fn serve_with_map_and_quotas(
         map: Arc::new(map),
         stats,
         expected_token: Arc::new(expected_token),
-        legacy_sessions_enabled,
+        legacy_sessions_enabled: mode.legacy_sessions_enabled,
         request_slots: Arc::new(Semaphore::new(quotas.max_data_plane_in_flight_requests)),
     };
     loop {
@@ -252,9 +290,17 @@ async fn serve_with_map_and_quotas(
             continue;
         };
         let shared = shared.clone();
-        tokio::spawn(async move {
-            let _ = handle_conn(sock, shared, handshake_permit).await;
-        });
+        let connection_scope = mode.task_scope.clone();
+        let connection = async move {
+            let _ = handle_conn(sock, shared, handshake_permit, connection_scope).await;
+        };
+        if let Some(scope) = &mode.task_scope {
+            if !scope.spawn(connection) {
+                return Ok(());
+            }
+        } else {
+            tokio::spawn(connection);
+        }
     }
 }
 
@@ -262,6 +308,7 @@ async fn handle_conn(
     sock: TcpStream,
     shared: ConnShared,
     handshake_permit: OwnedSemaphorePermit,
+    task_scope: Option<DaemonTaskScope>,
 ) -> io::Result<()> {
     // Pipelining (M5.3): read requests off the connection and dispatch each on
     // its own task, writing responses (tagged with the request id) as they
@@ -312,7 +359,7 @@ async fn handle_conn(
         let map = shared.map.clone();
         let stats = shared.stats.clone();
         let wr = wr.clone();
-        tokio::spawn(async move {
+        let request = async move {
             let _request_permit = request_permit;
             let resp_payload =
                 dispatch(header.op, &payload, &cap, registry.store(), &map, &stats).await;
@@ -331,7 +378,14 @@ async fn handle_conn(
                     shutdown_response_writer(&mut *w).await;
                 }
             }
-        });
+        };
+        if let Some(scope) = &task_scope {
+            if !scope.spawn(request) {
+                return Ok(());
+            }
+        } else {
+            tokio::spawn(request);
+        }
     }
 }
 
@@ -1346,6 +1400,64 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn open_read_cannot_insert_a_pin_after_session_shutdown_clear() {
+        let scratch = ScratchDir::new("pin-after-shutdown");
+        let input = scratch.path().join("input.h");
+        std::fs::write(&input, b"race bytes").unwrap();
+        let requested = input.to_string_lossy().into_owned();
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        let capability = registry
+            .create("pin-after-shutdown".into(), None, Vec::new())
+            .await;
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        capability.install_before_pin_insert_hook(reached_tx, release_rx);
+
+        let request_capability = Arc::clone(&capability);
+        let store = registry.store().clone();
+        let request = tokio::spawn(async move {
+            dispatch(
+                OpCode::OpenRead,
+                &OpenReadRequest {
+                    path: requested,
+                    want_inline: true,
+                }
+                .encode(),
+                &request_capability,
+                &store,
+                &PathMap::Identity,
+                &ServerStats::default(),
+            )
+            .await
+            .unwrap()
+        });
+        reached_rx
+            .await
+            .expect("OpenRead must stop after dispatch's initial closed check");
+
+        registry.shutdown_sessions().await;
+        release_tx.send(()).unwrap();
+        let response = OpenReadResponse::decode(&request.await.unwrap()).unwrap();
+        let pinned_after_shutdown = capability.pinned_count().await;
+        drop(capability);
+        let cleanup_registry = Arc::clone(&registry);
+        tokio::task::spawn_blocking(move || cleanup_registry.shutdown_cleanup_blocking())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !response.exists,
+            "an OpenRead already past dispatch's first check must still reject after close"
+        );
+        assert_eq!(
+            pinned_after_shutdown, 0,
+            "shutdown clear must be terminal; no PinCell may be inserted afterward"
+        );
+    }
+
     #[tokio::test]
     async fn unauthenticated_handshake_flood_is_bounded() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1358,7 +1470,10 @@ mod tests {
                 Arc::new(ServerStats::default()),
                 None,
                 registry,
-                true,
+                ServerTaskMode {
+                    legacy_sessions_enabled: true,
+                    task_scope: None,
+                },
                 QuotaLimits {
                     max_unauthenticated_handshakes: 1,
                     max_data_plane_in_flight_requests: MAX_DATA_PLANE_IN_FLIGHT_REQUESTS,

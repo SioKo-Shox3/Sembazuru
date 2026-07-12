@@ -42,7 +42,7 @@ tokio = { version = "1", features = [
     "signal",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 # OS CSPRNG for unpredictable per-action session ids (ADR 0013 / PROTO-001): an
@@ -53,10 +53,14 @@ getrandom = "0.3"
 # Windows Service support for `sembazuru-daemon --service` (M9.3b). Windows-only;
 # the daemon's plain-CLI mode has no service dependency.
 windows-service = "0.7"
-
-[target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
 

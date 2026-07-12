@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -23,20 +24,50 @@ use tokio_util::sync::CancellationToken;
 use crate::action_cache::AgentCache;
 use crate::config::DaemonConfig;
 use crate::coordination::{DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination_with_token};
-use crate::fileserver::{ServerStats, serve_files_with_stats_token};
-use crate::intake::{IntakeService, IntakeVfsContext, LocalIntakeTransport, require_loopback};
+use crate::fileserver::{ServerStats, serve_files_with_stats_token_tracked};
+use crate::intake::{
+    IntakeService, IntakeVfsContext, LocalIntakeTransport, require_loopback,
+    serve_intake_service_with_shutdown,
+};
 use crate::scheduler::Scheduler;
-use crate::session_registry::SessionRegistry;
+use crate::session_registry::{DaemonTaskScope, SessionRegistry};
 use crate::status::{StatusState, evict_cache_to_cap, serve_status_service};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ServerFuture = Pin<Box<dyn Future<Output = Result<(), BoxError>> + Send>>;
+
+#[cfg(test)]
+type DaemonReadySender = tokio::sync::oneshot::Sender<(
+    std::net::SocketAddr,
+    std::net::SocketAddr,
+    Arc<SessionRegistry>,
+)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static NEXT_SERVER_FAILURE: std::cell::Cell<Option<ServerRole>> = const {
+        std::cell::Cell::new(None)
+    };
+    static NEXT_GATED_SERVER_FAILURE: std::cell::RefCell<
+        Option<(ServerRole, tokio::sync::oneshot::Receiver<()>)>
+    > = const { std::cell::RefCell::new(None) };
+    static NEXT_DAEMON_READY: std::cell::RefCell<Option<DaemonReadySender>> =
+        const { std::cell::RefCell::new(None) };
+    static NEXT_AFTER_SESSION_DRAIN: std::cell::RefCell<
+        Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+static SUBMISSION_DEADLINES: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Duration>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ServerRole {
     Coordination,
     FileServer,
     Status,
+    #[cfg_attr(not(test), allow(dead_code))]
     LocalIntake,
 }
 
@@ -56,6 +87,29 @@ impl ServerRole {
             Self::Status => "Status",
             Self::LocalIntake => "LocalIntake",
         }
+    }
+}
+
+#[cfg(test)]
+fn inject_server_failure(role: ServerRole, task: ServerFuture) -> ServerFuture {
+    if NEXT_SERVER_FAILURE.with(|failure| failure.take()) == Some(role) {
+        Box::pin(async move { Err(format!("injected {} failure", role.label()).into()) })
+    } else if let Some(trigger) = NEXT_GATED_SERVER_FAILURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        match slot.take() {
+            Some((injected_role, trigger)) if injected_role == role => Some(trigger),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    }) {
+        Box::pin(async move {
+            let _ = trigger.await;
+            Err(format!("injected {} failure", role.label()).into())
+        })
+    } else {
+        task
     }
 }
 
@@ -88,6 +142,7 @@ struct SupervisedServers {
 }
 
 impl SupervisedServers {
+    #[cfg(test)]
     fn spawn(tasks: RequiredServerTasks) -> Self {
         let mut supervised = Self {
             tasks: JoinSet::new(),
@@ -107,6 +162,12 @@ impl SupervisedServers {
 
     fn abort_all(&mut self) {
         self.tasks.abort_all();
+    }
+
+    async fn abort_and_drain(&mut self) {
+        self.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+        self.roles.clear();
     }
 
     async fn next_exit(&mut self) -> Result<(), BoxError> {
@@ -161,28 +222,98 @@ impl SupervisedServers {
     }
 }
 
+#[cfg(test)]
 async fn supervise_server_tasks_until_shutdown(
     tasks: RequiredServerTasks,
     shutdown: CancellationToken,
 ) -> Result<(), BoxError> {
     let mut servers = SupervisedServers::spawn(tasks);
-    tokio::select! {
+    let result = tokio::select! {
         biased;
-        result = servers.next_exit() => {
-            servers.abort_all();
-            result
-        }
+        result = servers.next_exit() => result,
         _ = shutdown.cancelled() => {
             tokio::task::yield_now().await;
             if let Some(result) = servers.try_next_exit() {
-                servers.abort_all();
-                return result;
+                result
+            } else {
+                eprintln!("sembazuru-daemon: shutdown requested; stopping");
+                Ok(())
             }
-            eprintln!("sembazuru-daemon: shutdown requested; stopping");
-            servers.abort_all();
-            Ok(())
+        }
+    };
+    servers.abort_and_drain().await;
+    result
+}
+
+const SUBMISSION_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(120);
+
+async fn supervise_daemon_servers_until_shutdown(
+    tasks: RequiredServerTasks,
+    shutdown: CancellationToken,
+    intake_shutdown: CancellationToken,
+    child_tasks: &DaemonTaskScope,
+    submission_deadline: Duration,
+) -> Result<(), BoxError> {
+    let RequiredServerTasks {
+        coordination,
+        file_server,
+        status,
+        local_intake,
+    } = tasks;
+    let mut servers = SupervisedServers {
+        tasks: JoinSet::new(),
+        roles: HashMap::new(),
+    };
+    servers.spawn_one(ServerRole::Coordination, coordination);
+    servers.spawn_one(ServerRole::FileServer, file_server);
+    servers.spawn_one(ServerRole::Status, status);
+    let mut local_intake = tokio::spawn(local_intake);
+
+    let (result, local_intake_done) = tokio::select! {
+        biased;
+        result = servers.next_exit() => (result, false),
+        joined = &mut local_intake => (
+            match joined {
+                Ok(Ok(())) => Err("LocalIntake task unexpectedly exited successfully".into()),
+                Ok(Err(error)) => Err(format!("LocalIntake task exited with error: {error}").into()),
+                Err(error) if error.is_panic() => {
+                    Err(format!("LocalIntake task panicked: {error}").into())
+                }
+                Err(error) => Err(format!("LocalIntake task failed to join: {error}").into()),
+            },
+            true,
+        ),
+        _ = shutdown.cancelled() => {
+            tokio::task::yield_now().await;
+            if let Some(result) = servers.try_next_exit() {
+                (result, false)
+            } else {
+                eprintln!("sembazuru-daemon: shutdown requested; stopping");
+                (Ok(()), false)
+            }
+        }
+    };
+
+    child_tasks.begin_shutdown();
+    intake_shutdown.cancel();
+    servers.abort_and_drain().await;
+    child_tasks.wait_cancel().await;
+    child_tasks.drain_until(submission_deadline).await;
+
+    if !local_intake_done {
+        match local_intake.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(format!("{result:?}; LocalIntake shutdown failed: {error}").into());
+            }
+            Err(error) => {
+                return Err(
+                    format!("{result:?}; LocalIntake shutdown join failed: {error}").into(),
+                );
+            }
         }
     }
+    result
 }
 
 /// Refuses unauthenticated LAN-reachable Coordination/file-server binds by
@@ -225,6 +356,14 @@ fn refuse_unauthenticated_lan(
 /// loopback Status surface — until `shutdown` is cancelled or the LocalIntake
 /// server exits. `config` is the already-resolved effective config (file + env).
 pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Result<(), BoxError> {
+    #[cfg(test)]
+    let submission_deadline = SUBMISSION_DEADLINES
+        .lock()
+        .expect("submission deadline mutex poisoned")
+        .remove(&config.intake_addr)
+        .unwrap_or(SUBMISSION_SHUTDOWN_DEADLINE);
+    #[cfg(not(test))]
+    let submission_deadline = SUBMISSION_SHUTDOWN_DEADLINE;
     let cluster_token = config.cluster_token.clone();
     eprintln!(
         "sembazuru-daemon: worker auth {}",
@@ -236,14 +375,13 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     );
 
     let table = WorkerTable::new(DEFAULT_DEAD_TIMEOUT);
-    let scheduler = Scheduler::with_cluster_token(table.clone(), cluster_token.clone());
-
-    // The data-plane session registry (ADR 0013): one shared instance threaded
-    // into BOTH the file server (which binds a worker's Hello session id to the
-    // agent's authoritative capability) and intake (which creates a session right
-    // before dispatch and finishes it after). This is the object the two planes
-    // used to lack — the seam that makes the agent, not the worker, the authority.
-    let registry = Arc::new(SessionRegistry::new()?);
+    let tracker = crate::action_tracker::ActionTracker::default();
+    let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
+        table.clone(),
+        crate::scheduler::DEFAULT_REMOTE_BUDGET,
+        cluster_token.clone(),
+        tracker.clone(),
+    );
 
     // Coordination: workers register + heartbeat in. Spawned; the table it fills
     // is shared with the scheduler.
@@ -264,6 +402,8 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         Box::pin(async move { serve_coordination_with_token(coord_listener, t, tok).await })
             as ServerFuture
     };
+    #[cfg(test)]
+    let coordination_task = inject_server_failure(ServerRole::Coordination, coordination_task);
 
     // File supply: workers pull inputs on demand over the data plane. The bound
     // address is what VFS-mode workers dial, so capture it for VfsExecution. Stats
@@ -285,20 +425,6 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         );
     }
     let server_stats = Arc::new(ServerStats::default());
-    let file_server_task = {
-        let stats = server_stats.clone();
-        let tok = cluster_token.clone();
-        let reg = registry.clone();
-        let legacy_sessions_enabled = config.unsafe_legacy_dataplane_sessions;
-        Box::pin(async move {
-            // Empty/unknown session ids are rejected by default (ADD-002); the
-            // legacy empty-session compatibility path is wired from config and
-            // defaults off.
-            serve_files_with_stats_token(file_listener, stats, tok, reg, legacy_sessions_enabled)
-                .await?;
-            Ok(())
-        }) as ServerFuture
-    };
 
     // Action cache (M4): opt-in via config.cache_root. Per-action trace dirs go
     // under trace_root.
@@ -326,16 +452,6 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             .into_owned()
     });
 
-    let intake = IntakeService::with_vfs(
-        scheduler,
-        IntakeVfsContext {
-            agent_fileserver: fileserver_addr.to_string(),
-            cache: cache.clone(),
-            scratch_root: std::path::PathBuf::from(trace_root),
-            registry: registry.clone(),
-        },
-    );
-
     // Status surface (M9.1, ADR 0008 §4): loopback-only read-only plane for the
     // GUI; refuses any non-loopback bind.
     let status_sockaddr = require_loopback(&config.status_addr, "Status")?;
@@ -344,6 +460,54 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         "sembazuru-daemon: Status on {}",
         status_listener.local_addr()?
     );
+
+    // Complete every fallible listener/transport setup before creating the
+    // ephemeral registry. After this point all exits use the cleanup funnel.
+    let intake_transport = LocalIntakeTransport::loopback_tcp(&config.intake_addr)?;
+    let intake_listener = match intake_transport {
+        LocalIntakeTransport::LoopbackTcp(addr) => tokio::net::TcpListener::bind(addr).await?,
+    };
+    let intake_addr = intake_listener.local_addr()?;
+    eprintln!("sembazuru-daemon: LocalIntake on {intake_addr}");
+
+    // The data-plane session registry (ADR 0013): one shared instance threaded
+    // into both the file server and intake.
+    let registry = Arc::new(SessionRegistry::new()?);
+    let child_tasks = DaemonTaskScope::new();
+    #[cfg(test)]
+    if let Some(ready) = NEXT_DAEMON_READY.with(|slot| slot.borrow_mut().take()) {
+        let _ = ready.send((fileserver_addr, intake_addr, Arc::clone(&registry)));
+    }
+    let file_server_task = {
+        let stats = server_stats.clone();
+        let tok = cluster_token.clone();
+        let reg = registry.clone();
+        let scope = child_tasks.clone();
+        let legacy_sessions_enabled = config.unsafe_legacy_dataplane_sessions;
+        Box::pin(async move {
+            serve_files_with_stats_token_tracked(
+                file_listener,
+                stats,
+                tok,
+                reg,
+                legacy_sessions_enabled,
+                scope,
+            )
+            .await?;
+            Ok(())
+        }) as ServerFuture
+    };
+    let intake = IntakeService::with_vfs_tracked_and_tracker(
+        scheduler,
+        IntakeVfsContext {
+            agent_fileserver: fileserver_addr.to_string(),
+            cache: cache.clone(),
+            scratch_root: std::path::PathBuf::from(trace_root),
+            registry: registry.clone(),
+        },
+        child_tasks.clone(),
+        tracker.clone(),
+    );
     let status_task = {
         let state = StatusState {
             table: table.clone(),
@@ -351,17 +515,16 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             cache: cache.clone(),
             cache_max_bytes,
             metrics: intake.metrics(),
+            tracker,
             auth_enabled: cluster_token.is_some(),
             config_path: DaemonConfig::path_from_env(),
-            // SEC-001 interim (ADR 0016): the mutating Status RPCs are opt-in
-            // (default off) because the loopback Status plane has no caller auth.
+            // SEC-001 interim (ADR 0016): mutating Status RPCs are opt-in.
             admin_enabled: config.status_admin,
         };
         Box::pin(async move { serve_status_service(status_listener, state).await }) as ServerFuture
     };
 
-    // Periodic CAS eviction sweep (M9.2 / deferred #8): bounds the cache when a cap
-    // is configured. Correctness-safe (only ever a miss).
+    // Periodic CAS eviction is detached but does not retain the session registry.
     if let (Some(c), Some(max)) = (cache.clone(), cache_max_bytes) {
         const EVICTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         tokio::spawn(async move {
@@ -385,7 +548,7 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     // NO live connection that are older than a generous TTL (far longer than any
     // action runs, and a live connection holds a ConnGuard regardless), mirroring
     // the WorkerTable opportunistic reaper.
-    {
+    let session_sweeper = {
         const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(900);
         let reg = registry.clone();
@@ -398,20 +561,21 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
                     eprintln!("sembazuru-daemon: reaped {reaped} stale data-plane session(s)");
                 }
             }
-        });
-    }
+        })
+    };
 
-    // LocalIntake: the build front door (loopback-only). This is the blocking
-    // server; the daemon runs until the LocalIntake server exits OR `shutdown` is
-    // cancelled (Ctrl-C in CLI mode, SCM Stop in service mode).
-    let intake_transport = LocalIntakeTransport::loopback_tcp(&config.intake_addr)?;
-    match &intake_transport {
-        LocalIntakeTransport::LoopbackTcp(addr) => {
-            eprintln!("sembazuru-daemon: LocalIntake on {addr}");
-        }
-    }
-    let local_intake_task = Box::pin(async move { intake_transport.serve(intake).await });
-    supervise_server_tasks_until_shutdown(
+    // LocalIntake is the build front door. Its root is stopped gracefully so
+    // accepted RPCs retain their response stream until their submission is safe.
+    let intake_shutdown = CancellationToken::new();
+    let local_intake_task = {
+        let graceful = intake_shutdown.clone();
+        Box::pin(async move {
+            serve_intake_service_with_shutdown(intake_listener, intake, graceful).await
+        }) as ServerFuture
+    };
+    #[cfg(test)]
+    let local_intake_task = inject_server_failure(ServerRole::LocalIntake, local_intake_task);
+    let server_result = supervise_daemon_servers_until_shutdown(
         RequiredServerTasks::new(
             coordination_task,
             file_server_task,
@@ -419,8 +583,33 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             local_intake_task,
         ),
         shutdown,
+        intake_shutdown,
+        &child_tasks,
+        submission_deadline,
     )
-    .await
+    .await;
+    session_sweeper.abort();
+    let _ = session_sweeper.await;
+    registry.shutdown_sessions().await;
+    #[cfg(test)]
+    if let Some((reached, release)) = NEXT_AFTER_SESSION_DRAIN.with(|slot| slot.borrow_mut().take())
+    {
+        let _ = reached.send(());
+        let _ = release.await;
+    }
+    let cleanup = tokio::task::spawn_blocking(move || registry.shutdown_cleanup_blocking()).await;
+    let cleanup_result: Result<(), BoxError> = match cleanup {
+        Ok(result) => result.map_err(|error| Box::new(error) as BoxError),
+        Err(error) => Err(format!("registry cleanup task failed to join: {error}").into()),
+    };
+    match (server_result, cleanup_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(server), Ok(())) => Err(server),
+        (Ok(()), Err(cleanup)) => Err(cleanup),
+        (Err(server), Err(cleanup)) => {
+            Err(format!("{server}; registry cleanup also failed: {cleanup}").into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -457,8 +646,276 @@ mod tests {
         assert!(res.is_ok(), "run_daemon returned an error: {res:?}");
     }
 
+    async fn exercise_daemon_cleanup(failing_server: bool) -> (bool, Result<(), BoxError>) {
+        let config = DaemonConfig {
+            coord_addr: "127.0.0.1:0".into(),
+            intake_addr: "127.0.0.1:0".into(),
+            fileserver_addr: "127.0.0.1:0".into(),
+            status_addr: "127.0.0.1:0".into(),
+            ..DaemonConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let (root_tx, root_rx) = tokio::sync::oneshot::channel();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        SessionRegistry::observe_next_cleanup(root_tx, reached_tx, release_rx);
+        if failing_server {
+            NEXT_SERVER_FAILURE.with(|failure| failure.set(Some(ServerRole::Coordination)));
+        }
+        let mut daemon = tokio::spawn(run_daemon(config, shutdown.clone()));
+        let root = root_rx
+            .await
+            .expect("daemon registry root was not observed");
+        if !failing_server {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            shutdown.cancel();
+        }
+        tokio::task::spawn_blocking(move || reached_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("daemon cleanup did not reach its barrier");
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut daemon).await;
+        let returned_early = early.is_ok();
+        release_tx.send(()).unwrap();
+        let joined = match early {
+            Ok(joined) => joined,
+            Err(_) => daemon.await,
+        }
+        .expect("run_daemon task panicked");
+        for _ in 0..100 {
+            if !root.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!root.exists(), "daemon cleanup did not remove its CAS root");
+        (returned_early, joined)
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_waits_for_registry_cleanup_completion() {
+        let (returned_early, result) = exercise_daemon_cleanup(false).await;
+        assert!(
+            !returned_early,
+            "normal shutdown returned before cleanup completion"
+        );
+        assert!(result.is_ok(), "normal shutdown failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn server_failure_waits_for_registry_cleanup_completion() {
+        let (returned_early, result) = exercise_daemon_cleanup(true).await;
+        assert!(
+            !returned_early,
+            "server failure returned before cleanup completion"
+        );
+        assert!(result.is_err(), "injected server failure was lost");
+    }
+
+    async fn exercise_descendant_drain_during_pin_barrier(
+        failing_server: bool,
+    ) -> Result<(), BoxError> {
+        use sembazuru_dataplane::async_io::{read_frame, write_frame};
+        use sembazuru_dataplane::ops::{
+            HelloRequest, HelloResponse, OpenReadRequest, OpenReadResponse,
+        };
+        use sembazuru_dataplane::wire::{FrameHeader, OpCode};
+        use tokio::io::AsyncWriteExt;
+
+        let config = DaemonConfig {
+            coord_addr: "127.0.0.1:0".into(),
+            intake_addr: "127.0.0.1:0".into(),
+            fileserver_addr: "127.0.0.1:0".into(),
+            status_addr: "127.0.0.1:0".into(),
+            ..DaemonConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        NEXT_DAEMON_READY.with(|slot| {
+            assert!(slot.borrow_mut().replace(ready_tx).is_none());
+        });
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let (release_drain_tx, release_drain_rx) = tokio::sync::oneshot::channel();
+        NEXT_AFTER_SESSION_DRAIN.with(|slot| {
+            assert!(
+                slot.borrow_mut()
+                    .replace((drained_tx, release_drain_rx))
+                    .is_none()
+            );
+        });
+        let failure_trigger = if failing_server {
+            let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel();
+            NEXT_GATED_SERVER_FAILURE.with(|slot| {
+                assert!(
+                    slot.borrow_mut()
+                        .replace((ServerRole::Coordination, trigger_rx))
+                        .is_none()
+                );
+            });
+            Some(trigger_tx)
+        } else {
+            None
+        };
+        let (root_tx, root_rx) = tokio::sync::oneshot::channel();
+        let (cleanup_reached_tx, cleanup_reached_rx) = std::sync::mpsc::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = std::sync::mpsc::channel();
+        SessionRegistry::observe_next_cleanup(root_tx, cleanup_reached_tx, cleanup_release_rx);
+        let mut daemon = tokio::spawn(run_daemon(config, shutdown.clone()));
+        let (fileserver_addr, _intake_addr, registry) =
+            ready_rx.await.expect("daemon did not publish readiness");
+        let store_root = root_rx
+            .await
+            .expect("daemon registry root was not observed");
+
+        let fixture = std::env::temp_dir().join(format!(
+            "sbz-daemon-child-race-{}-{}",
+            std::process::id(),
+            u8::from(failing_server)
+        ));
+        let _ = std::fs::remove_dir_all(&fixture);
+        std::fs::create_dir(&fixture).unwrap();
+        let input = fixture.join("input.h");
+        std::fs::write(&input, b"tracked child race").unwrap();
+        let requested = input.to_string_lossy().into_owned();
+        let session_id = format!("tracked-child-{}", u8::from(failing_server));
+        let capability = registry.create(session_id.clone(), None, Vec::new()).await;
+
+        let mut socket = loop {
+            match tokio::net::TcpStream::connect(fileserver_addr).await {
+                Ok(socket) => break socket,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        write_frame(
+            &mut socket,
+            FrameHeader {
+                request_id: 0,
+                op: OpCode::Hello,
+                is_response: false,
+            },
+            &HelloRequest {
+                token: String::new(),
+                root: String::new(),
+                session_id,
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        socket.flush().await.unwrap();
+        let (_, hello) = read_frame(&mut socket).await.unwrap();
+        assert!(HelloResponse::decode(&hello).unwrap().ok);
+
+        let (pin_reached_tx, pin_reached_rx) = tokio::sync::oneshot::channel();
+        let (pin_release_tx, pin_release_rx) = tokio::sync::oneshot::channel();
+        capability.install_before_pin_insert_hook(pin_reached_tx, pin_release_rx);
+        let request = tokio::spawn(async move {
+            let write = write_frame(
+                &mut socket,
+                FrameHeader {
+                    request_id: 1,
+                    op: OpCode::OpenRead,
+                    is_response: false,
+                },
+                &OpenReadRequest {
+                    path: requested,
+                    want_inline: true,
+                }
+                .encode(),
+            )
+            .await;
+            let response = match write {
+                Ok(()) => match socket.flush().await {
+                    Ok(()) => read_frame(&mut socket).await.and_then(|(_, payload)| {
+                        OpenReadResponse::decode(&payload)
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    }),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
+            (socket, response)
+        });
+        pin_reached_rx
+            .await
+            .expect("request did not reach the pre-pin barrier");
+
+        if let Some(trigger) = failure_trigger {
+            trigger.send(()).unwrap();
+        } else {
+            shutdown.cancel();
+        }
+        drained_rx
+            .await
+            .expect("daemon did not finish its session drain");
+        let descendant_was_drained = pin_release_tx.send(()).is_err();
+        let (socket, response) = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("OpenRead did not terminate during daemon shutdown")
+            .unwrap();
+        let pinned_after_shutdown = capability.pinned_count().await;
+        drop((socket, capability));
+        for _ in 0..200 {
+            if registry.active_pin_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            registry.active_pin_count(),
+            0,
+            "test cleanup retained a pin"
+        );
+        release_drain_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            cleanup_reached_rx.recv_timeout(Duration::from_secs(5))
+        })
+        .await
+        .unwrap()
+        .expect("daemon cleanup did not reach its barrier");
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut daemon).await;
+        assert!(
+            early.is_err(),
+            "daemon returned before CAS cleanup completion"
+        );
+        cleanup_release_tx.send(()).unwrap();
+        let daemon_result = daemon.await.expect("run_daemon task panicked");
+        assert_eq!(failing_server, daemon_result.is_err());
+        assert!(!store_root.exists(), "daemon CAS root survived cleanup");
+        std::fs::remove_dir_all(fixture).ok();
+
+        assert!(
+            !matches!(response, Ok(open) if open.exists),
+            "a descendant request crossed session shutdown and published a pin"
+        );
+        assert!(
+            descendant_was_drained,
+            "the request future remained alive until after session shutdown"
+        );
+        assert_eq!(
+            pinned_after_shutdown, 0,
+            "shutdown clear was followed by a descendant pin insertion"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normal_shutdown_drains_descendant_request_before_session_cleanup() {
+        exercise_descendant_drain_during_pin_barrier(false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_failure_drains_descendant_request_before_session_cleanup() {
+        exercise_descendant_drain_during_pin_barrier(true)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn daemon_refuses_coord_lan_without_token() {
+        let registry_count = SessionRegistry::current_thread_creation_count();
         let config = DaemonConfig {
             coord_addr: "0.0.0.0:0".into(),
             cluster_token: None,
@@ -475,6 +932,11 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("Coordination"), "{message}");
         assert!(message.contains("non-loopback"), "{message}");
+        assert_eq!(
+            SessionRegistry::current_thread_creation_count(),
+            registry_count,
+            "fallible daemon setup must finish before registry creation"
+        );
     }
 
     #[tokio::test]
@@ -681,5 +1143,326 @@ mod tests {
 
         assert_eq!(ServerRole::ALL.len(), 4);
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(windows)]
+    fn local_fixture_command(
+        addr: std::net::SocketAddr,
+        output: &std::path::Path,
+    ) -> sembazuru_proto::v0::Command {
+        let executable = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        // This synthetic fixture is the test executable itself, which embeds the
+        // production runtime constants and test needle strings without importing
+        // those DLLs. Isolate that exact metadata key from the production scan.
+        crate::scheduler::prime_bypass_runtime_none(&executable).unwrap();
+        sembazuru_proto::v0::Command {
+            argv: vec![
+                executable,
+                "--ignored".into(),
+                "--exact".into(),
+                "tests::local_job_child_fixture".into(),
+                "--nocapture".into(),
+            ],
+            env: [
+                ("SEMBAZURU_JOB_FIXTURE_MODE".into(), "parent".into()),
+                ("SEMBAZURU_JOB_FIXTURE_ADDR".into(), addr.to_string()),
+                (
+                    "SEMBAZURU_JOB_FIXTURE_OUTPUT".into(),
+                    output.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn exercise_daemon_submission_drain(failing_server: bool) {
+        use std::io::Write;
+
+        let _guard = crate::LOCAL_JOB_TEST_LOCK.lock().await;
+
+        let config = DaemonConfig {
+            coord_addr: "127.0.0.1:0".into(),
+            intake_addr: "127.0.0.1:0".into(),
+            fileserver_addr: "127.0.0.1:0".into(),
+            status_addr: "127.0.0.1:0".into(),
+            ..DaemonConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        NEXT_DAEMON_READY.with(|slot| {
+            assert!(slot.borrow_mut().replace(ready_tx).is_none());
+        });
+        let failure = if failing_server {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            NEXT_GATED_SERVER_FAILURE.with(|slot| {
+                assert!(
+                    slot.borrow_mut()
+                        .replace((ServerRole::Coordination, rx))
+                        .is_none()
+                );
+            });
+            Some(tx)
+        } else {
+            None
+        };
+        let daemon = tokio::spawn(run_daemon(config, shutdown.clone()));
+        let (_, intake_addr, _) = ready_rx.await.expect("daemon did not publish readiness");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let output = std::env::temp_dir().join(format!(
+            "sembazuru-daemon-drain-{}-{}-{}.txt",
+            std::process::id(),
+            u8::from(failing_server),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let command = local_fixture_command(listener.local_addr().unwrap(), &output);
+        let mut client = tokio::spawn(crate::intake::submit_to_daemon(
+            format!("http://{intake_addr}"),
+            command,
+            crate::intake::SubmitOptions::default(),
+        ));
+        let mut peers = crate::accept_local_job_fixture(listener).await;
+
+        if let Some(failure) = failure {
+            failure.send(()).unwrap();
+        } else {
+            shutdown.cancel();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut client)
+                .await
+                .is_err(),
+            "accepted LocalIntake RPC closed before the local child completed"
+        );
+        for peer in &mut peers {
+            peer.socket.write_all(&[1]).unwrap();
+        }
+        let (exit, _) = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client did not receive the natural Exit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit, 0);
+        let daemon_result = tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("daemon did not finish cleanup")
+            .unwrap();
+        assert_eq!(daemon_result.is_err(), failing_server);
+        assert_eq!(std::fs::read(&output).unwrap(), b"completed\n");
+        for peer in &peers {
+            peer.assert_signaled();
+        }
+        let _ = std::fs::remove_file(output);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn daemon_normal_shutdown_drains_local_submission_to_real_exit() {
+        exercise_daemon_submission_drain(false).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn daemon_non_intake_failure_drains_local_submission_to_real_exit() {
+        exercise_daemon_submission_drain(true).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn daemon_deadline_reaps_old_tree_before_retry_eof() {
+        let _guard = crate::LOCAL_JOB_TEST_LOCK.lock().await;
+        let config = DaemonConfig {
+            coord_addr: "127.0.0.1:0".into(),
+            intake_addr: "127.0.0.2:0".into(),
+            fileserver_addr: "127.0.0.1:0".into(),
+            status_addr: "127.0.0.1:0".into(),
+            ..DaemonConfig::default()
+        };
+        SUBMISSION_DEADLINES
+            .lock()
+            .unwrap()
+            .insert(config.intake_addr.clone(), Duration::from_millis(10));
+        let shutdown = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        NEXT_DAEMON_READY.with(|slot| {
+            assert!(slot.borrow_mut().replace(ready_tx).is_none());
+        });
+        let daemon = tokio::spawn(run_daemon(config, shutdown.clone()));
+        let (_, intake_addr, _) = ready_rx.await.expect("daemon did not publish readiness");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let output = std::env::temp_dir().join(format!(
+            "sembazuru-daemon-deadline-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let command = local_fixture_command(listener.local_addr().unwrap(), &output);
+        let client = tokio::spawn(crate::intake::submit_to_daemon(
+            format!("http://{intake_addr}"),
+            command,
+            crate::intake::SubmitOptions::default(),
+        ));
+        let peers = crate::accept_local_job_fixture(listener).await;
+        shutdown.cancel();
+
+        let client_error = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client did not receive retry-safe EOF")
+            .unwrap()
+            .expect_err("forced submission must not publish a fake Exit");
+        assert!(
+            client_error.to_string().contains("exit status"),
+            "{client_error}"
+        );
+        for peer in &peers {
+            peer.assert_signaled();
+        }
+        assert!(!output.exists(), "old tree wrote output before force reap");
+        drop(peers);
+        tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("daemon did not finish after forced reap")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn daemon_deadline_forces_disarm_wait_before_retry_eof() {
+        use std::io::Write;
+
+        let _guard = crate::LOCAL_JOB_TEST_LOCK.lock().await;
+        let config = DaemonConfig {
+            coord_addr: "127.0.0.1:0".into(),
+            intake_addr: "127.0.0.3:0".into(),
+            fileserver_addr: "127.0.0.1:0".into(),
+            status_addr: "127.0.0.1:0".into(),
+            ..DaemonConfig::default()
+        };
+        SUBMISSION_DEADLINES
+            .lock()
+            .unwrap()
+            .insert(config.intake_addr.clone(), Duration::from_millis(10));
+        let shutdown = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        NEXT_DAEMON_READY.with(|slot| {
+            assert!(slot.borrow_mut().replace(ready_tx).is_none());
+        });
+        let daemon = tokio::spawn(run_daemon(config, shutdown.clone()));
+        let (_, intake_addr, _) = ready_rx.await.expect("daemon did not publish readiness");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let output = std::env::temp_dir().join(format!(
+            "sembazuru-daemon-disarm-force-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut command = local_fixture_command(listener.local_addr().unwrap(), &output);
+        command
+            .env
+            .insert("SEMBAZURU_JOB_FIXTURE_DETACH".into(), "1".into());
+        let control = crate::local_job::TestGuardianControl::bind(&mut command).unwrap();
+        control.install(4);
+        control.observe_job();
+        let client = tokio::spawn(crate::intake::submit_to_daemon(
+            format!("http://{intake_addr}"),
+            command,
+            crate::intake::SubmitOptions::default(),
+        ));
+        let mut peers = crate::accept_local_job_fixture(listener).await;
+        let observed_job = control.take_observed_job_handle();
+        let membership = if observed_job == 0 {
+            Vec::new()
+        } else {
+            peers
+                .iter()
+                .map(|peer| {
+                    (
+                        peer.role,
+                        peer.pid,
+                        peer.is_in_job(observed_job)
+                            .map_err(|error| error.to_string()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        if observed_job != 0 {
+            unsafe {
+                let _ = windows_sys::Win32::Foundation::CloseHandle(observed_job as _);
+            }
+        }
+        peers
+            .iter_mut()
+            .find(|peer| peer.role == 1)
+            .unwrap()
+            .socket
+            .write_all(&[1])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !peers
+                .iter()
+                .find(|peer| peer.role == 1)
+                .unwrap()
+                .is_signaled()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("top process did not exit into the disarm wait");
+        assert!(
+            !peers
+                .iter()
+                .find(|peer| peer.role == 0)
+                .unwrap()
+                .is_signaled(),
+            "detached descendant exited before force"
+        );
+        shutdown.cancel();
+
+        let client_result = tokio::time::timeout(Duration::from_secs(5), client)
+            .await
+            .expect("client did not receive safe EOF after disarm force")
+            .unwrap();
+        let branch = control.take_natural_publish_branch();
+        let failpoint4_consumed = control.take_last_consumed_failpoint();
+        let audit = control.take_last_audit_counts();
+        let run_local_deadline_state = control.take_run_local_deadline_state();
+        let peer_signals = peers
+            .iter()
+            .map(|peer| (peer.role, peer.pid, peer.is_signaled()))
+            .collect::<Vec<_>>();
+        let diagnostic = format!(
+            "observed_job={observed_job} membership={membership:?} audit={audit:?} natural_branch={branch} failpoint4_consumed={failpoint4_consumed} run_local_deadline_state={run_local_deadline_state} peer_signals={peer_signals:?}"
+        );
+        let client_error = client_result.expect_err(&format!(
+            "forced disarm wait must not publish the natural Exit; {diagnostic}"
+        ));
+        assert!(
+            client_error.to_string().contains("exit status"),
+            "{client_error}; {diagnostic}"
+        );
+        for peer in &peers {
+            peer.assert_signaled();
+        }
+        tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("daemon did not finish after disarm force")
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), b"completed\n");
+        let _ = std::fs::remove_file(output);
     }
 }
