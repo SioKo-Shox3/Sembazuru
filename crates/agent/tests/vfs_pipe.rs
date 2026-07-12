@@ -32,13 +32,18 @@ impl Drop for TempDir {
     }
 }
 
-async fn start_file_server() -> std::net::SocketAddr {
+async fn start_file_server_with_stats() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<sembazuru_agent::fileserver::ServerStats>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
+    let served_stats = std::sync::Arc::clone(&stats);
     tokio::spawn(async move {
-        let _ = sembazuru_agent::fileserver::serve_files(listener).await;
+        let _ = sembazuru_agent::fileserver::serve_files_with_stats(listener, served_stats).await;
     });
-    addr
+    (addr, stats)
 }
 
 async fn start_file_server_with_token(token: &str) -> std::net::SocketAddr {
@@ -130,7 +135,7 @@ async fn pipe_hydrates_file_into_scratch() {
     std::fs::write(&logical, content).unwrap();
     let logical_str = logical.to_string_lossy().into_owned();
 
-    let addr = start_file_server().await;
+    let (addr, _stats) = start_file_server_with_stats().await;
     let scratch = dir.join("scratch");
     let pipe_name = format!("sbz-vfs-test-{}", std::process::id());
     let full = format!(r"\\.\pipe\{pipe_name}");
@@ -171,6 +176,76 @@ async fn pipe_hydrates_file_into_scratch() {
     let missing = dir.join("nope.h").to_string_lossy().into_owned();
     let (status, _) = pipe_hydrate(&full, &missing).await;
     assert_eq!(status, 1, "missing file is reported not-found");
+}
+
+#[tokio::test]
+async fn concurrent_prefetch_and_open_share_one_hydration() {
+    use std::sync::atomic::Ordering;
+
+    let source = TempDir::new("single-flight-source");
+    let path = source.join("shared.h");
+    let body = vec![0x5a; 700_000];
+    std::fs::write(&path, &body).unwrap();
+    let (addr, stats) = start_file_server_with_stats().await;
+    let scratch = source.join("scratch");
+    let pipe_name = format!("sbz-vfs-single-flight-{}", std::process::id());
+    let full = format!(r"\\.\pipe\{pipe_name}");
+    let predicted = path.to_string_lossy().to_uppercase();
+    let server = sembazuru_worker::vfs_pipe::start_action_vfs(
+        pipe_name,
+        addr,
+        scratch.clone(),
+        source.join("cas"),
+        Duration::ZERO,
+        vec![predicted],
+        String::new(),
+        String::new(),
+        String::new(),
+    )
+    .await
+    .unwrap();
+
+    let logical = path.to_string_lossy().replace('\\', "/");
+    let uppercase_logical = logical.to_uppercase();
+    let (first, second) = tokio::join!(
+        pipe_hydrate(&full, &logical),
+        pipe_hydrate(&full, &uppercase_logical),
+    );
+
+    assert_eq!(first, second, "all waiters must receive the same output");
+    for hydrated in [first, second] {
+        assert_eq!(hydrated.0, 0);
+        assert_eq!(std::fs::read(hydrated.1).unwrap(), body);
+    }
+    assert_eq!(stats.content_bytes(), body.len() as u64);
+    assert_eq!(stats.read_ops.load(Ordering::Relaxed), 3);
+
+    server.shutdown().await;
+    let temp_files = walk_files(&scratch)
+        .into_iter()
+        .filter(|path| path.to_string_lossy().contains(".sbz-tmp-"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        temp_files.len(),
+        0,
+        "temporary files remained: {temp_files:?}"
+    );
+}
+
+fn walk_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return files;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            files.extend(walk_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
 }
 
 #[tokio::test]

@@ -63,4 +63,4 @@ embed-manifest = "1"
 toml = "0.8"
 sembazuru-agent = { path = "../agent" }
 sembazuru-worker = { path = "../worker" }
-
+tokio = { version = "1", features = ["test-util"] }

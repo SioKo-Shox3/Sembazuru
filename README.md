@@ -188,6 +188,10 @@ what remains is publishing the first release and proving install→join on real 
   status on a loopback Status feed, and exposes start/stop and config. The one piece
   still in progress is the **GUI-only 2nd-machine worker-join flow** (M11) so a second
   PC can join a cluster without hand-editing `worker.toml`.
+  The live monitor exposes source basenames and recent outcomes over the current
+  loopback Status endpoint. Until Status moves to a caller-authenticated named pipe,
+  any local process can read that short-lived metadata; full paths, arguments,
+  environment values, and tokens are never exposed.
 - **Real two-machine LAN (M10).** Everything above runs daemon + worker + build on a
   single host (speed numbers use RTT emulation). The cross-machine specifics —
   `cwd`=input-root drift, returning the trace over the data plane, write-back scope,

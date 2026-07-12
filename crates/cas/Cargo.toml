@@ -11,6 +11,19 @@ publish.workspace = true
 # Content hash for digest-as-identity (ADR 0003: BLAKE3, decided with real data
 # in docs/decisions/0003-cas-hash-and-chunking.md). CC0 OR Apache-2.0.
 blake3 = "1"
+cap-fs-ext = "4"
+cap-std = "4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 # Measurement-only dependencies for the `hash_bench` example (M4.0), kept so the
 # ADR's numbers stay reproducible: it compares blake3 against `sha2` (SHA-NI)

@@ -5,6 +5,8 @@
 //! is layered on. No compiler or DLL involved.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use sembazuru_agent::session_registry::{DEFAULT_OUTPUT_MAX_BYTES, OutputSpec, staging_temp};
@@ -79,7 +81,11 @@ fn staging_files(dir: &std::path::Path) -> Vec<PathBuf> {
 
 /// Starts the production-mode agent file server on an ephemeral port; returns
 /// its address and a pre-created unscoped bound session id.
-async fn start_server() -> (std::net::SocketAddr, String) {
+async fn start_server() -> (
+    std::net::SocketAddr,
+    String,
+    Arc<sembazuru_agent::fileserver::ServerStats>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let stats = std::sync::Arc::new(sembazuru_agent::fileserver::ServerStats::default());
@@ -89,13 +95,18 @@ async fn start_server() -> (std::net::SocketAddr, String) {
     registry
         .create(session_id.clone(), None, Default::default())
         .await;
+    let served_stats = Arc::clone(&stats);
     tokio::spawn(async move {
         let _ = sembazuru_agent::fileserver::serve_files_with_stats_token(
-            listener, stats, None, registry, false,
+            listener,
+            served_stats,
+            None,
+            registry,
+            false,
         )
         .await;
     });
-    (addr, session_id)
+    (addr, session_id, stats)
 }
 
 /// Starts the legacy no-token helper with empty-session compatibility enabled.
@@ -181,12 +192,13 @@ async fn send_raw_writeback(
 #[tokio::test]
 async fn fetch_returns_exact_bytes_and_verifies_digest() {
     let dir = TempDir::new("fetch");
-    // A file larger than the 64 KiB inline chunk, to exercise the Read loop.
-    let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    // Inline 64 KiB, two full 256 KiB reads, then a trailing partial read.
+    let big: Vec<u8> = (0..700_123u32).map(|i| (i % 251) as u8).collect();
     let path = dir.write("sub/main.cpp", &big);
 
-    let (addr, session_id) = start_server().await;
+    let (addr, session_id, stats) = start_server().await;
     let client = connect_bound(addr, &session_id).await;
+    let before = stats.read_ops.load(Ordering::Relaxed);
 
     let (bytes, digest) = client
         .fetch(&path)
@@ -194,6 +206,7 @@ async fn fetch_returns_exact_bytes_and_verifies_digest() {
         .expect("rpc ok")
         .expect("file exists");
     assert_eq!(bytes, big, "fetched bytes must match on disk exactly");
+    assert_eq!(stats.read_ops.load(Ordering::Relaxed) - before, 3);
     // BLAKE3 (ADR 0003): canonical "blake3:<64 hex>".
     assert_eq!(digest.algo(), sembazuru_cas::DigestAlgo::Blake3);
     assert_eq!(digest.hex().len(), 64, "blake3 hex digest");
@@ -212,7 +225,7 @@ async fn snapshot_pins_content_against_midbuild_edits() {
     let v1 = b"version-ONE-content".to_vec();
     let path = dir.write("hdr.h", &v1);
 
-    let (addr, session_id) = start_server().await;
+    let (addr, session_id, _stats) = start_server().await;
     let client = connect_bound(addr, &session_id).await;
 
     // Digest-first open pins v1 in the agent's CAS.
@@ -245,7 +258,7 @@ async fn has_probe_reports_agent_cas_membership() {
     let dir = TempDir::new("has");
     let path = dir.write("a.h", b"ingest me\n");
 
-    let (addr, session_id) = start_server().await;
+    let (addr, session_id, _stats) = start_server().await;
     let client = connect_bound(addr, &session_id).await;
 
     let (digest, _) = client.probe_digest(&path).await.unwrap().expect("exists");
@@ -264,7 +277,7 @@ async fn stat_batch_reports_existence_per_path() {
     let present = dir.write("a.h", b"#pragma once\n");
     let absent = dir.join("b.h").to_string_lossy().into_owned();
 
-    let (addr, session_id) = start_server().await;
+    let (addr, session_id, _stats) = start_server().await;
     let client = connect_bound(addr, &session_id).await;
 
     let resp = client.stat_batch(&[present, absent]).await.expect("rpc ok");
@@ -607,7 +620,7 @@ async fn dir_list_snapshots_a_directory() {
     dir.write("inc/stdlib.h", b"yy");
     std::fs::create_dir_all(dir.join("inc/sys")).unwrap();
 
-    let (addr, session_id) = start_server().await;
+    let (addr, session_id, _stats) = start_server().await;
     let client = connect_bound(addr, &session_id).await;
 
     let inc = dir.join("inc").to_string_lossy().into_owned();
@@ -628,7 +641,7 @@ async fn dir_list_over_entry_quota_fails_remote_call_without_partial_entries() {
         std::fs::write(dir.join(&format!("inc/h{i}.h")), b"x").unwrap();
     }
 
-    let (addr, session_id) = start_server().await;
+    let (addr, session_id, _stats) = start_server().await;
     let client = connect_bound(addr, &session_id).await;
 
     let inc = dir.join("inc").to_string_lossy().into_owned();
@@ -662,7 +675,7 @@ async fn one_connection_multiplexes_concurrent_ops() {
         paths.push((dir.write(&format!("tu{i}.cpp"), body.as_bytes()), body));
     }
 
-    let (addr, session_id) = start_server().await;
+    let (addr, session_id, _stats) = start_server().await;
     let client = connect_bound(addr, &session_id).await;
 
     // Fire all fetches concurrently on clones of the one connection.

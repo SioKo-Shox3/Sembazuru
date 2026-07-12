@@ -22,6 +22,7 @@
 //! by the M4.6 rebuild gate. Correctness rule: any changed input moves the
 //! strong key, so a stale result is never served.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -419,24 +420,34 @@ impl AgentCache {
         )
     }
 
-    /// The agent-side logical paths a prior build of this action read, for
+    /// The normalized absolute paths a prior build of this action read, for
     /// dependency-prediction prefetch (M5.4, `ExecuteRequest.predicted_paths`).
     /// Empty when the action has no cached manifest yet — a first build has
-    /// nothing to predict, so prefetch is simply skipped. NOTE: returns the
-    /// manifest's *logical* paths; reconciling those with the paths the worker
-    /// hydrates under the deployed `PathMap` is part of the M5.5 daemon wiring.
-    pub fn predicted_paths(&self, weak: &Digest) -> io::Result<Vec<String>> {
+    /// nothing to predict, so prefetch is simply skipped. Non-content and
+    /// out-of-scope inputs are excluded before applying the quota.
+    pub fn predicted_paths(
+        &self,
+        weak: &Digest,
+        normalized_vfs_root: Option<&str>,
+    ) -> io::Result<Vec<String>> {
         let Some(bytes) = self.cache.get_manifest(weak)? else {
             return Ok(Vec::new());
         };
         let Some(manifest) = decode_manifest(&bytes) else {
             return Ok(Vec::new()); // corrupt manifest → no prediction
         };
+
+        let mut seen = HashSet::new();
         Ok(manifest
             .inputs
             .into_iter()
+            .filter(|entry| entry.kind == InputKind::Content)
+            .filter_map(|entry| {
+                crate::fileserver::normalize_prefetch_path(&entry.absolute, normalized_vfs_root)
+            })
+            .filter(|path| crate::fileserver::path_in_scope(path, normalized_vfs_root))
+            .filter(|path| seen.insert(path.clone()))
             .take(MAX_PREDICTED_PATHS)
-            .map(|e| e.logical)
             .collect())
     }
 
@@ -2121,7 +2132,16 @@ mod tests {
     #[test]
     fn predicted_paths_come_from_the_recorded_manifest() {
         let root = tmp("predict");
-        let build = tmp("predict-build");
+        let build = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "sbz-predict-build-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+        let _ = std::fs::remove_dir_all(&build);
+        std::fs::create_dir_all(&build).unwrap();
         let cache = AgentCache::open(&root).unwrap();
         let input = build.join("a.cpp");
         std::fs::write(&input, b"src").unwrap();
@@ -2131,7 +2151,7 @@ mod tests {
         let weak = cache.weak_key(&argv, &[], "");
 
         // No manifest yet → nothing to predict (a first build skips prefetch).
-        assert!(cache.predicted_paths(&weak).unwrap().is_empty());
+        assert!(cache.predicted_paths(&weak, None).unwrap().is_empty());
 
         // After recording, the manifest's input logical paths are the prediction.
         let header = build.join("h.h");
@@ -2149,13 +2169,20 @@ mod tests {
             )
             .unwrap();
 
-        let mut predicted = cache.predicted_paths(&weak).unwrap();
+        let mut predicted = cache.predicted_paths(&weak, None).unwrap();
         predicted.sort();
-        assert_eq!(predicted, vec!["a.cpp".to_string(), "h.h".to_string()]);
+        let mut expected = vec![
+            crate::fileserver::normalize_requested(&input.to_string_lossy()).unwrap(),
+            crate::fileserver::normalize_requested(&header.to_string_lossy()).unwrap(),
+        ];
+        expected.sort();
+        assert_eq!(predicted, expected);
 
         // An unknown action still predicts nothing.
         let other = cache.weak_key(&["other".to_string()], &[], "");
-        assert!(cache.predicted_paths(&other).unwrap().is_empty());
+        assert!(cache.predicted_paths(&other, None).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(build);
     }
 
     #[test]
@@ -2183,14 +2210,122 @@ mod tests {
             .put_manifest(&weak, &encode_manifest(&manifest))
             .unwrap();
 
-        let predicted = cache.predicted_paths(&weak).unwrap();
+        let predicted = cache.predicted_paths(&weak, None).unwrap();
 
         assert_eq!(predicted.len(), MAX_PREDICTED_PATHS);
-        assert_eq!(predicted[0], "include\\h0.h");
+        assert_eq!(predicted[0], "c:\\src\\include\\h0.h");
         assert_eq!(
             predicted[MAX_PREDICTED_PATHS - 1],
-            format!("include\\h{}.h", MAX_PREDICTED_PATHS - 1)
+            format!("c:\\src\\include\\h{}.h", MAX_PREDICTED_PATHS - 1)
         );
+    }
+
+    fn predicted_paths_for_absolute(
+        tag: &str,
+        absolute: &str,
+        normalized_vfs_root: Option<&str>,
+    ) -> Vec<String> {
+        let root = tmp(tag);
+        let cache = AgentCache::open(&root).unwrap();
+        let weak = cache.weak_key(&["clang-cl".into(), "/c".into(), tag.into()], &[], "");
+        let manifest = InputManifest {
+            inputs: vec![InputEntry {
+                logical: "src\\in.h".into(),
+                absolute: absolute.into(),
+                kind: InputKind::Content,
+            }],
+            cmds: vec![],
+            cacheable: true,
+        };
+        cache
+            .cache
+            .put_manifest(&weak, &encode_manifest(&manifest))
+            .unwrap();
+
+        cache.predicted_paths(&weak, normalized_vfs_root).unwrap()
+    }
+
+    #[test]
+    fn predicted_paths_allow_short_alias_in_declared_root_prefix() {
+        let predicted = predicted_paths_for_absolute(
+            "predict-root-alias",
+            "C:\\Users\\<user>\\Documents\\Sembazuru\\project\\src\\in.h",
+            Some("c:\\users\\kingka~1\\documents\\sembazuru\\project"),
+        );
+
+        assert_eq!(
+            predicted,
+            vec!["c:\\users\\kingka~1\\documents\\sembazuru\\project\\src\\in.h"]
+        );
+    }
+
+    #[test]
+    fn predicted_paths_reject_short_alias_in_root_relative_suffix() {
+        let predicted = predicted_paths_for_absolute(
+            "predict-suffix-alias",
+            "C:\\project\\PROGRA~1\\in.h",
+            Some("c:\\project"),
+        );
+
+        assert!(predicted.is_empty());
+    }
+
+    #[test]
+    fn predicted_paths_unscoped_reject_ambiguous_short_alias() {
+        let predicted = predicted_paths_for_absolute(
+            "predict-unscoped-alias",
+            "C:\\Users\\<user>\\project\\src\\in.h",
+            None,
+        );
+
+        assert!(predicted.is_empty());
+    }
+
+    fn assert_tail_content_survives(prefix_kind: InputKind, tag: &str) {
+        let root = tmp("predict-filter");
+        let cache = AgentCache::open(&root).unwrap();
+        let weak = cache.weak_key(&["clang-cl".into(), "/c".into(), tag.into()], &[], "");
+
+        let mut inputs = (0..MAX_PREDICTED_PATHS)
+            .map(|i| InputEntry {
+                logical: format!("prefix\\h{i}.h"),
+                absolute: format!("c:\\outside\\h{i}.h"),
+                kind: prefix_kind,
+            })
+            .collect::<Vec<_>>();
+        inputs.push(InputEntry {
+            logical: "src/a.cpp".into(),
+            absolute: "C:/PROJ/src/./a.cpp".into(),
+            kind: InputKind::Content,
+        });
+        inputs.push(InputEntry {
+            logical: "src/a-duplicate.cpp".into(),
+            absolute: "c:\\proj\\src\\a.cpp".into(),
+            kind: InputKind::Content,
+        });
+
+        let manifest = InputManifest {
+            inputs,
+            cmds: vec![],
+            cacheable: true,
+        };
+        cache
+            .cache
+            .put_manifest(&weak, &encode_manifest(&manifest))
+            .unwrap();
+
+        let predicted = cache.predicted_paths(&weak, Some("c:\\proj")).unwrap();
+        assert_eq!(predicted, vec!["c:\\proj\\src\\a.cpp"]);
+    }
+
+    #[test]
+    fn scope_filter_runs_before_quota() {
+        assert_tail_content_survives(InputKind::Content, "scope.cpp");
+    }
+
+    #[test]
+    fn kind_filter_runs_before_quota() {
+        assert_tail_content_survives(InputKind::Absent, "kind.cpp");
     }
 
     #[test]

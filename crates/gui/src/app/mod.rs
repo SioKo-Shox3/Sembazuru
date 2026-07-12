@@ -17,9 +17,22 @@ use crate::tray::{Tray, TrayMessage};
 const TRAY_HINT_TEXT: &str = "トレイに常駐します。終了はトレイメニューから。";
 const TRAY_HINT_FRAMES: u16 = 180;
 
+fn configure_app_theme(ctx: &egui::Context) {
+    ctx.set_visuals(egui::Visuals::dark());
+}
+
+fn apply_root_theme(ui: &mut egui::Ui) {
+    ui.style_mut().visuals = egui::Visuals::dark();
+}
+
+fn root_background_fill(visuals: &egui::Visuals) -> egui::Color32 {
+    visuals.panel_fill
+}
+
 pub mod config;
 pub mod dashboard;
 pub mod join_panel;
+pub mod monitor;
 mod services;
 
 /// Which view the window is showing.
@@ -27,6 +40,7 @@ mod services;
 enum Tab {
     #[default]
     Dashboard,
+    Monitor,
     Services,
     Join,
     Settings,
@@ -59,6 +73,7 @@ impl SembazuruApp {
     /// egui repaints, installs the tray, and begins polling the loopback Status
     /// service at `endpoint`.
     pub fn new(cc: &eframe::CreationContext<'_>, endpoint: String) -> Self {
+        configure_app_theme(&cc.egui_ctx);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -123,6 +138,9 @@ impl eframe::App for SembazuruApp {
     // eframe 0.34's `App::ui` hands us the root central `Ui` directly (no margin);
     // `update` is deprecated. We read the latest snapshot and render it.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        apply_root_theme(ui);
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, root_background_fill(ui.visuals()));
         let ctx = ui.ctx().clone();
         self.handle_tray(&ctx);
 
@@ -130,6 +148,7 @@ impl eframe::App for SembazuruApp {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Dashboard, "Dashboard");
+                ui.selectable_value(&mut self.tab, Tab::Monitor, "Monitor");
                 ui.selectable_value(&mut self.tab, Tab::Services, "Services");
                 ui.selectable_value(&mut self.tab, Tab::Join, "Join");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
@@ -154,6 +173,7 @@ impl eframe::App for SembazuruApp {
                     self.services.start_daemon(&ctx);
                 }
             }
+            Tab::Monitor => monitor::render(ui, &self.shared.snapshot()),
             Tab::Services => self.services.render(ui, &ctx),
             Tab::Join => self.join_panel.render(ui, &mut self.services, &ctx),
             Tab::Settings => self
@@ -163,5 +183,28 @@ impl eframe::App for SembazuruApp {
 
         // Keep heartbeat ages ticking even if a repaint signal is ever missed.
         ctx.request_repaint_after(POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_ui_theme_is_explicitly_dark() {
+        egui::__run_test_ui(|ui| {
+            ui.style_mut().visuals = egui::Visuals::light();
+
+            apply_root_theme(ui);
+
+            assert!(ui.visuals().dark_mode);
+        });
+    }
+
+    #[test]
+    fn root_background_uses_current_panel_fill() {
+        let visuals = egui::Visuals::dark();
+
+        assert_eq!(root_background_fill(&visuals), visuals.panel_fill);
     }
 }

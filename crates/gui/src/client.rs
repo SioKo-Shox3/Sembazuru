@@ -10,6 +10,7 @@
 //! The GUI only ever dials loopback; it never binds a listener and never speaks
 //! the cluster-facing Coordination plane.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -216,28 +217,55 @@ fn rpc_err(status: tonic::Status) -> ClientError {
 pub async fn run_client(
     endpoint: String,
     shared: SharedState,
-    mut commands: mpsc::Receiver<UiCommand>,
+    commands: mpsc::Receiver<UiCommand>,
     wake: Waker,
 ) {
+    run_client_with_poll_factory(endpoint, shared, commands, wake, |endpoint| async move {
+        fetch_status(&endpoint).await
+    })
+    .await;
+}
+
+async fn run_client_with_poll_factory<P, F>(
+    endpoint: String,
+    shared: SharedState,
+    mut commands: mpsc::Receiver<UiCommand>,
+    wake: Waker,
+    mut poll: P,
+) where
+    P: FnMut(Arc<str>) -> F + Send,
+    F: Future<Output = ConnectionState> + Send + 'static,
+{
     let endpoint: Arc<str> = Arc::from(endpoint);
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut pending_poll: Option<tokio::task::JoinHandle<ConnectionState>> = None;
     loop {
         tokio::select! {
-            _ = tick.tick() => {
-                // Poll off the select path so a slow GetStatus never starves command
-                // servicing (last-writer-wins on SharedState if two ever overlap).
+            _ = tick.tick(), if pending_poll.is_none() => {
                 let endpoint = endpoint.clone();
-                let shared = shared.clone();
-                let wake = wake.clone();
-                tokio::spawn(async move {
-                    shared.set(fetch_status(&endpoint).await);
-                    wake();
-                });
+                pending_poll = Some(tokio::spawn(poll(endpoint)));
+            }
+            result = async {
+                pending_poll
+                    .as_mut()
+                    .expect("pending poll branch is guarded")
+                    .await
+            }, if pending_poll.is_some() => {
+                let state = result.unwrap_or_else(|error| ConnectionState::Error(error.to_string()));
+                pending_poll = None;
+                shared.set(state);
+                wake();
             }
             command = commands.recv() => match command {
                 Some(command) => spawn_command(endpoint.clone(), command),
-                None => break,
+                None => {
+                    if let Some(handle) = pending_poll.take() {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                    break;
+                }
             }
         }
     }
@@ -264,7 +292,23 @@ fn spawn_command(endpoint: Arc<str>, command: UiCommand) {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_loopback;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::{Notify, mpsc, oneshot};
+
+    use super::{
+        ConnectionState, POLL_INTERVAL, SharedState, UiCommand, resolve_loopback,
+        run_client_with_poll_factory,
+    };
+
+    struct ActivePollGuard(Arc<AtomicUsize>);
+
+    impl Drop for ActivePollGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn loopback_addresses_are_accepted() {
@@ -288,5 +332,117 @@ mod tests {
         assert!(resolve_loopback("0.0.0.0:50073").is_err());
         assert!(resolve_loopback("10.0.0.5:50073").is_err());
         assert!(resolve_loopback("not a socket addr").is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poller_never_overlaps_status_requests() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let poll = {
+            let active = active.clone();
+            let peak = peak.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_endpoint| {
+                let active = active.clone();
+                let peak = peak.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    let _guard = ActivePollGuard(active);
+                    entered.notify_one();
+                    release.notified().await;
+                    ConnectionState::Connected(Box::default())
+                }
+            }
+        };
+        let shared = SharedState::new();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = wakes.clone();
+        let (commands, command_rx) = mpsc::channel(4);
+        let client = tokio::spawn(run_client_with_poll_factory(
+            "not a valid uri".into(),
+            shared.clone(),
+            command_rx,
+            Arc::new(move || {
+                wake_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            poll,
+        ));
+
+        entered.notified().await;
+        tokio::time::advance(POLL_INTERVAL * 2).await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        commands.send(UiCommand::GetConfig(reply_tx)).await.unwrap();
+        assert!(
+            reply_rx.await.unwrap().is_err(),
+            "the deliberately invalid command endpoint should fail promptly"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a pending Status request must suppress later poll ticks"
+        );
+
+        release.notify_one();
+        for _ in 0..100 {
+            if wakes.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(matches!(shared.snapshot(), ConnectionState::Connected(_)));
+        drop(commands);
+        client.await.unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn channel_close_aborts_pending_status_without_late_publish() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Notify::new());
+        let poll = {
+            let active = active.clone();
+            let entered = entered.clone();
+            move |_endpoint| {
+                let active = active.clone();
+                let entered = entered.clone();
+                async move {
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let _guard = ActivePollGuard(active);
+                    entered.notify_one();
+                    std::future::pending::<ConnectionState>().await
+                }
+            }
+        };
+        let shared = SharedState::new();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wake_count = wakes.clone();
+        let (commands, command_rx) = mpsc::channel(1);
+        let client = tokio::spawn(run_client_with_poll_factory(
+            "unused".into(),
+            shared.clone(),
+            command_rx,
+            Arc::new(move || {
+                wake_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            poll,
+        ));
+
+        entered.notified().await;
+        drop(commands);
+        client.await.unwrap();
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert!(matches!(shared.snapshot(), ConnectionState::Connecting));
+        tokio::time::advance(POLL_INTERVAL * 2).await;
+        tokio::task::yield_now().await;
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert!(matches!(shared.snapshot(), ConnectionState::Connecting));
     }
 }

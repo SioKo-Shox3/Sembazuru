@@ -13,11 +13,16 @@ use std::time::Duration;
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::fileserver::ServerStats;
 use sembazuru_agent::status::{Metrics, StatusState, serve_status_service};
-use sembazuru_proto::v0::Capabilities;
+use sembazuru_proto::v0::{
+    ActionActivity, ActivityExecutionKind, ActivityState as ProtoActivityState, Capabilities,
+    GetStatusResponse,
+};
 
 use sembazuru_gui::app::config::lan_daemon_addrs;
 use sembazuru_gui::client::{apply_config, fetch_config, fetch_status};
-use sembazuru_gui::model::{ConfigEdit, ConnectionState, TokenAction};
+use sembazuru_gui::model::{
+    ActivityKind, ActivityStatus, ConfigEdit, ConnectionState, TokenAction, map_dashboard,
+};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -45,6 +50,7 @@ async fn start_status_with_admin(
         cache: None,
         cache_max_bytes: None,
         metrics: Arc::new(Metrics::default()),
+        tracker: sembazuru_agent::action_tracker::ActionTracker::default(),
         auth_enabled: false,
         config_path,
         admin_enabled,
@@ -81,6 +87,55 @@ async fn wait_until(limit: Duration, mut pred: impl FnMut() -> bool) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     pred()
+}
+
+#[test]
+fn maps_activity_without_command_material() {
+    let response = GetStatusResponse {
+        activities: vec![ActionActivity {
+            activity_id: "9f02a1b3c4d5e6f7".into(),
+            attempt_no: 1,
+            worker_id: "w1".into(),
+            execution_kind: ActivityExecutionKind::Remote as i32,
+            display_name: "main.cpp".into(),
+            state: ProtoActivityState::Running as i32,
+            lane_index: 2,
+            started_age_ms: 250,
+            finished_age_ms: None,
+            duration_us: 250_000,
+        }],
+        ..Default::default()
+    };
+    let model = map_dashboard(response);
+    assert_eq!(model.activities.len(), 1);
+    let activity = &model.activities[0];
+    assert_eq!(activity.activity_id, "9f02a1b3c4d5e6f7");
+    assert_eq!(activity.attempt_no, 1);
+    assert_eq!(activity.worker_id, "w1");
+    assert_eq!(activity.kind, ActivityKind::Remote);
+    assert_eq!(activity.display_name, "main.cpp");
+    assert_eq!(activity.status, ActivityStatus::Running);
+    assert_eq!(activity.lane_index, 2);
+    assert_eq!(activity.started_age_ms, 250);
+    assert_eq!(activity.finished_age_ms, None);
+    assert_eq!(activity.duration_us, 250_000);
+
+    let unknown = map_dashboard(GetStatusResponse {
+        activities: vec![ActionActivity {
+            execution_kind: i32::MAX,
+            state: i32::MAX,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    assert_eq!(unknown.activities[0].kind, ActivityKind::Unknown);
+    assert_eq!(unknown.activities[0].status, ActivityStatus::Unknown);
+    assert!(
+        map_dashboard(GetStatusResponse::default())
+            .activities
+            .is_empty(),
+        "a missing activity snapshot must clear prior rows"
+    );
 }
 
 #[tokio::test]

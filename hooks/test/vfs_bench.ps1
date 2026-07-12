@@ -31,8 +31,18 @@ if (-not (Get-Command cl -ErrorAction SilentlyContinue)) { throw 'cl.exe not on 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Push-Location $repo
 try {
-    & cargo build -p sembazuru-worker --example vfs_host 2>&1 | Out-String | Write-Host
-    if ($LASTEXITCODE -ne 0) { throw 'vfs_host build failed' }
+    $savedErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        # Windows PowerShell 5 wraps native stderr as ErrorRecord; stringify it to avoid
+        # replaying verbose NativeCommandError metadata. LASTEXITCODE remains authoritative.
+        $cargoOutput = @(& cargo build -p sembazuru-worker --example vfs_host 2>&1 | ForEach-Object { "$_" })
+        $cargoExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $savedErrorPreference
+    }
+    Write-Host ($cargoOutput -join [Environment]::NewLine)
+    if ($cargoExitCode -ne 0) { throw "vfs_host build failed with exit code $cargoExitCode" }
 } finally { Pop-Location }
 $hostExe = Join-Path $repo 'target\debug\examples\vfs_host.exe'
 

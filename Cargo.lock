@@ -724,6 +724,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cap-fs-ext"
+version = "4.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78e5a3368ae89b7cb68186411452b4b9fac8b41be9c19bf3f47c2d2c8e36e6b"
+dependencies = [
+ "cap-primitives",
+ "cap-std",
+ "io-lifetimes 3.0.1",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cap-primitives"
 version = "4.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3892,6 +3904,7 @@ dependencies = [
  "toml",
  "tonic",
  "windows-service",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3899,9 +3912,12 @@ name = "sembazuru-cas"
 version = "0.0.3"
 dependencies = [
  "blake3",
+ "cap-fs-ext",
+ "cap-std",
  "proptest",
  "sembazuru-tracer",
  "sha2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3955,6 +3971,7 @@ dependencies = [
 name = "sembazuru-worker"
 version = "0.0.3"
 dependencies = [
+ "futures-util",
  "sembazuru-agent",
  "sembazuru-cas",
  "sembazuru-dataplane",
@@ -4449,6 +4466,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]

@@ -25,9 +25,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sembazuru_proto::v0::{
-    CacheStatus, ExecBreakdown, FileServerStatus, GetConfigRequest, GetConfigResponse,
-    GetStatusRequest, GetStatusResponse, SetConfigRequest, SetConfigResponse,
-    TriggerEvictionRequest, TriggerEvictionResponse, WorkerStatus,
+    ActionActivity, ActivityExecutionKind as ProtoExecutionKind,
+    ActivityState as ProtoActivityState, CacheStatus, ExecBreakdown, FileServerStatus,
+    GetConfigRequest, GetConfigResponse, GetStatusRequest, GetStatusResponse, SetConfigRequest,
+    SetConfigResponse, TriggerEvictionRequest, TriggerEvictionResponse, WorkerStatus,
     status_server::Status as StatusRpc,
 };
 use tokio::net::TcpListener;
@@ -36,6 +37,7 @@ use tonic::{Request, Response, Status};
 
 use crate::Execution;
 use crate::action_cache::AgentCache;
+use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
 use crate::config::DaemonConfig;
 use crate::coordination::WorkerTable;
 use crate::fileserver::ServerStats;
@@ -139,6 +141,8 @@ pub struct StatusState {
     pub cache_max_bytes: Option<u64>,
     /// Daemon-wide counters (shared with the intake path that feeds them).
     pub metrics: Arc<Metrics>,
+    /// Recent redacted execution attempts shared with Scheduler and Intake.
+    pub tracker: ActionTracker,
     /// Whether the daemon requires a cluster token (ADR 0006) — surfaced so the
     /// GUI can show the cluster's auth posture.
     pub auth_enabled: bool,
@@ -204,6 +208,39 @@ impl StatusState {
             .collect();
 
         let m = &self.metrics;
+        let activities = self
+            .tracker
+            .snapshot()
+            .into_iter()
+            .map(|activity| {
+                let identity = format!("{}:{}", activity.key.action_id, activity.key.attempt_no);
+                ActionActivity {
+                    activity_id: sembazuru_cas::Digest::of(identity.as_bytes()).hex()[..16]
+                        .to_owned(),
+                    attempt_no: activity.key.attempt_no,
+                    worker_id: activity.worker_id,
+                    execution_kind: match activity.execution_kind {
+                        ExecutionKind::Remote => ProtoExecutionKind::Remote as i32,
+                        ExecutionKind::Local => ProtoExecutionKind::Local as i32,
+                        ExecutionKind::Fallback => ProtoExecutionKind::Fallback as i32,
+                    },
+                    display_name: activity.display_name,
+                    state: match activity.state {
+                        ActivityState::Created => ProtoActivityState::Unknown as i32,
+                        ActivityState::Queued => ProtoActivityState::Queued as i32,
+                        ActivityState::Preparing => ProtoActivityState::Preparing as i32,
+                        ActivityState::Running => ProtoActivityState::Running as i32,
+                        ActivityState::Completed => ProtoActivityState::Completed as i32,
+                        ActivityState::Failed => ProtoActivityState::Failed as i32,
+                        ActivityState::Interrupted => ProtoActivityState::Interrupted as i32,
+                    },
+                    lane_index: activity.lane_index,
+                    started_age_ms: clamp_u128(activity.started_age.as_millis()),
+                    finished_age_ms: activity.finished_age.map(|age| clamp_u128(age.as_millis())),
+                    duration_us: clamp_u128(activity.duration.as_micros()),
+                }
+            })
+            .collect();
         GetStatusResponse {
             workers,
             cache: Some(CacheStatus {
@@ -225,8 +262,13 @@ impl StatusState {
                 inline_bytes: self.server_stats.inline_bytes.load(Ordering::Relaxed),
             }),
             auth_enabled: self.auth_enabled,
+            activities,
         }
     }
+}
+
+fn clamp_u128(value: u128) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[tonic::async_trait]
