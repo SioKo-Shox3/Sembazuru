@@ -213,7 +213,9 @@
            whole tree (incl. the seeded *.toml and any operator edits) on uninstall,
            so the only-MSI-tracked files leave nothing behind. -->
       <Component Id="DataFolderComp" Directory="DataFolder">
-        <CreateFolder />
+        <CreateFolder>
+          <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)" />
+        </CreateFolder>
         <util:RemoveFolderEx On="uninstall" Property="SBZ_DATADIR" />
         <!-- Persist the resolved data path so the RegistrySearch above can read it
              back at uninstall; doubles as the component keypath. -->
@@ -226,18 +228,14 @@
            LocalSystem and needs no explicit grant. -->
       <Component Id="ScratchFolderComp" Directory="ScratchFolder">
         <CreateFolder>
-          <util:PermissionEx User="SembazuruWorker" Domain="NT SERVICE"
-                             GenericRead="yes" GenericWrite="yes" GenericExecute="yes"
-                             Delete="yes" DeleteChild="yes" />
+          <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)" />
         </CreateFolder>
         <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="ScratchDir"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
       <Component Id="CasFolderComp" Directory="CasFolder">
         <CreateFolder>
-          <util:PermissionEx User="SembazuruWorker" Domain="NT SERVICE"
-                             GenericRead="yes" GenericWrite="yes" GenericExecute="yes"
-                             Delete="yes" DeleteChild="yes" />
+          <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)" />
         </CreateFolder>
         <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="CasDir"
                        Type="integer" Value="1" KeyPath="yes" />
