@@ -126,24 +126,73 @@ function Format-CleanupError([object]$Record) {
         "TargetObject=$($Record.TargetObject)"
 }
 
+function Assert-GateAcl {
+    param(
+        [string]$Path,
+        [bool]$ExpectedProtected,
+        [Security.AccessControl.FileSystemRights]$RequiredUserRights,
+        [bool]$RequireInheritedRules,
+        [bool]$ForbidUserMutation
+    )
+    $acl = Get-Acl -LiteralPath $Path
+    if ($acl.AreAccessRulesProtected -ne $ExpectedProtected) {
+        throw "ACL inheritance mismatch for ${Path}: protected=$($acl.AreAccessRulesProtected)"
+    }
+    $requiredBySid = @{
+        'S-1-5-18' = [Security.AccessControl.FileSystemRights]::FullControl
+        'S-1-5-32-544' = [Security.AccessControl.FileSystemRights]::FullControl
+        'S-1-5-32-545' = $RequiredUserRights
+    }
+    $actualBySid = @{}
+    foreach ($sid in $requiredBySid.Keys) {
+        $actualBySid[$sid] = [Security.AccessControl.FileSystemRights]0
+    }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            ($RequireInheritedRules -and -not $rule.IsInherited)) {
+            continue
+        }
+        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($actualBySid.ContainsKey($sid)) {
+            $actualBySid[$sid] = $actualBySid[$sid] -bor $rule.FileSystemRights
+        }
+    }
+    foreach ($sid in $requiredBySid.Keys) {
+        $required = $requiredBySid[$sid]
+        $actual = $actualBySid[$sid]
+        if (($actual -band $required) -ne $required) {
+            throw "ACL rights mismatch for $Path SID ${sid}: got $actual, require $required"
+        }
+    }
+    if ($ForbidUserMutation) {
+        $forbidden = [Security.AccessControl.FileSystemRights]::Write -bor
+            [Security.AccessControl.FileSystemRights]::Delete -bor
+            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+            [Security.AccessControl.FileSystemRights]::TakeOwnership
+        $userRights = $actualBySid['S-1-5-32-545']
+        if (($userRights -band $forbidden) -ne 0) {
+            throw "Builtin Users can mutate protected path ${Path}: rights=$userRights"
+        }
+    }
+}
+
 $primaryError = $null
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 try {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
+    & icacls.exe $root /inheritance:r /grant:r `
+        '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' |
+        Write-Host
+    if ($LASTEXITCODE -ne 0) { throw 'failed to protect the temporary service directory' }
     New-Item -ItemType Directory -Path $ioRoot -Force | Out-Null
     Copy-Item -LiteralPath $sourceDaemon -Destination $daemonExe
     Copy-Item -LiteralPath $sourceLauncher -Destination $launcherExe
-
-    & icacls.exe $root /inheritance:r /grant:r `
-        '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' `
-        /T /C | Write-Host
-    if ($LASTEXITCODE -ne 0) { throw 'failed to protect the temporary service directory' }
 
     New-GateUser $userA $passwordA
     New-GateUser $userB $passwordB
     # Both standard callers need only the disposable evidence directory. The
     # service binary and config remain outside their writable ACL.
-    & icacls.exe $ioRoot /grant '*S-1-5-32-545:(OI)(CI)M' /T /C | Write-Host
+    & icacls.exe $ioRoot /grant:r '*S-1-5-32-545:(OI)(CI)M' | Write-Host
     if ($LASTEXITCODE -ne 0) { throw 'failed to grant caller evidence directory to Builtin Users' }
 
     $coord = "127.0.0.1:$(Get-FreeTcpPort)"
@@ -156,6 +205,13 @@ fileserver_addr = "$fileserver"
 status_addr = "$status"
 status_admin = false
 "@ | Set-Content -LiteralPath $configPath -Encoding utf8
+
+    Assert-GateAcl $root $true ([Security.AccessControl.FileSystemRights]::ReadAndExecute) $false $true
+    Assert-GateAcl $ioRoot $false ([Security.AccessControl.FileSystemRights]::Modify) $false $false
+    foreach ($protectedLeaf in @($daemonExe, $launcherExe, $configPath)) {
+        Assert-GateAcl $protectedLeaf $false `
+            ([Security.AccessControl.FileSystemRights]::ReadAndExecute) $true $true
+    }
 
     $installOutput = & $daemonExe install --account system 2>&1 | Out-String
     $ownedService = $null -ne (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
