@@ -50,6 +50,10 @@ $configPath = Join-Path $root 'daemon.toml'
 $sidFileA = Join-Path $ioRoot 'child-a.sid'
 $sidFileB = Join-Path $ioRoot 'child-b.sid'
 $fallbackSidFile = Join-Path $ioRoot 'fallback-a.sid'
+$nativeProbeA = Join-Path $root 'sid-probe-a.cmd'
+$nativeProbeB = Join-Path $root 'sid-probe-b.cmd'
+$nativeErrA = Join-Path $ioRoot 'native-a.stderr.txt'
+$nativeErrB = Join-Path $ioRoot 'native-b.stderr.txt'
 $createdUsers = [Collections.Generic.List[string]]::new()
 $ownedService = $false
 
@@ -67,24 +71,28 @@ function Invoke-LauncherAsUser {
         [string]$User,
         [string]$Password,
         [string]$SidPath,
-        [string]$LogStem
+        [string]$LogStem,
+        [string[]]$CommandArgs = $null
     )
     Remove-Item -LiteralPath $SidPath -Force -ErrorAction SilentlyContinue
     $stdout = Join-Path $ioRoot "$LogStem.stdout.txt"
     $stderr = Join-Path $ioRoot "$LogStem.stderr.txt"
     Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
 
-    $escapedPath = $SidPath.Replace("'", "''")
-    $childScript = "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value | Set-Content -LiteralPath '$escapedPath' -Encoding ascii"
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
-    $windowsPowerShell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if ($null -eq $CommandArgs) {
+        $escapedPath = $SidPath.Replace("'", "''")
+        $childScript = "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value | Set-Content -LiteralPath '$escapedPath' -Encoding ascii"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
+        $windowsPowerShell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $CommandArgs = @($windowsPowerShell, '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded)
+    }
     $secure = ConvertTo-SecureString $Password -AsPlainText -Force
     $credential = [Management.Automation.PSCredential]::new("$env:COMPUTERNAME\$User", $secure)
     $oldEndpoint = [Environment]::GetEnvironmentVariable('SEMBAZURU_DAEMON', 'Process')
     try {
         $env:SEMBAZURU_DAEMON = 'npipe://Sembazuru.LocalIntake.v1'
         $process = Start-Process -FilePath $launcherExe `
-            -ArgumentList @($windowsPowerShell, '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) `
+            -ArgumentList $CommandArgs `
             -Credential $credential -LoadUserProfile -WorkingDirectory $ioRoot -WindowStyle Hidden `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr -Wait -PassThru
     }
@@ -157,11 +165,13 @@ function Invoke-DaemonFallbackAsUser {
     param(
         [string]$User,
         [string]$Password,
-        [string]$SidPath
+        [string]$SidPath,
+        [string[]]$CommandArgs = $null
     )
     $lastAttemptJson = $null
     for ($attempt = 1; $attempt -le 30; $attempt++) {
-        $run = Invoke-LauncherAsUser $User $Password $SidPath "daemon-$User-$attempt"
+        $run = Invoke-LauncherAsUser $User $Password $SidPath "daemon-$User-$attempt" `
+            -CommandArgs $CommandArgs
         if ($run.ExitCode -eq 0 -and
             $run.Note -match 'local fallback:' -and
             $run.Note -notmatch 'daemon unavailable' -and
@@ -252,6 +262,17 @@ try {
     New-Item -ItemType Directory -Path $ioRoot -Force | Out-Null
     Copy-Item -LiteralPath $sourceDaemon -Destination $daemonExe
     Copy-Item -LiteralPath $sourceLauncher -Destination $launcherExe
+    $whoami = Join-Path $env:WINDIR 'System32\whoami.exe'
+    @"
+@echo off
+"$whoami" /user /fo csv /nh > "$sidFileA" 2> "$nativeErrA"
+exit /b %errorlevel%
+"@ | Set-Content -LiteralPath $nativeProbeA -Encoding ascii
+    @"
+@echo off
+"$whoami" /user /fo csv /nh > "$sidFileB" 2> "$nativeErrB"
+exit /b %errorlevel%
+"@ | Set-Content -LiteralPath $nativeProbeB -Encoding ascii
 
     New-GateUser $userA $passwordA
     New-GateUser $userB $passwordB
@@ -273,7 +294,7 @@ status_admin = false
 
     Assert-GateAcl $root $true ([Security.AccessControl.FileSystemRights]::ReadAndExecute) $false $true
     Assert-GateAcl $ioRoot $false ([Security.AccessControl.FileSystemRights]::Modify) $false $false
-    foreach ($protectedLeaf in @($daemonExe, $launcherExe, $configPath)) {
+    foreach ($protectedLeaf in @($daemonExe, $launcherExe, $configPath, $nativeProbeA, $nativeProbeB)) {
         Assert-GateAcl $protectedLeaf $false `
             ([Security.AccessControl.FileSystemRights]::ReadAndExecute) $true $true
     }
@@ -299,10 +320,38 @@ status_admin = false
     if ($administratorSids -contains $expectedA -or $administratorSids -contains $expectedB) {
         throw 'gate caller was unexpectedly a member of Builtin Administrators'
     }
-    Invoke-DaemonFallbackAsUser $userA $passwordA $sidFileA | Out-Null
-    Invoke-DaemonFallbackAsUser $userB $passwordB $sidFileB | Out-Null
-    $actualA = (Get-Content -LiteralPath $sidFileA -Raw).Trim()
-    $actualB = (Get-Content -LiteralPath $sidFileB -Raw).Trim()
+    $cmd = Join-Path $env:WINDIR 'System32\cmd.exe'
+    Invoke-DaemonFallbackAsUser $userA $passwordA $sidFileA `
+        -CommandArgs @($cmd, '/d', '/s', '/c', $nativeProbeA) | Out-Null
+    Invoke-DaemonFallbackAsUser $userB $passwordB $sidFileB `
+        -CommandArgs @($cmd, '/d', '/s', '/c', $nativeProbeB) | Out-Null
+    $rawA = if (Test-Path -LiteralPath $sidFileA) {
+        [string](Get-Content -LiteralPath $sidFileA -Raw)
+    } else { '<missing>' }
+    $rawB = if (Test-Path -LiteralPath $sidFileB) {
+        [string](Get-Content -LiteralPath $sidFileB -Raw)
+    } else { '<missing>' }
+    try {
+        $rowsA = @(Import-Csv -LiteralPath $sidFileA -Header Name, Sid)
+        $rowsB = @(Import-Csv -LiteralPath $sidFileB -Header Name, Sid)
+    }
+    catch {
+        throw "daemon-side native SID CSV parse failed: $($_.Exception.Message); A=$rawA; B=$rawB"
+    }
+    if ($rowsA.Count -ne 1 -or $rowsB.Count -ne 1) {
+        throw "daemon-side native SID CSV row mismatch: A=$($rowsA.Count) raw=$rawA; B=$($rowsB.Count) raw=$rawB"
+    }
+    $actualA = $rowsA[0].Sid
+    $actualB = $rowsB[0].Sid
+    [string]$stderrA = if (Test-Path -LiteralPath $nativeErrA) {
+        Get-Content -LiteralPath $nativeErrA -Raw
+    } else { '<missing>' }
+    [string]$stderrB = if (Test-Path -LiteralPath $nativeErrB) {
+        Get-Content -LiteralPath $nativeErrB -Raw
+    } else { '<missing>' }
+    if ($stderrA -ne '' -or $stderrB -ne '') {
+        throw "daemon-side native stderr was not empty: A=$stderrA; B=$stderrB"
+    }
 
     if ($actualA -ne $expectedA) { throw "caller A child SID mismatch: got $actualA, want $expectedA" }
     if ($actualB -ne $expectedB) { throw "caller B child SID mismatch: got $actualB, want $expectedB" }
