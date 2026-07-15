@@ -20,15 +20,21 @@
   <PropertyGroup>
     <SbzRustTarget Condition="'$(SbzRustTarget)' == ''">$(MSBuildProjectDirectory)\..\target\release</SbzRustTarget>
     <SbzStoreCtl Condition="'$(SbzStoreCtl)' == ''">$(SbzRustTarget)\sembazuru-storectl.exe</SbzStoreCtl>
+    <SbzRollbackFixture Condition="'$(SbzRollbackFixture)' == ''">0</SbzRollbackFixture>
     <SbzHooks Condition="'$(SbzHooks)' == ''">$(MSBuildProjectDirectory)\..\hooks\build\Release</SbzHooks>
     <SbzIntegration Condition="'$(SbzIntegration)' == ''">$(MSBuildProjectDirectory)\..\docs\integrations\msbuild</SbzIntegration>
     <SbzVersion Condition="'$(SbzVersion)' == ''">0.0.3</SbzVersion>
-    <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);StoreCtl=$(SbzStoreCtl);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
+    <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);StoreCtl=$(SbzStoreCtl);RollbackFixture=$(SbzRollbackFixture);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- Firewall extension for the LAN listen-port exceptions (M9.5b). -->
     <PackageReference Include="WixToolset.Firewall.wixext" Version="5.0.2" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(SbzRollbackFixture)' == '1'">
+    <!-- Build-time-only rollback fault injection; never linked into production MSI. -->
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
   </ItemGroup>
 
 </Project>

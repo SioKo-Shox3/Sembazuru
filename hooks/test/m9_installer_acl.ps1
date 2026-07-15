@@ -141,9 +141,27 @@ function Assert-StaticLifecycleSource {
     if ($constants -notmatch '(?:^|;)StoreCtl=\$\(SbzStoreCtl\)(?:;|$)') {
         $failures.Add('DefineConstants must export StoreCtl=$(SbzStoreCtl)')
     }
-    if (@($project.Project.ItemGroup.PackageReference | Where-Object {
-            $_.Include -eq 'WixToolset.Util.wixext' }).Count -ne 0) {
-        $failures.Add('WixToolset.Util.wixext must be removed')
+    $rollbackProperty = @($project.SelectNodes('//SbzRollbackFixture'))
+    if ($rollbackProperty.Count -ne 1 -or
+        ($rollbackProperty.Count -eq 1 -and (
+            $rollbackProperty[0].GetAttribute('Condition') -cne
+                "'`$(SbzRollbackFixture)' == ''" -or
+            [string]$rollbackProperty[0].InnerText -cne '0'))) {
+        $failures.Add('Package.wixproj must default SbzRollbackFixture to 0')
+    }
+    if ($constants -notmatch '(?:^|;)RollbackFixture=\$\(SbzRollbackFixture\)(?:;|$)') {
+        $failures.Add('DefineConstants must export RollbackFixture=$(SbzRollbackFixture)')
+    }
+    $utilReferences = @($project.SelectNodes(
+        '//PackageReference[@Include="WixToolset.Util.wixext"]'))
+    if ($utilReferences.Count -ne 1 -or
+        ($utilReferences.Count -eq 1 -and (
+            $utilReferences[0].GetAttribute('Version') -cne '5.0.2' -or
+            $utilReferences[0].GetAttribute('Condition') -ne '' -or
+            $utilReferences[0].ParentNode.Name -cne 'ItemGroup' -or
+            $utilReferences[0].ParentNode.GetAttribute('Condition') -cne
+                "'`$(SbzRollbackFixture)' == '1'"))) {
+        $failures.Add('WixToolset.Util.wixext must appear exactly once in the SbzRollbackFixture=1 ItemGroup at version 5.0.2')
     }
 
     if ($failures.Count -ne 0) {

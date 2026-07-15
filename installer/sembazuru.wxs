@@ -36,6 +36,14 @@
             Message="Automatic upgrade is blocked until a safe legacy migration is available. The earlier installation was left unchanged." />
     <MediaTemplate EmbedCab="yes" />
 
+    <?if $(var.RollbackFixture) = "1" ?>
+    <!-- WiX 5.0.2 intentionally supplies this fixture-only fail-fast CA as type
+         1025 (deferred, impersonated). It performs no mutation. Do not retry a
+         3073 override: the official CustomAction symbol is global/non-virtual.
+         Provision and rollback remain separate LocalSystem actions (3074/3330). -->
+    <util:FailWhenDeferred xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util" />
+    <?endif?>
+
     <!-- Program Files\Sembazuru\ (64-bit). -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Sembazuru">
@@ -88,6 +96,10 @@
               Condition="NOT Installed" />
       <Custom Action="ProvisionMachineStore" After="RollbackMachineStoreProvision"
               Condition="NOT Installed" />
+      <?if $(var.RollbackFixture) = "1" ?>
+      <Custom Action="override Wix4FailWhenDeferred_$(sys.BUILDARCHSHORT)"
+              After="ProvisionMachineStore" Condition="NOT Installed" />
+      <?endif?>
       <Custom Action="UninstallMachineStore" After="StopServices"
               Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
       <Custom Action="SeedDaemonConfig" After="InstallFiles" Condition="NOT Installed" />

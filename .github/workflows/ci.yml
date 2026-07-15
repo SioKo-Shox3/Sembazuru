@@ -239,6 +239,12 @@ jobs:
         run: pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 -Msi installer/bin/x64/Release/Sembazuru.msi -StoreCtl target/release/sembazuru-storectl.exe
       - name: ProgramData pre-positioning fails closed before services
         run: pwsh -NoProfile -File hooks/test/m9_programdata_preposition.ps1 -PackagePath installer/bin/x64/Release/Sembazuru.msi
+      # Build-time-only fault injection proves the provision rollback transaction.
+      # Its official WiX Type 1025 CA is never linked into the production package.
+      - name: Build machine-store rollback fixture
+        run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64 -p:SbzRollbackFixture=1 -p:BaseOutputPath=bin\rollback-fixture\ -p:BaseIntermediateOutputPath=obj\rollback-fixture\ -p:OutputName=Sembazuru.RollbackFixture
+      - name: Machine-store rollback leaves zero residue
+        run: pwsh -NoProfile -File hooks/test/m9_installer_rollback.ps1 -Full -ProductionMsi installer/bin/x64/Release/Sembazuru.msi -FixtureMsi installer/bin/rollback-fixture/x64/Release/Sembazuru.RollbackFixture.msi
       - name: Upload MSI artifact (unsigned)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
         with:
