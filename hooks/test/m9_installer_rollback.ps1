@@ -203,8 +203,8 @@ function Get-RollbackExecutionProofEvents {
             Pattern = $recordPrefix + 'Executing op:\s*CustomActionRollback\(Action=RollbackMachineStoreProvision,ActionType=3330,Source=BinaryData,Target=rollback-provision,\)\s*$'
         }
     )
-    $resultPattern = $recordPrefix + 'CustomAction (?<Action>ProvisionMachineStore|Wix4FailWhenDeferred_X64|RollbackMachineStoreProvision) returned actual error code (?<Code>-?\d+)(?:\s+\([^\r\n]*\))?\s*$'
-    $returnThreePattern = $recordPrefix + 'Action ended [^\r\n]*?:\s*(?<Action>ProvisionMachineStore|RollbackMachineStoreProvision)\.\s*Return value 3\.[^\r\n]*$'
+    $resultPattern = '^CustomAction (?<Action>ProvisionMachineStore|Wix4FailWhenDeferred_X64|RollbackMachineStoreProvision) returned actual error code (?<Code>-?\d+)(?:\s+\([^\r\n]*\))?\s*$'
+    $returnThreePattern = '^Action ended [^\r\n]*?:\s*(?<Action>ProvisionMachineStore|RollbackMachineStoreProvision)\.\s*Return value 3\.[^\r\n]*$'
     $lines = if ($Log.Length -eq 0) { @() } else {
         @([regex]::Split($Log, '\r\n|\n|\r'))
     }
@@ -494,7 +494,7 @@ function Assert-RollbackExecutionProofFixture {
         'MSI (s) (10:20) [00:00:00:000]: Executing op: CustomActionSchedule(Action=RollbackMachineStoreProvision,ActionType=3330,Source=BinaryData,Target=rollback-provision,)',
         'MSI (s) (10:20) [00:00:00:001]: Executing op: CustomActionSchedule(Action=ProvisionMachineStore,ActionType=3074,Source=BinaryData,Target=provision,)',
         'MSI (s) (10:20) [00:00:00:002]: Executing op: CustomActionSchedule(Action=Wix4FailWhenDeferred_X64,ActionType=1025,Source=BinaryData,Target=WixFailWhenDeferred,)',
-        'MSI (s) (10:20) [00:00:00:003]: CustomAction Wix4FailWhenDeferred_X64 returned actual error code 1603 (note this may not be 100% accurate if translation happened inside sandbox)',
+        'CustomAction Wix4FailWhenDeferred_X64 returned actual error code 1603 (note this may not be 100% accurate if translation happened inside sandbox)',
         'MSI (s) (10:20) [00:00:00:004]: Executing op: CustomActionRollback(Action=RollbackMachineStoreProvision,ActionType=3330,Source=BinaryData,Target=rollback-provision,)'
     )
     $assertAccepted = {
@@ -518,10 +518,14 @@ function Assert-RollbackExecutionProofFixture {
         }) -Label 'client logger record with variable-width thread fields'
     $withOptionalZero = @(
         $baseLines[0], $baseLines[1],
-        'MSI (s) (10:20) [00:00:00:001]: CustomAction ProvisionMachineStore returned actual error code 0',
+        'CustomAction ProvisionMachineStore returned actual error code 0',
         $baseLines[2], $baseLines[3], $baseLines[4],
-        'MSI (s) (10:20) [00:00:00:005]: CustomAction RollbackMachineStoreProvision returned actual error code 0')
+        'CustomAction RollbackMachineStoreProvision returned actual error code 0')
     & $assertAccepted -Lines $withOptionalZero -Label 'optional code 0 evidence'
+    & $assertAccepted -Label 'property echo result and Return value 3 noise' -Lines @(
+        $baseLines[0], $baseLines[1], $baseLines[2], $baseLines[3], $baseLines[4],
+        'MSI (s) (10:20) [00:00:00:005]: PROPERTY CHANGE: Adding FakeProvisionResult property. Its value is CustomAction ProvisionMachineStore returned actual error code 10',
+        'MSI (s) (10:20) [00:00:00:006]: PROPERTY CHANGE: Adding FakeReturnValue property. Its value is Action ended 00:00:01: ProvisionMachineStore. Return value 3.')
 
     & $assertRejected -Label 'ActionStart only' -Lines @(
         'MSI (s): Executing op: ActionStart(Name=RollbackMachineStoreProvision)',
@@ -544,14 +548,14 @@ function Assert-RollbackExecutionProofFixture {
 
     & $assertRejected -Label 'Provision nonzero result' -Lines @(
         $baseLines[0], $baseLines[1],
-        'MSI (s) (10:20) [00:00:00:001]: CustomAction ProvisionMachineStore returned actual error code 10',
+        'CustomAction ProvisionMachineStore returned actual error code 10',
         $baseLines[2], $baseLines[3], $baseLines[4])
     & $assertRejected -Label 'Rollback nonzero result' -Lines @(
         $baseLines[0], $baseLines[1], $baseLines[2], $baseLines[3], $baseLines[4],
-        'MSI (s) (10:20) [00:00:00:005]: CustomAction RollbackMachineStoreProvision returned actual error code 10')
+        'CustomAction RollbackMachineStoreProvision returned actual error code 10')
     & $assertRejected -Label 'Provision Return value 3' -Lines @(
         $baseLines[0], $baseLines[1], $baseLines[2], $baseLines[3], $baseLines[4],
-        'MSI (s) (10:20) [00:00:00:005]: Action ended 00:00:01: ProvisionMachineStore. Return value 3.')
+        'Action ended 00:00:01: ProvisionMachineStore. Return value 3.')
 
     $actionPrefix = @($baseLines)
     $actionPrefix[1] = $actionPrefix[1].Replace(
