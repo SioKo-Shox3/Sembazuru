@@ -119,6 +119,15 @@ function Invoke-DaemonFallbackAsUser {
     throw "launcher for $User never reached daemon-side local fallback"
 }
 
+function Format-CleanupError([object]$Record) {
+    if ($null -eq $Record) { return 'none' }
+    return "type=$($Record.Exception.GetType().FullName), message=$($Record.Exception.Message), " +
+        "HResult=$($Record.Exception.HResult.ToString('X8')), FQID=$($Record.FullyQualifiedErrorId), " +
+        "TargetObject=$($Record.TargetObject)"
+}
+
+$primaryError = $null
+$cleanupErrors = [Collections.Generic.List[string]]::new()
 try {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     New-Item -ItemType Directory -Path $ioRoot -Force | Out-Null
@@ -198,20 +207,31 @@ status_admin = false
     Write-Host "DAEMON DOWN FALLBACK: caller=$fallbackSid note=verified"
     Write-Host 'PASS: standard users cannot turn LocalSystem LocalIntake into SYSTEM command execution; legitimate daemon and launcher fallback paths both work.'
 }
+catch {
+    $primaryError = $_
+}
 finally {
-    $cleanupErrors = [Collections.Generic.List[string]]::new()
     if ($ownedService) {
         $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         if ($null -ne $service -and $service.Status -ne 'Stopped') {
             Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
-            $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+            try {
+                $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(15))
+            }
+            catch {
+                $cleanupErrors.Add("temporary service stop wait failed: $($_.Exception.Message)")
+            }
         }
         if (Test-Path -LiteralPath $daemonExe) {
-            & $daemonExe uninstall 2>&1 | Out-Null
+            try { & $daemonExe uninstall 2>&1 | Out-Null }
+            catch { $cleanupErrors.Add("temporary service uninstall failed: $($_.Exception.Message)") }
         }
         for ($attempt = 0; $attempt -lt 20; $attempt++) {
             if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) { break }
-            if ($attempt -eq 0) { & sc.exe delete $serviceName 2>&1 | Out-Null }
+            if ($attempt -eq 0) {
+                try { & sc.exe delete $serviceName 2>&1 | Out-Null }
+                catch { $cleanupErrors.Add("temporary service delete failed: $($_.Exception.Message)") }
+            }
             Start-Sleep -Milliseconds 250
         }
         if ($null -ne (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
@@ -224,14 +244,77 @@ finally {
             $cleanupErrors.Add("temporary user $user still exists")
         }
     }
-    for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $root); $attempt++) {
-        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $root) { Start-Sleep -Milliseconds 250 }
+    try {
+        $firstRootCleanupError = $null
+        $lastRootCleanupError = $null
+        for ($attempt = 0; $attempt -lt 20 -and (Test-Path -LiteralPath $root); $attempt++) {
+            try {
+                Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                if ($null -eq $firstRootCleanupError) { $firstRootCleanupError = $_ }
+                $lastRootCleanupError = $_
+            }
+            if (Test-Path -LiteralPath $root) { Start-Sleep -Milliseconds 250 }
+        }
+        if (Test-Path -LiteralPath $root) {
+            $detail = "temporary directory $root still exists; " +
+                "first Remove-Item error: $(Format-CleanupError $firstRootCleanupError); " +
+                "last Remove-Item error: $(Format-CleanupError $lastRootCleanupError)"
+            try {
+                $remainingPaths = @($root) + @(
+                    Get-ChildItem -LiteralPath $root -Force -Recurse -ErrorAction Stop |
+                        ForEach-Object { $_.FullName }
+                )
+                $detail += "; remaining paths: $($remainingPaths -join ', ')"
+            }
+            catch {
+                $detail += "; remaining path enumeration failed: $($_.Exception.Message)"
+            }
+            try {
+                $aclSnapshot = (& icacls.exe $root /T /C 2>&1 | Out-String).Trim()
+                $detail += "; icacls snapshot: $aclSnapshot"
+            }
+            catch {
+                $detail += "; icacls snapshot failed: $($_.Exception.Message)"
+            }
+            try {
+                $serviceSnapshot = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" |
+                    Select-Object State, ProcessId, PathName | ConvertTo-Json -Compress
+                if (-not $serviceSnapshot) { $serviceSnapshot = 'none' }
+                $detail += "; service snapshot: $serviceSnapshot"
+            }
+            catch {
+                $detail += "; service snapshot failed: $($_.Exception.Message)"
+            }
+            try {
+                $processSnapshot = Get-CimInstance Win32_Process |
+                    Where-Object {
+                        $_.ExecutablePath -like "*$root*" -or $_.CommandLine -like "*$root*"
+                    } |
+                    Select-Object ProcessId, Name, ExecutablePath, CommandLine |
+                    ConvertTo-Json -Compress
+                if (-not $processSnapshot) { $processSnapshot = 'none' }
+                $detail += "; root process snapshot: $processSnapshot"
+            }
+            catch {
+                $detail += "; root process snapshot failed: $($_.Exception.Message)"
+            }
+            $cleanupErrors.Add($detail)
+        }
     }
-    if (Test-Path -LiteralPath $root) {
-        $cleanupErrors.Add("temporary directory $root still exists")
+    catch {
+        $cleanupErrors.Add("temporary directory cleanup failed: $($_.Exception.Message)")
     }
-    if ($cleanupErrors.Count -ne 0) {
-        throw "LocalIntake gate cleanup failed: $($cleanupErrors -join '; ')"
+}
+
+if ($null -ne $primaryError) {
+    Write-Error -ErrorRecord $primaryError -ErrorAction Continue
+    if ($cleanupErrors.Count -eq 0) {
+        throw $primaryError
     }
+    throw "LocalIntake gate failed: $($primaryError.Exception.Message); cleanup failed: $($cleanupErrors -join '; ')"
+}
+if ($cleanupErrors.Count -ne 0) {
+    throw "LocalIntake gate cleanup failed: $($cleanupErrors -join '; ')"
 }
