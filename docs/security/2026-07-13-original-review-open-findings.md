@@ -6,12 +6,22 @@
 
 ## Critical
 
-### OPEN: LocalSystem LocalIntakeの呼出元認証
+### RESOLVED: LocalSystem LocalIntakeの呼出元認証
 
-- 根拠: `installer/sembazuru.wxs:117-121`、`crates/agent/src/intake.rs:310-317,823-869`。
-- 現状: MSIのdaemonはLocalSystemで動き、LocalIntakeはloopback TCP制限だけで任意の`Command`を受理する。
-- 修正方向: caller-SIDを検証できるDACL付きnamed pipeへ移行し、実行はimpersonation/restricted tokenで呼出元権限へ落とす。管理APIとは分離する。
-- Done: 標準ユーザーが他ユーザー／SYSTEM権限でコマンドを起動できず、正規launcherのlocal fallbackは維持される統合テストが通る。
+- 対応: `68e5422`（DACL付きnamed pipe、caller SID、impersonation／restricted primary token、管理API分離）、
+  `e284940`（LocalSystem server PIDのread-only SCM照合）、`a35bf9f`（2標準ユーザーのnative SID A/B）。
+  設計同期と失敗証拠の保全は `b2ebb17`、`9ff8390`、`e8b7372`、`82cb16e`、`c0fc0f7`。
+- 境界: production pipeはfirst-instance／remote reject／protected DACLを維持し、clientはserver SIDを送信前に検証する。
+  daemonはfirst authenticated readでcaller tokenを捕捉し、callerのrestricted tokenでsuspended起動→Job割当て→resumeする。
+  token／process起動失敗時にLocalSystem tokenへretryせず、Status/Admin RPCは別listenerのまま。
+- ローカル検証: `cargo test -p sembazuru-agent --lib` は `258 passed; 0 failed; 2 ignored`、
+  `rustup run 1.97.0 cargo clippy -p sembazuru-agent --all-targets -- -D warnings`、fmt、scope、差分検査が成功。
+- clean Windows A/B: [CI run 29394437184](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29394437184)／
+  [LocalIntake job 87284613248](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29394437184/job/87284613248) が成功。
+  `DAEMON FALLBACK: A=...-1003 B=...-1004 SYSTEM=false crossed=false`、
+  `DAEMON DOWN FALLBACK: caller=...-1003 note=verified`、最終PASSを確認した。
+- Done: 標準ユーザーA/Bのdaemon-side childは各caller SIDで動き、SYSTEMにも相互callerにもならない。
+  daemon停止後も正規launcherのlocal fallbackが同じ標準ユーザーSID・exit 0で完走する。
 
 ## High
 

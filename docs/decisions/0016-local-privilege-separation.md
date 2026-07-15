@@ -1,8 +1,8 @@
 # 0016 — LocalIntake 特権分離（authenticated named pipe＋caller restricted token）
 
-- ステータス: **ローカル実装済み・clean Windows CI 未確認。** 起案: 2026-06-24。
-  実装: commit `68e5422`（2026-07-15）。SEC-001 のバックログは clean Windows の標準ユーザー／LocalSystem
-  統合ゲートが緑になるまで `OPEN` のまま維持する。
+- ステータス: **実装済み・clean Windows CI 確認済み。** 起案: 2026-06-24、解決: 2026-07-15。
+  中核実装は `68e5422`、LocalSystem server照合は `e284940`、clean A/B証拠は `a35bf9f`。
+  SEC-001 は初回レビューバックログで `RESOLVED`。
 - 出所: コードレビュー（SEC-001・最も危険な P0＝local EoP→SYSTEM）。
 - 決めたこと: Windows production LocalIntake を **machine-wide authenticated named pipe** とし、DACL、server
   SID 検証、caller impersonation、restricted primary token、管理 API 分離を一つの境界として維持する。
@@ -62,15 +62,19 @@ service の完全分離は別設計とし、この境界を弱める理由には
 
 ## 検証状況
 
-- ローカル: `intake_pipe::tests` 7件、`tests::caller_` 9件、`service::tests` 5件、workspace test／fmt／clippy／
-  release build／`cargo deny check` が成功。統合差分は Codex と Claude の第2ラウンドで blocking なし。
-- clean Windows CI: `local-intake-security` job に、標準ユーザーから LocalSystem service の SYSTEM marker を作れない
-  negative case と、正規 launcher fallback の caller SID marker／終了コード／出力を確認する positive caseを配線済み。
+- ローカル: `cargo test -p sembazuru-agent --lib` は `258 passed; 0 failed; 2 ignored`。
+  `intake_pipe::tests` 9件、Rust 1.97 clippy／fmt／scope／差分検査も成功し、HEAVY統合reviewはblockingなし。
+- clean Windows CI: [run 29394437184](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29394437184) の
+  [LocalIntake job 87284613248](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29394437184/job/87284613248) が成功。
+  2標準ユーザーのdaemon-side childは別々のcaller SIDで、`SYSTEM=false crossed=false`。daemon停止後も
+  launcher fallbackがcaller SID・exit 0で完走し、最終PASSを出した。
 - 現ローカル機には既存の canonical `SembazuruDaemon` service があるため、ゲートは service/config/account を変更せず
-  exit 1 で拒否した。したがって実機 A/B 証拠が得られるまで SEC-001 を `RESOLVED` としない。
+  exit 1 で拒否する。このfail-fastは既存serviceを変更しない安全条件として維持する。
 
 ## 繰延・未決
 
-- clean Windows CI の標準ユーザー／LocalSystem A/B 証拠と、実 2 ユーザー環境での追加確認。
+- LocalSystem service側fallbackは現在stdout/stderrをlauncherへstreamしない。clean CIでWindows PowerShellを直接
+  payloadにするとhost初期化が `0xFFFF0000` で失敗したため、SEC-001のSID証拠はOS一次情報の`whoami.exe`へ固定した。
+  console process互換性と出力転送は別correctness残課題であり、解消のためにrestricted token境界を弱めない。
 - user-session agent と machine service の完全分離、ProgramData の最小権限化（別 OPEN 項目）。
 - signing／EDR allowlist の実運用確認。
