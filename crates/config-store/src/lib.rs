@@ -1,0 +1,458 @@
+//! Fail-closed lifecycle for Sembazuru's machine configuration store.
+
+use std::fmt;
+use std::io;
+
+#[cfg(windows)]
+mod windows;
+
+/// Stable failure categories for callers that must fail closed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineStoreErrorClass {
+    /// The platform cannot provide the required Windows security semantics.
+    Unsupported,
+    /// The canonical namespace entry already existed at fresh provisioning.
+    NamespaceAlreadyExists,
+    /// Persisted identity, type, security, or lifecycle state was not exact.
+    IntegrityViolation,
+    /// An operating-system operation failed without proving an integrity fault.
+    Io,
+}
+
+/// A classified machine-store lifecycle failure.
+#[derive(Debug)]
+pub struct MachineStoreError {
+    class: MachineStoreErrorClass,
+    context: &'static str,
+    source: Option<io::Error>,
+}
+
+impl MachineStoreError {
+    /// Returns the stable class suitable for mapping to a process exit reason.
+    pub const fn classification(&self) -> MachineStoreErrorClass {
+        self.class
+    }
+
+    fn new(class: MachineStoreErrorClass, context: &'static str) -> Self {
+        Self {
+            class,
+            context,
+            source: None,
+        }
+    }
+
+    fn with_io(class: MachineStoreErrorClass, context: &'static str, source: io::Error) -> Self {
+        Self {
+            class,
+            context,
+            source: Some(source),
+        }
+    }
+}
+
+impl fmt::Display for MachineStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(source) = &self.source {
+            write!(f, "{}: {source}", self.context)
+        } else {
+            f.write_str(self.context)
+        }
+    }
+}
+
+impl std::error::Error for MachineStoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Atomically creates the fixed `%ProgramData%\Sembazuru` machine store.
+pub fn provision_fresh_machine_store() -> Result<(), MachineStoreError> {
+    platform::provision()
+}
+
+/// Removes an uncommitted store only when its marker and identities are exact.
+pub fn rollback_machine_store_provision() -> Result<(), MachineStoreError> {
+    platform::rollback()
+}
+
+/// Commits an exact provisioned store by deleting its private marker.
+pub fn commit_machine_store_provision() -> Result<(), MachineStoreError> {
+    platform::commit()
+}
+
+/// Removes an exact committed store without following reparse children.
+pub fn uninstall_committed_machine_store() -> Result<(), MachineStoreError> {
+    platform::uninstall()
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::{MachineStoreError, windows};
+
+    pub(super) fn provision() -> Result<(), MachineStoreError> {
+        windows::provision_canonical()
+    }
+
+    pub(super) fn rollback() -> Result<(), MachineStoreError> {
+        windows::rollback_canonical()
+    }
+
+    pub(super) fn commit() -> Result<(), MachineStoreError> {
+        windows::commit_canonical()
+    }
+
+    pub(super) fn uninstall() -> Result<(), MachineStoreError> {
+        windows::uninstall_canonical()
+    }
+}
+
+#[cfg(not(windows))]
+mod platform {
+    use super::{MachineStoreError, MachineStoreErrorClass};
+
+    fn unsupported() -> Result<(), MachineStoreError> {
+        Err(MachineStoreError::new(
+            MachineStoreErrorClass::Unsupported,
+            "machine configuration store lifecycle requires Windows",
+        ))
+    }
+
+    pub(super) fn provision() -> Result<(), MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn rollback() -> Result<(), MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn commit() -> Result<(), MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn uninstall() -> Result<(), MachineStoreError> {
+        unsupported()
+    }
+}
+
+#[cfg(all(test, windows))]
+use windows::{
+    TestSecurityPolicy as SecurityPolicy, commit_at_for_test, create_secure_test_directory,
+    current_user_test_policy, inspect_path_nofollow_for_test,
+    install_after_root_drop_hook_for_test, parse_marker_for_test, provision_at_for_test,
+    rollback_at_for_test, security_matches_for_test, uninstall_at_for_test,
+};
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::*;
+    use tempfile::TempDir;
+
+    const ROOT_NAME: &str = "Sembazuru";
+    const MARKER_NAME: &str = ".provisioning-v1";
+
+    struct Fixture {
+        temp: TempDir,
+        parent: PathBuf,
+        root: PathBuf,
+        policy: SecurityPolicy,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().expect("create test root");
+            let parent = temp.path().join("parent");
+            fs::create_dir(&parent).expect("create parent");
+            let root = parent.join(ROOT_NAME);
+            let policy = current_user_test_policy().expect("current-user policy");
+            Self {
+                temp,
+                parent,
+                root,
+                policy,
+            }
+        }
+
+        fn provision(&self) -> Result<(), MachineStoreError> {
+            provision_at_for_test(&self.parent, OsStr::new(ROOT_NAME), &self.policy)
+        }
+
+        fn commit(&self) -> Result<(), MachineStoreError> {
+            commit_at_for_test(&self.parent, OsStr::new(ROOT_NAME), &self.policy)
+        }
+
+        fn rollback(&self) -> Result<(), MachineStoreError> {
+            rollback_at_for_test(&self.parent, OsStr::new(ROOT_NAME), &self.policy)
+        }
+
+        fn uninstall(&self) -> Result<(), MachineStoreError> {
+            uninstall_at_for_test(&self.parent, OsStr::new(ROOT_NAME), &self.policy)
+        }
+    }
+
+    fn create_junction(link: &Path, target: &Path) {
+        let output = Command::new("cmd")
+            .args([
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                link.to_str().expect("UTF-8 test link"),
+                target.to_str().expect("UTF-8 test target"),
+            ])
+            .output()
+            .expect("run mklink");
+        assert!(
+            output.status.success(),
+            "mklink failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn prepositioned_directory_is_rejected_without_mutation() {
+        let fixture = Fixture::new();
+        fs::create_dir(&fixture.root).unwrap();
+        let sentinel = fixture.root.join("sentinel");
+        fs::write(&sentinel, b"unchanged").unwrap();
+
+        let error = fixture.provision().unwrap_err();
+
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::NamespaceAlreadyExists
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn prepositioned_junction_is_rejected_without_following_target() {
+        let fixture = Fixture::new();
+        let external = fixture.temp.path().join("external");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel");
+        fs::write(&sentinel, b"external").unwrap();
+        let before = inspect_path_nofollow_for_test(&external).unwrap();
+        create_junction(&fixture.root, &external);
+
+        let error = fixture.provision().unwrap_err();
+
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::NamespaceAlreadyExists
+        );
+        assert_eq!(inspect_path_nofollow_for_test(&external).unwrap(), before);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"external");
+        fs::remove_dir(&fixture.root).unwrap();
+    }
+
+    #[test]
+    fn provision_creates_verified_root_and_children() {
+        let fixture = Fixture::new();
+        fixture.provision().unwrap();
+
+        let root = inspect_path_nofollow_for_test(&fixture.root).unwrap();
+        let scratch = inspect_path_nofollow_for_test(&fixture.root.join("scratch")).unwrap();
+        let cas = inspect_path_nofollow_for_test(&fixture.root.join("cas")).unwrap();
+        assert!(root.is_directory && !root.is_reparse);
+        assert!(scratch.is_directory && !scratch.is_reparse);
+        assert!(cas.is_directory && !cas.is_reparse);
+        assert_ne!(root.identity, scratch.identity);
+        assert_ne!(root.identity, cas.identity);
+        assert_ne!(scratch.identity, cas.identity);
+        assert!(security_matches_for_test(&fixture.root, fixture.policy.root_sddl()).unwrap());
+        assert!(
+            security_matches_for_test(&fixture.root.join("scratch"), fixture.policy.child_sddl())
+                .unwrap()
+        );
+        assert!(
+            security_matches_for_test(&fixture.root.join("cas"), fixture.policy.child_sddl())
+                .unwrap()
+        );
+
+        fixture.rollback().unwrap();
+    }
+
+    #[test]
+    fn marker_is_reopened_and_removed_by_commit() {
+        let fixture = Fixture::new();
+        fixture.provision().unwrap();
+        assert!(fixture.root.join(MARKER_NAME).exists());
+
+        fixture.commit().unwrap();
+
+        assert!(!fixture.root.join(MARKER_NAME).exists());
+        assert!(fixture.root.is_dir());
+        fixture.uninstall().unwrap();
+    }
+
+    #[test]
+    fn rollback_reopens_and_removes_matching_tree() {
+        let fixture = Fixture::new();
+        fixture.provision().unwrap();
+
+        fixture.rollback().unwrap();
+
+        assert!(!fixture.root.exists());
+    }
+
+    #[test]
+    fn missing_or_malformed_marker_preserves_tree() {
+        for malformed in [false, true] {
+            let fixture = Fixture::new();
+            fixture.provision().unwrap();
+            let marker = fixture.root.join(MARKER_NAME);
+            if malformed {
+                fs::write(&marker, b"not a marker").unwrap();
+            } else {
+                fs::remove_file(&marker).unwrap();
+            }
+
+            let error = fixture.rollback().unwrap_err();
+
+            assert_eq!(
+                error.classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+            assert!(fixture.root.is_dir());
+            fs::remove_dir_all(&fixture.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn child_identity_mismatch_preserves_tree() {
+        let fixture = Fixture::new();
+        fixture.provision().unwrap();
+        let scratch = fixture.root.join("scratch");
+        let moved = fixture.root.join("scratch-original");
+        fs::rename(&scratch, &moved).unwrap();
+        create_secure_test_directory(
+            &fixture.root,
+            OsStr::new("scratch"),
+            fixture.policy.child_sddl(),
+        )
+        .unwrap();
+
+        let error = fixture.rollback().unwrap_err();
+
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert!(fixture.root.is_dir());
+        assert!(scratch.is_dir());
+        fs::remove_dir(&scratch).unwrap();
+        fs::rename(&moved, &scratch).unwrap();
+        fixture.rollback().unwrap();
+    }
+
+    #[test]
+    fn uninstall_unlinks_reparse_child_without_touching_external_target() {
+        let fixture = Fixture::new();
+        fixture.provision().unwrap();
+        fixture.commit().unwrap();
+        let external = fixture.temp.path().join("outside");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel");
+        fs::write(&sentinel, b"outside").unwrap();
+        let before = inspect_path_nofollow_for_test(&external).unwrap();
+        create_junction(&fixture.root.join("outside-link"), &external);
+
+        fixture.uninstall().unwrap();
+
+        assert!(!fixture.root.exists());
+        assert_eq!(inspect_path_nofollow_for_test(&external).unwrap(), before);
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn replaced_root_with_stale_marker_is_preserved() {
+        let fixture = Fixture::new();
+        fixture.provision().unwrap();
+        let stale_marker = fs::read(fixture.root.join(MARKER_NAME)).unwrap();
+        let original = fixture.parent.join("original");
+        fs::rename(&fixture.root, &original).unwrap();
+
+        provision_at_for_test(&fixture.parent, OsStr::new("replacement"), &fixture.policy).unwrap();
+        let replacement = fixture.parent.join("replacement");
+        let replacement_marker = fs::read(replacement.join(MARKER_NAME)).unwrap();
+        fs::write(replacement.join(MARKER_NAME), &stale_marker).unwrap();
+        fs::rename(&replacement, &fixture.root).unwrap();
+
+        let error = fixture.rollback().unwrap_err();
+
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert!(fixture.root.is_dir());
+        fs::write(fixture.root.join(MARKER_NAME), replacement_marker).unwrap();
+        fixture.rollback().unwrap();
+        rollback_at_for_test(&fixture.parent, OsStr::new("original"), &fixture.policy).unwrap();
+    }
+
+    #[test]
+    fn regular_file_replacement_after_root_drop_is_preserved() {
+        let fixture = Fixture::new();
+        fixture.provision().unwrap();
+        let replacement = fixture.root.clone();
+        install_after_root_drop_hook_for_test(&fixture.root, move || {
+            fs::write(replacement, b"replacement").unwrap();
+        })
+        .unwrap();
+
+        let error = fixture.rollback().unwrap_err();
+
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert!(fixture.root.is_file());
+        assert_eq!(fs::read(&fixture.root).unwrap(), b"replacement");
+        fs::remove_file(&fixture.root).unwrap();
+    }
+
+    #[test]
+    fn malformed_marker_parser_is_rejected() {
+        for bytes in [
+            &b""[..],
+            &b"SEMBSTORE\0"[..],
+            &b"SEMBSTORE\0v=2\n"[..],
+            &b"SEMBSTORE\0v=1\nroot=not-an-identity\n"[..],
+        ] {
+            assert!(parse_marker_for_test(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn public_api_has_no_path_or_policy_parameters() {
+        let _: fn() -> Result<(), MachineStoreError> = provision_fresh_machine_store;
+        let _: fn() -> Result<(), MachineStoreError> = rollback_machine_store_provision;
+        let _: fn() -> Result<(), MachineStoreError> = commit_machine_store_provision;
+        let _: fn() -> Result<(), MachineStoreError> = uninstall_committed_machine_store;
+
+        let source = include_str!("lib.rs");
+        for name in [
+            "provision_fresh_machine_store",
+            "rollback_machine_store_provision",
+            "commit_machine_store_provision",
+            "uninstall_committed_machine_store",
+        ] {
+            let declaration = source
+                .lines()
+                .find(|line| line.contains(&format!("pub fn {name}")))
+                .expect("public lifecycle declaration");
+            assert!(declaration.contains("()"), "{declaration}");
+            assert!(!declaration.contains("Path"), "{declaration}");
+            assert!(!declaration.contains("Policy"), "{declaration}");
+        }
+    }
+}

@@ -1,0 +1,27 @@
+[package]
+name = "sembazuru-config-store"
+description = "Fail-closed machine configuration store lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile = "3"

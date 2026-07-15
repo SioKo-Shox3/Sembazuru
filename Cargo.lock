@@ -3946,6 +3946,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sembazuru-config-store"
+version = "0.0.3"
+dependencies = [
+ "tempfile",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "sembazuru-dataplane"
 version = "0.0.3"
 dependencies = [
