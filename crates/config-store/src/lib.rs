@@ -88,9 +88,89 @@ pub fn uninstall_committed_machine_store() -> Result<(), MachineStoreError> {
     platform::uninstall()
 }
 
+/// Selects one of the two fixed machine configuration identities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineConfigTarget {
+    /// `%ProgramData%\Sembazuru\daemon.toml`.
+    Daemon,
+    /// `%ProgramData%\Sembazuru\worker.toml`.
+    Worker,
+}
+
+/// Atomically replaces a fixed configuration in an exact committed store.
+pub fn replace_machine_config(
+    target: MachineConfigTarget,
+    contents: &[u8],
+) -> Result<(), MachineStoreError> {
+    platform::replace_config(target, contents)
+}
+
+/// Creates a fixed configuration only when absent in an exact provisioned store.
+pub fn seed_machine_config(
+    target: MachineConfigTarget,
+    contents: &[u8],
+) -> Result<bool, MachineStoreError> {
+    platform::seed_config(target, contents)
+}
+
+#[cfg(test)]
+mod machine_config_api_tests {
+    use super::*;
+
+    #[test]
+    fn machine_config_public_api_is_identity_fixed() {
+        let _: fn(MachineConfigTarget, &[u8]) -> Result<(), MachineStoreError> =
+            replace_machine_config;
+        let _: fn(MachineConfigTarget, &[u8]) -> Result<bool, MachineStoreError> =
+            seed_machine_config;
+        assert_ne!(MachineConfigTarget::Daemon, MachineConfigTarget::Worker);
+
+        let source = include_str!("lib.rs");
+        for name in ["replace_machine_config", "seed_machine_config"] {
+            let start = source
+                .find(&format!("pub fn {name}"))
+                .expect("public machine-config declaration");
+            let declaration = source[start..]
+                .split_once(" {")
+                .expect("complete public machine-config declaration")
+                .0;
+            assert!(declaration.contains("MachineConfigTarget"), "{declaration}");
+            assert!(!declaration.contains("Path"), "{declaration}");
+            assert!(!declaration.contains("Policy"), "{declaration}");
+            assert!(!declaration.contains("mode"), "{declaration}");
+        }
+
+        let windows_source = include_str!("windows.rs");
+        assert!(windows_source.contains("NtSetInformationFile"));
+        assert!(windows_source.contains("FileRenameInformation"));
+        for forbidden in ["MoveFileExW", "ReplaceFileW", "FileRenameInfo,"] {
+            assert!(!windows_source.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn machine_config_is_unsupported_without_side_effects_off_windows() {
+        for target in [MachineConfigTarget::Daemon, MachineConfigTarget::Worker] {
+            assert_eq!(
+                replace_machine_config(target, b"new")
+                    .unwrap_err()
+                    .classification(),
+                MachineStoreErrorClass::Unsupported
+            );
+            assert_eq!(
+                seed_machine_config(target, b"seed")
+                    .unwrap_err()
+                    .classification(),
+                MachineStoreErrorClass::Unsupported
+            );
+        }
+    }
+}
+
 #[cfg(windows)]
 mod platform {
-    use super::{MachineStoreError, windows};
+    use super::{MachineConfigTarget, MachineStoreError, windows};
 
     pub(super) fn provision() -> Result<(), MachineStoreError> {
         windows::provision_canonical()
@@ -107,11 +187,25 @@ mod platform {
     pub(super) fn uninstall() -> Result<(), MachineStoreError> {
         windows::uninstall_canonical()
     }
+
+    pub(super) fn replace_config(
+        target: MachineConfigTarget,
+        contents: &[u8],
+    ) -> Result<(), MachineStoreError> {
+        windows::replace_config_canonical(target, contents)
+    }
+
+    pub(super) fn seed_config(
+        target: MachineConfigTarget,
+        contents: &[u8],
+    ) -> Result<bool, MachineStoreError> {
+        windows::seed_config_canonical(target, contents)
+    }
 }
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{MachineStoreError, MachineStoreErrorClass};
+    use super::{MachineConfigTarget, MachineStoreError, MachineStoreErrorClass};
 
     fn unsupported() -> Result<(), MachineStoreError> {
         Err(MachineStoreError::new(
@@ -134,6 +228,23 @@ mod platform {
 
     pub(super) fn uninstall() -> Result<(), MachineStoreError> {
         unsupported()
+    }
+
+    pub(super) fn replace_config(
+        _target: MachineConfigTarget,
+        _contents: &[u8],
+    ) -> Result<(), MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn seed_config(
+        _target: MachineConfigTarget,
+        _contents: &[u8],
+    ) -> Result<bool, MachineStoreError> {
+        Err(MachineStoreError::new(
+            MachineStoreErrorClass::Unsupported,
+            "machine configuration replacement requires Windows",
+        ))
     }
 }
 
