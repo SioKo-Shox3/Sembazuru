@@ -238,6 +238,8 @@ jobs:
         run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64
       - name: ProgramData ACLs (protected root, worker-only write, clean uninstall)
         run: pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 -Msi installer/bin/x64/Release/Sembazuru.msi
+      - name: ProgramData pre-positioning fails closed before services
+        run: pwsh -NoProfile -File hooks/test/m9_programdata_preposition.ps1 -PackagePath installer/bin/x64/Release/Sembazuru.msi
       - name: Upload MSI artifact (unsigned)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
         with:
