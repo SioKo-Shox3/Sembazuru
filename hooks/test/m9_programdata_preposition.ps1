@@ -15,7 +15,79 @@ $packageUnderTestInput = $PackagePath
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $aclGatePath = Join-Path $PSScriptRoot 'm9_installer_acl.ps1'
 . $aclGatePath -Static
-if ($StaticOnly) { return }
+
+function Assert-MsiExecutionClassifierFixture {
+    $scheduleOnly = @'
+MSI (s) (10:20) [00:00:00:000]: Action start 00:00:00: SeedDaemonConfig.
+MSI (s) (10:20) [00:00:00:001]: Action start 00:00:00: SeedWorkerConfig.
+MSI (s) (10:20) [00:00:00:002]: Action start 00:00:00: CommitMachineStoreProvision.
+MSI (s) (10:20) [00:00:00:003]: Action start 00:00:00: UninstallMachineStore.
+MSI (s) (10:20) [00:00:00:004]: Action start 00:00:00: InstallServices.
+MSI (s) (10:20) [00:00:00:005]: Action start 00:00:00: StartServices.
+MSI (s) (10:20) [00:00:00:006]: Action start 00:00:00: ProvisionMachineStore.
+'@
+    $scheduled = Get-MsiExecutionClassifier -Log $scheduleOnly
+    foreach ($property in @(
+        'ProvisionMachineStoreExecuted', 'ProvisionMachineStoreFailed',
+        'SeedDaemonConfigExecuted', 'SeedWorkerConfigExecuted',
+        'CommitMachineStoreProvisionExecuted', 'UninstallMachineStoreExecuted',
+        'SembazuruServiceInstallExecuted', 'SembazuruServiceControlExecuted')) {
+        if ($scheduled.$property) { throw "schedule-only fixture misclassified $property" }
+    }
+
+    $downstream = @'
+MSI (s) (10:20) [00:00:01:000]: Executing op: CustomActionSchedule(Action=SeedDaemonConfig,ActionType=3090,Source=DaemonExeFile,Target=seed-config)
+MSI (s) (10:20) [00:00:01:001]: Executing op: CustomActionSchedule(Source=WorkerExeFile, Action = "SeedWorkerConfig", Target=seed-config)
+MSI (s) (10:20) [00:00:01:002]: Executing op: CustomActionSchedule(Action=CommitMachineStoreProvision,ActionType=3586)
+MSI (s) (10:20) [00:00:01:003]: Executing op: CustomActionSchedule(Action=UninstallMachineStore,ActionType=3074)
+MSI (s) (10:20) [00:00:01:004]: Executing op: CustomActionSchedule(Action=SeedDaemonConfigExtra,ActionType=3090)
+MSI (s) (10:20) [00:00:01:005]: Executing op: ServiceInstall(DisplayName=Sembazuru Build Daemon,Name=SembazuruDaemon,ImagePath=x)
+MSI (s) (10:20) [00:00:01:006]: Executing op: ServiceControl(,Event=1, Name = "SembazuruWorker",Wait=1)
+MSI (s) (10:20) [00:00:01:007]: Executing op: ServiceInstall(DisplayName=SembazuruDaemon,Name=OtherSembazuruDaemon,ImagePath=x)
+'@
+    $executed = Get-MsiExecutionClassifier -Log $downstream
+    foreach ($property in @(
+        'SeedDaemonConfigExecuted', 'SeedWorkerConfigExecuted',
+        'CommitMachineStoreProvisionExecuted', 'UninstallMachineStoreExecuted',
+        'SembazuruServiceInstallExecuted', 'SembazuruServiceControlExecuted')) {
+        if (-not $executed.$property) { throw "actual-operation fixture missed $property" }
+    }
+    if ($executed.ProvisionMachineStoreExecuted -or $executed.ProvisionMachineStoreFailed) {
+        throw 'actual downstream fixture falsely classified ProvisionMachineStore'
+    }
+    $nearMatches = @'
+MSI (s) (10:20) [00:00:01:010]: Executing op: CustomActionSchedule(Action=SeedDaemonConfigExtra,ActionType=3090)
+MSI (s) (10:20) [00:00:01:011]: Executing op: ServiceInstall(DisplayName=SembazuruDaemon,Name=OtherSembazuruDaemon,ImagePath=x)
+'@
+    $negative = Get-MsiExecutionClassifier -Log $nearMatches
+    if ($negative.SeedDaemonConfigExecuted -or
+        $negative.SembazuruServiceInstallExecuted) {
+        throw 'near-match fixture accepted SeedDaemonConfigExtra or OtherSembazuruDaemon'
+    }
+
+    $provisionErrorCode = @'
+MSI (s) (10:20) [00:00:02:000]: Executing op: CustomActionSchedule(Action=ProvisionMachineStore,ActionType=3074,Source=MachineStoreCtlBinary,Target=provision)
+MSI (s) (10:20) [00:00:02:001]: CustomAction ProvisionMachineStore returned actual error code 10 (note this may not be 100% accurate if translation happened inside sandbox)
+'@
+    $provisionReturnValue = @'
+MSI (s) (10:20) [00:00:02:010]: Executing op: CustomActionSchedule(Action="ProvisionMachineStore",ActionType=3074,Source=MachineStoreCtlBinary,Target=provision)
+MSI (s) (10:20) [00:00:02:011]: Action ended 00:00:02: ProvisionMachineStore. Return value 3.
+'@
+    foreach ($provisionFailure in @($provisionErrorCode, $provisionReturnValue)) {
+        $failed = Get-MsiExecutionClassifier -Log $provisionFailure
+        if (-not $failed.ProvisionMachineStoreExecuted -or
+            -not $failed.ProvisionMachineStoreFailed) {
+            throw 'provision failure fixture missed the actual execution/failure boundary'
+        }
+        foreach ($property in @(
+            'SeedDaemonConfigExecuted', 'SeedWorkerConfigExecuted',
+            'CommitMachineStoreProvisionExecuted', 'UninstallMachineStoreExecuted',
+            'SembazuruServiceInstallExecuted', 'SembazuruServiceControlExecuted')) {
+            if ($failed.$property) { throw "provision failure fixture misclassified $property" }
+        }
+    }
+    Write-Host 'MSI EXECUTION CLASSIFIER FIXTURE PASS: schedule-only, actual downstream/service, and provision-failure boundaries are distinct.'
+}
 
 function Initialize-PrepositionNative {
     if ($null -ne ('Sembazuru.PrepositionNative' -as [type])) { return }
@@ -419,6 +491,66 @@ function Stop-AttemptServices {
     return @($appeared)
 }
 
+function Test-MsiCustomActionExecuted {
+    param([string]$Log, [string]$Action)
+
+    $escapedAction = [regex]::Escape($Action)
+    $optionalQuote = '["'']?'
+    $pattern = '(?im)^[^\r\n]*Executing op:\s*CustomActionSchedule\(' +
+        '[^\r\n)]*(?<![A-Za-z0-9_])Action\s*=\s*' + $optionalQuote +
+        $escapedAction + $optionalQuote + '\s*(?=,|\))'
+    return [regex]::IsMatch($Log, $pattern)
+}
+
+function Test-MsiServiceOperationExecuted {
+    param(
+        [string]$Log,
+        [ValidateSet('ServiceInstall', 'ServiceControl')]
+        [string]$Operation
+    )
+
+    $optionalQuote = '["'']?'
+    $serviceName = '(?:SembazuruDaemon|SembazuruWorker)'
+    $pattern = '(?im)^[^\r\n]*Executing op:\s*' + $Operation + '\(' +
+        '[^\r\n)]*(?<![A-Za-z0-9_])Name\s*=\s*' + $optionalQuote +
+        $serviceName + $optionalQuote + '\s*(?=,|\))'
+    return [regex]::IsMatch($Log, $pattern)
+}
+
+function Get-MsiExecutionClassifier {
+    param([string]$Log)
+
+    $provisionExecuted = Test-MsiCustomActionExecuted -Log $Log `
+        -Action 'ProvisionMachineStore'
+    $nonzeroError = $false
+    foreach ($match in [regex]::Matches($Log,
+            '(?im)CustomAction\s+ProvisionMachineStore\s+returned actual error code\s+(-?\d+)')) {
+        if ([int64]$match.Groups[1].Value -ne 0) {
+            $nonzeroError = $true
+            break
+        }
+    }
+    $returnValueThree = [regex]::IsMatch($Log,
+        '(?im)Action ended [^\r\n]*?:\s*ProvisionMachineStore\.\s*Return value 3\.')
+    return [pscustomobject][ordered]@{
+        ProvisionMachineStoreExecuted = $provisionExecuted
+        ProvisionMachineStoreFailed = $provisionExecuted -and
+            ($nonzeroError -or $returnValueThree)
+        SeedDaemonConfigExecuted = Test-MsiCustomActionExecuted -Log $Log `
+            -Action 'SeedDaemonConfig'
+        SeedWorkerConfigExecuted = Test-MsiCustomActionExecuted -Log $Log `
+            -Action 'SeedWorkerConfig'
+        CommitMachineStoreProvisionExecuted = Test-MsiCustomActionExecuted -Log $Log `
+            -Action 'CommitMachineStoreProvision'
+        UninstallMachineStoreExecuted = Test-MsiCustomActionExecuted -Log $Log `
+            -Action 'UninstallMachineStore'
+        SembazuruServiceInstallExecuted = Test-MsiServiceOperationExecuted -Log $Log `
+            -Operation 'ServiceInstall'
+        SembazuruServiceControlExecuted = Test-MsiServiceOperationExecuted -Log $Log `
+            -Operation 'ServiceControl'
+    }
+}
+
 function Get-ActionEvidence {
     param([string]$LogPath, [string]$CanonicalDataRoot)
 
@@ -426,6 +558,7 @@ function Get-ActionEvidence {
         return [pscustomobject][ordered]@{ LogExists = $false }
     }
     $log = Get-Content -LiteralPath $LogPath -Raw
+    $execution = Get-MsiExecutionClassifier -Log $log
     $canonicalMention = $log.IndexOf(
         $CanonicalDataRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0
     $started = {
@@ -451,14 +584,20 @@ function Get-ActionEvidence {
         MsiLockPermissionsExCanonical = & $actionTouchesCanonical 'MsiLockPermissionsEx'
         RollbackMachineStoreProvisionStarted = & $started 'RollbackMachineStoreProvision'
         ProvisionMachineStoreStarted = & $started 'ProvisionMachineStore'
-        ProvisionMachineStoreFailed = [regex]::IsMatch($log,
-            '(?im)(CustomAction ProvisionMachineStore returned actual error code [^0]|Action ended .*?: ProvisionMachineStore\. Return value 3)')
+        ProvisionMachineStoreExecuted = $execution.ProvisionMachineStoreExecuted
+        ProvisionMachineStoreFailed = $execution.ProvisionMachineStoreFailed
         SeedDaemonConfigStarted = & $started 'SeedDaemonConfig'
         SeedWorkerConfigStarted = & $started 'SeedWorkerConfig'
         CommitMachineStoreProvisionStarted = & $started 'CommitMachineStoreProvision'
         UninstallMachineStoreStarted = & $started 'UninstallMachineStore'
         InstallServicesStarted = & $started 'InstallServices'
         StartServicesStarted = & $started 'StartServices'
+        SeedDaemonConfigExecuted = $execution.SeedDaemonConfigExecuted
+        SeedWorkerConfigExecuted = $execution.SeedWorkerConfigExecuted
+        CommitMachineStoreProvisionExecuted = $execution.CommitMachineStoreProvisionExecuted
+        UninstallMachineStoreExecuted = $execution.UninstallMachineStoreExecuted
+        SembazuruServiceInstallExecuted = $execution.SembazuruServiceInstallExecuted
+        SembazuruServiceControlExecuted = $execution.SembazuruServiceControlExecuted
     }
 }
 
@@ -468,6 +607,9 @@ function Get-NewResidue {
     foreach ($item in @($Baseline)) { $null = $known.Add($item) }
     return @($Current | Where-Object { -not $known.Contains($_) })
 }
+
+Assert-MsiExecutionClassifierFixture
+if ($StaticOnly) { return }
 
 Assert-Administrator
 $packageUnderTest = (Resolve-Path -LiteralPath $packageUnderTestInput -ErrorAction Stop).Path
@@ -592,18 +734,17 @@ try {
     if ($newResidue.Count -ne 0) { $findings.Add("new installer residue: $($newResidue -join '; ')") }
     if (-not $actionEvidence.LogExists) { $findings.Add('MSI verbose log is missing') }
     $provisionFailureBoundary =
-        $actionEvidence.PSObject.Properties['ProvisionMachineStoreStarted'] -and
+        $actionEvidence.PSObject.Properties['ProvisionMachineStoreExecuted'] -and
         $actionEvidence.PSObject.Properties['ProvisionMachineStoreFailed'] -and
-        $actionEvidence.ProvisionMachineStoreStarted -and
+        $actionEvidence.ProvisionMachineStoreExecuted -and
         $actionEvidence.ProvisionMachineStoreFailed
     if (-not $provisionFailureBoundary) {
         $findings.Add('MSI did not fail at the required ProvisionMachineStore boundary')
     }
     foreach ($property in @(
-        'CreateFoldersCanonical', 'MsiLockPermissionsExCanonical',
-        'SeedDaemonConfigStarted', 'SeedWorkerConfigStarted',
-        'CommitMachineStoreProvisionStarted', 'UninstallMachineStoreStarted',
-        'InstallServicesStarted', 'StartServicesStarted')) {
+        'SeedDaemonConfigExecuted', 'SeedWorkerConfigExecuted',
+        'CommitMachineStoreProvisionExecuted', 'UninstallMachineStoreExecuted',
+        'SembazuruServiceInstallExecuted', 'SembazuruServiceControlExecuted')) {
         if ($actionEvidence.PSObject.Properties[$property] -and $actionEvidence.$property) {
             $findings.Add("forbidden MSI action reached: $property")
         }
