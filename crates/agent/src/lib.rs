@@ -23,6 +23,9 @@ pub mod coordination;
 pub mod env_filter;
 pub mod fileserver;
 pub mod intake;
+#[cfg(windows)]
+#[allow(dead_code)] // Task 4 wires these authenticated transport primitives into the daemon.
+mod intake_pipe;
 pub mod rootdir;
 pub mod run;
 pub mod scheduler;
@@ -530,6 +533,56 @@ impl std::fmt::Display for LocalFallbackReason {
     }
 }
 
+/// The security context under which a daemon-side local execution must run.
+///
+/// Authenticated intake must carry the captured caller token all the way to
+/// the execution boundary. It must never silently fall back to the daemon's
+/// ambient token when caller-token process creation fails.
+#[derive(Clone, Debug)]
+pub(crate) enum LocalExecutionContext {
+    /// Compatibility context for trusted in-process callers and test fixtures.
+    CurrentProcess,
+    /// Caller established by the authenticated Windows LocalIntake transport.
+    #[cfg(windows)]
+    AuthenticatedCaller(crate::intake_pipe::CallerIdentity),
+}
+
+/// Runs a local fallback under its explicitly selected security context.
+///
+/// Authenticated callers always use their captured restricted primary token;
+/// process creation failures fail closed without an ambient-token retry.
+pub(crate) async fn run_local_with_context(
+    command: &Command,
+    context: &LocalExecutionContext,
+) -> std::io::Result<i32> {
+    match context {
+        LocalExecutionContext::CurrentProcess => run_local(command).await,
+        #[cfg(windows)]
+        LocalExecutionContext::AuthenticatedCaller(identity) => {
+            #[cfg(test)]
+            let test_control = local_job::resolve_test_control(command)?;
+            let deadline = current_submission_deadline().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "authenticated caller execution requires a submission deadline",
+                )
+            })?;
+            #[cfg(test)]
+            if let Some(state) = &test_control {
+                state.record_run_local_deadline(true);
+            }
+            local_job::run_as_caller(
+                command,
+                identity,
+                deadline,
+                #[cfg(test)]
+                test_control,
+            )
+            .await
+        }
+    }
+}
+
 /// Runs `command` on the local machine, returning its exit code. This is the
 /// fallback path; outputs land where the command writes them (a self-contained
 /// local build), so no write-back is involved.
@@ -576,8 +629,11 @@ pub async fn run_local(command: &Command) -> std::io::Result<i32> {
 mod local_job {
     use std::ffi::c_void;
     use std::mem::{size_of, zeroed};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -588,8 +644,12 @@ mod local_job {
         CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_INVALID_PARAMETER, HANDLE,
         INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
+    use windows_sys::Win32::Storage::FileSystem::GetFullPathNameW;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock,
     };
     use windows_sys::Win32::System::IO::{
         CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus,
@@ -606,8 +666,9 @@ mod local_job {
         JOB_OBJECT_MSG_EXIT_PROCESS, JOB_OBJECT_MSG_NEW_PROCESS,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_SUSPENDED, GetCurrentProcess, INFINITE, OpenProcess, OpenThread,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, GetCurrentProcess,
+        GetExitCodeProcess, INFINITE, OpenProcess, OpenThread, PROCESS_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, ResumeThread, STARTUPINFOW,
         THREAD_SUSPEND_RESUME, TerminateProcess, WaitForSingleObject,
     };
 
@@ -1661,27 +1722,15 @@ mod local_job {
         )
     }
 
-    fn duplicate_process_handle(child: &tokio::process::Child) -> std::io::Result<OwnedHandle> {
-        unsafe {
-            let current = GetCurrentProcess();
-            let mut duplicate = null_mut();
-            let process = child
-                .raw_handle()
-                .ok_or_else(|| std::io::Error::other("child process handle is unavailable"))?;
-            if DuplicateHandle(
-                current,
-                process as HANDLE,
-                current,
-                &mut duplicate,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            ) == 0
-            {
-                return Err(last_error("DuplicateHandle(process) failed"));
-            }
-            OwnedHandle::new(duplicate)
+    #[cfg(test)]
+    pub(super) fn process_is_in_job_for_test(pid: u32, job: usize) -> std::io::Result<bool> {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        let process = OwnedHandle::new(process)?;
+        let mut contained = 0;
+        if unsafe { IsProcessInJob(process.raw(), job as HANDLE, &mut contained) } == 0 {
+            return Err(last_error("IsProcessInJob(test child) failed"));
         }
+        Ok(contained != 0)
     }
 
     fn resume_initial_thread(pid: u32) -> std::io::Result<()> {
@@ -2197,9 +2246,717 @@ mod local_job {
         }
     }
 
+    pub(super) struct CallerLaunch {
+        pub(super) application: String,
+        command_line: String,
+        cwd: String,
+        environment: Vec<(String, String)>,
+    }
+
+    fn validate_environment_entry(key: &str, value: &str) -> std::io::Result<()> {
+        if key.is_empty() || key.contains('\0') || value.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "environment keys and values must be nonempty NUL-free UTF-16 strings",
+            ));
+        }
+        if key.contains('=') && !key.starts_with('=') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("environment key contains '=': {key}"),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn overlay_environment(
+        mut base: Vec<(String, String)>,
+        overlay: &std::collections::HashMap<String, String>,
+    ) -> std::io::Result<Vec<(String, String)>> {
+        for (key, value) in overlay {
+            #[cfg(test)]
+            if key.eq_ignore_ascii_case(TEST_CONTROL_MARKER) {
+                continue;
+            }
+            validate_environment_entry(key, value)?;
+            base.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
+            base.push((key.clone(), value.clone()));
+        }
+        #[cfg(test)]
+        base.retain(|(key, _)| !key.eq_ignore_ascii_case(TEST_CONTROL_MARKER));
+        base.sort_by(|left, right| {
+            left.0
+                .to_ascii_lowercase()
+                .cmp(&right.0.to_ascii_lowercase())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        Ok(base)
+    }
+
+    fn environment_from_token(token: HANDLE) -> std::io::Result<Vec<(String, String)>> {
+        let mut raw = null_mut();
+        if unsafe { CreateEnvironmentBlock(&mut raw, token, 0) } == 0 {
+            return Err(last_error("CreateEnvironmentBlock failed"));
+        }
+        struct EnvironmentBlock(*mut c_void);
+        impl Drop for EnvironmentBlock {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyEnvironmentBlock(self.0);
+                }
+            }
+        }
+        let block = EnvironmentBlock(raw);
+        let mut entries = Vec::new();
+        let mut offset = 0usize;
+        const MAX_ENVIRONMENT_UNITS: usize = 16 * 1024 * 1024;
+        loop {
+            if offset >= MAX_ENVIRONMENT_UNITS {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "caller environment block is not terminated",
+                ));
+            }
+            let start = unsafe { (block.0 as *const u16).add(offset) };
+            if unsafe { *start } == 0 {
+                break;
+            }
+            let mut length = 0usize;
+            while unsafe { *start.add(length) } != 0 {
+                length += 1;
+                if offset + length >= MAX_ENVIRONMENT_UNITS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "caller environment entry is not terminated",
+                    ));
+                }
+            }
+            let entry = String::from_utf16(unsafe { std::slice::from_raw_parts(start, length) })
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "caller environment contains invalid UTF-16",
+                    )
+                })?;
+            let delimiter = if let Some(entry_without_prefix) = entry.strip_prefix('=') {
+                entry_without_prefix.find('=').map(|index| index + 1)
+            } else {
+                entry.find('=')
+            }
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "caller environment entry has no '=' delimiter",
+                )
+            })?;
+            let (key, value) = entry.split_at(delimiter);
+            let value = &value[1..];
+            validate_environment_entry(key, value)?;
+            entries.push((key.to_owned(), value.to_owned()));
+            offset += length + 1;
+        }
+        Ok(entries)
+    }
+
+    fn environment_value<'a>(environment: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        environment
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn resolve_caller_program(
+        program: &str,
+        cwd: &Path,
+        environment: &[(String, String)],
+    ) -> std::io::Result<PathBuf> {
+        if program.is_empty() || program.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "command argv[0] must be a nonempty NUL-free string",
+            ));
+        }
+        let program_path = Path::new(program);
+        let explicit_path = program_path.is_absolute()
+            || program.contains('\\')
+            || program.contains('/')
+            || program_path.components().count() > 1;
+        let mut directories = Vec::new();
+        if explicit_path {
+            let candidate = if program_path.is_absolute() {
+                program_path.to_path_buf()
+            } else {
+                cwd.join(program_path)
+            };
+            if let Some(parent) = candidate.parent() {
+                directories.push((
+                    parent.to_path_buf(),
+                    candidate.file_name().unwrap().to_owned(),
+                ));
+            }
+        } else {
+            if let Some(path) = environment_value(environment, "PATH") {
+                directories.extend(
+                    std::env::split_paths(path)
+                        .filter(|directory| !directory.as_os_str().is_empty())
+                        .map(|directory| {
+                            let directory = if directory.is_absolute() {
+                                directory
+                            } else {
+                                cwd.join(directory)
+                            };
+                            (directory, program_path.as_os_str().to_owned())
+                        }),
+                );
+            }
+        }
+        for (directory, file_name) in directories {
+            let candidate = directory.join(&file_name);
+            let candidates = if candidate.extension().is_none() {
+                vec![candidate.with_extension("exe")]
+            } else {
+                vec![candidate]
+            };
+            for candidate in candidates {
+                if candidate.is_file() {
+                    return candidate.canonicalize();
+                }
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("caller program was not found using caller cwd/PATH: {program}"),
+        ))
+    }
+
+    fn quote_windows_arg(argument: &str) -> String {
+        if !argument.is_empty()
+            && !argument
+                .chars()
+                .any(|character| character == ' ' || character == '\t' || character == '"')
+        {
+            return argument.to_owned();
+        }
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0usize;
+        for character in argument.chars() {
+            match character {
+                '\\' => backslashes += 1,
+                '"' => {
+                    quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                    quoted.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    quoted.extend(std::iter::repeat_n('\\', backslashes));
+                    backslashes = 0;
+                    quoted.push(character);
+                }
+            }
+        }
+        quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+        quoted.push('"');
+        quoted
+    }
+
+    pub(super) fn quote_windows_argv(argv: &[String]) -> String {
+        argv.iter()
+            .map(|argument| quote_windows_arg(argument))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn append_batch_argument(command_line: &mut Vec<u16>, argument: &str) -> std::io::Result<()> {
+        if argument.contains(['\0', '\r', '\n']) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch file arguments must not contain NUL, CR, or LF",
+            ));
+        }
+        let mut quote = argument.is_empty() || argument.ends_with('\\');
+        const UNQUOTED: &str = r"#$*+-./:?@\_";
+        for character in argument.chars() {
+            let ascii_needs_quotes = character.is_ascii()
+                && !(character.is_ascii_alphanumeric() || UNQUOTED.contains(character));
+            if ascii_needs_quotes || character.is_control() {
+                quote = true;
+            }
+        }
+        if quote {
+            command_line.push('"' as u16);
+        }
+        let mut backslashes = 0usize;
+        for unit in std::ffi::OsStr::new(argument).encode_wide() {
+            if unit == '\\' as u16 {
+                backslashes += 1;
+            } else {
+                if unit == '"' as u16 {
+                    command_line.extend(std::iter::repeat_n('\\' as u16, backslashes));
+                    command_line.push('"' as u16);
+                } else if unit == '%' as u16 {
+                    command_line.extend("%%cd:~,".encode_utf16());
+                }
+                backslashes = 0;
+            }
+            command_line.push(unit);
+        }
+        if quote {
+            command_line.extend(std::iter::repeat_n('\\' as u16, backslashes));
+            command_line.push('"' as u16);
+        }
+        Ok(())
+    }
+
+    fn verified_batch_user_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        const LEGACY_MAX_PATH: usize = 260;
+        if wide.len() > LEGACY_MAX_PATH {
+            return Ok(wide);
+        }
+        let candidate = match wide.as_slice() {
+            [sep1, sep2, query, sep3, _, colon, sep4, ..]
+                if *sep1 == '\\' as u16
+                    && *sep2 == '\\' as u16
+                    && *query == '?' as u16
+                    && *sep3 == '\\' as u16
+                    && *colon == ':' as u16
+                    && *sep4 == '\\' as u16 =>
+            {
+                wide[4..].to_vec()
+            }
+            [sep1, sep2, query, sep3, u, n, c, sep4, ..]
+                if *sep1 == '\\' as u16
+                    && *sep2 == '\\' as u16
+                    && *query == '?' as u16
+                    && *sep3 == '\\' as u16
+                    && *u == 'U' as u16
+                    && *n == 'N' as u16
+                    && *c == 'C' as u16
+                    && *sep4 == '\\' as u16 =>
+            {
+                let mut candidate = vec!['\\' as u16, '\\' as u16];
+                candidate.extend_from_slice(&wide[8..]);
+                candidate
+            }
+            _ => return Ok(wide),
+        };
+        let required = unsafe { GetFullPathNameW(candidate.as_ptr(), 0, null_mut(), null_mut()) };
+        if required == 0 {
+            return Err(last_error("GetFullPathNameW(batch path length) failed"));
+        }
+        let mut full = vec![0u16; required as usize];
+        let written = unsafe {
+            GetFullPathNameW(
+                candidate.as_ptr(),
+                full.len() as u32,
+                full.as_mut_ptr(),
+                null_mut(),
+            )
+        };
+        if written == 0 || written as usize >= full.len() {
+            return Err(last_error("GetFullPathNameW(batch path) failed"));
+        }
+        full.truncate(written as usize);
+        if full.as_slice() != &candidate[..candidate.len() - 1] {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch path cannot be safely converted from verbatim form",
+            ));
+        }
+        full.push(0);
+        Ok(full)
+    }
+
+    pub(super) fn make_batch_command_line(
+        script: &Path,
+        args: &[String],
+    ) -> std::io::Result<String> {
+        let script = verified_batch_user_path(script)?;
+        if script.starts_with(&['\\' as u16, '\\' as u16, '?' as u16, '\\' as u16]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cmd.exe does not support verbatim batch paths",
+            ));
+        }
+        let script = script.strip_suffix(&[0]).unwrap_or(&script);
+        if script.contains(&('"' as u16)) || script.last() == Some(&('\\' as u16)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Windows batch paths must not contain quotes or end with backslash",
+            ));
+        }
+        let mut command_line = "cmd.exe /e:ON /v:OFF /d /c \""
+            .encode_utf16()
+            .collect::<Vec<_>>();
+        command_line.push('"' as u16);
+        command_line.extend_from_slice(script);
+        command_line.push('"' as u16);
+        for argument in args {
+            command_line.push(' ' as u16);
+            append_batch_argument(&mut command_line, argument)?;
+        }
+        command_line.push('"' as u16);
+        String::from_utf16(&command_line).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch command line contains invalid UTF-16",
+            )
+        })
+    }
+
+    pub(super) fn prepare_caller_launch(
+        command: &Command,
+        environment: Vec<(String, String)>,
+    ) -> std::io::Result<CallerLaunch> {
+        if command.argv.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "command.argv is empty",
+            ));
+        }
+        if command.argv.iter().any(|argument| argument.contains('\0')) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "command arguments must not contain NUL",
+            ));
+        }
+        if command.cwd.is_empty() || command.cwd.contains('\0') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "authenticated caller command requires a nonempty NUL-free cwd",
+            ));
+        }
+        let cwd = PathBuf::from(&command.cwd);
+        if !cwd.is_absolute() || !cwd.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "authenticated caller cwd is not an absolute directory: {}",
+                    command.cwd
+                ),
+            ));
+        }
+        let application = resolve_caller_program(&command.argv[0], &cwd, &environment)?;
+        let is_batch = application
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+            });
+        let (application, command_line) = if is_batch {
+            let comspec = environment_value(&environment, "ComSpec").ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "caller environment has no ComSpec for batch execution",
+                )
+            })?;
+            let comspec = resolve_caller_program(comspec, &cwd, &environment)?;
+            let command_line = make_batch_command_line(&application, &command.argv[1..])?;
+            (comspec, command_line)
+        } else {
+            let mut argv = command.argv.clone();
+            argv[0] = application.to_string_lossy().into_owned();
+            let command_line = quote_windows_argv(&argv);
+            (application, command_line)
+        };
+        Ok(CallerLaunch {
+            application: application.to_string_lossy().into_owned(),
+            command_line,
+            cwd: cwd.to_string_lossy().into_owned(),
+            environment,
+        })
+    }
+
+    fn encode_environment_block(environment: &[(String, String)]) -> std::io::Result<Vec<u16>> {
+        let mut block = Vec::new();
+        for (key, value) in environment {
+            validate_environment_entry(key, value)?;
+            block.extend(std::ffi::OsStr::new(key).encode_wide());
+            block.push('=' as u16);
+            block.extend(std::ffi::OsStr::new(value).encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        if block.len() == 1 {
+            block.push(0);
+        }
+        Ok(block)
+    }
+
+    struct CallerChild {
+        process: OwnedHandle,
+        initial_thread: Option<OwnedHandle>,
+        pid: u32,
+    }
+
+    enum LocalChild {
+        Ambient(Box<tokio::process::Child>),
+        Caller(CallerChild),
+    }
+
+    impl LocalChild {
+        fn pid(&self) -> std::io::Result<u32> {
+            match self {
+                Self::Ambient(child) => child
+                    .id()
+                    .ok_or_else(|| std::io::Error::other("suspended child has no process id")),
+                Self::Caller(child) => Ok(child.pid),
+            }
+        }
+
+        fn process_raw(&self) -> std::io::Result<HANDLE> {
+            match self {
+                Self::Ambient(child) => child
+                    .raw_handle()
+                    .map(|handle| handle as HANDLE)
+                    .ok_or_else(|| std::io::Error::other("child process handle is unavailable")),
+                Self::Caller(child) => Ok(child.process.raw()),
+            }
+        }
+
+        fn duplicate_process(&self) -> std::io::Result<OwnedHandle> {
+            duplicate_raw_process_handle(self.process_raw()?)
+        }
+
+        fn resume(&mut self) -> std::io::Result<()> {
+            match self {
+                Self::Ambient(child) => {
+                    resume_initial_thread(child.id().ok_or_else(|| {
+                        std::io::Error::other("suspended child has no process id")
+                    })?)
+                }
+                Self::Caller(child) => {
+                    let thread = child.initial_thread.take().ok_or_else(|| {
+                        std::io::Error::other("caller child initial thread is unavailable")
+                    })?;
+                    let previous = unsafe { ResumeThread(thread.raw()) };
+                    if previous == u32::MAX {
+                        return Err(last_error("ResumeThread(caller child) failed"));
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        async fn terminate_and_wait(&mut self) -> std::io::Result<()> {
+            match self {
+                Self::Ambient(child) => {
+                    let _ = child.start_kill();
+                    child.wait().await.map(|_| ())
+                }
+                Self::Caller(child) => {
+                    if unsafe { TerminateProcess(child.process.raw(), 1) } == 0 {
+                        let wait = unsafe { WaitForSingleObject(child.process.raw(), 0) };
+                        if wait != WAIT_OBJECT_0 {
+                            return Err(last_error("TerminateProcess(caller child) failed"));
+                        }
+                    }
+                    match unsafe { WaitForSingleObject(child.process.raw(), INFINITE) } {
+                        WAIT_OBJECT_0 => Ok(()),
+                        WAIT_FAILED => Err(last_error("WaitForSingleObject(caller child) failed")),
+                        unexpected => Err(std::io::Error::other(format!(
+                            "unexpected caller child wait result {unexpected}"
+                        ))),
+                    }
+                }
+            }
+        }
+
+        async fn wait(&mut self) -> std::io::Result<i32> {
+            match self {
+                Self::Ambient(child) => {
+                    let status = child.wait().await?;
+                    Ok(status.code().unwrap_or(-1))
+                }
+                Self::Caller(child) => {
+                    let process = duplicate_raw_process_handle(child.process.raw())?;
+                    tokio::task::spawn_blocking(move || {
+                        match unsafe { WaitForSingleObject(process.raw(), INFINITE) } {
+                            WAIT_OBJECT_0 => {
+                                let mut exit_code = 0;
+                                if unsafe { GetExitCodeProcess(process.raw(), &mut exit_code) } == 0
+                                {
+                                    Err(last_error("GetExitCodeProcess(caller child) failed"))
+                                } else {
+                                    Ok(exit_code as i32)
+                                }
+                            }
+                            WAIT_FAILED => {
+                                Err(last_error("WaitForSingleObject(caller child) failed"))
+                            }
+                            unexpected => Err(std::io::Error::other(format!(
+                                "unexpected caller child wait result {unexpected}"
+                            ))),
+                        }
+                    })
+                    .await
+                    .map_err(|error| {
+                        std::io::Error::other(format!("caller child waiter panicked: {error}"))
+                    })?
+                }
+            }
+        }
+    }
+
+    fn duplicate_raw_process_handle(process: HANDLE) -> std::io::Result<OwnedHandle> {
+        unsafe {
+            let current = GetCurrentProcess();
+            let mut duplicate = null_mut();
+            if DuplicateHandle(
+                current,
+                process,
+                current,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ) == 0
+            {
+                return Err(last_error("DuplicateHandle(process) failed"));
+            }
+            OwnedHandle::new(duplicate)
+        }
+    }
+
+    fn spawn_ambient(command: &Command) -> std::io::Result<LocalChild> {
+        let mut cmd = tokio::process::Command::new(&command.argv[0]);
+        cmd.args(&command.argv[1..]);
+        if !command.cwd.is_empty() {
+            cmd.current_dir(&command.cwd);
+        }
+        #[cfg(test)]
+        cmd.env_remove(TEST_CONTROL_MARKER);
+        for (key, value) in &command.env {
+            #[cfg(test)]
+            if key.eq_ignore_ascii_case(TEST_CONTROL_MARKER) {
+                continue;
+            }
+            cmd.env(key, value);
+        }
+        cmd.kill_on_drop(true);
+        cmd.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        cmd.spawn().map(Box::new).map(LocalChild::Ambient)
+    }
+
+    fn spawn_as_caller(
+        command: &Command,
+        identity: &crate::intake_pipe::CallerIdentity,
+        #[cfg(test)] test_control: Option<&TestGuardianState>,
+    ) -> std::io::Result<LocalChild> {
+        let base = environment_from_token(identity.primary_token.as_raw_handle() as HANDLE)?;
+        let environment = overlay_environment(base, &command.env)?;
+        let launch = prepare_caller_launch(command, environment)?;
+        let mut application = std::ffi::OsStr::new(&launch.application)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut command_line = std::ffi::OsStr::new(&launch.command_line)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let cwd = std::ffi::OsStr::new(&launch.cwd)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let environment = encode_environment_block(&launch.environment)?;
+        #[cfg(test)]
+        if test_control.is_some_and(|control| control.take_failpoint(23)) {
+            return Err(std::io::Error::other(
+                "injected failure before CreateProcessAsUserW",
+            ));
+        }
+        let mut startup: STARTUPINFOW = unsafe { zeroed() };
+        startup.cb = size_of::<STARTUPINFOW>() as u32;
+        let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
+        let created = unsafe {
+            CreateProcessAsUserW(
+                identity.primary_token.as_raw_handle() as HANDLE,
+                application.as_mut_ptr(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                environment.as_ptr().cast(),
+                cwd.as_ptr(),
+                &startup,
+                &mut process,
+            )
+        };
+        if created == 0 {
+            return Err(last_error("CreateProcessAsUserW failed"));
+        }
+        let process_handle = OwnedHandle::new(process.hProcess);
+        let thread_handle = OwnedHandle::new(process.hThread);
+        match (process_handle, thread_handle) {
+            (Ok(process_handle), Ok(thread_handle)) => Ok(LocalChild::Caller(CallerChild {
+                process: process_handle,
+                initial_thread: Some(thread_handle),
+                pid: process.dwProcessId,
+            })),
+            (process_result, thread_result) => {
+                unsafe {
+                    if let Ok(process_handle) = &process_result {
+                        let _ = TerminateProcess(process_handle.raw(), 1);
+                        let _ = WaitForSingleObject(process_handle.raw(), INFINITE);
+                    } else if !process.hProcess.is_null() {
+                        let _ = TerminateProcess(process.hProcess, 1);
+                        let _ = WaitForSingleObject(process.hProcess, INFINITE);
+                        close_handle(process.hProcess);
+                    }
+                    if thread_result.is_err() && !process.hThread.is_null() {
+                        close_handle(process.hThread);
+                    }
+                }
+                process_result.and(thread_result).map(|_| unreachable!())
+            }
+        }
+    }
+
+    enum SpawnContext<'a> {
+        Ambient,
+        Caller(&'a crate::intake_pipe::CallerIdentity),
+    }
+
+    pub(super) async fn run_as_caller(
+        command: &Command,
+        identity: &crate::intake_pipe::CallerIdentity,
+        deadline: Arc<SubmissionDeadline>,
+        #[cfg(test)] test_control: Option<Arc<TestGuardianState>>,
+    ) -> std::io::Result<i32> {
+        run_inner(
+            command,
+            deadline,
+            SpawnContext::Caller(identity),
+            #[cfg(test)]
+            test_control,
+        )
+        .await
+    }
+
     pub(super) async fn run(
         command: &Command,
         deadline: Arc<SubmissionDeadline>,
+        #[cfg(test)] test_control: Option<Arc<TestGuardianState>>,
+    ) -> std::io::Result<i32> {
+        run_inner(
+            command,
+            deadline,
+            SpawnContext::Ambient,
+            #[cfg(test)]
+            test_control,
+        )
+        .await
+    }
+
+    async fn run_inner(
+        command: &Command,
+        deadline: Arc<SubmissionDeadline>,
+        spawn_context: SpawnContext<'_>,
         #[cfg(test)] test_control: Option<Arc<TestGuardianState>>,
     ) -> std::io::Result<i32> {
         if !deadline.try_begin_setup() {
@@ -2251,23 +3008,16 @@ mod local_job {
             shared,
         };
 
-        let mut cmd = tokio::process::Command::new(&command.argv[0]);
-        cmd.args(&command.argv[1..]);
-        if !command.cwd.is_empty() {
-            cmd.current_dir(&command.cwd);
-        }
-        #[cfg(test)]
-        cmd.env_remove(TEST_CONTROL_MARKER);
-        for (key, value) in &command.env {
-            #[cfg(test)]
-            if key.eq_ignore_ascii_case(TEST_CONTROL_MARKER) {
-                continue;
-            }
-            cmd.env(key, value);
-        }
-        cmd.kill_on_drop(true);
-        cmd.as_std_mut().creation_flags(CREATE_SUSPENDED);
-        let mut child = match cmd.spawn() {
+        let spawn_result = match spawn_context {
+            SpawnContext::Ambient => spawn_ambient(command),
+            SpawnContext::Caller(identity) => spawn_as_caller(
+                command,
+                identity,
+                #[cfg(test)]
+                test_control.as_deref(),
+            ),
+        };
+        let mut child = match spawn_result {
             Ok(child) => child,
             Err(error) => {
                 let _ = stop_monitor(&mut handles);
@@ -2276,11 +3026,10 @@ mod local_job {
                 return Err(error);
             }
         };
-        let process = match duplicate_process_handle(&child) {
+        let process = match child.duplicate_process() {
             Ok(process) => process,
             Err(error) => {
-                let _ = child.start_kill();
-                let waited = child.wait().await;
+                let waited = child.terminate_and_wait().await;
                 let _ = stop_monitor(&mut handles);
                 handles.close_after_monitor();
                 if waited.is_ok() {
@@ -2333,7 +3082,7 @@ mod local_job {
         {
             use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
 
-            let pid = child.id().unwrap_or(0);
+            let pid = child.pid().unwrap_or(0);
             let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
             assert!(
                 !process.is_null(),
@@ -2360,20 +3109,14 @@ mod local_job {
                 "injected failure after suspended spawn",
             ));
         }
-        let assigned = {
-            let child_handle = child.raw_handle().ok_or_else(|| {
-                std::io::Error::other("suspended child process handle is unavailable")
-            })?;
-            unsafe { AssignProcessToJobObject(guardian.job_raw(), child_handle as HANDLE) }
-        };
+        let assigned =
+            unsafe { AssignProcessToJobObject(guardian.job_raw(), child.process_raw()?) };
         if assigned == 0 {
             let error = last_error("AssignProcessToJobObject failed");
             guardian.force_reap(true).await?;
             return Err(error);
         }
-        let pid = child
-            .id()
-            .ok_or_else(|| std::io::Error::other("suspended child has no process id"))?;
+        let pid = child.pid()?;
         if let Err(error) = guardian.seed_top(pid) {
             let _ = guardian.force_reap(true).await;
             return Err(error);
@@ -2396,7 +3139,7 @@ mod local_job {
             guardian.force_reap(true).await?;
             return Err(std::io::Error::other("injected failure before resume"));
         }
-        if let Err(error) = resume_initial_thread(pid) {
+        if let Err(error) = child.resume() {
             guardian.force_reap(true).await?;
             return Err(error);
         }
@@ -2417,10 +3160,10 @@ mod local_job {
                     "local process was stopped for daemon shutdown",
                 ))
             }
-            status = child.wait() => {
-                let status = status?;
+            exit_code = child.wait() => {
+                let exit_code = exit_code?;
                 match guardian.finish_natural().await? {
-                    FinishOutcome::Natural => Ok(status.code().unwrap_or(-1)),
+                    FinishOutcome::Natural => Ok(exit_code),
                     FinishOutcome::Forced => Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "local process tree was stopped during post-exit drain",
@@ -2456,6 +3199,454 @@ pub async fn execute_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_launch_quotes_windows_argv_and_overlays_environment() {
+        let base = [
+            ("Path".to_string(), r"C:\caller\bin".to_string()),
+            ("KEEP".to_string(), "base".to_string()),
+            ("replace".to_string(), "old".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let overlay = [
+            ("PATH".to_string(), r"C:\override\bin".to_string()),
+            ("REPLACE".to_string(), "new".to_string()),
+            ("Unicode".to_string(), "鶴".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let merged = local_job::overlay_environment(base, &overlay).unwrap();
+        assert_eq!(
+            merged
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("path"))
+                .unwrap()
+                .1,
+            r"C:\override\bin"
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("replace"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            merged
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("replace"))
+                .unwrap()
+                .1,
+            "new"
+        );
+        assert_eq!(
+            local_job::quote_windows_argv(&[
+                r"C:\space dir\tool.exe".into(),
+                "".into(),
+                r#"a\"b"#.into(),
+                r"ends\\".into(),
+                "鶴".into(),
+            ]),
+            r#""C:\space dir\tool.exe" "" "a\\\"b" ends\\ 鶴"#
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_bare_program_resolves_only_from_caller_path() {
+        let root = std::env::temp_dir().join(format!(
+            "sembazuru-caller-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd = root.join("cwd");
+        let path = root.join("path");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(cwd.join("same-name.exe"), b"cwd impostor").unwrap();
+        std::fs::write(path.join("same-name.exe"), b"caller path target").unwrap();
+        let command = Command {
+            argv: vec!["same-name.exe".into()],
+            env: Default::default(),
+            cwd: cwd.to_string_lossy().into_owned(),
+        };
+        let environment = vec![("Path".into(), path.to_string_lossy().into_owned())];
+
+        let launch = local_job::prepare_caller_launch(&command, environment).unwrap();
+        assert_eq!(
+            std::path::Path::new(&launch.application),
+            path.join("same-name.exe").canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_path_search_ignores_empty_entries_and_cwd_impostor() {
+        let root = std::env::temp_dir().join(format!(
+            "sembazuru-caller-empty-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd = root.join("cwd");
+        let path = root.join("path");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(cwd.join("cl.exe"), b"cwd impostor").unwrap();
+        std::fs::write(path.join("cl.exe"), b"caller path target").unwrap();
+        let command = Command {
+            argv: vec!["cl".into()],
+            env: Default::default(),
+            cwd: cwd.to_string_lossy().into_owned(),
+        };
+        let environment = vec![("Path".into(), format!(";{};;", path.to_string_lossy()))];
+
+        let launch = local_job::prepare_caller_launch(&command, environment).unwrap();
+        assert_eq!(
+            std::path::Path::new(&launch.application),
+            path.join("cl.exe").canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_extensionless_program_never_resolves_plain_file() {
+        let root = std::env::temp_dir().join(format!(
+            "sembazuru-caller-extensionless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cwd = root.join("cwd");
+        let path = root.join("path");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("bare"), b"not an exe candidate").unwrap();
+        std::fs::write(cwd.join("explicit"), b"not an exe candidate").unwrap();
+
+        let bare = Command {
+            argv: vec!["bare".into()],
+            env: Default::default(),
+            cwd: cwd.to_string_lossy().into_owned(),
+        };
+        let path_environment = vec![("Path".into(), path.to_string_lossy().into_owned())];
+        assert_eq!(
+            local_job::prepare_caller_launch(&bare, path_environment)
+                .err()
+                .expect("bare extensionless file unexpectedly resolved")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+
+        let explicit = Command {
+            argv: vec![r".\explicit".into()],
+            env: Default::default(),
+            cwd: cwd.to_string_lossy().into_owned(),
+        };
+        assert_eq!(
+            local_job::prepare_caller_launch(&explicit, Vec::new())
+                .err()
+                .expect("explicit extensionless file unexpectedly resolved")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_normal_launch_rejects_embedded_nul() {
+        let executable = std::env::current_exe().unwrap();
+        let command = Command {
+            argv: vec![
+                executable.to_string_lossy().into_owned(),
+                "before\0after".into(),
+            ],
+            env: Default::default(),
+            cwd: executable.parent().unwrap().to_string_lossy().into_owned(),
+        };
+
+        assert_eq!(
+            local_job::prepare_caller_launch(&command, Vec::new())
+                .err()
+                .expect("embedded NUL argument was accepted")
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn caller_batch_command_line_matches_rust_std_golden() {
+        let script = std::path::Path::new(r"C:\test.cmd");
+        let prefix = r#"cmd.exe /e:ON /v:OFF /d /c ""C:\test.cmd" "#;
+        assert_eq!(
+            local_job::make_batch_command_line(script, &[]).unwrap(),
+            r#"cmd.exe /e:ON /v:OFF /d /c ""C:\test.cmd"""#
+        );
+        assert_eq!(
+            local_job::make_batch_command_line(script, &[String::new()]).unwrap(),
+            format!("{prefix}\"\"\"")
+        );
+        assert_eq!(
+            local_job::make_batch_command_line(script, &["a&b".into()]).unwrap(),
+            format!("{prefix}\"a&b\"\"")
+        );
+        assert_eq!(
+            local_job::make_batch_command_line(script, &["%PATH%".into()]).unwrap(),
+            format!("{prefix}\"%%cd:~,%PATH%%cd:~,%\"\"")
+        );
+        assert_eq!(
+            local_job::make_batch_command_line(script, &["a\"b".into()]).unwrap(),
+            format!("{prefix}\"a\"\"b\"\"")
+        );
+        assert_eq!(
+            local_job::make_batch_command_line(script, &["ends\\".into()]).unwrap(),
+            format!("{prefix}\"ends\\\\\"\"")
+        );
+        for invalid in ["line\rbreak", "line\nbreak", "nul\0inside"] {
+            assert_eq!(
+                local_job::make_batch_command_line(script, &[invalid.into()])
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        let long_nonverbatim =
+            std::path::PathBuf::from(format!(r"C:\{}\test.cmd", "a".repeat(270)));
+        assert!(local_job::make_batch_command_line(&long_nonverbatim, &[]).is_ok());
+        let long_verbatim =
+            std::path::PathBuf::from(format!(r"\\?\C:\{}\test.cmd", "a".repeat(270)));
+        assert_eq!(
+            local_job::make_batch_command_line(&long_verbatim, &[])
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn caller_batch_launch_matches_std_argv() {
+        use std::os::windows::ffi::OsStrExt;
+
+        fn expected_binary(arguments: &[String]) -> Vec<u8> {
+            let mut output = Vec::new();
+            output.extend_from_slice(&(arguments.len() as u32).to_le_bytes());
+            for argument in arguments {
+                let wide = std::ffi::OsStr::new(argument)
+                    .encode_wide()
+                    .collect::<Vec<_>>();
+                output.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+                for unit in wide {
+                    output.extend_from_slice(&unit.to_le_bytes());
+                }
+            }
+            output
+        }
+
+        let cwd = std::env::temp_dir().join(format!(
+            "sembazuru-caller-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let helper_source = cwd.join("helper.rs");
+        let helper = cwd.join("helper.exe");
+        let script = cwd.join("oracle.cmd");
+        let std_output = cwd.join("std-argv.bin");
+        let caller_output = cwd.join("caller-argv.bin");
+        let sentinel = cwd.join("injected.txt");
+        std::fs::write(
+            &helper_source,
+            r#"use std::os::windows::ffi::OsStrExt;
+fn main() {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut output = Vec::new();
+    output.extend_from_slice(&(arguments.len() as u32).to_le_bytes());
+    for argument in arguments {
+        let wide = argument.encode_wide().collect::<Vec<_>>();
+        output.extend_from_slice(&(wide.len() as u32).to_le_bytes());
+        for unit in wide { output.extend_from_slice(&unit.to_le_bytes()); }
+    }
+    std::fs::write(std::env::var_os("SEMBAZURU_ARGV_OUTPUT").unwrap(), output).unwrap();
+}
+"#,
+        )
+        .unwrap();
+        let build = std::process::Command::new("rustc")
+            .arg(&helper_source)
+            .arg("-o")
+            .arg(&helper)
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "helper build failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&build.stdout),
+            String::from_utf8_lossy(&build.stderr)
+        );
+        std::fs::write(&script, "@echo off\r\n\"%~dp0helper.exe\" %*\r\n").unwrap();
+        let arguments = vec![
+            "".into(),
+            "space value".into(),
+            format!("a&echo PWNED>{}", sentinel.display()),
+            format!("left|echo PWNED>{}", sentinel.display()),
+            "angle>value<input".into(),
+            "(parentheses)".into(),
+            "%PATH%".into(),
+            "!PATH!".into(),
+            format!("x\" & echo PWNED > {} & \"y", sentinel.display()),
+            "ends\\".into(),
+            "caret^value".into(),
+            "鶴".into(),
+        ];
+        let std_run = std::process::Command::new(&script)
+            .args(&arguments)
+            .current_dir(&cwd)
+            .env("SEMBAZURU_ARGV_OUTPUT", &std_output)
+            .output()
+            .unwrap();
+        assert!(
+            std_run.status.success(),
+            "std batch oracle failed: stdout={}; stderr={}",
+            String::from_utf8_lossy(&std_run.stdout),
+            String::from_utf8_lossy(&std_run.stderr)
+        );
+        let mut environment = std::collections::HashMap::new();
+        environment.insert(
+            "SEMBAZURU_ARGV_OUTPUT".into(),
+            caller_output.to_string_lossy().into_owned(),
+        );
+        let command = Command {
+            argv: std::iter::once(script.to_string_lossy().into_owned())
+                .chain(arguments.iter().cloned())
+                .collect(),
+            env: environment,
+            cwd: cwd.to_string_lossy().into_owned(),
+        };
+        let identity = crate::intake_pipe::CallerIdentity::restricted_current_for_test().unwrap();
+        let deadline = Arc::new(session_registry::SubmissionDeadline::new());
+        let exit_code = with_submission_deadline(Arc::clone(&deadline), async {
+            run_local_with_context(
+                &command,
+                &LocalExecutionContext::AuthenticatedCaller(identity),
+            )
+            .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(exit_code, 0);
+        let expected = expected_binary(&arguments);
+        let std_actual = std::fs::read(&std_output).unwrap();
+        let caller_actual = std::fs::read(&caller_output).unwrap();
+        assert_eq!(std_actual, expected, "std batch argv did not round-trip");
+        assert_eq!(
+            caller_actual, expected,
+            "caller batch argv did not round-trip"
+        );
+        assert_eq!(caller_actual, std_actual);
+        assert!(
+            !sentinel.exists(),
+            "cmd metacharacters escaped the argument"
+        );
+        std::fs::remove_dir_all(cwd).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn caller_token_spawn_failure_never_retries_with_daemon_token() {
+        let output = unique_job_output("caller-spawn-failure");
+        let mut command = Command {
+            argv: vec![
+                "cmd.exe".into(),
+                "/D".into(),
+                "/C".into(),
+                format!("echo retry>{}", output.display()),
+            ],
+            env: Default::default(),
+            cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        };
+        let control = local_job::TestGuardianControl::bind(&mut command).unwrap();
+        control.install(23);
+        let identity = crate::intake_pipe::CallerIdentity::restricted_current_for_test().unwrap();
+        let deadline = Arc::new(session_registry::SubmissionDeadline::new());
+        let result = with_submission_deadline(Arc::clone(&deadline), async {
+            run_local_with_context(
+                &command,
+                &LocalExecutionContext::AuthenticatedCaller(identity),
+            )
+            .await
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            !output.exists(),
+            "ambient-token retry executed the sentinel"
+        );
+        assert_eq!(control.take_last_consumed_failpoint(), 23);
+        assert_eq!(
+            deadline.phase(),
+            session_registry::SubmissionPhase::RetrySafeReaped
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_job_as_caller_is_assigned_before_resume() {
+        let _guard = LOCAL_JOB_TEST_LOCK.lock().await;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let output = unique_job_output("authenticated-caller");
+        let mut command = fixture_command(listener.local_addr().unwrap(), &output);
+        let control = local_job::TestGuardianControl::bind(&mut command).unwrap();
+        control.observe_job();
+        let identity = crate::intake_pipe::CallerIdentity::restricted_current_for_test().unwrap();
+        let expected_sid = identity.sid.clone();
+        let deadline = Arc::new(session_registry::SubmissionDeadline::new());
+        let run_deadline = Arc::clone(&deadline);
+        let run = tokio::spawn(with_submission_deadline(run_deadline, async move {
+            run_local_with_context(
+                &command,
+                &LocalExecutionContext::AuthenticatedCaller(identity),
+            )
+            .await
+        }));
+        let mut peers = accept_local_job_fixture(listener).await;
+        let job = control.take_observed_job_handle();
+        assert_ne!(job, 0);
+        for peer in &peers {
+            assert_eq!(
+                crate::intake_pipe::process_sid_for_test(peer.pid).unwrap(),
+                expected_sid
+            );
+            assert!(local_job::process_is_in_job_for_test(peer.pid, job).unwrap());
+        }
+        for peer in &mut peers {
+            use std::io::Write;
+            peer.socket.write_all(&[1]).unwrap();
+        }
+        assert_eq!(run.await.unwrap().unwrap(), 0);
+        unsafe {
+            let _ = windows_sys::Win32::Foundation::CloseHandle(job as _);
+        }
+        let _ = std::fs::remove_file(output);
+    }
 
     #[cfg(windows)]
     fn break_process_stderr() {

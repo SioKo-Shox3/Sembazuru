@@ -64,10 +64,12 @@ You now have:
 
 ## 3. Start the cluster
 
-Start the **daemon** (one terminal). It listens on loopback by default:
-Coordination `127.0.0.1:50070`, LocalIntake `127.0.0.1:50071`, file server
-`127.0.0.1:50072`. Set `SEMBAZURU_CACHE_ROOT` to enable the action cache (a 2nd
-identical build skips the compile):
+Start the **daemon** (one terminal). Coordination (`127.0.0.1:50070`), the file
+server (`127.0.0.1:50072`), and Status (`127.0.0.1:50073`) listen on TCP.
+Windows LocalIntake uses the protected machine-local pipe
+`\\.\pipe\Sembazuru.LocalIntake.v1`; production does not open the former intake
+TCP port. Set `SEMBAZURU_CACHE_ROOT` to enable the action cache (a 2nd identical
+build skips the compile):
 
 ```powershell
 $env:SEMBAZURU_CACHE_ROOT = "$PWD\.sbz-cache"
@@ -90,7 +92,9 @@ target\release\sembazuru-worker.exe 127.0.0.1:50061
 > **Trust model.** Out of the box the cluster is LAN-trusted and unauthenticated;
 > the daemon warns if a LAN-reachable listener has auth off. To require a shared
 > token, set `SEMBAZURU_CLUSTER_TOKEN` on the daemon **and** every worker (ADR
-> 0006). Intake is loopback-only and refuses non-loopback binds.
+> 0006). Windows LocalIntake is separate from those LAN listeners: its named pipe
+> has an explicit DACL, authenticates the server before sending a request, and
+> runs daemon-side fallback with the authenticated caller's restricted token.
 
 > **Persistent config & participation modes (ADR 0012).** The env vars above are the
 > dev/CLI path; an installed worker *service* reads `%ProgramData%\Sembazuru\worker.toml`
@@ -166,8 +170,9 @@ directory is simply left uncached (never miscached). The launcher writes
 content-addressed response files under `<root>\.sembazuru\` — add that to
 `.gitignore`.
 
-If the daemon's intake is not at the default `http://127.0.0.1:50071`, point the
-launcher at it with `SEMBAZURU_DAEMON`.
+If the daemon's intake is not at the default
+`npipe://Sembazuru.LocalIntake.v1`, point the launcher at it with
+`SEMBAZURU_DAEMON`.
 
 ## 5. What you should see
 

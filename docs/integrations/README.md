@@ -50,8 +50,9 @@ ninja
 
 `CMAKE_<LANG>_COMPILER_LAUNCHER` is supported by the Ninja and Makefile
 generators (not the Visual Studio generator — use the MSBuild path below for
-that). Set `SEMBAZURU_DAEMON` if the daemon is not at the default
-`http://127.0.0.1:50071`.
+that). On Windows, LocalIntake uses a protected named pipe; set
+`SEMBAZURU_DAEMON` only if the daemon is not at the default
+`npipe://Sembazuru.LocalIntake.v1`.
 
 ## MSBuild / Visual Studio (CLToolExe shim)
 
@@ -64,7 +65,7 @@ compiler-launcher variable, so Sembazuru substitutes the CL task's executable.
    ```
    SEMBAZURU_LAUNCHER_DIR = <dir containing sembazuru.exe>
    SEMBAZURU_SHIM_CC      = cl.exe        (or clang-cl.exe)
-   SEMBAZURU_DAEMON       = http://127.0.0.1:50071
+   SEMBAZURU_DAEMON       = npipe://Sembazuru.LocalIntake.v1
    ```
 3. `msbuild your.sln /p:Configuration=Release /p:Platform=x64`
 

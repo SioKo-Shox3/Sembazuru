@@ -130,6 +130,13 @@ async fn get_config_defaults_when_absent() {
     assert!(!cfg.cluster_token_set);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_default_local_intake_is_the_authenticated_named_pipe() {
+    assert_eq!(DEFAULT_INTAKE, "npipe://Sembazuru.LocalIntake.v1");
+    assert_eq!(DaemonConfig::default().intake_addr, DEFAULT_INTAKE);
+}
+
 #[tokio::test]
 async fn set_config_preserves_valid_existing_values() {
     let path = tmp_config();

@@ -1,8 +1,8 @@
 //! `sembazuru` — the compiler launcher (M6.0). The build system invokes it as
 //! `sembazuru <compiler> <args...>` (e.g. via `CMAKE_<LANG>_COMPILER_LAUNCHER`,
 //! which prepends the launcher to the compiler command line). It hands the
-//! action to the agent daemon over loopback and exits with the compiler's exit
-//! code.
+//! action to the agent daemon over the authenticated machine-local LocalIntake
+//! transport and exits with the compiler's exit code.
 //!
 //! **Local fallback is mandatory (DESIGN.md §2).** If the daemon is unreachable
 //! or the remote path errors, the launcher runs the compiler locally so the
@@ -10,7 +10,8 @@
 //! trigger — a compiler that legitimately fails (a syntax error) must surface
 //! its own exit code, not be silently re-run.
 //!
-//!   SEMBAZURU_DAEMON  daemon LocalIntake endpoint (default http://127.0.0.1:50071)
+//!   SEMBAZURU_DAEMON  daemon LocalIntake endpoint (Windows default:
+//!                     npipe://Sembazuru.LocalIntake.v1)
 
 use std::collections::HashMap;
 
@@ -222,7 +223,7 @@ async fn main() {
     let env = sembazuru_agent::env_filter::filter_compiler_env(&full_env);
     let command = Command { argv, env, cwd };
 
-    let endpoint = env_or("SEMBAZURU_DAEMON", "http://127.0.0.1:50071");
+    let endpoint = env_or("SEMBAZURU_DAEMON", sembazuru_agent::config::DEFAULT_INTAKE);
     let opts = SubmitOptions {
         declared_outputs: declared_outputs(&command.argv),
         // Mark non-byte-reproducible actions (e.g. tests) so the daemon

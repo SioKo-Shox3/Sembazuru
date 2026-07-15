@@ -13,7 +13,8 @@ use sembazuru_agent::action_cache::AgentCache;
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::fileserver::ServerStats;
 use sembazuru_agent::intake::{
-    IntakeService, IntakeVfsContext, SubmitOptions, serve_intake_service, submit_to_daemon,
+    IntakeService, IntakeVfsContext, SubmitOptions, serve_intake_service,
+    submit_to_loopback_fixture,
 };
 use sembazuru_agent::scheduler::Scheduler;
 use sembazuru_agent::status::{Metrics, StatusState, serve_status_service};
@@ -63,7 +64,7 @@ async fn trace_dir_is_removed_after_a_submission() {
         serve_intake_service(listener, intake).await.unwrap();
     });
 
-    let (code, _note) = submit_to_daemon(
+    let (code, _note) = submit_to_loopback_fixture(
         format!("http://{addr}"),
         cmd(&["cmd", "/c", "exit", "0"]),
         SubmitOptions::default(),

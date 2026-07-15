@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 /// Default listen addresses — the daemon's historical hard-coded defaults, now in
 /// one place so the file, the env override, and [`DaemonConfig::default`] agree.
 pub const DEFAULT_COORD: &str = "127.0.0.1:50070";
+#[cfg(windows)]
+pub const DEFAULT_INTAKE: &str = "npipe://Sembazuru.LocalIntake.v1";
+#[cfg(not(windows))]
 pub const DEFAULT_INTAKE: &str = "127.0.0.1:50071";
 pub const DEFAULT_FILESERVER: &str = "127.0.0.1:50072";
 pub const DEFAULT_STATUS: &str = "127.0.0.1:50073";
@@ -35,7 +38,8 @@ pub const CONFIG_PATH_ENV: &str = "SEMBAZURU_CONFIG";
 pub struct DaemonConfig {
     /// Coordination listen address (workers register + heartbeat here).
     pub coord_addr: String,
-    /// LocalIntake listen address (launchers submit actions; loopback-only).
+    /// LocalIntake endpoint (authenticated named pipe on Windows; loopback TCP
+    /// on non-Windows).
     pub intake_addr: String,
     /// File-supply (data-plane) listen address (workers pull inputs).
     pub fileserver_addr: String,

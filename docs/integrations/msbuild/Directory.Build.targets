@@ -11,7 +11,7 @@
          2. Before running msbuild, set:
               SEMBAZURU_LAUNCHER_DIR = directory containing sembazuru.exe
               SEMBAZURU_SHIM_CC      = the real compiler ("cl.exe" or "clang-cl.exe")
-              SEMBAZURU_DAEMON       = daemon endpoint (default http://127.0.0.1:50071)
+              SEMBAZURU_DAEMON       = daemon endpoint (default npipe://Sembazuru.LocalIntake.v1)
               SEMBAZURU_INPUT_ROOT   = your solution/repo root (see below)
             and start a daemon + at least one worker (see docs/integrations).
 

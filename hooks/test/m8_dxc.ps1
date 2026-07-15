@@ -134,11 +134,11 @@ try {
 if (Same-Bytes $refDxil $ref2Dxil) { Write-Host 'DIAG: dxc is deterministic in this env (ref == ref2)' }
 else { Write-Host 'DIAG: dxc NON-deterministic in this env (ref != ref2)'; Dump-Diff 'ref-vs-ref2' $refDxil $ref2Dxil }
 
-$coord = '127.0.0.1:50190'; $intake = '127.0.0.1:50191'; $fs = '127.0.0.1:50192'; $worker = '127.0.0.1:50161'
-$daemonUrl = "http://$intake"
+$coord = '127.0.0.1:50190'; $fs = '127.0.0.1:50192'; $worker = '127.0.0.1:50161'
+$daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 
 function Start-Daemon {
-    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $intake; $env:SEMBAZURU_FILESERVER = $fs
+    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
     $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
     if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
     $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden

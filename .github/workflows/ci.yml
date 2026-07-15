@@ -18,6 +18,18 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  local-intake-security:
+    name: LocalIntake caller isolation (LocalSystem service)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build production daemon and launcher
+        run: cargo build --release -p sembazuru-agent
+      - name: Standard-user callers stay standard across LocalSystem LocalIntake
+        run: pwsh -NoProfile -File hooks/test/m6_local_intake_security.ps1 -Configuration Release
+
   supply-chain:
     name: Supply chain (cargo-deny)
     # OS-agnostic dependency-graph check (no compilation): cargo-deny resolves the

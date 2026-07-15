@@ -25,8 +25,10 @@ use crate::action_cache::AgentCache;
 use crate::config::DaemonConfig;
 use crate::coordination::{DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination_with_token};
 use crate::fileserver::{ServerStats, serve_files_with_stats_token_tracked};
+#[cfg(windows)]
+use crate::intake::serve_named_pipe_service_with_shutdown;
 use crate::intake::{
-    IntakeService, IntakeVfsContext, LocalIntakeTransport, require_loopback,
+    BoundLocalIntake, IntakeService, IntakeVfsContext, LocalIntakeTransport, require_loopback,
     serve_intake_service_with_shutdown,
 };
 use crate::scheduler::Scheduler;
@@ -374,6 +376,37 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         }
     );
 
+    // Reserve the LocalIntake front door before any other daemon listener. On
+    // Windows production this takes the protected first named-pipe instance, so
+    // another process cannot race daemon initialization and impersonate it.
+    #[cfg(all(windows, test))]
+    let intake_transport = {
+        let fixture = if config.intake_addr == crate::intake_pipe::PIPE_ENDPOINT {
+            "127.0.0.1:0"
+        } else {
+            &config.intake_addr
+        };
+        LocalIntakeTransport::loopback_tcp(fixture)?
+    };
+    #[cfg(not(all(windows, test)))]
+    let intake_transport = LocalIntakeTransport::production_server(&config.intake_addr)?;
+    let intake_listener = intake_transport.bind().await?;
+    match &intake_listener {
+        BoundLocalIntake::LoopbackTcp(listener) => {
+            eprintln!(
+                "sembazuru-daemon: LocalIntake test/non-Windows TCP on {}",
+                listener.local_addr()?
+            );
+        }
+        #[cfg(windows)]
+        BoundLocalIntake::NamedPipe(_) => {
+            eprintln!(
+                "sembazuru-daemon: LocalIntake on {}",
+                crate::intake_pipe::PIPE_ENDPOINT
+            );
+        }
+    }
+
     let table = WorkerTable::new(DEFAULT_DEAD_TIMEOUT);
     let tracker = crate::action_tracker::ActionTracker::default();
     let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
@@ -461,21 +494,19 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
         status_listener.local_addr()?
     );
 
-    // Complete every fallible listener/transport setup before creating the
-    // ephemeral registry. After this point all exits use the cleanup funnel.
-    let intake_transport = LocalIntakeTransport::loopback_tcp(&config.intake_addr)?;
-    let intake_listener = match intake_transport {
-        LocalIntakeTransport::LoopbackTcp(addr) => tokio::net::TcpListener::bind(addr).await?,
-    };
-    let intake_addr = intake_listener.local_addr()?;
-    eprintln!("sembazuru-daemon: LocalIntake on {intake_addr}");
-
     // The data-plane session registry (ADR 0013): one shared instance threaded
     // into both the file server and intake.
     let registry = Arc::new(SessionRegistry::new()?);
     let child_tasks = DaemonTaskScope::new();
     #[cfg(test)]
     if let Some(ready) = NEXT_DAEMON_READY.with(|slot| slot.borrow_mut().take()) {
+        let intake_addr = match &intake_listener {
+            BoundLocalIntake::LoopbackTcp(listener) => listener.local_addr()?,
+            #[cfg(windows)]
+            BoundLocalIntake::NamedPipe(_) => {
+                return Err("test daemon unexpectedly selected production named pipe".into());
+            }
+        };
         let _ = ready.send((fileserver_addr, intake_addr, Arc::clone(&registry)));
     }
     let file_server_task = {
@@ -569,9 +600,15 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
     let intake_shutdown = CancellationToken::new();
     let local_intake_task = {
         let graceful = intake_shutdown.clone();
-        Box::pin(async move {
-            serve_intake_service_with_shutdown(intake_listener, intake, graceful).await
-        }) as ServerFuture
+        match intake_listener {
+            BoundLocalIntake::LoopbackTcp(listener) => Box::pin(async move {
+                serve_intake_service_with_shutdown(listener, intake, graceful).await
+            }) as ServerFuture,
+            #[cfg(windows)]
+            BoundLocalIntake::NamedPipe(first) => Box::pin(async move {
+                serve_named_pipe_service_with_shutdown(first, intake, graceful).await
+            }) as ServerFuture,
+        }
     };
     #[cfg(test)]
     let local_intake_task = inject_server_failure(ServerRole::LocalIntake, local_intake_task);
@@ -1224,7 +1261,7 @@ mod tests {
                 .as_nanos()
         ));
         let command = local_fixture_command(listener.local_addr().unwrap(), &output);
-        let mut client = tokio::spawn(crate::intake::submit_to_daemon(
+        let mut client = tokio::spawn(crate::intake::submit_to_loopback_fixture(
             format!("http://{intake_addr}"),
             command,
             crate::intake::SubmitOptions::default(),
@@ -1307,7 +1344,7 @@ mod tests {
                 .as_nanos()
         ));
         let command = local_fixture_command(listener.local_addr().unwrap(), &output);
-        let client = tokio::spawn(crate::intake::submit_to_daemon(
+        let client = tokio::spawn(crate::intake::submit_to_loopback_fixture(
             format!("http://{intake_addr}"),
             command,
             crate::intake::SubmitOptions::default(),
@@ -1376,7 +1413,7 @@ mod tests {
         let control = crate::local_job::TestGuardianControl::bind(&mut command).unwrap();
         control.install(4);
         control.observe_job();
-        let client = tokio::spawn(crate::intake::submit_to_daemon(
+        let client = tokio::spawn(crate::intake::submit_to_loopback_fixture(
             format!("http://{intake_addr}"),
             command,
             crate::intake::SubmitOptions::default(),

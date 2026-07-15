@@ -223,10 +223,10 @@ if (-not (Test-Path $exe)) { throw 'reference build produced no app.exe' }
 Write-Host "REF build OK: $($tus.Count) TUs + app.exe"
 
 # --- daemon / worker rig (same env contract as m6_daemon_compile.ps1) ----------
-$coord = '127.0.0.1:50095'; $intake = '127.0.0.1:50096'; $fs = '127.0.0.1:50097'; $worker = '127.0.0.1:50063'
-$daemonUrl = "http://$intake"
+$coord = '127.0.0.1:50095'; $fs = '127.0.0.1:50097'; $worker = '127.0.0.1:50063'
+$daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 function Start-Daemon {
-    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $intake; $env:SEMBAZURU_FILESERVER = $fs
+    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
     $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
     if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
     $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
@@ -368,8 +368,8 @@ if (-not (Test-Path $exe)) { $failures += 'fallback produced no app.exe' }
 # is a cl-on-non-English-locale encoding edge (docs/deferred.md), not a distribution
 # defect; clang-cl emits ASCII and is unaffected. Fresh cache root + fresh ports isolate
 # this probe (and dodge worker-port TIME_WAIT).
-$coord = '127.0.0.1:50105'; $intake = '127.0.0.1:50106'; $fs = '127.0.0.1:50107'; $worker = '127.0.0.1:50064'
-$daemonUrl = "http://$intake"
+$coord = '127.0.0.1:50105'; $fs = '127.0.0.1:50107'; $worker = '127.0.0.1:50064'
+$daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 $cacheRoot = Join-Path $WorkRoot 'acache-inc'; $traceRoot = Join-Path $WorkRoot 'atrace-inc'
 $scratchRoot = Join-Path $WorkRoot 'wscratch-inc'; $casRoot = Join-Path $WorkRoot 'wcas-inc'
 foreach ($d in @($cacheRoot, $traceRoot, $scratchRoot, $casRoot)) { New-Item -ItemType Directory -Force $d | Out-Null }

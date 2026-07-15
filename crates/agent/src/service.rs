@@ -192,11 +192,13 @@ impl ServiceAccount {
         match self {
             Self::System => Some(concat!(
                 "WARNING: installing SembazuruDaemon as LocalSystem.\n",
-                "Running the daemon as LocalSystem means a local low-privilege user who can ",
-                "reach LocalIntake could cause SYSTEM-level local-fallback command execution ",
-                "(privilege escalation).\n",
+                "LocalIntake authenticates each caller and runs local fallback with the ",
+                "authenticated caller's restricted token. Failed caller authentication is ",
+                "rejected.\n",
+                "LocalSystem still gives the daemon broad access to source roots, ",
+                "configuration, cache, and file-serving resources.\n",
                 "Prefer the default virtual account. Never use System unless you understand ",
-                "the risk and have other mitigations."
+                "this broader daemon resource access and explicitly accept it."
             )),
             Self::Virtual | Self::NetworkService => None,
         }
@@ -328,7 +330,13 @@ mod tests {
             ServiceAccount::resolve_self_install(ServiceAccount::parse("system")),
             ServiceAccount::System
         );
-        assert!(ServiceAccount::System.warning().is_some());
+        let warning = ServiceAccount::System
+            .warning()
+            .expect("LocalSystem must remain an explicit, warned opt-in");
+        assert!(warning.contains("authenticated caller's restricted token"));
+        assert!(warning.contains("Failed caller authentication is rejected"));
+        assert!(warning.contains("source roots, configuration, cache, and file-serving resources"));
+        assert!(!warning.contains("SYSTEM-level local-fallback command execution"));
         assert!(ServiceAccount::Virtual.warning().is_none());
         assert!(ServiceAccount::NetworkService.warning().is_none());
     }

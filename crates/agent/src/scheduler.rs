@@ -31,8 +31,8 @@ use sembazuru_proto::{
 use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind, display_name};
 use crate::coordination::{WorkerEntry, WorkerTable};
 use crate::{
-    ActionObserver, ExecOptions, ExecuteError, Execution, LocalFallbackReason,
-    execute_on_channel_with_observer, run_local,
+    ActionObserver, ExecOptions, ExecuteError, Execution, LocalExecutionContext,
+    LocalFallbackReason, execute_on_channel_with_observer, run_local_with_context,
 };
 
 /// Upper bound on a worker's self-reported `cpu_count` when used for load
@@ -567,6 +567,26 @@ impl Scheduler {
         opts: ExecOptions,
         display: String,
     ) -> ObservedExecution {
+        self.dispatch_observed_with_context(
+            command,
+            action_id,
+            session_id,
+            opts,
+            display,
+            &LocalExecutionContext::CurrentProcess,
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_observed_with_context(
+        &self,
+        command: Command,
+        action_id: String,
+        session_id: String,
+        opts: ExecOptions,
+        display: String,
+        execution_context: &LocalExecutionContext,
+    ) -> ObservedExecution {
         let mut attempt_no = 0_u32;
         // Route-away screen (M8.2, ADR 0007 §a①). A process that bypasses the
         // user-mode hooks — the msys2/Cygwin runtime issues direct NT syscalls
@@ -586,7 +606,9 @@ impl Scheduler {
             if let Some(lease) = &attempt {
                 lease.transition(ActivityState::Running);
             }
-            let exit_code = run_local(&command).await.unwrap_or(-1);
+            let exit_code = run_local_with_context(&command, execution_context)
+                .await
+                .unwrap_or(-1);
             if let Some(lease) = &mut attempt {
                 lease.finish(if exit_code == 0 {
                     ActivityState::Completed
@@ -716,7 +738,9 @@ impl Scheduler {
         if let Some(lease) = &tracked {
             lease.transition(ActivityState::Running);
         }
-        let exit_code = run_local(&command).await.unwrap_or(-1);
+        let exit_code = run_local_with_context(&command, execution_context)
+            .await
+            .unwrap_or(-1);
         if let Some(lease) = &mut tracked {
             lease.finish(if exit_code == 0 {
                 ActivityState::Completed

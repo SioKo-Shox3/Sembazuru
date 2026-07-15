@@ -99,10 +99,11 @@ Set-Content (Join-Path $proj 'test.vcxproj') $vcxproj -Encoding utf8
 $scratchRoot = Join-Path $WorkRoot 'wscratch'; $casRoot = Join-Path $WorkRoot 'wcas'
 $cacheRoot = Join-Path $WorkRoot 'acache'; $traceRoot = Join-Path $WorkRoot 'atrace'
 foreach ($d in @($scratchRoot, $casRoot, $cacheRoot, $traceRoot)) { New-Item -ItemType Directory -Force $d | Out-Null }
-$coord = '127.0.0.1:50090'; $intake = '127.0.0.1:50091'; $fs = '127.0.0.1:50092'; $worker = '127.0.0.1:50061'
+$coord = '127.0.0.1:50090'; $fs = '127.0.0.1:50092'; $worker = '127.0.0.1:50061'
+$daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 
 function Start-Daemon {
-    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $intake; $env:SEMBAZURU_FILESERVER = $fs
+    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
     $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
     $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
     Remove-Item Env:\SEMBAZURU_COORD, Env:\SEMBAZURU_INTAKE, Env:\SEMBAZURU_FILESERVER, `
@@ -139,7 +140,7 @@ function Invoke-MSBuild {
     param([switch]$NoInputRoot)
     Clean-Outputs
     $env:SEMBAZURU_SHIM_CC = 'cl'      # the real compiler the shim prepends
-    $env:SEMBAZURU_DAEMON = "http://$intake"
+    $env:SEMBAZURU_DAEMON = $daemonUrl
     if (-not $NoInputRoot) { $env:SEMBAZURU_INPUT_ROOT = $proj }
     $out = & msbuild (Join-Path $proj 'test.vcxproj') /nologo /v:minimal /t:Build `
         /p:Configuration=Release /p:Platform=x64 2>&1 | Out-String

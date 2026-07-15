@@ -162,11 +162,11 @@ if ($byteGate) {
     }
 }
 
-$coord = '127.0.0.1:50090'; $intake = '127.0.0.1:50091'; $fs = '127.0.0.1:50092'; $worker = '127.0.0.1:50061'
-$daemonUrl = "http://$intake"
+$coord = '127.0.0.1:50090'; $fs = '127.0.0.1:50092'; $worker = '127.0.0.1:50061'
+$daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 
 function Start-Daemon {
-    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $intake; $env:SEMBAZURU_FILESERVER = $fs
+    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
     $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
     if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
     $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden

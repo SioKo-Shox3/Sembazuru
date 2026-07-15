@@ -2,15 +2,14 @@
 //!
 //! A compiler launcher (`sembazuru <compiler> <args...>`, set as
 //! `CMAKE_<LANG>_COMPILER_LAUNCHER` or an MSBuild `CLToolExe` shim) is a
-//! short-lived process. It hands its one action to the long-lived daemon over
-//! loopback; the daemon schedules it across workers (or runs it locally on
-//! fallback) and streams the result back so the launcher exits exactly as the
-//! compiler would have (`docs/protocol/v0.md` §3.2; see `LocalIntake` in
+//! short-lived process. It hands its one action to the long-lived daemon over a
+//! machine-local transport; the daemon schedules it across workers (or runs it
+//! locally on fallback) and streams the result back so the launcher exits exactly
+//! as the compiler would have (`docs/protocol/v0.md` §3.2; see `LocalIntake` in
 //! `control.proto`).
 //!
-//! This plane is loopback-only. Carrying the full command (not just an input
-//! root) is safe here precisely because it never leaves the machine — the
-//! launcher already has the command on its argv.
+//! This plane never leaves the machine. Windows uses a DACL-protected named pipe
+//! with caller/server SID authentication; non-Windows uses loopback TCP.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -40,7 +39,13 @@ use crate::session_registry::{
     SubmissionDeadline, SubmissionPhase,
 };
 use crate::status::Metrics;
-use crate::{ExecOptions, ExecuteError, Execution, LocalFallbackReason, run_local};
+use crate::{
+    ExecOptions, ExecuteError, Execution, LocalExecutionContext, LocalFallbackReason,
+    run_local_with_context,
+};
+
+#[cfg(windows)]
+use crate::intake_pipe::CallerIdentityConnectInfo;
 
 #[cfg(test)]
 struct SubmissionBarrier {
@@ -228,6 +233,36 @@ pub struct IntakeService {
     metrics: Arc<Metrics>,
     task_scope: Option<DaemonTaskScope>,
     tracker: ActionTracker,
+    authority: IntakeAuthority,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IntakeAuthority {
+    TrustedCurrentProcess,
+    #[cfg(windows)]
+    AuthenticatedCaller,
+}
+
+impl IntakeAuthority {
+    fn execution_context<T>(self, request: &Request<T>) -> Result<LocalExecutionContext, Status> {
+        match self {
+            Self::TrustedCurrentProcess => Ok(LocalExecutionContext::CurrentProcess),
+            #[cfg(windows)]
+            Self::AuthenticatedCaller => {
+                let connect_info = request
+                    .extensions()
+                    .get::<CallerIdentityConnectInfo>()
+                    .ok_or_else(|| Status::unauthenticated("caller identity is missing"))?;
+                let identity = connect_info
+                    .caller_identity()
+                    .map_err(|error| {
+                        Status::unauthenticated(format!("caller authentication failed: {error}"))
+                    })?
+                    .ok_or_else(|| Status::unauthenticated("caller identity is not established"))?;
+                Ok(LocalExecutionContext::AuthenticatedCaller(identity))
+            }
+        }
+    }
 }
 
 /// Mints an unpredictable 128-bit data-plane session id as 32 lowercase hex
@@ -252,7 +287,23 @@ impl IntakeService {
             metrics: Arc::new(Metrics::default()),
             task_scope: None,
             tracker: ActionTracker::default(),
+            authority: IntakeAuthority::TrustedCurrentProcess,
         }
+    }
+
+    /// Intake front door used by the authenticated Windows named-pipe server.
+    /// Requests without pipe-established caller identity fail before submission
+    /// ids, sessions, scratch paths, or commands can be created.
+    #[cfg(all(windows, test))]
+    pub(crate) fn authenticated(scheduler: Scheduler) -> Self {
+        let mut service = Self::new(scheduler);
+        service.require_authenticated_caller();
+        service
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn require_authenticated_caller(&mut self) {
+        self.authority = IntakeAuthority::AuthenticatedCaller;
     }
 
     /// Intake that runs submissions under the read-VFS (and the action cache when
@@ -265,6 +316,7 @@ impl IntakeService {
             metrics: Arc::new(Metrics::default()),
             task_scope: None,
             tracker: ActionTracker::default(),
+            authority: IntakeAuthority::TrustedCurrentProcess,
         }
     }
 
@@ -292,6 +344,7 @@ impl IntakeService {
             metrics: Arc::new(Metrics::default()),
             task_scope: Some(task_scope),
             tracker,
+            authority: IntakeAuthority::TrustedCurrentProcess,
         }
     }
 
@@ -311,6 +364,7 @@ impl LocalIntake for IntakeService {
         &self,
         request: Request<SubmitActionRequest>,
     ) -> Result<Response<Self::SubmitActionStream>, Status> {
+        let execution_context = self.authority.execution_context(&request)?;
         let req = request.into_inner();
         let command = req
             .command
@@ -334,6 +388,7 @@ impl LocalIntake for IntakeService {
             self.vfs.clone(),
             self.metrics.clone(),
             self.tracker.clone(),
+            execution_context,
             command,
             req.declared_outputs,
             req.non_deterministic,
@@ -434,10 +489,12 @@ fn declared_output_specs(declared_outputs: &[String], root: Option<&str>) -> Vec
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn publish_remote_or_fallback(
     outcome: Execution,
     cap: &SessionCapability,
     fallback_command: &Command,
+    execution_context: &LocalExecutionContext,
     tracker: &ActionTracker,
     action_id: &str,
     attempt_no: u32,
@@ -459,7 +516,9 @@ async fn publish_remote_or_fallback(
         if let Some(lease) = &tracked {
             lease.transition(ActivityState::Running);
         }
-        let exit_code = run_local(fallback_command).await.unwrap_or(-1);
+        let exit_code = run_local_with_context(fallback_command, execution_context)
+            .await
+            .unwrap_or(-1);
         if let Some(lease) = &mut tracked {
             lease.finish(if exit_code == 0 {
                 ActivityState::Completed
@@ -485,6 +544,7 @@ async fn run_submission(
     vfs: Option<Arc<IntakeVfsContext>>,
     metrics: Arc<Metrics>,
     tracker: ActionTracker,
+    execution_context: LocalExecutionContext,
     command: Command,
     declared_outputs: Vec<String>,
     non_deterministic: bool,
@@ -503,12 +563,13 @@ async fn run_submission(
     let Some(ctx) = vfs else {
         // Plain dispatch (M6.0 / tests): no VFS config, no cache.
         let observed = scheduler
-            .dispatch_observed(
+            .dispatch_observed_with_context(
                 command,
                 action_id,
                 session_id,
                 ExecOptions::default(),
                 display,
+                &execution_context,
             )
             .await;
         metrics.record_outcome(&observed.execution);
@@ -675,12 +736,13 @@ async fn run_submission(
 
     let fallback_command = command.clone();
     let observed = scheduler
-        .dispatch_observed(
+        .dispatch_observed_with_context(
             command,
             action_id.clone(),
             session_id.clone(),
             opts,
             display.clone(),
+            &execution_context,
         )
         .await;
 
@@ -695,6 +757,7 @@ async fn run_submission(
         observed.execution,
         &cap,
         &fallback_command,
+        &execution_context,
         &tracker,
         &action_id,
         observed.next_attempt_no,
@@ -853,26 +916,71 @@ pub fn resolve_loopback_intake(addr: &str) -> Result<std::net::SocketAddr, Strin
     require_loopback(addr, "LocalIntake")
 }
 
-/// LocalIntake transport.
-///
-/// A Windows named-pipe variant with a caller-SID DACL lands in 4.3; this
-/// preparatory abstraction keeps the M6 default TCP behavior unchanged.
+/// LocalIntake transport. Windows production accepts only the authenticated
+/// named pipe; loopback TCP remains an explicit fixture/non-Windows transport.
 #[derive(Clone, Debug)]
 pub enum LocalIntakeTransport {
-    /// Loopback TCP (the M6 default).
+    /// Explicit loopback TCP fixture, and the non-Windows production transport.
     LoopbackTcp(SocketAddr),
+    #[cfg(windows)]
+    /// Protected Windows named pipe with mutual caller/server authentication.
+    NamedPipe,
+}
+
+pub(crate) enum BoundLocalIntake {
+    LoopbackTcp(TcpListener),
+    #[cfg(windows)]
+    NamedPipe(tokio::net::windows::named_pipe::NamedPipeServer),
 }
 
 impl LocalIntakeTransport {
-    /// Server-side loopback TCP transport from config such as `127.0.0.1:50071`.
+    /// Explicit loopback TCP transport for non-Windows and test fixtures.
     pub fn loopback_tcp(addr: &str) -> Result<Self, String> {
         Ok(Self::LoopbackTcp(require_loopback(addr, "LocalIntake")?))
     }
 
+    /// Validates a production daemon LocalIntake config.
+    #[cfg(windows)]
+    pub fn production_server(endpoint: &str) -> Result<Self, String> {
+        if endpoint == crate::intake_pipe::PIPE_ENDPOINT {
+            Ok(Self::NamedPipe)
+        } else {
+            Err(format!(
+                "Windows LocalIntake must use {}; refusing legacy or unauthenticated endpoint {endpoint:?}",
+                crate::intake_pipe::PIPE_ENDPOINT
+            ))
+        }
+    }
+
+    /// Non-Windows production keeps the loopback-only TCP transport.
+    #[cfg(not(windows))]
+    pub fn production_server(endpoint: &str) -> Result<Self, String> {
+        Self::loopback_tcp(endpoint.strip_prefix("http://").unwrap_or(endpoint))
+    }
+
     /// Client-side LocalIntake transport from the launcher's endpoint string.
     pub fn from_endpoint(endpoint: &str) -> Result<Self, String> {
-        let addr = endpoint.strip_prefix("http://").unwrap_or(endpoint);
-        Ok(Self::LoopbackTcp(require_loopback(addr, "LocalIntake")?))
+        #[cfg(windows)]
+        {
+            Self::production_server(endpoint)
+        }
+        #[cfg(not(windows))]
+        {
+            let addr = endpoint.strip_prefix("http://").unwrap_or(endpoint);
+            Self::loopback_tcp(addr)
+        }
+    }
+
+    pub(crate) async fn bind(self) -> Result<BoundLocalIntake, std::io::Error> {
+        match self {
+            Self::LoopbackTcp(addr) => Ok(BoundLocalIntake::LoopbackTcp(
+                TcpListener::bind(addr).await?,
+            )),
+            #[cfg(windows)]
+            Self::NamedPipe => Ok(BoundLocalIntake::NamedPipe(
+                crate::intake_pipe::create_server(true)?,
+            )),
+        }
     }
 
     /// Serve LocalIntake over this transport.
@@ -880,11 +988,12 @@ impl LocalIntakeTransport {
         self,
         service: IntakeService,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        match self {
-            Self::LoopbackTcp(addr) => {
-                let listener = TcpListener::bind(addr).await?;
+        match self.bind().await? {
+            BoundLocalIntake::LoopbackTcp(listener) => {
                 serve_intake_service(listener, service).await
             }
+            #[cfg(windows)]
+            BoundLocalIntake::NamedPipe(first) => serve_named_pipe_service(first, service).await,
         }
     }
 
@@ -900,8 +1009,35 @@ impl LocalIntakeTransport {
                     .map_err(ExecuteError::Transport)?;
                 Ok(LocalIntakeClient::new(channel))
             }
+            #[cfg(windows)]
+            Self::NamedPipe => Ok(LocalIntakeClient::new(
+                connect_named_pipe_with_opener(crate::intake_pipe::open_authenticated_client)
+                    .await?,
+            )),
         }
     }
+}
+
+#[cfg(windows)]
+async fn connect_named_pipe_with_opener<F>(opener: F) -> Result<Channel, ExecuteError>
+where
+    F: Fn() -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeClient>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    use hyper_util::rt::TokioIo;
+    use tower::service_fn;
+
+    Endpoint::from_static("http://localhost")
+        .connect_timeout(Duration::from_millis(500))
+        .connect_with_connector(service_fn(move |_uri: tonic::transport::Uri| {
+            let opener = opener.clone();
+            async move { opener().map(TokioIo::new) }
+        }))
+        .await
+        .map_err(ExecuteError::Transport)
 }
 
 /// Serves a plain LocalIntake (no VFS, no cache) on an already-bound listener.
@@ -945,6 +1081,59 @@ pub(crate) async fn serve_intake_service_with_shutdown(
     Ok(())
 }
 
+#[cfg(windows)]
+fn harden_named_pipe_service(mut service: IntakeService) -> IntakeService {
+    service.require_authenticated_caller();
+    service
+}
+
+#[cfg(windows)]
+async fn serve_named_pipe_service(
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    service: IntakeService,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sembazuru_proto::v0::local_intake_server::LocalIntakeServer;
+
+    let service = harden_named_pipe_service(service);
+    tonic::transport::Server::builder()
+        .add_service(LocalIntakeServer::new(service))
+        .serve_with_incoming(crate::intake_pipe::AuthenticatedPipeIncoming::new(first))
+        .await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) async fn serve_named_pipe_service_with_shutdown(
+    first: tokio::net::windows::named_pipe::NamedPipeServer,
+    service: IntakeService,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    serve_named_pipe_incoming_with_shutdown(
+        crate::intake_pipe::AuthenticatedPipeIncoming::new(first),
+        service,
+        shutdown,
+    )
+    .await
+}
+
+#[cfg(windows)]
+async fn serve_named_pipe_incoming_with_shutdown(
+    incoming: crate::intake_pipe::AuthenticatedPipeIncoming,
+    service: IntakeService,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use sembazuru_proto::v0::local_intake_server::LocalIntakeServer;
+
+    let service = harden_named_pipe_service(service);
+    tonic::transport::Server::builder()
+        // Deliberately only LocalIntake. Status and its mutating admin RPCs stay
+        // on the independently bound loopback Status listener.
+        .add_service(LocalIntakeServer::new(service))
+        .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
+        .await?;
+    Ok(())
+}
+
 /// Launcher side: submit `command` to the daemon at `endpoint` and return the
 /// exit code plus the daemon's terminal state note ("remote", "cache hit", or
 /// "local fallback: …") once the stream closes. A transport/RPC error here is
@@ -958,6 +1147,28 @@ pub async fn submit_to_daemon(
 ) -> Result<(i32, String), ExecuteError> {
     let transport = LocalIntakeTransport::from_endpoint(&endpoint)
         .map_err(|e| ExecuteError::Rpc(Status::invalid_argument(e)))?;
+    submit_with_transport(transport, command, opts).await
+}
+
+/// Explicit TCP seam for unit/integration fixtures. Production launchers call
+/// [`submit_to_daemon`], which rejects TCP endpoints on Windows.
+#[doc(hidden)]
+pub async fn submit_to_loopback_fixture(
+    endpoint: String,
+    command: Command,
+    opts: SubmitOptions,
+) -> Result<(i32, String), ExecuteError> {
+    let addr = endpoint.strip_prefix("http://").unwrap_or(&endpoint);
+    let transport = LocalIntakeTransport::loopback_tcp(addr)
+        .map_err(|e| ExecuteError::Rpc(Status::invalid_argument(e)))?;
+    submit_with_transport(transport, command, opts).await
+}
+
+async fn submit_with_transport(
+    transport: LocalIntakeTransport,
+    command: Command,
+    opts: SubmitOptions,
+) -> Result<(i32, String), ExecuteError> {
     let mut client = transport.connect().await?;
     let request = SubmitActionRequest {
         command: Some(command),
@@ -996,7 +1207,7 @@ pub async fn submit_to_daemon(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::Duration;
 
     use super::{
@@ -1004,9 +1215,10 @@ mod tests {
         declared_output_specs, hold_eof_until_submission_is_safe, install_next_submission_barrier,
         is_verified_tool, mint_session_id, observe_next_submission_deadline,
         publish_remote_or_fallback, resolve_loopback_intake, serve_intake_service_with_shutdown,
-        should_record_cache, submit_to_daemon, worker_tool_matches,
+        should_record_cache, submit_to_loopback_fixture, worker_tool_matches,
     };
-    use crate::Execution;
+    #[cfg(windows)]
+    use super::{connect_named_pipe_with_opener, serve_named_pipe_incoming_with_shutdown};
     use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
     use crate::coordination::WorkerTable;
     use crate::scheduler::Scheduler;
@@ -1015,6 +1227,7 @@ mod tests {
         create_staging_temp,
     };
     use crate::status::Metrics;
+    use crate::{Execution, LocalExecutionContext};
     use sembazuru_cas::Digest;
     use sembazuru_cas::toolchain::ToolchainIdentity;
     use sembazuru_proto::v0::local_intake_server::LocalIntake;
@@ -1022,6 +1235,49 @@ mod tests {
     use sembazuru_proto::v0::{ActionState, Command, SubmitActionRequest};
     use tokio::net::TcpListener;
     use tokio_stream::StreamExt;
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_caller_identity_rejects_before_side_effects() {
+        let scheduler = Scheduler::new(WorkerTable::new(Duration::from_secs(60)));
+        let service = IntakeService::authenticated(scheduler);
+        let sentinel = std::env::temp_dir().join(format!(
+            "sbz-missing-caller-identity-{}-sentinel",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sentinel);
+
+        let error = LocalIntake::submit_action(
+            &service,
+            tonic::Request::new(SubmitActionRequest {
+                command: Some(Command {
+                    argv: vec![
+                        "cmd".into(),
+                        "/D".into(),
+                        "/S".into(),
+                        "/C".into(),
+                        format!("type nul > \"{}\"", sentinel.display()),
+                    ],
+                    env: Default::default(),
+                    cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+                }),
+                declared_outputs: Vec::new(),
+                non_deterministic: false,
+                strict_vfs: false,
+                input_root: String::new(),
+            }),
+        )
+        .await
+        .expect_err("authenticated intake must reject a request without caller identity");
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(service.seq.load(Ordering::Relaxed), 0);
+        assert!(service.tracker.snapshot().is_empty());
+        assert!(
+            !sentinel.exists(),
+            "rejected request ran its command before caller authentication"
+        );
+    }
 
     #[tokio::test]
     async fn outer_eof_lease_waits_after_inner_ok_until_natural_reaped() {
@@ -1554,6 +1810,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn transport_from_endpoint_parses_loopback() {
         for endpoint in ["http://127.0.0.1:50071", "127.0.0.1:50071"] {
             let transport = LocalIntakeTransport::from_endpoint(endpoint)
@@ -1567,6 +1824,90 @@ mod tests {
 
         assert!(LocalIntakeTransport::from_endpoint("http://10.0.0.5:50071").is_err());
         assert!(LocalIntakeTransport::loopback_tcp("127.0.0.1:0").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_production_server_rejects_legacy_tcp_config() {
+        let error = LocalIntakeTransport::production_server("127.0.0.1:50071")
+            .expect_err("Windows production must not retain a TCP LocalIntake escape hatch");
+        assert!(error.contains("npipe://Sembazuru.LocalIntake.v1"));
+        assert!(
+            LocalIntakeTransport::production_server("npipe://Sembazuru.LocalIntake.v1").is_ok()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_connector_propagates_authentication_failure() {
+        let error = connect_named_pipe_with_opener(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "test rejected server SID",
+            ))
+        })
+        .await
+        .expect_err("connector must fail closed when server authentication fails");
+        assert!(
+            matches!(error, crate::ExecuteError::Transport(_)),
+            "authentication refusal must surface as a transport error: {error:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn named_pipe_service_hardening_promotes_trusted_authority() {
+        let service = IntakeService::new(Scheduler::new(WorkerTable::new(Duration::from_secs(60))));
+        assert!(matches!(
+            service.authority,
+            super::IntakeAuthority::TrustedCurrentProcess
+        ));
+
+        let service = super::harden_named_pipe_service(service);
+        assert!(matches!(
+            service.authority,
+            super::IntakeAuthority::AuthenticatedCaller
+        ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_exposes_local_intake_but_not_status_or_admin() {
+        use sembazuru_proto::v0::GetStatusRequest;
+        use sembazuru_proto::v0::status_client::StatusClient;
+
+        static PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            r"\\.\pipe\Sembazuru.LocalIntake.v1.service-only.{}.{}",
+            std::process::id(),
+            PIPE_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let (incoming, server_sid) = crate::intake_pipe::test_incoming_at(name.clone()).unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = shutdown.clone();
+        let service = IntakeService::new(Scheduler::new(WorkerTable::new(Duration::from_secs(60))));
+        let server = tokio::spawn(async move {
+            serve_named_pipe_incoming_with_shutdown(incoming, service, server_shutdown)
+                .await
+                .unwrap();
+        });
+
+        let channel = connect_named_pipe_with_opener(move || {
+            crate::intake_pipe::open_test_client_at(&name, &server_sid)
+        })
+        .await
+        .unwrap();
+        let error = StatusClient::new(channel)
+            .get_status(GetStatusRequest {})
+            .await
+            .expect_err("Status/Admin must not be routed over LocalIntake pipe");
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("named-pipe LocalIntake server did not stop")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1591,8 +1932,12 @@ mod tests {
         let endpoint = format!("http://{addr}");
         let mut result = None;
         for _ in 0..20 {
-            match submit_to_daemon(endpoint.clone(), command.clone(), SubmitOptions::default())
-                .await
+            match submit_to_loopback_fixture(
+                endpoint.clone(),
+                command.clone(),
+                SubmitOptions::default(),
+            )
+            .await
             {
                 Ok(ok) => {
                     result = Some(ok);
@@ -1683,6 +2028,7 @@ mod tests {
             }),
             &cap,
             &fallback_cmd,
+            &LocalExecutionContext::CurrentProcess,
             &tracker,
             "publish-fallback",
             1,

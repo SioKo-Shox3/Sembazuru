@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use sembazuru_agent::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
 use sembazuru_agent::coordination::WorkerTable;
-use sembazuru_agent::intake::{SubmitOptions, serve_intake, submit_to_daemon};
+use sembazuru_agent::intake::{SubmitOptions, serve_intake, submit_to_loopback_fixture};
 use sembazuru_agent::scheduler::Scheduler;
 use sembazuru_proto::v0::{Capabilities, Command};
 use sembazuru_worker::WorkerService;
@@ -83,7 +83,7 @@ async fn intake_runs_action_remotely_and_mirrors_exit() {
 
     // A launcher submitting `cmd /c exit 5` must get exit 5 back, and the action
     // must have actually run on the worker (not local fallback).
-    let (code, _note) = submit_to_daemon(
+    let (code, _note) = submit_to_loopback_fixture(
         endpoint,
         cmd(&["cmd", "/c", "exit", "5"]),
         SubmitOptions::default(),
@@ -115,7 +115,7 @@ async fn intake_completes_via_local_fallback_with_no_workers() {
     );
     let endpoint = start_intake(scheduler).await;
 
-    let (code, _note) = submit_to_daemon(
+    let (code, _note) = submit_to_loopback_fixture(
         endpoint,
         cmd(&["cmd", "/c", "exit", "3"]),
         SubmitOptions::default(),
@@ -138,7 +138,7 @@ async fn submit_errors_when_daemon_is_down() {
     // A dead intake endpoint: submit_to_daemon must error. This is precisely the
     // signal the `sembazuru` launcher converts into a local compiler run, so the
     // build completes even with no daemon at all.
-    let err = submit_to_daemon(
+    let err = submit_to_loopback_fixture(
         "http://127.0.0.1:1".into(),
         cmd(&["cmd", "/c", "exit", "0"]),
         SubmitOptions::default(),

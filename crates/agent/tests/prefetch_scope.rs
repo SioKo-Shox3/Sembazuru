@@ -7,7 +7,8 @@ use sembazuru_agent::action_cache::AgentCache;
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::fileserver::{ServerStats, normalize_requested, serve_files_with_stats_token};
 use sembazuru_agent::intake::{
-    IntakeService, IntakeVfsContext, SubmitOptions, serve_intake_service, submit_to_daemon,
+    IntakeService, IntakeVfsContext, SubmitOptions, serve_intake_service,
+    submit_to_loopback_fixture,
 };
 use sembazuru_agent::scheduler::Scheduler;
 use sembazuru_agent::session_registry::SessionRegistry;
@@ -269,7 +270,7 @@ fn production_prefetch_only_exposes_scope_content_inputs() {
         });
 
         let input_root = root.path.to_string_lossy().into_owned();
-        let submit = tokio::spawn(submit_to_daemon(
+        let submit = tokio::spawn(submit_to_loopback_fixture(
             format!("http://{intake_addr}"),
             command,
             SubmitOptions {

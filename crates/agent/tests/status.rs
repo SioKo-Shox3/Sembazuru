@@ -12,7 +12,8 @@ use std::time::Duration;
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::fileserver::ServerStats;
 use sembazuru_agent::intake::{
-    IntakeService, SubmitOptions, require_loopback, serve_intake_service, submit_to_daemon,
+    IntakeService, SubmitOptions, require_loopback, serve_intake_service,
+    submit_to_loopback_fixture,
 };
 use sembazuru_agent::scheduler::Scheduler;
 use sembazuru_agent::status::{StatusState, serve_status_service};
@@ -131,7 +132,7 @@ async fn status_reports_a_remote_run_and_the_connected_worker() {
     assert!(!before.auth_enabled, "auth disabled in this test");
 
     // Run one action remotely through intake.
-    let (code, _note) = submit_to_daemon(
+    let (code, _note) = submit_to_loopback_fixture(
         intake,
         cmd(&["cmd", "/c", "exit", "0"]),
         SubmitOptions::default(),
@@ -166,7 +167,7 @@ async fn status_counts_a_local_fallback_when_no_worker_is_live() {
     assert!(before.workers.is_empty(), "no workers connected");
     assert!(before.auth_enabled, "auth posture is surfaced");
 
-    let (code, _note) = submit_to_daemon(
+    let (code, _note) = submit_to_loopback_fixture(
         intake,
         cmd(&["cmd", "/c", "exit", "0"]),
         SubmitOptions::default(),
