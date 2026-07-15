@@ -333,6 +333,36 @@ function ConvertTo-SingleQuotedLiteral {
     return "'$($Value.Replace("'", "''"))'"
 }
 
+function New-StandardProbeRoot {
+    param([string]$Path, [string]$UserSid)
+
+    New-Item -ItemType Directory -Path $Path -ErrorAction Stop | Out-Null
+    $script:createdCallerProbeRoot = $true
+    $acl = [Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetSecurityDescriptorSddlForm(
+        "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$UserSid)")
+    Set-Acl -LiteralPath $Path -AclObject $acl
+
+    $applied = Get-Acl -LiteralPath $Path
+    $expected = @{
+        'S-1-5-18' = [int64]0x1f01ff
+        'S-1-5-32-544' = [int64]0x1f01ff
+        $UserSid = [int64]0x1301bf
+    }
+    $rules = @($applied.Access)
+    if (-not $applied.AreAccessRulesProtected -or $rules.Count -ne 3) {
+        throw "standard-user probe root DACL shape mismatch: protected=$($applied.AreAccessRulesProtected) rules=$($rules.Count)"
+    }
+    foreach ($rule in $rules) {
+        $sid = Get-RuleSid -Rule $rule
+        if (-not $expected.ContainsKey($sid) -or $rule.IsInherited -or
+            $rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            [int64]$rule.FileSystemRights -ne $expected[$sid]) {
+            throw "standard-user probe root DACL mismatch: sid=$sid inherited=$($rule.IsInherited) rights=$($rule.FileSystemRights)"
+        }
+    }
+}
+
 function Assert-StandardUserDenied {
     param(
         [string]$User,
@@ -342,7 +372,7 @@ function Assert-StandardUserDenied {
         [string]$CasRoot,
         [string]$DaemonConfig,
         [string]$WorkerConfig,
-        [string]$LogRoot
+        [string]$ProbeRoot
     )
 
     $paths = [ordered]@{
@@ -379,15 +409,22 @@ function Test-AccessDenied([scriptblock]`$Action) {
 `$results.CasCreate = Test-AccessDenied { Set-Content -LiteralPath (Join-Path $($paths.CasRoot) 'standard-user-cas.probe') -Value denied -ErrorAction Stop }
 [pscustomobject]`$results | ConvertTo-Json -Compress
 "@
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($childScript))
-    $stdout = Join-Path $LogRoot 'standard-user.stdout.txt'
-    $stderr = Join-Path $LogRoot 'standard-user.stderr.txt'
+    $scriptPath = Join-Path $ProbeRoot 'p.ps1'
+    $stdout = Join-Path $ProbeRoot 'o.txt'
+    $stderr = Join-Path $ProbeRoot 'e.txt'
+    Set-Content -LiteralPath $scriptPath -Value $childScript -Encoding Unicode
     $secure = ConvertTo-SecureString $Password -AsPlainText -Force
     $credential = [Management.Automation.PSCredential]::new(
         "$([Environment]::MachineName)\$User", $secure)
     $windowsPowerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
+    $argumentLine = "-NoProfile -NonInteractive -File `"$scriptPath`""
+    $commandLine = "`"$windowsPowerShell`" $argumentLine"
+    if ($commandLine.Length -ge 1024) {
+        throw "standard-user child command line is too long: $($commandLine.Length) >= 1024"
+    }
+    Write-Host "STANDARD USER COMMAND: length=$($commandLine.Length) limit=1024 script=$scriptPath"
     $process = Start-Process -FilePath $windowsPowerShell `
-        -ArgumentList @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) `
+        -ArgumentList $argumentLine `
         -Credential $credential -LoadUserProfile -WorkingDirectory ([Environment]::SystemDirectory) `
         -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden `
         -Wait -PassThru
@@ -445,6 +482,22 @@ function Remove-GateUser {
     }
 }
 
+function Remove-StandardProbeRoot {
+    param([string]$Path)
+
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (-not (Test-Path -LiteralPath $Path)) { return }
+        try { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
+        catch {
+            if ($attempt -eq 5) { throw }
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    if (Test-Path -LiteralPath $Path) {
+        throw "standard-user probe root still exists after cleanup: $Path"
+    }
+}
+
 function Wait-ForUninstallCleanup {
     param(
         [string]$DataRoot,
@@ -482,11 +535,13 @@ Assert-CleanPreflight -DataRoot $dataRoot -InstallRoot $installRoot -ProductKey 
 $tag = [Guid]::NewGuid().ToString('N').Substring(0, 8)
 $gateUser = "SbzAcl$tag"
 $gatePassword = "SbZ!9a$tag"
+$callerProbeRoot = Join-Path $commonData "Sembazuru-M9-Acl-Probe-$tag"
 $logRoot = Join-Path ([IO.Path]::GetTempPath()) "sembazuru-m9-acl-$tag"
 $installLog = Join-Path $logRoot 'install.log'
 $uninstallLog = Join-Path $logRoot 'uninstall.log'
 $installSucceeded = $false
 $createdGateUser = $false
+$createdCallerProbeRoot = $false
 $primaryError = $null
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 
@@ -533,9 +588,10 @@ try {
     Write-Host 'CHILD ACL PASS: scratch/cas file+directory probes inherit worker Modify and no other SID.'
 
     $gateSid = New-StandardGateUser -Name $gateUser -Password $gatePassword
+    New-StandardProbeRoot -Path $callerProbeRoot -UserSid $gateSid
     Assert-StandardUserDenied -User $gateUser -Password $gatePassword -DataRoot $dataRoot `
         -ScratchRoot $scratchRoot -CasRoot $casRoot -DaemonConfig $daemonConfig `
-        -WorkerConfig $workerConfig -LogRoot $logRoot
+        -WorkerConfig $workerConfig -ProbeRoot $callerProbeRoot
     Write-Host "STANDARD USER SID: $gateSid"
 
     Write-Host 'WORKER CAPABILITY EVIDENCE: SembazuruWorker is Running under its virtual account; exact worker SID grants worker.toml RX and scratch/cas Modify. The packaged worker exposes no minimal self-probe for isolated filesystem operations.'
@@ -544,6 +600,10 @@ catch {
     $primaryError = $_
 }
 finally {
+    if ($createdCallerProbeRoot) {
+        try { Remove-StandardProbeRoot -Path $callerProbeRoot }
+        catch { $cleanupErrors.Add("standard-user probe root cleanup failed: $($_.Exception.Message)") }
+    }
     if ($createdGateUser) {
         try { Remove-GateUser -Name $gateUser }
         catch { $cleanupErrors.Add("temporary user cleanup failed: $($_.Exception.Message)") }
