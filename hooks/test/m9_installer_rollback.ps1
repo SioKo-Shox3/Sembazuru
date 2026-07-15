@@ -181,42 +181,122 @@ function Assert-RollbackFixtureTables {
     }
 }
 
-function Get-ExactCustomActionOperations {
-    param([string]$Log, [string]$Action)
+function Get-RollbackExecutionProofEvents {
+    param([string]$Log)
 
-    $escaped = [regex]::Escape($Action)
-    $optionalQuote = '["'']?'
-    $pattern = '(?im)^[^\r\n]*Executing op:\s*CustomActionSchedule\(' +
-        '[^\r\n)]*(?<![A-Za-z0-9_])Action\s*=\s*' + $optionalQuote +
-        $escaped + $optionalQuote + '\s*(?=,|\))[^\r\n]*$'
-    return @([regex]::Matches($Log, $pattern) | ForEach-Object {
-        [pscustomobject]@{ Action = $Action; Index = $_.Index; Line = $_.Value }
-    })
-}
-
-function Get-CustomActionResultCodes {
-    param([string]$Log, [string]$Action)
-
-    $escaped = [regex]::Escape($Action)
-    $pattern = '(?im)^[^\r\n]*CustomAction\s+' + $escaped +
-        '\s+returned actual error code\s+(-?\d+)[^\r\n]*$'
-    return @([regex]::Matches($Log, $pattern) | ForEach-Object {
+    $recordPrefix = '^MSI \((?:s|c)\)\s+\([^()\r\n]+\)\s+\[[^\]\r\n]+\]:\s*'
+    $operationPatterns = @(
         [pscustomobject]@{
-            Action = $Action
-            Code = [int64]$_.Groups[1].Value
-            Index = $_.Index
-            Line = $_.Value
+            Kind = 'RollbackReserved'
+            Pattern = $recordPrefix + 'Executing op:\s*CustomActionSchedule\(Action=RollbackMachineStoreProvision,ActionType=3330,Source=BinaryData,Target=rollback-provision,\)\s*$'
+        },
+        [pscustomobject]@{
+            Kind = 'ProvisionScheduled'
+            Pattern = $recordPrefix + 'Executing op:\s*CustomActionSchedule\(Action=ProvisionMachineStore,ActionType=3074,Source=BinaryData,Target=provision,\)\s*$'
+        },
+        [pscustomobject]@{
+            Kind = 'FailureScheduled'
+            Pattern = $recordPrefix + 'Executing op:\s*CustomActionSchedule\(Action=Wix4FailWhenDeferred_X64,ActionType=1025,Source=BinaryData,Target=WixFailWhenDeferred,\)\s*$'
+        },
+        [pscustomobject]@{
+            Kind = 'RollbackExecuted'
+            Pattern = $recordPrefix + 'Executing op:\s*CustomActionRollback\(Action=RollbackMachineStoreProvision,ActionType=3330,Source=BinaryData,Target=rollback-provision,\)\s*$'
         }
-    })
+    )
+    $resultPattern = $recordPrefix + 'CustomAction (?<Action>ProvisionMachineStore|Wix4FailWhenDeferred_X64|RollbackMachineStoreProvision) returned actual error code (?<Code>-?\d+)(?:\s+\([^\r\n]*\))?\s*$'
+    $returnThreePattern = $recordPrefix + 'Action ended [^\r\n]*?:\s*(?<Action>ProvisionMachineStore|RollbackMachineStoreProvision)\.\s*Return value 3\.[^\r\n]*$'
+    $lines = if ($Log.Length -eq 0) { @() } else {
+        @([regex]::Split($Log, '\r\n|\n|\r'))
+    }
+    $events = [Collections.Generic.List[object]]::new()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        $line = [string]$lines[$index]
+        foreach ($expectation in $operationPatterns) {
+            if ([regex]::IsMatch($line, $expectation.Pattern)) {
+                $events.Add([pscustomobject]@{
+                    Kind = $expectation.Kind
+                    LineNumber = $index + 1
+                    Code = $null
+                    Line = $line
+                })
+            }
+        }
+        $result = [regex]::Match($line, $resultPattern)
+        if ($result.Success) {
+            $events.Add([pscustomobject]@{
+                Kind = "$($result.Groups['Action'].Value)Result"
+                LineNumber = $index + 1
+                Code = [int64]$result.Groups['Code'].Value
+                Line = $line
+            })
+        }
+        $returnThree = [regex]::Match($line, $returnThreePattern)
+        if ($returnThree.Success) {
+            $events.Add([pscustomobject]@{
+                Kind = "$($returnThree.Groups['Action'].Value)ReturnValue3"
+                LineNumber = $index + 1
+                Code = 3L
+                Line = $line
+            })
+        }
+    }
+    return @($events)
 }
 
-function Test-CustomActionReturnValueThree {
-    param([string]$Log, [string]$Action)
+function Test-RollbackExecutionProof {
+    param([string]$Log)
 
-    $escaped = [regex]::Escape($Action)
-    return [regex]::IsMatch($Log,
-        '(?im)^[^\r\n]*Action ended [^\r\n]*?:\s*' + $escaped +
-        '\.\s*Return value 3\.[^\r\n]*$')
+    $events = @(Get-RollbackExecutionProofEvents -Log $Log)
+    $findings = [Collections.Generic.List[string]]::new()
+    $requiredKinds = @(
+        'RollbackReserved', 'ProvisionScheduled', 'FailureScheduled',
+        'Wix4FailWhenDeferred_X64Result', 'RollbackExecuted')
+    $required = @{}
+    foreach ($kind in $requiredKinds) {
+        $matches = @($events | Where-Object { $_.Kind -ceq $kind })
+        if ($matches.Count -ne 1) {
+            $findings.Add("required rollback proof event $kind count must be 1; got $($matches.Count)")
+        } else {
+            $required[$kind] = $matches[0]
+        }
+    }
+    if ($required.Count -eq $requiredKinds.Count) {
+        $lineNumbers = @($requiredKinds | ForEach-Object {
+            [int]$required[$_].LineNumber
+        })
+        for ($index = 1; $index -lt $lineNumbers.Count; $index++) {
+            if ($lineNumbers[$index - 1] -ge $lineNumbers[$index]) {
+                $findings.Add(
+                    "rollback proof event order invalid: $($requiredKinds -join ' < ') at lines $($lineNumbers -join ',')")
+                break
+            }
+        }
+        if ([int64]$required['Wix4FailWhenDeferred_X64Result'].Code -ne 1603) {
+            $findings.Add(
+                "fixture failure result must be 1603; got $($required['Wix4FailWhenDeferred_X64Result'].Code)")
+        }
+    }
+
+    foreach ($action in @('ProvisionMachineStore', 'RollbackMachineStoreProvision')) {
+        $results = @($events | Where-Object { $_.Kind -ceq "${action}Result" })
+        if ($results.Count -gt 1) {
+            $findings.Add("optional success result for $action appeared more than once: $($results.Count)")
+        }
+        $nonzero = @($results | Where-Object { [int64]$_.Code -ne 0 })
+        if ($nonzero.Count -ne 0) {
+            $findings.Add("$action has forbidden nonzero actual error code(s): $(@($nonzero | ForEach-Object { $_.Code }) -join ',')")
+        }
+        if (@($events | Where-Object {
+                $_.Kind -ceq "${action}ReturnValue3"
+            }).Count -ne 0) {
+            $findings.Add("$action unexpectedly ended with Return value 3")
+        }
+    }
+    return [pscustomobject]@{
+        Passed = $findings.Count -eq 0
+        Findings = @($findings)
+        Events = @($events)
+    }
 }
 
 function Wait-RollbackFixtureResidue {
@@ -409,7 +489,87 @@ function Assert-BoundedRollbackLogDiagnosticFixture {
     Write-Host 'ROLLBACK LOG DIAGNOSTIC FIXTURE PASS: three actions retained within maxLines=4 and maxCharacters=500 with truncation.'
 }
 
+function Assert-RollbackExecutionProofFixture {
+    $baseLines = @(
+        'MSI (s) (10:20) [00:00:00:000]: Executing op: CustomActionSchedule(Action=RollbackMachineStoreProvision,ActionType=3330,Source=BinaryData,Target=rollback-provision,)',
+        'MSI (s) (10:20) [00:00:00:001]: Executing op: CustomActionSchedule(Action=ProvisionMachineStore,ActionType=3074,Source=BinaryData,Target=provision,)',
+        'MSI (s) (10:20) [00:00:00:002]: Executing op: CustomActionSchedule(Action=Wix4FailWhenDeferred_X64,ActionType=1025,Source=BinaryData,Target=WixFailWhenDeferred,)',
+        'MSI (s) (10:20) [00:00:00:003]: CustomAction Wix4FailWhenDeferred_X64 returned actual error code 1603 (note this may not be 100% accurate if translation happened inside sandbox)',
+        'MSI (s) (10:20) [00:00:00:004]: Executing op: CustomActionRollback(Action=RollbackMachineStoreProvision,ActionType=3330,Source=BinaryData,Target=rollback-provision,)'
+    )
+    $assertAccepted = {
+        param([object[]]$Lines, [string]$Label)
+        $proof = Test-RollbackExecutionProof -Log ($Lines -join "`r`n")
+        if (-not $proof.Passed) {
+            throw "rollback proof positive fixture rejected ${Label}: $($proof.Findings -join '; ')"
+        }
+    }
+    $assertRejected = {
+        param([object[]]$Lines, [string]$Label)
+        $proof = Test-RollbackExecutionProof -Log ($Lines -join "`r`n")
+        if ($proof.Passed) {
+            throw "rollback proof negative fixture was accepted: $Label"
+        }
+    }
+
+    & $assertAccepted -Lines $baseLines -Label 'real format without optional code 0'
+    & $assertAccepted -Lines @($baseLines | ForEach-Object {
+            $_.Replace('MSI (s)', 'MSI (c)').Replace('(10:20)', '(A4:123)')
+        }) -Label 'client logger record with variable-width thread fields'
+    $withOptionalZero = @(
+        $baseLines[0], $baseLines[1],
+        'MSI (s) (10:20) [00:00:00:001]: CustomAction ProvisionMachineStore returned actual error code 0',
+        $baseLines[2], $baseLines[3], $baseLines[4],
+        'MSI (s) (10:20) [00:00:00:005]: CustomAction RollbackMachineStoreProvision returned actual error code 0')
+    & $assertAccepted -Lines $withOptionalZero -Label 'optional code 0 evidence'
+
+    & $assertRejected -Label 'ActionStart only' -Lines @(
+        'MSI (s): Executing op: ActionStart(Name=RollbackMachineStoreProvision)',
+        'MSI (s): Action start: ProvisionMachineStore.',
+        'MSI (s): Action start: Wix4FailWhenDeferred_X64.')
+    & $assertRejected -Label 'property echo containing all proof text' -Lines @(
+        "MSI (s) (10:20) [00:00:00:000]: PROPERTY CHANGE: Adding FakeRollbackReserved property. Its value is $($baseLines[0].Split(': ', 2)[1])",
+        "MSI (s) (10:20) [00:00:00:001]: PROPERTY CHANGE: Adding FakeProvisionScheduled property. Its value is $($baseLines[1].Split(': ', 2)[1])",
+        "MSI (s) (10:20) [00:00:00:002]: PROPERTY CHANGE: Adding FakeFailureScheduled property. Its value is $($baseLines[2].Split(': ', 2)[1])",
+        'MSI (s) (10:20) [00:00:00:003]: PROPERTY CHANGE: Adding FakeFailureResult property. Its value is CustomAction Wix4FailWhenDeferred_X64 returned actual error code 1603',
+        "MSI (s) (10:20) [00:00:00:004]: PROPERTY CHANGE: Adding FakeRollbackExecuted property. Its value is $($baseLines[4].Split(': ', 2)[1])")
+    & $assertRejected -Label 'required operation missing' -Lines @(
+        $baseLines[0], $baseLines[1], $baseLines[3], $baseLines[4])
+    & $assertRejected -Label 'required operation order changed' -Lines @(
+        $baseLines[0], $baseLines[2], $baseLines[1], $baseLines[3], $baseLines[4])
+
+    $typeChanged = @($baseLines)
+    $typeChanged[1] = $typeChanged[1].Replace('ActionType=3074', 'ActionType=3075')
+    & $assertRejected -Lines $typeChanged -Label 'Provision ActionType changed'
+
+    & $assertRejected -Label 'Provision nonzero result' -Lines @(
+        $baseLines[0], $baseLines[1],
+        'MSI (s) (10:20) [00:00:00:001]: CustomAction ProvisionMachineStore returned actual error code 10',
+        $baseLines[2], $baseLines[3], $baseLines[4])
+    & $assertRejected -Label 'Rollback nonzero result' -Lines @(
+        $baseLines[0], $baseLines[1], $baseLines[2], $baseLines[3], $baseLines[4],
+        'MSI (s) (10:20) [00:00:00:005]: CustomAction RollbackMachineStoreProvision returned actual error code 10')
+    & $assertRejected -Label 'Provision Return value 3' -Lines @(
+        $baseLines[0], $baseLines[1], $baseLines[2], $baseLines[3], $baseLines[4],
+        'MSI (s) (10:20) [00:00:00:005]: Action ended 00:00:01: ProvisionMachineStore. Return value 3.')
+
+    $actionPrefix = @($baseLines)
+    $actionPrefix[1] = $actionPrefix[1].Replace(
+        'Action=ProvisionMachineStore,', 'Action=ProvisionMachineStoreExtra,')
+    & $assertRejected -Lines $actionPrefix -Label 'same-name prefix action'
+    $targetChanged = @($baseLines)
+    $targetChanged[4] = $targetChanged[4].Replace(
+        'Target=rollback-provision,', 'Target=rollback-provision-extra,')
+    & $assertRejected -Lines $targetChanged -Label 'Rollback target changed'
+
+    & $assertRejected -Label 'duplicate required event' -Lines @(
+        $baseLines[0], $baseLines[1], $baseLines[2], $baseLines[2],
+        $baseLines[3], $baseLines[4])
+    Write-Host 'ROLLBACK EXECUTION PROOF FIXTURE PASS: real server/client records and optional code 0 accepted; property echoes, ActionStart, missing/reordered/mutated/nonzero/prefix/target/duplicate evidence rejected.'
+}
+
 Assert-BoundedRollbackLogDiagnosticFixture
+Assert-RollbackExecutionProofFixture
 
 $ProductionMsi = (Resolve-Path -LiteralPath $ProductionMsi -ErrorAction Stop).Path
 $FixtureMsi = (Resolve-Path -LiteralPath $FixtureMsi -ErrorAction Stop).Path
@@ -450,43 +610,9 @@ try {
         $log = Get-Content -LiteralPath $installLog -Raw
     }
 
-    $provisionOperations = @(Get-ExactCustomActionOperations -Log $log `
-        -Action 'ProvisionMachineStore')
-    $failureOperations = @(Get-ExactCustomActionOperations -Log $log `
-        -Action 'Wix4FailWhenDeferred_X64')
-    $rollbackOperations = @(Get-ExactCustomActionOperations -Log $log `
-        -Action 'RollbackMachineStoreProvision')
-    foreach ($expectation in @(
-        [pscustomobject]@{ Name = 'ProvisionMachineStore'; Rows = $provisionOperations },
-        [pscustomobject]@{ Name = 'Wix4FailWhenDeferred_X64'; Rows = $failureOperations },
-        [pscustomobject]@{ Name = 'RollbackMachineStoreProvision'; Rows = $rollbackOperations })) {
-        if ($expectation.Rows.Count -ne 1) {
-            $findings.Add("actual CustomActionSchedule $($expectation.Name) count must be 1; got $($expectation.Rows.Count)")
-        }
-    }
-    if ($provisionOperations.Count -eq 1 -and $failureOperations.Count -eq 1 -and
-        $rollbackOperations.Count -eq 1 -and
-        -not ($provisionOperations[0].Index -lt $failureOperations[0].Index -and
-            $failureOperations[0].Index -lt $rollbackOperations[0].Index)) {
-        $findings.Add(
-            "actual operation order must be provision < fail < rollback; got $($provisionOperations[0].Index),$($failureOperations[0].Index),$($rollbackOperations[0].Index)")
-    }
-
-    foreach ($action in @('ProvisionMachineStore', 'RollbackMachineStoreProvision')) {
-        $codes = @(Get-CustomActionResultCodes -Log $log -Action $action)
-        $zeroCodes = @($codes | Where-Object { $_.Code -eq 0 })
-        $nonzeroCodes = @($codes | Where-Object { $_.Code -ne 0 })
-        if ($codes.Count -ne 1 -or $zeroCodes.Count -ne 1 -or $nonzeroCodes.Count -ne 0) {
-            $findings.Add("$action must have exactly one actual error code 0 and no nonzero result; got $(@($codes | ForEach-Object { $_.Code }) -join ',')")
-        }
-        if (Test-CustomActionReturnValueThree -Log $log -Action $action) {
-            $findings.Add("$action unexpectedly ended with Return value 3")
-        }
-    }
-    $failureCodes = @(Get-CustomActionResultCodes -Log $log `
-        -Action 'Wix4FailWhenDeferred_X64')
-    if (@($failureCodes | Where-Object { $_.Code -ne 0 }).Count -eq 0) {
-        $findings.Add('fixture fail-fast action has no actual nonzero error code')
+    $rollbackProof = Test-RollbackExecutionProof -Log $log
+    foreach ($proofFinding in @($rollbackProof.Findings)) {
+        $findings.Add("rollback execution proof: $proofFinding")
     }
 
     $execution = Get-MsiExecutionClassifier -Log $log
@@ -501,7 +627,16 @@ try {
 
     $postAttemptResidue = @(Wait-RollbackFixtureResidue -DataRoot $dataRoot `
         -InstallRoot $installRoot -ProductKey $productKey)
-    Write-Host "ROLLBACK FIXTURE ACTUAL OPS: provision=$($provisionOperations.Count) fail=$($failureOperations.Count) rollback=$($rollbackOperations.Count)"
+    $proofCounts = [ordered]@{}
+    foreach ($kind in @(
+        'RollbackReserved', 'ProvisionScheduled', 'FailureScheduled',
+        'Wix4FailWhenDeferred_X64Result', 'RollbackExecuted',
+        'ProvisionMachineStoreResult', 'RollbackMachineStoreProvisionResult')) {
+        $proofCounts[$kind] = @($rollbackProof.Events | Where-Object {
+            $_.Kind -ceq $kind
+        }).Count
+    }
+    Write-Host "ROLLBACK FIXTURE PROOF EVENTS: $(ConvertTo-StableJson $proofCounts)"
     Write-Host "ROLLBACK FIXTURE RESIDUE: $(ConvertTo-StableJson $postAttemptResidue)"
     if ($postAttemptResidue.Count -ne 0) {
         $findings.Add("rollback residue remained: $($postAttemptResidue -join '; ')")
@@ -511,7 +646,7 @@ try {
         Write-BoundedRollbackLogDiagnostic -Path $installLog -Log $log
         throw "ROLLBACK FIXTURE DYNAMIC FAIL:`n - $($findings -join "`n - ")"
     }
-    Write-Host 'PASS: fixture failed with 1603 after actual LocalSystem provision, official fail-fast injection, successful actual LocalSystem rollback, and zero residue.'
+    Write-Host 'PASS: fixture failed with 1603 after exact rollback reservation < provision schedule < fail schedule/result < CustomActionRollback evidence, no lifecycle nonzero result, no forbidden downstream operation, and zero residue.'
 }
 catch {
     $primaryError = $_
