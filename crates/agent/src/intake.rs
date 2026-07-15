@@ -1855,6 +1855,29 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[tokio::test]
+    async fn named_pipe_connector_display_includes_opener_failure_source() {
+        const SENTINEL: &str = "named-pipe-opener-permission-denied-sentinel";
+        let error = connect_named_pipe_with_opener(|| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                SENTINEL,
+            ))
+        })
+        .await
+        .expect_err("connector must preserve the opener failure source");
+
+        let displayed = error.to_string();
+        assert!(
+            displayed.contains(SENTINEL),
+            "display omitted the opener source: {displayed}"
+        );
+        assert_eq!(displayed.matches(SENTINEL).count(), 1);
+        let source = std::error::Error::source(&error).expect("transport source must be exposed");
+        assert!(source.downcast_ref::<tonic::transport::Error>().is_some());
+    }
+
+    #[cfg(windows)]
     #[test]
     fn named_pipe_service_hardening_promotes_trusted_authority() {
         let service = IntakeService::new(Scheduler::new(WorkerTable::new(Duration::from_secs(60))));

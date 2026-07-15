@@ -190,16 +190,57 @@ pub enum ExecuteError {
     Rpc(tonic::Status),
 }
 
+const MAX_ERROR_CHAIN_DEPTH: usize = 16;
+
+struct ErrorChain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut current = Some(self.0);
+        let mut previous = None;
+        let mut wrote = false;
+        for _ in 0..MAX_ERROR_CHAIN_DEPTH {
+            let Some(error) = current else {
+                return Ok(());
+            };
+            let message = error.to_string();
+            if previous.as_deref() != Some(message.as_str()) {
+                if wrote {
+                    f.write_str(": ")?;
+                }
+                f.write_str(&message)?;
+                wrote = true;
+            }
+            previous = Some(message);
+            current = error.source();
+        }
+        if current.is_some() {
+            if wrote {
+                f.write_str(": ")?;
+            }
+            f.write_str("[source chain truncated]")?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for ExecuteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExecuteError::Transport(e) => write!(f, "transport: {e}"),
+            ExecuteError::Transport(e) => write!(f, "transport: {}", ErrorChain(e)),
             ExecuteError::Rpc(s) => write!(f, "rpc: {s}"),
         }
     }
 }
 
-impl std::error::Error for ExecuteError {}
+impl std::error::Error for ExecuteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ExecuteError::Transport(error) => Some(error),
+            ExecuteError::Rpc(status) => Some(status),
+        }
+    }
+}
 
 impl From<tonic::transport::Error> for ExecuteError {
     fn from(e: tonic::transport::Error) -> Self {
@@ -3199,6 +3240,37 @@ pub async fn execute_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct SourceError(&'static str, bool);
+
+    impl std::fmt::Display for SourceError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for SourceError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.then_some(self)
+        }
+    }
+
+    #[test]
+    fn execute_error_rpc_display_does_not_expand_status_source() {
+        let status = tonic::Status::from_error(Box::new(SourceError("rpc-source", false)));
+        let expected = format!("rpc: {status}");
+        let error = ExecuteError::Rpc(status);
+        assert_eq!(error.to_string(), expected);
+        let source = std::error::Error::source(&error).unwrap();
+        assert!(source.is::<tonic::Status>());
+    }
+
+    #[test]
+    fn error_chain_display_bounds_cycles() {
+        let displayed = ErrorChain(&SourceError("cycle-source", true)).to_string();
+        assert_eq!(displayed, "cycle-source: [source chain truncated]");
+    }
 
     #[cfg(windows)]
     #[test]
