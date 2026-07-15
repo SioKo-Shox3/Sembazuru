@@ -449,10 +449,14 @@ function Get-ActionEvidence {
         CanonicalDataRootMentioned = $canonicalMention
         CreateFoldersCanonical = & $actionTouchesCanonical 'CreateFolders'
         MsiLockPermissionsExCanonical = & $actionTouchesCanonical 'MsiLockPermissionsEx'
+        RollbackMachineStoreProvisionStarted = & $started 'RollbackMachineStoreProvision'
+        ProvisionMachineStoreStarted = & $started 'ProvisionMachineStore'
+        ProvisionMachineStoreFailed = [regex]::IsMatch($log,
+            '(?im)(CustomAction ProvisionMachineStore returned actual error code [^0]|Action ended .*?: ProvisionMachineStore\. Return value 3)')
         SeedDaemonConfigStarted = & $started 'SeedDaemonConfig'
-        SeedDaemonConfigFailed = [regex]::IsMatch($log,
-            '(?im)(CustomAction SeedDaemonConfig returned actual error code [^0]|Action ended .*?: SeedDaemonConfig\. Return value 3)')
         SeedWorkerConfigStarted = & $started 'SeedWorkerConfig'
+        CommitMachineStoreProvisionStarted = & $started 'CommitMachineStoreProvision'
+        UninstallMachineStoreStarted = & $started 'UninstallMachineStore'
         InstallServicesStarted = & $started 'InstallServices'
         StartServicesStarted = & $started 'StartServices'
     }
@@ -587,15 +591,19 @@ try {
     if ($appearedServices.Count -ne 0) { $findings.Add("service(s) appeared: $($appearedServices -join ',')") }
     if ($newResidue.Count -ne 0) { $findings.Add("new installer residue: $($newResidue -join '; ')") }
     if (-not $actionEvidence.LogExists) { $findings.Add('MSI verbose log is missing') }
-    $seedFailureBoundary = $actionEvidence.PSObject.Properties['SeedDaemonConfigStarted'] -and
-        $actionEvidence.PSObject.Properties['SeedDaemonConfigFailed'] -and
-        $actionEvidence.SeedDaemonConfigStarted -and $actionEvidence.SeedDaemonConfigFailed
-    if (-not $seedFailureBoundary) {
-        $findings.Add('MSI failed before the required SeedDaemonConfig start/failure boundary')
+    $provisionFailureBoundary =
+        $actionEvidence.PSObject.Properties['ProvisionMachineStoreStarted'] -and
+        $actionEvidence.PSObject.Properties['ProvisionMachineStoreFailed'] -and
+        $actionEvidence.ProvisionMachineStoreStarted -and
+        $actionEvidence.ProvisionMachineStoreFailed
+    if (-not $provisionFailureBoundary) {
+        $findings.Add('MSI did not fail at the required ProvisionMachineStore boundary')
     }
     foreach ($property in @(
         'CreateFoldersCanonical', 'MsiLockPermissionsExCanonical',
-        'SeedWorkerConfigStarted', 'InstallServicesStarted', 'StartServicesStarted')) {
+        'SeedDaemonConfigStarted', 'SeedWorkerConfigStarted',
+        'CommitMachineStoreProvisionStarted', 'UninstallMachineStoreStarted',
+        'InstallServicesStarted', 'StartServicesStarted')) {
         if ($actionEvidence.PSObject.Properties[$property] -and $actionEvidence.$property) {
             $findings.Add("forbidden MSI action reached: $property")
         }
@@ -603,7 +611,7 @@ try {
     if ($findings.Count -ne 0) {
         throw "PREPOSITION RED: $($findings -join '; ')"
     }
-    Write-Host 'PASS: MSI failed closed before changing the pre-positioned ProgramData target.'
+    Write-Host 'PASS: ProvisionMachineStore rejected the pre-positioned root before seed/services and without changing the target.'
 }
 catch {
     $primaryError = $_

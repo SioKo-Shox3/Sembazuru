@@ -18,11 +18,11 @@
     $(var.RustTarget)   release dir holding the Rust .exe set
     $(var.Hooks)        Release dir holding launcher.exe + sbz_interceptor{64,32}.dll
     $(var.Integration)  dir holding Directory.Build.targets
+    $(var.StoreCtl)     release sembazuru-storectl.exe embedded for machine-store CAs
     $(var.ProductVersion)
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall"
-     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
   <Package
       Name="Sembazuru"
       Manufacturer="Sembazuru Project"
@@ -32,6 +32,8 @@
       Compressed="yes">
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <Launch Condition="Installed OR NOT WIX_UPGRADE_DETECTED"
+            Message="Automatic upgrade is blocked until a safe legacy migration is available. The earlier installation was left unchanged." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Program Files\Sembazuru\ (64-bit). -->
@@ -51,49 +53,47 @@
          StartupFolder (Windows only runs loose shortcuts there, not subfolders). -->
     <StandardDirectory Id="StartupFolder" />
 
-    <!-- %ProgramData%\Sembazuru: per-machine config + runtime data root (M9.5d). The
-         seeded daemon.toml/worker.toml live here; scratch/cas are the worker's VFS
-         roots. The whole tree is removed on uninstall (no residue). -->
-    <StandardDirectory Id="CommonAppDataFolder">
-      <Directory Id="DataFolder" Name="Sembazuru">
-        <Directory Id="ScratchFolder" Name="scratch" />
-        <Directory Id="CasFolder" Name="cas" />
-      </Directory>
-    </StandardDirectory>
-
     <Feature Id="Main" Title="Sembazuru" Level="1">
       <ComponentGroupRef Id="Binaries" />
       <ComponentGroupRef Id="Integration" />
-      <ComponentGroupRef Id="DataDirs" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="GuiAutostartShortcut" />
     </Feature>
 
-    <!-- Seed default daemon.toml/worker.toml if absent (M9.5d). Deferred, no
-         impersonation (LocalSystem) so it can write under %ProgramData%; runs after
-         the binaries are laid down and before the services start, so the worker reads
-         its VFS-wired config on first start. The exes' `seed-config` subcommand is
-         only-if-absent (idempotent) and never writes the cluster token. These live in
-         the Package (not a Fragment) so they are always linked into the product. -->
-    <!-- Return="ignore": config seeding is a best-effort convenience. A seed hiccup
-         (or a packaged binary that predates seed-config) must NOT abort the install —
-         the services still install and run on built-in defaults (zero-config). -->
+    <!-- The helper is an embedded Binary stream only: it never enters Program Files.
+         All lifecycle actions run as LocalSystem and fail the transaction closed. -->
+    <Binary Id="MachineStoreCtlBinary" SourceFile="$(var.StoreCtl)" />
+    <CustomAction Id="RollbackMachineStoreProvision" BinaryRef="MachineStoreCtlBinary"
+                  ExeCommand="rollback-provision" Execute="rollback"
+                  Impersonate="no" Return="check" />
+    <CustomAction Id="ProvisionMachineStore" BinaryRef="MachineStoreCtlBinary"
+                  ExeCommand="provision" Execute="deferred"
+                  Impersonate="no" Return="check" />
+    <CustomAction Id="CommitMachineStoreProvision" BinaryRef="MachineStoreCtlBinary"
+                  ExeCommand="commit-provision" Execute="commit"
+                  Impersonate="no" Return="check" />
+    <CustomAction Id="UninstallMachineStore" BinaryRef="MachineStoreCtlBinary"
+                  ExeCommand="uninstall" Execute="deferred"
+                  Impersonate="no" Return="check" />
+
+    <!-- Config seeding follows successful machine-store provisioning and is vital.
+         Fresh installs only: repair must leave the store byte-for-byte unchanged. -->
     <CustomAction Id="SeedDaemonConfig" FileRef="DaemonExeFile" ExeCommand="seed-config"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
+                  Execute="deferred" Impersonate="no" Return="check" />
     <CustomAction Id="SeedWorkerConfig" FileRef="WorkerExeFile" ExeCommand="seed-config"
-                  Execute="deferred" Impersonate="no" Return="ignore" />
-    <!-- RemoveFolderEx (below) needs the data path available early (AppSearch) at
-         uninstall, but the WixRemoveFoldersEx action runs before CostFinalize so a
-         SetProperty from [DataFolder] would be too late. Canonical fix: persist the
-         resolved path in the registry at install (DataFolderComp) and read it back
-         here via a RegistrySearch, so it is populated by AppSearch on uninstall. -->
-    <Property Id="SBZ_DATADIR">
-      <RegistrySearch Id="SbzDataDirSearch" Root="HKLM" Key="Software\Sembazuru"
-                      Name="DataDirPath" Type="raw" />
-    </Property>
+                  Execute="deferred" Impersonate="no" Return="check" />
+
     <InstallExecuteSequence>
-      <Custom Action="SeedDaemonConfig" After="InstallFiles" Condition="NOT REMOVE" />
-      <Custom Action="SeedWorkerConfig" After="SeedDaemonConfig" Condition="NOT REMOVE" />
+      <Custom Action="RollbackMachineStoreProvision" After="InstallInitialize"
+              Condition="NOT Installed" />
+      <Custom Action="ProvisionMachineStore" After="RollbackMachineStoreProvision"
+              Condition="NOT Installed" />
+      <Custom Action="UninstallMachineStore" After="StopServices"
+              Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="SeedDaemonConfig" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="SeedWorkerConfig" After="SeedDaemonConfig" Condition="NOT Installed" />
+      <Custom Action="CommitMachineStoreProvision" After="StartServices"
+              Condition="NOT Installed" />
     </InstallExecuteSequence>
   </Package>
 
@@ -204,43 +204,6 @@
       <RegistryValue Root="HKCU" Key="Software\Sembazuru" Name="StartupShortcut"
                      Type="integer" Value="1" KeyPath="yes" />
     </Component>
-  </Fragment>
-
-  <!-- Per-machine data root + ACLs + clean-uninstall removal (M9.5d). -->
-  <Fragment>
-    <ComponentGroup Id="DataDirs">
-      <!-- %ProgramData%\Sembazuru itself. RemoveFolderEx recursively deletes the
-           whole tree (incl. the seeded *.toml and any operator edits) on uninstall,
-           so the only-MSI-tracked files leave nothing behind. -->
-      <Component Id="DataFolderComp" Directory="DataFolder">
-        <CreateFolder>
-          <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)" />
-        </CreateFolder>
-        <util:RemoveFolderEx On="uninstall" Property="SBZ_DATADIR" />
-        <!-- Persist the resolved data path so the RegistrySearch above can read it
-             back at uninstall; doubles as the component keypath. -->
-        <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="DataDirPath"
-                       Type="string" Value="[DataFolder]" KeyPath="yes" />
-      </Component>
-      <!-- scratch + cas: the worker runs least-privilege (NT SERVICE\SembazuruWorker)
-           and must create/read/delete files and per-action subtrees here, so grant it
-           modify (read/write/execute/delete + delete-child). The daemon runs as
-           LocalSystem and needs no explicit grant. -->
-      <Component Id="ScratchFolderComp" Directory="ScratchFolder">
-        <CreateFolder>
-          <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)" />
-        </CreateFolder>
-        <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="ScratchDir"
-                       Type="integer" Value="1" KeyPath="yes" />
-      </Component>
-      <Component Id="CasFolderComp" Directory="CasFolder">
-        <CreateFolder>
-          <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)" />
-        </CreateFolder>
-        <RegistryValue Root="HKLM" Key="Software\Sembazuru" Name="CasDir"
-                       Type="integer" Value="1" KeyPath="yes" />
-      </Component>
-    </ComponentGroup>
   </Fragment>
 
 </Wix>

@@ -7,6 +7,10 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$Msi,
 
+    [Parameter(Mandatory = $true, ParameterSetName = 'Full')]
+    [ValidateNotNullOrEmpty()]
+    [string]$StoreCtl,
+
     [string]$Source
 )
 
@@ -16,13 +20,14 @@ Set-StrictMode -Version Latest
 $workerSid = 'S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795'
 $rootSddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;$workerSid)"
 $workerWriteSddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$workerSid)"
+$safeUpgradeMessage = 'Automatic upgrade is blocked until a safe legacy migration is available. The earlier installation was left unchanged.'
 
 if ([string]::IsNullOrWhiteSpace($Source)) {
     $Source = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) `
         'installer\sembazuru.wxs'
 }
 
-function Assert-StaticAclSource {
+function Assert-StaticLifecycleSource {
     param([string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -32,51 +37,331 @@ function Assert-StaticAclSource {
     [xml]$document = Get-Content -LiteralPath $Path -Raw
     $namespaces = [Xml.XmlNamespaceManager]::new($document.NameTable)
     $namespaces.AddNamespace('w', 'http://wixtoolset.org/schemas/v4/wxs')
-    $namespaces.AddNamespace('util', 'http://wixtoolset.org/schemas/v4/wxs/util')
     $failures = [Collections.Generic.List[string]]::new()
-    $expectations = @(
-        [pscustomobject]@{ Component = 'DataFolderComp'; Sddl = $rootSddl },
-        [pscustomobject]@{ Component = 'ScratchFolderComp'; Sddl = $workerWriteSddl },
-        [pscustomobject]@{ Component = 'CasFolderComp'; Sddl = $workerWriteSddl }
+
+    $binary = @($document.SelectNodes("//w:Binary[@Id='MachineStoreCtlBinary']", $namespaces))
+    if ($binary.Count -ne 1 -or $binary[0].GetAttribute('SourceFile') -cne '$(var.StoreCtl)') {
+        $failures.Add('MachineStoreCtlBinary must appear exactly once with SourceFile=$(var.StoreCtl)')
+    }
+
+    $actionExpectations = @(
+        [pscustomobject]@{ Id = 'RollbackMachineStoreProvision'; Command = 'rollback-provision'; Execute = 'rollback' },
+        [pscustomobject]@{ Id = 'ProvisionMachineStore'; Command = 'provision'; Execute = 'deferred' },
+        [pscustomobject]@{ Id = 'CommitMachineStoreProvision'; Command = 'commit-provision'; Execute = 'commit' },
+        [pscustomobject]@{ Id = 'UninstallMachineStore'; Command = 'uninstall'; Execute = 'deferred' }
     )
-
-    foreach ($expectation in $expectations) {
-        $component = $document.SelectSingleNode(
-            "//w:Component[@Id='$($expectation.Component)']", $namespaces)
-        if ($null -eq $component) {
-            $failures.Add("missing Component $($expectation.Component)")
+    foreach ($expectation in $actionExpectations) {
+        $action = @($document.SelectNodes(
+            "//w:CustomAction[@Id='$($expectation.Id)']", $namespaces))
+        if ($action.Count -ne 1) {
+            $failures.Add("$($expectation.Id) must appear exactly once")
             continue
         }
-        $createFolder = $component.SelectSingleNode('w:CreateFolder', $namespaces)
-        if ($null -eq $createFolder) {
-            $failures.Add("$($expectation.Component) is missing CreateFolder")
-            continue
-        }
-        $permissions = @($createFolder.SelectNodes('w:PermissionEx', $namespaces))
-        if ($permissions.Count -ne 1) {
-            $failures.Add(
-                "$($expectation.Component) requires exactly one core PermissionEx; found $($permissions.Count)")
-            continue
-        }
-        if ($permissions[0].GetAttribute('Sddl') -cne $expectation.Sddl) {
-            $failures.Add(
-                "$($expectation.Component) Sddl mismatch: '$($permissions[0].GetAttribute('Sddl'))'")
+        foreach ($attribute in @(
+            [pscustomobject]@{ Name = 'BinaryRef'; Value = 'MachineStoreCtlBinary' },
+            [pscustomobject]@{ Name = 'ExeCommand'; Value = $expectation.Command },
+            [pscustomobject]@{ Name = 'Execute'; Value = $expectation.Execute },
+            [pscustomobject]@{ Name = 'Impersonate'; Value = 'no' },
+            [pscustomobject]@{ Name = 'Return'; Value = 'check' })) {
+            if ($action[0].GetAttribute($attribute.Name) -cne $attribute.Value) {
+                $failures.Add("$($expectation.Id) $($attribute.Name) must be '$($attribute.Value)'")
+            }
         }
     }
 
-    $legacyPermissions = @($document.SelectNodes('//util:PermissionEx', $namespaces))
-    if ($legacyPermissions.Count -ne 0) {
-        $failures.Add("util:PermissionEx must be absent; found $($legacyPermissions.Count)")
+    foreach ($seedId in @('SeedDaemonConfig', 'SeedWorkerConfig')) {
+        $seed = @($document.SelectNodes("//w:CustomAction[@Id='$seedId']", $namespaces))
+        if ($seed.Count -ne 1 -or $seed[0].GetAttribute('Execute') -cne 'deferred' -or
+            $seed[0].GetAttribute('Impersonate') -cne 'no' -or
+            $seed[0].GetAttribute('Return') -cne 'check') {
+            $failures.Add("$seedId must be one deferred, non-impersonated, checked action")
+        }
     }
-    $removeFolderEx = @($document.SelectNodes('//util:RemoveFolderEx', $namespaces))
-    if ($removeFolderEx.Count -ne 1) {
-        $failures.Add("exactly one util:RemoveFolderEx must remain; found $($removeFolderEx.Count)")
+
+    $scheduleExpectations = @(
+        [pscustomobject]@{ Id = 'RollbackMachineStoreProvision'; Anchor = 'After'; Value = 'InstallInitialize'; Condition = 'NOT Installed' },
+        [pscustomobject]@{ Id = 'ProvisionMachineStore'; Anchor = 'After'; Value = 'RollbackMachineStoreProvision'; Condition = 'NOT Installed' },
+        [pscustomobject]@{ Id = 'SeedDaemonConfig'; Anchor = 'After'; Value = 'InstallFiles'; Condition = 'NOT Installed' },
+        [pscustomobject]@{ Id = 'SeedWorkerConfig'; Anchor = 'After'; Value = 'SeedDaemonConfig'; Condition = 'NOT Installed' },
+        [pscustomobject]@{ Id = 'CommitMachineStoreProvision'; Anchor = 'After'; Value = 'StartServices'; Condition = 'NOT Installed' },
+        [pscustomobject]@{ Id = 'UninstallMachineStore'; Anchor = 'After'; Value = 'StopServices'; Condition = 'REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE' }
+    )
+    foreach ($expectation in $scheduleExpectations) {
+        $row = @($document.SelectNodes(
+            "//w:InstallExecuteSequence/w:Custom[@Action='$($expectation.Id)']", $namespaces))
+        if ($row.Count -ne 1) {
+            $failures.Add("schedule for $($expectation.Id) must appear exactly once")
+            continue
+        }
+        if ($row[0].GetAttribute($expectation.Anchor) -cne $expectation.Value) {
+            $failures.Add("$($expectation.Id) must be $($expectation.Anchor) $($expectation.Value)")
+        }
+        if ($row[0].GetAttribute('Condition') -cne
+            [Net.WebUtility]::HtmlDecode($expectation.Condition)) {
+            $failures.Add("$($expectation.Id) condition mismatch")
+        }
+    }
+
+    $launch = @($document.SelectNodes('//w:Launch', $namespaces))
+    if ($launch.Count -ne 1 -or
+        $launch[0].GetAttribute('Condition') -cne 'Installed OR NOT WIX_UPGRADE_DETECTED' -or
+        $launch[0].GetAttribute('Message') -cne $safeUpgradeMessage) {
+        $failures.Add('legacy major upgrades must use the required safe Launch condition and message')
+    }
+
+    foreach ($query in @(
+        '//w:StandardDirectory[@Id="CommonAppDataFolder"]',
+        '//w:Directory[@Id="DataFolder" or @Id="ScratchFolder" or @Id="CasFolder"]',
+        '//w:ComponentGroup[@Id="DataDirs"]',
+        '//w:ComponentGroupRef[@Id="DataDirs"]',
+        '//w:Component[@Id="DataFolderComp" or @Id="ScratchFolderComp" or @Id="CasFolderComp"]',
+        '//w:Property[@Id="SBZ_DATADIR"]',
+        '//*[local-name()="RegistrySearch"]', '//*[local-name()="CreateFolder"]',
+        '//*[local-name()="PermissionEx"]', '//*[local-name()="RemoveFolderEx"]')) {
+        $found = @($document.SelectNodes($query, $namespaces))
+        if ($found.Count -ne 0) { $failures.Add("legacy ProgramData authoring remains: $query") }
+    }
+    $externalStoreCtl = @($document.SelectNodes(
+        "//w:File[contains(@Source, 'storectl') or contains(@Id, 'StoreCtl')]", $namespaces))
+    if ($externalStoreCtl.Count -ne 0) {
+        $failures.Add('storectl must remain an embedded Binary stream, not an installed File')
+    }
+
+    $projectPath = Join-Path (Split-Path $Path -Parent) 'Package.wixproj'
+    [xml]$project = Get-Content -LiteralPath $projectPath -Raw
+    $storeCtlProperty = @($project.SelectNodes('//SbzStoreCtl'))
+    if ($storeCtlProperty.Count -ne 1 -or
+        ($storeCtlProperty.Count -eq 1 -and (
+            $storeCtlProperty[0].GetAttribute('Condition') -cne "'`$(SbzStoreCtl)' == ''" -or
+            [string]$storeCtlProperty[0].InnerText -cne '$(SbzRustTarget)\sembazuru-storectl.exe'))) {
+        $failures.Add('Package.wixproj must default SbzStoreCtl from SbzRustTarget')
+    }
+    $constantsNode = @($project.SelectNodes('//DefineConstants'))
+    $constants = if ($constantsNode.Count -eq 1) { [string]$constantsNode[0].InnerText } else { '' }
+    if ($constants -notmatch '(?:^|;)StoreCtl=\$\(SbzStoreCtl\)(?:;|$)') {
+        $failures.Add('DefineConstants must export StoreCtl=$(SbzStoreCtl)')
+    }
+    if (@($project.Project.ItemGroup.PackageReference | Where-Object {
+            $_.Include -eq 'WixToolset.Util.wixext' }).Count -ne 0) {
+        $failures.Add('WixToolset.Util.wixext must be removed')
     }
 
     if ($failures.Count -ne 0) {
-        throw "STATIC ACL SOURCE FAIL:`n - $($failures -join "`n - ")"
+        throw "STATIC LIFECYCLE SOURCE FAIL:`n - $($failures -join "`n - ")"
     }
-    Write-Host "STATIC ACL SOURCE PASS: protected root + worker-only scratch/cas; SID=$workerSid"
+    Write-Host 'STATIC LIFECYCLE SOURCE PASS: embedded storectl owns fresh/rollback/commit/uninstall; legacy directory authoring is absent.'
+}
+
+function Invoke-MsiQuery {
+    param(
+        [Parameter(Mandatory = $true)]$Database,
+        [Parameter(Mandatory = $true)][string]$Sql,
+        [Parameter(Mandatory = $true)][int]$Columns
+    )
+
+    $view = $Database.GetType().InvokeMember(
+        'OpenView', 'InvokeMethod', $null, $Database, @($Sql))
+    try {
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+        while ($true) {
+            $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+            if ($null -eq $record) { break }
+            $values = @()
+            try {
+                for ($index = 1; $index -le $Columns; $index++) {
+                    $values += $record.GetType().InvokeMember(
+                        'StringData', 'GetProperty', $null, $record, @($index))
+                }
+            }
+            finally {
+                [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
+            }
+            ,$values
+        }
+    }
+    finally {
+        try { $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null }
+        catch { }
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
+    }
+}
+
+function Get-MsiBinaryStreamSize {
+    param([Parameter(Mandatory = $true)]$Database, [string]$Name)
+
+    $view = $Database.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $Database,
+        @("SELECT ``Name``, ``Data`` FROM ``Binary`` WHERE ``Name``='$Name'"))
+    $record = $null
+    try {
+        $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+        if ($null -eq $record) { return 0 }
+        return [int64]$record.GetType().InvokeMember(
+            'DataSize', 'GetProperty', $null, $record, @(2))
+    }
+    finally {
+        if ($null -ne $record) {
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) | Out-Null
+        }
+        try { $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null }
+        catch { }
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
+    }
+}
+
+function Assert-MsiLifecycleTables {
+    param([string]$Path)
+
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $null
+    try {
+        $database = $installer.GetType().InvokeMember(
+            'OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
+        $failures = [Collections.Generic.List[string]]::new()
+
+        $streamSize = 0L
+        $binaryRows = @(Invoke-MsiQuery -Database $database -Columns 1 -Sql `
+            'SELECT `Name` FROM `Binary` WHERE `Name`=''MachineStoreCtlBinary''')
+        if ($binaryRows.Count -ne 1) {
+            $failures.Add("Binary.MachineStoreCtlBinary row count must be 1; got $($binaryRows.Count)")
+        } else {
+            $streamSize = Get-MsiBinaryStreamSize -Database $database `
+                -Name 'MachineStoreCtlBinary'
+            if ($streamSize -le 0) {
+                $failures.Add("embedded storectl Binary stream must be nonempty; size=$streamSize")
+            }
+        }
+
+        $actionExpectations = @(
+            [pscustomobject]@{ Id = 'ProvisionMachineStore'; Type = '3074'; Source = 'MachineStoreCtlBinary'; Target = 'provision' },
+            [pscustomobject]@{ Id = 'UninstallMachineStore'; Type = '3074'; Source = 'MachineStoreCtlBinary'; Target = 'uninstall' },
+            [pscustomobject]@{ Id = 'RollbackMachineStoreProvision'; Type = '3330'; Source = 'MachineStoreCtlBinary'; Target = 'rollback-provision' },
+            [pscustomobject]@{ Id = 'CommitMachineStoreProvision'; Type = '3586'; Source = 'MachineStoreCtlBinary'; Target = 'commit-provision' },
+            [pscustomobject]@{ Id = 'SeedDaemonConfig'; Type = '3090'; Source = 'DaemonExeFile'; Target = 'seed-config' },
+            [pscustomobject]@{ Id = 'SeedWorkerConfig'; Type = '3090'; Source = 'WorkerExeFile'; Target = 'seed-config' }
+        )
+        foreach ($expectation in $actionExpectations) {
+            $rows = @(Invoke-MsiQuery -Database $database -Columns 4 -Sql `
+                "SELECT ``Action``, ``Type``, ``Source``, ``Target`` FROM ``CustomAction`` WHERE ``Action``='$($expectation.Id)'")
+            if ($rows.Count -ne 1) {
+                $failures.Add("CustomAction $($expectation.Id) row count must be 1; got $($rows.Count)")
+                continue
+            }
+            $row = $rows[0]
+            if ([string]$row[1] -cne $expectation.Type -or
+                [string]$row[2] -cne $expectation.Source -or
+                [string]$row[3] -cne $expectation.Target) {
+                $failures.Add("CustomAction $($expectation.Id) mismatch: Type=$($row[1]) Source=$($row[2]) Target=$($row[3])")
+            }
+            if (([int]$row[1] -band 64) -ne 0) {
+                $failures.Add("CustomAction $($expectation.Id) has forbidden Continue bit")
+            }
+        }
+
+        $sequenceRows = @(Invoke-MsiQuery -Database $database -Columns 3 -Sql `
+            'SELECT `Action`, `Condition`, `Sequence` FROM `InstallExecuteSequence`')
+        $sequence = @{}
+        $conditions = @{}
+        foreach ($row in $sequenceRows) {
+            $sequence[[string]$row[0]] = [int]$row[2]
+            $conditions[[string]$row[0]] = [string]$row[1]
+        }
+        foreach ($name in @(
+            'InstallInitialize', 'RollbackMachineStoreProvision', 'ProvisionMachineStore',
+            'ProcessComponents', 'InstallFiles', 'SeedDaemonConfig', 'SeedWorkerConfig',
+            'InstallServices', 'StartServices', 'CommitMachineStoreProvision', 'InstallFinalize',
+            'StopServices', 'UninstallMachineStore', 'DeleteServices',
+            'FindRelatedProducts', 'LaunchConditions', 'RemoveExistingProducts')) {
+            if (-not $sequence.ContainsKey($name)) { $failures.Add("InstallExecuteSequence row missing: $name") }
+        }
+        foreach ($pair in @(
+            @('InstallInitialize', 'RollbackMachineStoreProvision'),
+            @('RollbackMachineStoreProvision', 'ProvisionMachineStore'),
+            @('ProvisionMachineStore', 'ProcessComponents'),
+            @('ProcessComponents', 'InstallFiles'),
+            @('InstallFiles', 'SeedDaemonConfig'),
+            @('SeedDaemonConfig', 'SeedWorkerConfig'),
+            @('SeedWorkerConfig', 'InstallServices'),
+            @('InstallServices', 'StartServices'),
+            @('StartServices', 'CommitMachineStoreProvision'),
+            @('CommitMachineStoreProvision', 'InstallFinalize'),
+            @('StopServices', 'UninstallMachineStore'),
+            @('UninstallMachineStore', 'DeleteServices'),
+            @('FindRelatedProducts', 'LaunchConditions'),
+            @('LaunchConditions', 'RemoveExistingProducts'))) {
+            if ($sequence.ContainsKey($pair[0]) -and $sequence.ContainsKey($pair[1]) -and
+                $sequence[$pair[0]] -ge $sequence[$pair[1]]) {
+                $failures.Add("sequence order violated: $($pair[0])=$($sequence[$pair[0]]) !< $($pair[1])=$($sequence[$pair[1]])")
+            }
+        }
+        foreach ($name in @(
+            'RollbackMachineStoreProvision', 'ProvisionMachineStore', 'SeedDaemonConfig',
+            'SeedWorkerConfig', 'CommitMachineStoreProvision')) {
+            if ($conditions[$name] -cne 'NOT Installed') {
+                $failures.Add("$name condition must be NOT Installed; got '$($conditions[$name])'")
+            }
+        }
+        if ($conditions['UninstallMachineStore'] -cne
+            'REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE') {
+            $failures.Add("UninstallMachineStore condition mismatch: '$($conditions['UninstallMachineStore'])'")
+        }
+
+        $launchRows = @(Invoke-MsiQuery -Database $database -Columns 2 -Sql `
+            'SELECT `Condition`, `Description` FROM `LaunchCondition`')
+        if (@($launchRows | Where-Object {
+                $_[0] -ceq 'Installed OR NOT WIX_UPGRADE_DETECTED' -and
+                $_[1] -ceq $safeUpgradeMessage }).Count -ne 1) {
+            $failures.Add('required legacy-upgrade LaunchCondition/Description row is missing')
+        }
+
+        $legacyPropertyRows = @(Invoke-MsiQuery -Database $database -Columns 1 -Sql `
+            'SELECT `Property` FROM `Property` WHERE `Property`=''SBZ_DATADIR''')
+        if ($legacyPropertyRows.Count -ne 0) {
+            $failures.Add('legacy Property.SBZ_DATADIR row remains')
+        }
+
+        $allActionRows = @(Invoke-MsiQuery -Database $database -Columns 1 -Sql `
+            'SELECT `Action` FROM `CustomAction`')
+        $legacyActionRows = @($allActionRows | Where-Object {
+            [string]$_[0] -match '(?i)RemoveFoldersEx|MsiLockPermissionsEx'
+        })
+        if ($legacyActionRows.Count -ne 0) {
+            $failures.Add("legacy directory custom action row(s) remain: $(@($legacyActionRows | ForEach-Object { $_[0] }) -join ', ')")
+        }
+
+        foreach ($legacy in @(
+            [pscustomobject]@{ Table = 'Directory'; Column = 'Directory'; Values = @('DataFolder', 'ScratchFolder', 'CasFolder') },
+            [pscustomobject]@{ Table = 'Component'; Column = 'Component'; Values = @('DataFolderComp', 'ScratchFolderComp', 'CasFolderComp') },
+            [pscustomobject]@{ Table = 'CustomAction'; Column = 'Action'; Values = @('WixRemoveFoldersEx', 'MsiLockPermissionsEx') },
+            [pscustomobject]@{ Table = 'File'; Column = 'File'; Values = @('MachineStoreCtlBinary', 'StoreCtlExeFile') })) {
+            foreach ($value in $legacy.Values) {
+                $rows = @(Invoke-MsiQuery -Database $database -Columns 1 -Sql `
+                    "SELECT ``$($legacy.Column)`` FROM ``$($legacy.Table)`` WHERE ``$($legacy.Column)``='$value'")
+                if ($rows.Count -ne 0) {
+                    $failures.Add("legacy/external row remains: $($legacy.Table).$($legacy.Column)=$value")
+                }
+            }
+        }
+        $fileRows = @(Invoke-MsiQuery -Database $database -Columns 2 -Sql `
+            'SELECT `File`, `FileName` FROM `File`')
+        foreach ($row in $fileRows) {
+            if ([string]$row[0] -match '(?i)storectl' -or
+                [string]$row[1] -match '(?i)storectl') {
+                $failures.Add("storectl escaped into File table: File=$($row[0]) FileName=$($row[1])")
+            }
+        }
+
+        if ($failures.Count -ne 0) {
+            throw "MSI LIFECYCLE TABLE FAIL:`n - $($failures -join "`n - ")"
+        }
+        Write-Host "MSI LIFECYCLE TABLE PASS: embedded stream=$streamSize bytes, exact checked CA types, fresh/repair/uninstall sequencing, and upgrade block verified."
+    }
+    finally {
+        if ($null -ne $database) {
+            [Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) | Out-Null
+        }
+        [Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
+    }
 }
 
 function Assert-Administrator {
@@ -310,6 +595,54 @@ function Assert-ServicesRunning {
     }
 }
 
+function Get-StoreSnapshot {
+    param([string]$DataRoot)
+
+    $items = [Collections.Generic.List[object]]::new()
+    foreach ($path in @($DataRoot, (Join-Path $DataRoot 'scratch'), (Join-Path $DataRoot 'cas'))) {
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        $items.Add([ordered]@{
+            RelativePath = $item.FullName.Substring($DataRoot.Length).TrimStart('\')
+            Kind = 'Directory'
+            Sddl = (Get-Acl -LiteralPath $item.FullName).Sddl
+        })
+    }
+    foreach ($item in @(Get-ChildItem -LiteralPath $DataRoot -Force -Recurse -ErrorAction Stop |
+            Sort-Object FullName)) {
+        $relative = $item.FullName.Substring($DataRoot.Length).TrimStart('\')
+        if ($item.PSIsContainer) {
+            if ($relative -in @('scratch', 'cas')) { continue }
+            $items.Add([ordered]@{
+                RelativePath = $relative
+                Kind = 'Directory'
+                Sddl = (Get-Acl -LiteralPath $item.FullName).Sddl
+            })
+        } else {
+            $items.Add([ordered]@{
+                RelativePath = $relative
+                Kind = 'File'
+                Length = $item.Length
+                Hash = (Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256).Hash
+                Sddl = (Get-Acl -LiteralPath $item.FullName).Sddl
+            })
+        }
+    }
+    return ($items | ConvertTo-Json -Compress -Depth 5)
+}
+
+function Assert-CheckedActionsNotStarted {
+    param([string]$LogPath, [string[]]$Actions)
+
+    $log = Get-Content -LiteralPath $LogPath -Raw -ErrorAction Stop
+    $started = @($Actions | Where-Object {
+        [regex]::IsMatch($log, "(?im)Action start .*?:\s*$([regex]::Escape($_))\.")
+    })
+    if ($started.Count -ne 0) {
+        throw "repair unexpectedly started fresh/uninstall action(s): $($started -join ', ')"
+    }
+    Write-Host "REPAIR ACTION PASS: $($Actions.Count) lifecycle/seed actions did not start."
+}
+
 function New-StandardGateUser {
     param([string]$Name, [string]$Password)
 
@@ -372,7 +705,8 @@ function Assert-StandardUserDenied {
         [string]$CasRoot,
         [string]$DaemonConfig,
         [string]$WorkerConfig,
-        [string]$ProbeRoot
+        [string]$ProbeRoot,
+        [string]$StoreCtl
     )
 
     $paths = [ordered]@{
@@ -381,6 +715,8 @@ function Assert-StandardUserDenied {
         CasRoot = ConvertTo-SingleQuotedLiteral $CasRoot
         DaemonConfig = ConvertTo-SingleQuotedLiteral $DaemonConfig
         WorkerConfig = ConvertTo-SingleQuotedLiteral $WorkerConfig
+        StoreCtl = ConvertTo-SingleQuotedLiteral $StoreCtl
+        ProbeRoot = ConvertTo-SingleQuotedLiteral $ProbeRoot
     }
     $childScript = @"
 `$ErrorActionPreference = 'Stop'
@@ -407,7 +743,21 @@ function Test-AccessDenied([scriptblock]`$Action) {
 `$results.WorkerWrite = Test-AccessDenied { Add-Content -LiteralPath $($paths.WorkerConfig) -Value denied -ErrorAction Stop }
 `$results.ScratchCreate = Test-AccessDenied { Set-Content -LiteralPath (Join-Path $($paths.ScratchRoot) 'standard-user-scratch.probe') -Value denied -ErrorAction Stop }
 `$results.CasCreate = Test-AccessDenied { Set-Content -LiteralPath (Join-Path $($paths.CasRoot) 'standard-user-cas.probe') -Value denied -ErrorAction Stop }
-[pscustomobject]`$results | ConvertTo-Json -Compress
+`$results.StoreCtl = [ordered]@{}
+foreach (`$verb in @('provision', 'rollback-provision', 'commit-provision', 'uninstall')) {
+    `$verbTag = `$verb.Replace('-', '_')
+    `$verbOut = Join-Path $($paths.ProbeRoot) "storectl-`$verbTag.out"
+    `$verbErr = Join-Path $($paths.ProbeRoot) "storectl-`$verbTag.err"
+    `$attempt = Start-Process -FilePath $($paths.StoreCtl) -ArgumentList @(`$verb) `
+        -WorkingDirectory ([Environment]::SystemDirectory) -WindowStyle Hidden -Wait -PassThru `
+        -RedirectStandardOutput `$verbOut -RedirectStandardError `$verbErr
+    `$results.StoreCtl[`$verb] = [ordered]@{
+        ExitCode = `$attempt.ExitCode
+        Stdout = [string](Get-Content -LiteralPath `$verbOut -Raw -ErrorAction Stop)
+        Stderr = [string](Get-Content -LiteralPath `$verbErr -Raw -ErrorAction Stop)
+    }
+}
+[pscustomobject]`$results | ConvertTo-Json -Compress -Depth 5
 "@
     $scriptPath = Join-Path $ProbeRoot 'p.ps1'
     $stdout = Join-Path $ProbeRoot 'o.txt'
@@ -449,18 +799,30 @@ function Test-AccessDenied([scriptblock]`$Action) {
     if ($failed.Count -ne 0) {
         throw "standard user escaped ProgramData ACL: $($failed -join '; ')"
     }
-    Write-Host "STANDARD USER ACCESS PASS: root listing/config reads/root+config+scratch+cas writes all denied; user=$User"
+    foreach ($verb in @('provision', 'rollback-provision', 'commit-provision', 'uninstall')) {
+        $entry = $result.StoreCtl.PSObject.Properties[$verb].Value
+        if ([int]$entry.ExitCode -ne 3 -or [string]$entry.Stdout -cne '' -or
+            [string]$entry.Stderr -cnotmatch
+                '\Asembazuru-storectl: unauthorized\r?\n\z') {
+            throw "standard user storectl boundary failed: verb=$verb exit=$($entry.ExitCode) stdout='$($entry.Stdout)' stderr='$($entry.Stderr)'"
+        }
+    }
+    Write-Host "STANDARD USER ACCESS PASS: filesystem denied and all four storectl verbs exited 3 with exact unauthorized stderr; user=$User"
 }
 
 function Invoke-Msi {
     param(
-        [ValidateSet('Install', 'Uninstall')]
+        [ValidateSet('Install', 'Repair', 'Uninstall')]
         [string]$Action,
         [string]$Path,
         [string]$LogPath
     )
 
-    $verb = if ($Action -eq 'Install') { '/i' } else { '/x' }
+    $verb = switch ($Action) {
+        'Install' { '/i' }
+        'Repair' { '/fa' }
+        'Uninstall' { '/x' }
+    }
     return Start-Process -FilePath 'msiexec.exe' `
         -ArgumentList @($verb, "`"$Path`"", '/qn', '/norestart', '/l*v', "`"$LogPath`"") `
         -Wait -PassThru
@@ -515,11 +877,13 @@ function Wait-ForUninstallCleanup {
     throw "uninstall residue remained: $($residue -join '; ')"
 }
 
-Assert-StaticAclSource -Path $Source
+Assert-StaticLifecycleSource -Path $Source
 if ($Static) { return }
 
-Assert-Administrator
 $Msi = (Resolve-Path -LiteralPath $Msi -ErrorAction Stop).Path
+$StoreCtl = (Resolve-Path -LiteralPath $StoreCtl -ErrorAction Stop).Path
+Assert-MsiLifecycleTables -Path $Msi
+Assert-Administrator
 $commonData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
 $dataRoot = Join-Path $commonData 'Sembazuru'
@@ -538,6 +902,7 @@ $gatePassword = "SbZ!9a$tag"
 $callerProbeRoot = Join-Path $commonData "Sembazuru-M9-Acl-Probe-$tag"
 $logRoot = Join-Path ([IO.Path]::GetTempPath()) "sembazuru-m9-acl-$tag"
 $installLog = Join-Path $logRoot 'install.log'
+$repairLog = Join-Path $logRoot 'repair.log'
 $uninstallLog = Join-Path $logRoot 'uninstall.log'
 $installSucceeded = $false
 $createdGateUser = $false
@@ -589,10 +954,42 @@ try {
 
     $gateSid = New-StandardGateUser -Name $gateUser -Password $gatePassword
     New-StandardProbeRoot -Path $callerProbeRoot -UserSid $gateSid
+    $storeCtlProbe = Join-Path $callerProbeRoot 'sembazuru-storectl.exe'
+    Copy-Item -LiteralPath $StoreCtl -Destination $storeCtlProbe -Force -ErrorAction Stop
+    $storeCtlProbeHash = (Get-FileHash -LiteralPath $storeCtlProbe -Algorithm SHA256).Hash
+    if ($storeCtlProbeHash -cne (Get-FileHash -LiteralPath $StoreCtl -Algorithm SHA256).Hash) {
+        throw 'standard-user storectl probe copy does not match the supplied artifact'
+    }
+    $beforeStandardProbe = Get-StoreSnapshot -DataRoot $dataRoot
     Assert-StandardUserDenied -User $gateUser -Password $gatePassword -DataRoot $dataRoot `
         -ScratchRoot $scratchRoot -CasRoot $casRoot -DaemonConfig $daemonConfig `
-        -WorkerConfig $workerConfig -ProbeRoot $callerProbeRoot
+        -WorkerConfig $workerConfig -ProbeRoot $callerProbeRoot -StoreCtl $storeCtlProbe
+    if ($storeCtlProbeHash -cne
+        (Get-FileHash -LiteralPath $storeCtlProbe -Algorithm SHA256).Hash) {
+        throw 'standard-user storectl probe copy changed during authorization checks'
+    }
+    $afterStandardProbe = Get-StoreSnapshot -DataRoot $dataRoot
+    if ($beforeStandardProbe -cne $afterStandardProbe) {
+        throw 'standard-user storectl/filesystem probes changed the machine-store snapshot'
+    }
+    Write-Host 'STANDARD USER STORE PASS: recursive store/config/ACL snapshot is unchanged.'
     Write-Host "STANDARD USER SID: $gateSid"
+
+    $beforeRepair = Get-StoreSnapshot -DataRoot $dataRoot
+    $repair = Invoke-Msi -Action Repair -Path $Msi -LogPath $repairLog
+    if ($repair.ExitCode -notin @(0, 3010)) {
+        throw "MSI repair failed: exit=$($repair.ExitCode) log=$repairLog"
+    }
+    Assert-CheckedActionsNotStarted -LogPath $repairLog -Actions @(
+        'RollbackMachineStoreProvision', 'ProvisionMachineStore',
+        'CommitMachineStoreProvision', 'UninstallMachineStore',
+        'SeedDaemonConfig', 'SeedWorkerConfig')
+    $afterRepair = Get-StoreSnapshot -DataRoot $dataRoot
+    if ($beforeRepair -cne $afterRepair) {
+        throw 'MSI repair changed the recursive store/config/ACL snapshot'
+    }
+    Assert-ServicesRunning
+    Write-Host "MSI REPAIR PASS: exit=$($repair.ExitCode) store/config/ACL unchanged; services running; log=$repairLog"
 
     Write-Host 'WORKER CAPABILITY EVIDENCE: SembazuruWorker is Running under its virtual account; exact worker SID grants worker.toml RX and scratch/cas Modify. The packaged worker exposes no minimal self-probe for isolated filesystem operations.'
 }

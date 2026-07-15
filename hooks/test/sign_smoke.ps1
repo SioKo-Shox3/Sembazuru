@@ -14,14 +14,14 @@
 #
 # Generic over whatever signable artifacts the build produced. By default it signs
 # the C++ injector PEs (launcher.exe + the interceptor DLLs). M9.5e adds the
-# distributable signing surface: pass -RustDir to also sign the four shipped Rust
-# binaries (daemon/worker/launcher/GUI) and -Msi to sign the MSI itself — i.e. the
+# distributable signing surface: pass -RustDir to also sign the five shipped Rust
+# payloads (daemon/worker/launcher/GUI + embedded storectl) and -Msi to sign the MSI — i.e. the
 # whole "shipped set == signed set" the EDR disclosure promises. Same placeholder
 # cert proves the structure; a real release passes a real cert + -TimestampServer.
 param(
     [string]$BuildDir = (Join-Path $PSScriptRoot '..\build\Release'),
-    # Optional: also sign the Rust distributables from this dir. The four the MSI
-    # ships; the dev-only tools (sembazuru-agent, sembazuru-trace) are not signed
+    # Optional: also sign the Rust distributables from this dir. The five the MSI
+    # carries (four installed files plus embedded storectl); dev-only tools are not signed
     # because they are not shipped (DESIGN §7).
     [string]$RustDir = '',
     # Optional: also sign the built MSI (proves the MSI signing structure, M9.5e).
@@ -39,9 +39,11 @@ foreach ($n in @('launcher.exe', 'sbz_interceptor64.dll', 'sbz_interceptor32.dll
     $p = Join-Path $BuildDir $n
     if (Test-Path $p) { $targets += $p }
 }
-# The four Rust binaries the MSI ships (M9.5e). Dev-only tools are excluded.
+# The five Rust binaries the MSI carries (M9.5e). Dev-only tools are excluded.
 if ($RustDir) {
-    foreach ($n in @('sembazuru-daemon.exe', 'sembazuru-worker.exe', 'sembazuru.exe', 'sembazuru-gui.exe')) {
+    foreach ($n in @(
+        'sembazuru-daemon.exe', 'sembazuru-worker.exe', 'sembazuru.exe',
+        'sembazuru-gui.exe', 'sembazuru-storectl.exe')) {
         $p = Join-Path $RustDir $n
         if (Test-Path $p) { $targets += $p }
     }

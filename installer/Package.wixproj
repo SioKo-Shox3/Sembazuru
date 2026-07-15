@@ -19,18 +19,16 @@
   -->
   <PropertyGroup>
     <SbzRustTarget Condition="'$(SbzRustTarget)' == ''">$(MSBuildProjectDirectory)\..\target\release</SbzRustTarget>
+    <SbzStoreCtl Condition="'$(SbzStoreCtl)' == ''">$(SbzRustTarget)\sembazuru-storectl.exe</SbzStoreCtl>
     <SbzHooks Condition="'$(SbzHooks)' == ''">$(MSBuildProjectDirectory)\..\hooks\build\Release</SbzHooks>
     <SbzIntegration Condition="'$(SbzIntegration)' == ''">$(MSBuildProjectDirectory)\..\docs\integrations\msbuild</SbzIntegration>
     <SbzVersion Condition="'$(SbzVersion)' == ''">0.0.3</SbzVersion>
-    <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
+    <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);StoreCtl=$(SbzStoreCtl);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
     <!-- Firewall extension for the LAN listen-port exceptions (M9.5b). -->
     <PackageReference Include="WixToolset.Firewall.wixext" Version="5.0.2" />
-    <!-- Util extension for RemoveFolderEx (clean uninstall of the seeded config /
-         runtime data); ACLs use WiX core PermissionEx with protected SDDL (M9.5d). -->
-    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
   </ItemGroup>
 
 </Project>
