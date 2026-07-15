@@ -237,7 +237,7 @@ fn render_ruler(ui: &mut egui::Ui) {
             let x = rect.right() - rect.width() * age as f32 / 60.0;
             painter.line_segment(
                 [egui::pos2(x, rect.center().y), egui::pos2(x, rect.bottom())],
-                egui::Stroke::new(1.0, MUTED),
+                egui::Stroke::new(1.0_f32, MUTED),
             );
             let label = if age == 0 {
                 "Now".to_owned()
@@ -262,7 +262,7 @@ fn render_activity_band(ui: &mut egui::Ui, label: &str, activities: &[ActivityRo
             ui.allocate_exact_size(Vec2::new(TIMELINE_WIDTH, LANE_HEIGHT), Sense::hover());
         ui.painter().line_segment(
             [rect.right_top(), rect.right_bottom()],
-            egui::Stroke::new(1.0, MUTED),
+            egui::Stroke::new(1.0_f32, MUTED),
         );
         for activity in activities {
             let Some((left, width)) = bar_geometry(
