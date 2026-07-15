@@ -288,7 +288,9 @@ function Assert-PrepositionOwnership {
             throw "preposition object owner mismatch: got $actual, want $ExpectedSid"
         }
     }
-    if ([uint32]$LinkIdentity.ReparseTag -ne [uint32]0xa0000003) {
+    # IO_REPARSE_TAG_MOUNT_POINT (0xA0000003)
+    $MountPointTag = [uint32]2684354563
+    if ([uint32]$LinkIdentity.ReparseTag -ne $MountPointTag) {
         throw "canonical path is not a mount-point junction: tag=0x$(([uint32]$LinkIdentity.ReparseTag).ToString('x8'))"
     }
     if (([uint32]$LinkIdentity.Attributes -band [uint32]0x400) -eq 0) {
