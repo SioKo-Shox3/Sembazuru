@@ -172,24 +172,41 @@ function Get-TargetSnapshot {
     param([string]$TargetPath, [string]$SentinelPath)
 
     $native = [Sembazuru.PrepositionNative]::InspectNoFollow($TargetPath)
+    if (([uint32]$native.Attributes -band [uint32]0x10) -eq 0 -or
+        ([uint32]$native.Attributes -band [uint32]0x400) -ne 0) {
+        throw "pre-position target is not a regular non-reparse directory: attributes=0x$(([uint32]$native.Attributes).ToString('x8'))"
+    }
     $acl = Get-Acl -LiteralPath $TargetPath
-    $prefix = $TargetPath.TrimEnd('\') + '\'
-    $children = @(Get-ChildItem -LiteralPath $TargetPath -Force -Recurse | ForEach-Object {
-        $relative = $_.FullName.Substring($prefix.Length)
-        $kind = if ($_.PSIsContainer) { 'D' } else { 'F' }
-        $length = if ($_.PSIsContainer) { '-' } else { [string]$_.Length }
-        $hash = if ($_.PSIsContainer) { '-' } else {
-            (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-        }
-        "$kind|$relative|$length|$hash"
-    } | Sort-Object)
+    $expectedSentinelName = Split-Path -Leaf $SentinelPath
+    $directChildren = @(Get-ChildItem -LiteralPath $TargetPath -Force)
+    if ($directChildren.Count -ne 1 -or -not [string]::Equals(
+        $directChildren[0].Name, $expectedSentinelName,
+        [StringComparison]::OrdinalIgnoreCase)) {
+        $childNames = @($directChildren | ForEach-Object { $_.Name }) -join ', '
+        throw "pre-position target contains unexpected direct children: $childNames"
+    }
+    $sentinelNative = [Sembazuru.PrepositionNative]::InspectNoFollow($SentinelPath)
+    if (([uint32]$sentinelNative.Attributes -band [uint32]0x10) -ne 0 -or
+        ([uint32]$sentinelNative.Attributes -band [uint32]0x400) -ne 0) {
+        throw "pre-position sentinel is not a regular non-reparse file: attributes=0x$(([uint32]$sentinelNative.Attributes).ToString('x8'))"
+    }
+    $sentinelAcl = Get-Acl -LiteralPath $SentinelPath
+    $sentinelHash = (Get-FileHash -LiteralPath $SentinelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $children = @("F|$expectedSentinelName|$($directChildren[0].Length)|$sentinelHash")
     return [pscustomobject][ordered]@{
-        OwnerSid = Get-PathOwnerSid -Path $TargetPath
+        OwnerSid = $native.OwnerSid
         FileId = $native.FileId
+        TargetAttributes = $native.Attributes
+        TargetReparseTag = $native.ReparseTag
         DaclSddl = $acl.GetSecurityDescriptorSddlForm(
             [Security.AccessControl.AccessControlSections]::Access)
-        SentinelOwnerSid = Get-PathOwnerSid -Path $SentinelPath
-        SentinelSha256 = (Get-FileHash -LiteralPath $SentinelPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        SentinelOwnerSid = $sentinelNative.OwnerSid
+        SentinelFileId = $sentinelNative.FileId
+        SentinelAttributes = $sentinelNative.Attributes
+        SentinelReparseTag = $sentinelNative.ReparseTag
+        SentinelDaclSddl = $sentinelAcl.GetSecurityDescriptorSddlForm(
+            [Security.AccessControl.AccessControlSections]::Access)
+        SentinelSha256 = $sentinelHash
         Children = $children
     }
 }
@@ -241,17 +258,11 @@ New-Item -ItemType Junction -Path $junctionLiteral -Target $targetLiteral -Error
         -Credential $credential -LoadUserProfile -WorkingDirectory $ProbeRoot `
         -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
         -WindowStyle Hidden -Wait -PassThru
-    [string]$stderrText = if (Test-Path -LiteralPath $stderrPath) {
-        Get-Content -LiteralPath $stderrPath -Raw
-    } else { '<missing>' }
-    [string]$stdoutText = if (Test-Path -LiteralPath $stdoutPath) {
-        Get-Content -LiteralPath $stdoutPath -Raw
-    } else { '<missing>' }
-    if ($process.ExitCode -ne 0 -or $stderrText -ne '') {
-        throw "preposition user setup failed: exit=$($process.ExitCode) stderr=$stderrText stdout=$stdoutText"
+    return [pscustomobject][ordered]@{
+        ExitCode = $process.ExitCode
+        StdoutPath = $stdoutPath
+        StderrPath = $stderrPath
     }
-    try { return $stdoutText | ConvertFrom-Json }
-    catch { throw "preposition user setup JSON failed: $($_.Exception.Message); stdout=$stdoutText" }
 }
 
 function Assert-PrepositionOwnership {
@@ -491,11 +502,22 @@ try {
     New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
     $gateSid = New-StandardGateUser -Name $gateUser -Password $gatePassword
     New-StandardProbeRoot -Path $probeRoot -UserSid $gateSid
-    $setup = Invoke-UserPrepositionSetup -User $gateUser -Password $gatePassword `
+    $setupAttempt = Invoke-UserPrepositionSetup -User $gateUser -Password $gatePassword `
         -ProbeRoot $probeRoot -TargetPath $targetPath -SentinelPath $sentinelPath `
         -JunctionPath $canonicalDataRoot
     $junctionBaseline = Get-LinkIdentity -Path $canonicalDataRoot -ExpectedTarget $targetPath
     $targetBaseline = Get-TargetSnapshot -TargetPath $targetPath -SentinelPath $sentinelPath
+    [string]$stderrText = if (Test-Path -LiteralPath $setupAttempt.StderrPath) {
+        Get-Content -LiteralPath $setupAttempt.StderrPath -Raw
+    } else { '<missing>' }
+    [string]$stdoutText = if (Test-Path -LiteralPath $setupAttempt.StdoutPath) {
+        Get-Content -LiteralPath $setupAttempt.StdoutPath -Raw
+    } else { '<missing>' }
+    if ($setupAttempt.ExitCode -ne 0 -or -not [string]::IsNullOrWhiteSpace($stderrText)) {
+        throw "preposition user setup failed: exit=$($setupAttempt.ExitCode) stderr=$stderrText stdout=$stdoutText"
+    }
+    try { $setup = $stdoutText | ConvertFrom-Json }
+    catch { throw "preposition user setup JSON failed: $($_.Exception.Message); stdout=$stdoutText" }
     Assert-PrepositionOwnership -ExpectedSid $gateSid -SetupResult $setup `
         -TargetSnapshot $targetBaseline -LinkIdentity $junctionBaseline
     $baselineResidue = @(Get-InstallResidue -DataRoot $canonicalDataRoot `
@@ -647,7 +669,16 @@ finally {
                 if (-not (Test-Path -LiteralPath $targetPath -PathType Container)) {
                     throw 'pre-position target disappeared during junction unlink'
                 }
-                Write-Host 'JUNCTION CLEANUP PASS: RemoveDirectoryW unlinked canonical path; target remains.'
+                if ($null -eq $targetBaseline) {
+                    throw 'pre-position target baseline is unavailable after junction unlink'
+                }
+                $targetAfterUnlink = Get-TargetSnapshot -TargetPath $targetPath `
+                    -SentinelPath $sentinelPath
+                if ((ConvertTo-StableJson $targetBaseline) -cne
+                    (ConvertTo-StableJson $targetAfterUnlink)) {
+                    throw 'pre-position target snapshot changed before probe-root cleanup'
+                }
+                Write-Host 'JUNCTION CLEANUP PASS: canonical path unlinked; full target snapshot unchanged.'
             }
             catch { $cleanupErrors.Add("junction unlink verification failed: $($_.Exception.Message)") }
         }
