@@ -19,6 +19,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOptions};
 use tokio_stream::Stream;
 use tonic::transport::server::Connected;
+use windows_service::service::{ServiceAccess, ServiceState, ServiceType};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
 };
@@ -559,6 +561,183 @@ fn current_process_sid() -> io::Result<String> {
     token_sid(token.as_raw_handle() as HANDLE).map_err(|error| error.to_io_error())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerSidLookupStage {
+    OpenProcess,
+    OpenProcessToken,
+    TokenUser,
+}
+
+impl fmt::Display for ServerSidLookupStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+#[derive(Debug)]
+struct ServerSidLookupError {
+    stage: ServerSidLookupStage,
+    process_id: u32,
+    error: io::Error,
+}
+
+impl fmt::Display for ServerSidLookupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({}): {}", self.stage, self.process_id, self.error)
+    }
+}
+
+impl std::error::Error for ServerSidLookupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[derive(Debug)]
+struct ScmAttestationError {
+    direct: ServerSidLookupError,
+    scm: io::Error,
+}
+
+impl fmt::Display for ScmAttestationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; SCM attestation failed: {}", self.direct, self.scm)
+    }
+}
+
+impl std::error::Error for ScmAttestationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.direct)
+    }
+}
+
+fn route_server_sid<F>(
+    direct: Result<String, ServerSidLookupError>,
+    attest: F,
+) -> io::Result<String>
+where
+    F: FnOnce(u32) -> io::Result<String>,
+{
+    match direct {
+        Ok(sid) => Ok(sid),
+        Err(error)
+            if error.stage == ServerSidLookupStage::OpenProcess
+                && error.error.raw_os_error() == Some(5) =>
+        {
+            let process_id = error.process_id;
+            attest(process_id).map_err(|scm| {
+                let kind = error.error.kind();
+                io::Error::new(kind, ScmAttestationError { direct: error, scm })
+            })
+        }
+        Err(error) => {
+            let kind = error.error.kind();
+            Err(io::Error::new(kind, error))
+        }
+    }
+}
+
+fn direct_server_process_sid(process_id: u32) -> Result<String, ServerSidLookupError> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        let error = io::Error::last_os_error();
+        return Err(ServerSidLookupError {
+            stage: ServerSidLookupStage::OpenProcess,
+            process_id,
+            error,
+        });
+    }
+    let process = unsafe { OwnedHandle::from_raw_handle(process as RawHandle) };
+    let mut token = null_mut();
+    let token_ok =
+        unsafe { OpenProcessToken(process.as_raw_handle() as HANDLE, TOKEN_QUERY, &mut token) };
+    if token_ok == 0 {
+        return Err(ServerSidLookupError {
+            stage: ServerSidLookupStage::OpenProcessToken,
+            process_id,
+            error: io::Error::last_os_error(),
+        });
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token as RawHandle) };
+    token_sid(token.as_raw_handle() as HANDLE).map_err(|error| ServerSidLookupError {
+        stage: ServerSidLookupStage::TokenUser,
+        process_id,
+        error: error.to_io_error(),
+    })
+}
+
+struct ServiceAttestationFacts<'a> {
+    process_id: u32,
+    status1_state: ServiceState,
+    status1_pid: Option<u32>,
+    status1_type: ServiceType,
+    config_type: ServiceType,
+    account_name: Option<&'a std::ffi::OsStr>,
+    status2_state: ServiceState,
+    status2_pid: Option<u32>,
+    status2_type: ServiceType,
+}
+
+fn validate_service_attestation(facts: &ServiceAttestationFacts<'_>) -> Result<(), &'static str> {
+    if facts.process_id == 0 {
+        return Err("pipe server PID is zero");
+    }
+    if facts.status1_state != ServiceState::Running || facts.status2_state != ServiceState::Running
+    {
+        return Err("service was not Running in both status queries");
+    }
+    if facts.status1_pid != Some(facts.process_id) || facts.status2_pid != Some(facts.process_id) {
+        return Err("service PID did not stably match the pipe server PID");
+    }
+    if facts.status1_type != ServiceType::OWN_PROCESS
+        || facts.config_type != ServiceType::OWN_PROCESS
+        || facts.status2_type != ServiceType::OWN_PROCESS
+    {
+        return Err("service type was not exactly OWN_PROCESS in all queries");
+    }
+    if facts.account_name != Some(std::ffi::OsStr::new("LocalSystem")) {
+        return Err("service account was not exactly LocalSystem");
+    }
+    Ok(())
+}
+
+fn scm_error(context: &str, error: impl fmt::Display) -> io::Error {
+    io::Error::other(format!("{context}: {error}"))
+}
+
+fn attest_system_service_process(process_id: u32) -> io::Result<String> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+        .map_err(|error| scm_error("open local ServiceManager", error))?;
+    let service = manager
+        .open_service(
+            crate::service::SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG,
+        )
+        .map_err(|error| scm_error("open SembazuruDaemon service", error))?;
+    let status1 = service
+        .query_status()
+        .map_err(|error| scm_error("query service status 1", error))?;
+    let config = service
+        .query_config()
+        .map_err(|error| scm_error("query service config", error))?;
+    let status2 = service
+        .query_status()
+        .map_err(|error| scm_error("query service status 2", error))?;
+    validate_service_attestation(&ServiceAttestationFacts {
+        process_id,
+        status1_state: status1.current_state,
+        status1_pid: status1.process_id,
+        status1_type: status1.service_type,
+        config_type: config.service_type,
+        account_name: config.account_name.as_deref(),
+        status2_state: status2.current_state,
+        status2_pid: status2.process_id,
+        status2_type: status2.service_type,
+    })
+    .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))?;
+    Ok(LOCAL_SYSTEM_SID.to_owned())
+}
+
 #[cfg(test)]
 pub(crate) fn process_sid_for_test(process_id: u32) -> io::Result<String> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
@@ -589,28 +768,10 @@ fn server_process_sid(pipe: HANDLE) -> io::Result<String> {
         ));
     }
 
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
-    if process.is_null() {
-        return Err(io::Error::new(
-            io::Error::last_os_error().kind(),
-            format!("OpenProcess({process_id}): {}", io::Error::last_os_error()),
-        ));
-    }
-    let process = unsafe { OwnedHandle::from_raw_handle(process as RawHandle) };
-    let mut token = null_mut();
-    let token_ok =
-        unsafe { OpenProcessToken(process.as_raw_handle() as HANDLE, TOKEN_QUERY, &mut token) };
-    if token_ok == 0 {
-        return Err(io::Error::new(
-            io::Error::last_os_error().kind(),
-            format!(
-                "OpenProcessToken({process_id}): {}",
-                io::Error::last_os_error()
-            ),
-        ));
-    }
-    let token = unsafe { OwnedHandle::from_raw_handle(token as RawHandle) };
-    token_sid(token.as_raw_handle() as HANDLE).map_err(|error| error.to_io_error())
+    route_server_sid(
+        direct_server_process_sid(process_id),
+        attest_system_service_process,
+    )
 }
 
 fn token_sid(token: HANDLE) -> Result<String, AuthError> {
@@ -677,6 +838,8 @@ fn wide_null(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::ffi::OsStr;
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::os::windows::io::{AsRawHandle, RawHandle};
@@ -726,6 +889,139 @@ mod tests {
         };
         assert_ne!(ok, 0, "CreateWellKnownSid({kind}) failed");
         sid
+    }
+
+    fn lookup_failure(stage: ServerSidLookupStage, error: io::Error) -> ServerSidLookupError {
+        ServerSidLookupError {
+            stage,
+            process_id: 7264,
+            error,
+        }
+    }
+
+    #[test]
+    fn scm_routing_is_only_for_open_process_raw_access_denied() {
+        let calls = Cell::new(0);
+        let sid = route_server_sid(Ok("direct-sid".into()), |_| {
+            calls.set(calls.get() + 1);
+            Ok(LOCAL_SYSTEM_SID.into())
+        })
+        .unwrap();
+        assert_eq!(sid, "direct-sid");
+        assert_eq!(calls.get(), 0);
+
+        let sid = route_server_sid(
+            Err(lookup_failure(
+                ServerSidLookupStage::OpenProcess,
+                io::Error::from_raw_os_error(5),
+            )),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(LOCAL_SYSTEM_SID.into())
+            },
+        )
+        .unwrap();
+        assert_eq!(sid, LOCAL_SYSTEM_SID);
+        assert_eq!(calls.get(), 1);
+        let error = route_server_sid(
+            Err(lookup_failure(
+                ServerSidLookupStage::OpenProcess,
+                io::Error::from_raw_os_error(5),
+            )),
+            |_| Err(io::Error::other("SCM query sentinel")),
+        )
+        .unwrap_err();
+        assert!(error.get_ref().unwrap().source().is_some());
+        let error = error.to_string();
+        assert!(error.contains("OpenProcess(7264)"));
+        assert!(error.contains("os error 5"));
+        assert!(error.contains("SCM query sentinel"));
+        for (stage, error) in [
+            (
+                ServerSidLookupStage::OpenProcess,
+                io::Error::new(io::ErrorKind::PermissionDenied, "no raw code"),
+            ),
+            (
+                ServerSidLookupStage::OpenProcessToken,
+                io::Error::from_raw_os_error(5),
+            ),
+            (
+                ServerSidLookupStage::TokenUser,
+                io::Error::from_raw_os_error(5),
+            ),
+            (
+                ServerSidLookupStage::OpenProcess,
+                io::Error::from_raw_os_error(87),
+            ),
+        ] {
+            assert!(
+                route_server_sid(Err(lookup_failure(stage, error)), |_| {
+                    calls.set(calls.get() + 1);
+                    Ok(LOCAL_SYSTEM_SID.into())
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    fn valid_attestation(pid: u32) -> ServiceAttestationFacts<'static> {
+        ServiceAttestationFacts {
+            process_id: pid,
+            status1_state: ServiceState::Running,
+            status1_pid: Some(pid),
+            status1_type: ServiceType::OWN_PROCESS,
+            config_type: ServiceType::OWN_PROCESS,
+            account_name: Some(OsStr::new("LocalSystem")),
+            status2_state: ServiceState::Running,
+            status2_pid: Some(pid),
+            status2_type: ServiceType::OWN_PROCESS,
+        }
+    }
+
+    #[test]
+    fn system_service_attestation_requires_exact_stable_facts() {
+        let pid = 7264;
+        assert!(validate_service_attestation(&valid_attestation(pid)).is_ok());
+
+        let mut invalid = valid_attestation(pid);
+        invalid.status1_type = ServiceType::SHARE_PROCESS;
+        assert!(validate_service_attestation(&invalid).is_err());
+        invalid = valid_attestation(pid);
+        invalid.status2_type = ServiceType::OWN_PROCESS | ServiceType::INTERACTIVE_PROCESS;
+        assert!(validate_service_attestation(&invalid).is_err());
+        invalid = valid_attestation(pid);
+        invalid.config_type = ServiceType::SHARE_PROCESS;
+        assert!(validate_service_attestation(&invalid).is_err());
+
+        for state in [ServiceState::StartPending, ServiceState::Stopped] {
+            invalid = valid_attestation(pid);
+            invalid.status1_state = state;
+            assert!(validate_service_attestation(&invalid).is_err());
+            invalid = valid_attestation(pid);
+            invalid.status2_state = state;
+            assert!(validate_service_attestation(&invalid).is_err());
+        }
+        for bad_pid in [None, Some(0), Some(pid + 1)] {
+            invalid = valid_attestation(pid);
+            invalid.status1_pid = bad_pid;
+            assert!(validate_service_attestation(&invalid).is_err());
+            invalid = valid_attestation(pid);
+            invalid.status2_pid = bad_pid;
+            assert!(validate_service_attestation(&invalid).is_err());
+        }
+        for account in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("localsystem")),
+            Some(OsStr::new("NT AUTHORITY\\SYSTEM")),
+            Some(OsStr::new("NT AUTHORITY\\NetworkService")),
+            Some(OsStr::new("NT SERVICE\\SembazuruDaemon")),
+        ] {
+            invalid = valid_attestation(pid);
+            invalid.account_name = account;
+            assert!(validate_service_attestation(&invalid).is_err());
+        }
     }
 
     unsafe fn ace_mask_for(dacl: *mut ACL, wanted_sid: &[u8], ace_count: u32) -> Option<u32> {
