@@ -97,7 +97,60 @@ function Invoke-LauncherAsUser {
     } else {
         ''
     }
-    return @{ ExitCode = $process.ExitCode; Note = $note }
+    $stdoutText = if (Test-Path -LiteralPath $stdout) {
+        Get-Content -LiteralPath $stdout -Raw
+    } else {
+        ''
+    }
+    $sidExists = Test-Path -LiteralPath $SidPath
+    $sidValue = if ($sidExists) { (Get-Content -LiteralPath $SidPath -Raw).Trim() } else { '' }
+    return @{
+        ExitCode = $process.ExitCode
+        Note = $note
+        Stdout = $stdoutText
+        SidExists = $sidExists
+        SidValue = $sidValue
+        LauncherProcessId = $process.Id
+    }
+}
+
+function Get-LocalIntakeAttemptJson {
+    param([int]$Attempt, [string]$User, [hashtable]$Run)
+    $serviceState = 'absent'
+    $serviceProcessId = $null
+    $serviceExitCode = $null
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction Stop
+        if ($null -ne $service) {
+            $serviceState = $service.State
+            $serviceProcessId = $service.ProcessId
+            $serviceExitCode = $service.ExitCode
+        }
+    }
+    catch {
+        $serviceState = "CIM failed: $($_.Exception.Message)"
+    }
+    try {
+        $canonicalPipeExists = [IO.Directory]::GetFiles('\\.\pipe\') -contains `
+            '\\.\pipe\Sembazuru.LocalIntake.v1'
+    }
+    catch {
+        $canonicalPipeExists = "pipe enumeration failed: $($_.Exception.Message)"
+    }
+    return [ordered]@{
+        attempt = $Attempt
+        user = $User
+        ExitCode = $Run.ExitCode
+        Note = $Run.Note
+        Stdout = $Run.Stdout
+        SidExists = $Run.SidExists
+        SidValue = $Run.SidValue
+        LauncherProcessId = $Run.LauncherProcessId
+        ServiceState = $serviceState
+        ServiceProcessId = $serviceProcessId
+        ServiceExitCode = $serviceExitCode
+        CanonicalPipeExists = $canonicalPipeExists
+    } | ConvertTo-Json -Compress
 }
 
 function Invoke-DaemonFallbackAsUser {
@@ -106,6 +159,7 @@ function Invoke-DaemonFallbackAsUser {
         [string]$Password,
         [string]$SidPath
     )
+    $lastAttemptJson = $null
     for ($attempt = 1; $attempt -le 30; $attempt++) {
         $run = Invoke-LauncherAsUser $User $Password $SidPath "daemon-$User-$attempt"
         if ($run.ExitCode -eq 0 -and
@@ -114,9 +168,20 @@ function Invoke-DaemonFallbackAsUser {
             (Test-Path -LiteralPath $SidPath)) {
             return $run
         }
+        try {
+            $lastAttemptJson = Get-LocalIntakeAttemptJson $attempt $User $run
+        }
+        catch {
+            $lastAttemptJson = [ordered]@{
+                attempt = $attempt
+                user = $User
+                DiagnosticError = $_.Exception.Message
+            } | ConvertTo-Json -Compress
+        }
+        Write-Host "LOCALINTAKE ATTEMPT $lastAttemptJson"
         Start-Sleep -Milliseconds 250
     }
-    throw "launcher for $User never reached daemon-side local fallback"
+    throw "launcher for $User never reached daemon-side local fallback; last attempt: $lastAttemptJson"
 }
 
 function Format-CleanupError([object]$Record) {
