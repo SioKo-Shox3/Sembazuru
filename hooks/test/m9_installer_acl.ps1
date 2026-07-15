@@ -696,10 +696,8 @@ function New-StandardProbeRoot {
     }
 }
 
-function Assert-StandardUserDenied {
+function New-StandardUserProbeScript {
     param(
-        [string]$User,
-        [string]$Password,
         [string]$DataRoot,
         [string]$ScratchRoot,
         [string]$CasRoot,
@@ -718,7 +716,7 @@ function Assert-StandardUserDenied {
         StoreCtl = ConvertTo-SingleQuotedLiteral $StoreCtl
         ProbeRoot = ConvertTo-SingleQuotedLiteral $ProbeRoot
     }
-    $childScript = @"
+    return @"
 `$ErrorActionPreference = 'Stop'
 function Test-AccessDenied([scriptblock]`$Action) {
     try {
@@ -748,9 +746,17 @@ foreach (`$verb in @('provision', 'rollback-provision', 'commit-provision', 'uni
     `$verbTag = `$verb.Replace('-', '_')
     `$verbOut = Join-Path $($paths.ProbeRoot) "storectl-`$verbTag.out"
     `$verbErr = Join-Path $($paths.ProbeRoot) "storectl-`$verbTag.err"
-    `$attempt = Start-Process -FilePath $($paths.StoreCtl) -ArgumentList @(`$verb) `
-        -WorkingDirectory ([Environment]::SystemDirectory) -WindowStyle Hidden -Wait -PassThru `
-        -RedirectStandardOutput `$verbOut -RedirectStandardError `$verbErr
+    `$startArguments = @{
+        FilePath = $($paths.StoreCtl)
+        ArgumentList = @(`$verb)
+        WorkingDirectory = [Environment]::SystemDirectory
+        WindowStyle = 'Hidden'
+        Wait = `$true
+        PassThru = `$true
+        RedirectStandardOutput = `$verbOut
+        RedirectStandardError = `$verbErr
+    }
+    `$attempt = Start-Process @startArguments
     `$results.StoreCtl[`$verb] = [ordered]@{
         ExitCode = `$attempt.ExitCode
         Stdout = [string](Get-Content -LiteralPath `$verbOut -Raw -ErrorAction Stop)
@@ -759,6 +765,54 @@ foreach (`$verb in @('provision', 'rollback-provision', 'commit-provision', 'uni
 }
 [pscustomobject]`$results | ConvertTo-Json -Compress -Depth 5
 "@
+}
+
+function Assert-StandardUserProbeScriptParses {
+    param([string]$Script)
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseInput(
+        $Script, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) {
+        throw "generated standard-user probe parse failed: $(@($parseErrors | ForEach-Object { $_.Message }) -join '; ')"
+    }
+    $commands = @($ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst]
+    }, $true))
+    $detachedParameters = @($commands | Where-Object {
+        $null -ne $_.GetCommandName() -and $_.GetCommandName().StartsWith('-')
+    })
+    if ($detachedParameters.Count -ne 0) {
+        throw "generated standard-user probe contains detached parameter command(s): $(@($detachedParameters | ForEach-Object { $_.GetCommandName() }) -join ', ')"
+    }
+    $startProcessCommands = @($commands | Where-Object {
+        $_.GetCommandName() -eq 'Start-Process'
+    })
+    if ($startProcessCommands.Count -ne 1) {
+        throw "generated standard-user probe must contain one Start-Process command; found $($startProcessCommands.Count)"
+    }
+    Write-Host 'STANDARD USER CHILD PARSE PASS: generated script has one splatted Start-Process and no detached parameter commands.'
+}
+
+function Assert-StandardUserDenied {
+    param(
+        [string]$User,
+        [string]$Password,
+        [string]$DataRoot,
+        [string]$ScratchRoot,
+        [string]$CasRoot,
+        [string]$DaemonConfig,
+        [string]$WorkerConfig,
+        [string]$ProbeRoot,
+        [string]$StoreCtl
+    )
+
+    $childScript = New-StandardUserProbeScript -DataRoot $DataRoot `
+        -ScratchRoot $ScratchRoot -CasRoot $CasRoot -DaemonConfig $DaemonConfig `
+        -WorkerConfig $WorkerConfig -ProbeRoot $ProbeRoot -StoreCtl $StoreCtl
+    Assert-StandardUserProbeScriptParses -Script $childScript
     $scriptPath = Join-Path $ProbeRoot 'p.ps1'
     $stdout = Join-Path $ProbeRoot 'o.txt'
     $stderr = Join-Path $ProbeRoot 'e.txt'
@@ -878,6 +932,15 @@ function Wait-ForUninstallCleanup {
 }
 
 Assert-StaticLifecycleSource -Path $Source
+$staticChildScript = New-StandardUserProbeScript `
+    -DataRoot 'C:\ProgramData\Sembazuru' `
+    -ScratchRoot 'C:\ProgramData\Sembazuru\scratch' `
+    -CasRoot 'C:\ProgramData\Sembazuru\cas' `
+    -DaemonConfig 'C:\ProgramData\Sembazuru\daemon.toml' `
+    -WorkerConfig 'C:\ProgramData\Sembazuru\worker.toml' `
+    -ProbeRoot "C:\ProgramData\Sembazuru Probe\operator's" `
+    -StoreCtl "C:\ProgramData\Sembazuru Probe\operator's\sembazuru-storectl.exe"
+Assert-StandardUserProbeScriptParses -Script $staticChildScript
 if ($Static) { return }
 
 $Msi = (Resolve-Path -LiteralPath $Msi -ErrorAction Stop).Path
