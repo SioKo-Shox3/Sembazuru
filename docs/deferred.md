@@ -72,7 +72,7 @@ execution_endpoint 乗っ取りも閉じた（`upsert_register` の first-regist
 | COR-005 | P0 | **CLOSED** | weak key に cwd・schema version＋**解決済みコンパイラ binary の content digest**（同名更新で invalidation, PR#1/#2）。heterogeneous で agent≠worker の別 cl を閉じる **worker 再検証も実装済み**（worker が起動 binary を自機 digest し `ExitStatus.resolved_tool_digest`(proto field 5) で報告→agent が weak key の toolchain digest と record ゲートで照合・不一致/未報告は非記録。Pass A a19c125＋Pass B cd7b8dc、2026-06-29、Codex+verifier(opus) 二重レビュー＋CI hooks M4/M6 で homogeneous 命中継続を確認） |
 | COR-006 | P1 | **CLOSED** | temp 中間物 heuristic を厳格化（`\temp\` 広域 fallback 除去, PR#1） |
 | COR-007 | P0 | **CLOSED** | 出力公開を set-atomic＋get_verified＋有界 memory／stdout-stderr の CAS 記録＆hit 時 replay（PR#1/#2） |
-| SEC-001 | P0 | **PARTIAL→繰延(B-machine)** | 暫定: 無認証 Status 書込み RPC を default-deny opt-in 化済み（PR#1）。本道＝**named-pipe transport＋`ImpersonateNamedPipeClient`＋非 LocalSystem 既定**で local EoP→SYSTEM を閉じる。実 Windows サービス＋2 ユーザー SID＋DACL＋EDR 申請を要し当環境で実装・検証不能＝M9.5/M10・lead（`docs/handoff/lead-actions.md` §3） |
+| SEC-001 | P0 | **実装済み／clean CI待ち** | commit `68e5422`: production LocalIntake を protected machine-wide named pipe 化し、双方向 SID 検証、caller impersonation、restricted primary token、`CreateProcessAsUserW`、ambient-token retry 禁止を実装。Status/Admin は別面を維持。ローカル unit/workspace/fmt/clippy/release/cargo-deny と二重レビューは成功。clean Windows の LocalSystem＋標準ユーザー A/B job が緑になるまで CLOSED にしない（ADR 0016） |
 | SEC-002 | P0 | **CLOSED** | worker plain-spawn が継承 env の `SEMBAZURU_*` を除去（PR#1） |
 | SEC-003 | P1 | **CLOSED** | WriteBack を within-root に scope（agent 権威, PR#1） |
 | SEC-004 | P1 | **CLOSED** | fileserver が worker 申告 root を無視し agent 権威 root を使用（PR#1） |
@@ -86,7 +86,7 @@ execution_endpoint 乗っ取りも閉じた（`upsert_register` の first-regist
 | TEST-001 | P2 | **PARTIAL→残=非 admin のみ** | cache 正当性ゲートの大半はユニットテスト済み＋codec 決定的 fuzz（c6cb607）。**supply-chain CI 実装・CI 緑**（cargo-deny advisories/licenses/bans/sources＋`deny.toml`・CycloneDX SBOM・C++ hooks の CodeQL、SHA-pin、b480b28、CI #109＋CodeQL run success）。**property-based fuzzing harness 実装・CI 緑**（proptest で dataplane wire/ops decode＋cas ActionResult codec の no-panic＋round-trip、f159b41、workspace 303）。SHA-pin は 8584537 で済。**残り＝security 非 admin 系のみ**（2 ユーザー/admin 権限の B-machine、当環境で安全に検証不能） |
 | DOC-001 | P3 | **CLOSED** | 本ステータス表が指摘状態を同期（doc とコードの整合） |
 
-**未クローズで実装が残るのは実 Windows サービス/2 ユーザー/EDR に依存する 2 件のみ**: SEC-001 本道（named-pipe transport＋`ImpersonateNamedPipeClient`＋非 LocalSystem・要実機 M9.5/M10）、TEST-001 の security 非 admin 系テスト（2 ユーザー/admin の B-machine）。いずれも当環境で安全に検証不能＝lead/後続マイルストーン（検証できない特権分離コードは非交渉 #1 により実装しない）。それ以外は全て CLOSED または現脅威モデルで受容（DEFERRED-ACCEPTED）。2026-06-29 にクローズ: **COR-004**（既定 cache off／verified-only、9c56295＋34895dc）、**COR-005** heterogeneous worker 再検証（worker digest 報告→agent 照合、a19c125＋cd7b8dc）、**TEST-001 の supply-chain CI**（cargo-deny＋SBOM＋CodeQL、b480b28）と **property-based fuzzing harness**（proptest no-panic、f159b41）。いずれも CI（#106/#107/#109＋CodeQL run）緑。
+**未クローズの実機依存検証は 2 件**: SEC-001 は本格策を commit `68e5422` で実装済みだが clean Windows の LocalSystem＋標準ユーザー A/B CI 待ち、TEST-001 は security 非 admin 系テスト（2 ユーザー/admin の B-machine）待ち。それ以外は全て CLOSED または現脅威モデルで受容（DEFERRED-ACCEPTED）。2026-06-29 にクローズ: **COR-004**（既定 cache off／verified-only、9c56295＋34895dc）、**COR-005** heterogeneous worker 再検証（worker digest 報告→agent 照合、a19c125＋cd7b8dc）、**TEST-001 の supply-chain CI**（cargo-deny＋SBOM＋CodeQL、b480b28）と **property-based fuzzing harness**（proptest no-panic、f159b41）。いずれも CI（#106/#107/#109＋CodeQL run）緑。
 
 ---
 
@@ -302,10 +302,10 @@ execution_endpoint 乗っ取りも閉じた（`upsert_register` の first-regist
 ## M6（ビルドシステム統合 / Integrations）
 
 ### M6.0 実装後の既知の残リスク（quality gates 2026-06-14）
-- **解消（M6.0 で fix）: LocalIntake の非ループバック bind 拒否。** intake は提出された任意コマンドを
-  実行し無認証（M7）。`SEMBAZURU_INTAKE=0.0.0.0:...` で無認証リモート RCE になりうるため、daemon 起動時に
-  `resolve_loopback_intake` で非ループバックを拒否（ランチャは常に 127.0.0.1 を叩くため無コスト）。
-  Coordination/fileserver は worker 用 LAN 到達が要るため非ガード。出所: security(M6.0 MEDIUM)。
+- **M6.0 の loopback 緩和を M7 で置換（commit `68e5422`）。** M6.0 は無認証 intake の非-loopback bind を
+  拒否しただけだった。現行 Windows production は protected machine-wide named pipe、双方向 SID 検証、caller
+  restricted token に移行し、TCP endpoint は明示 test fixture のみ。clean Windows A/B CI 待ちのため SEC-001 は
+  未クローズ。Coordination/fileserver は worker 用 LAN 到達が必要な別プレーンである。
 - **worker が stdout/stderr を捕捉しない（実コンパイラ診断が消える）。** `crates/worker/src/lib.rs` の
   `run_action` は stdin のみ null 化し stdout/stderr は継承。リモート実行時、警告/エラーが worker コンソールへ
   出て開発者に見えない。M6.0 自明ゲート（`cmd /c exit N`）では無害だが、**M6.1 の実コンパイルで診断ミラーが必須**
@@ -316,8 +316,9 @@ execution_endpoint 乗っ取りも閉じた（`upsert_register` の first-regist
   M6.1（リモート到達前）に「コンパイラ関連 env のみ」allowlist/denylist を検討。出所: security(M6.0 LOW)。
 - **intake 直 dispatch に admission 上限なし。** `IntakeService::submit_action` は per-call の `mpsc::channel(8)` の
   外側に同時 SubmitAction 数の上限を持たず、各 dispatch が（worker 不在時）`run_local` で実 OS プロセスを起こす。
-  intake flood → ローカルプロセス storm。loopback 強制で攻撃面はローカルに限定されるため M7（または非ループバック化
-  時に必須）で `run_build` 同様の semaphore ゲートを intake 層に。出所: security(M6.0 LOW)。
+  intake flood → ローカルプロセス storm。現行 pipe は caller を認証し SYSTEM 昇格を閉じるが、認証済み local caller
+  自身による resource exhaustion は別件として残る。`run_build` 同様の semaphore ゲートを intake 層に検討する。
+  出所: security(M6.0 LOW)。
 - **ランチャの run_local 失敗が bare -1 で原因を握り潰す。** daemon 不達＋コンパイラ不在時、メッセージが
   daemon を誤って責め、`run_local` の実エラー（program not found 等）が捨てられ exit -1。ビルドは正しく失敗するが
   診断が誤誘導。M6.1 で run_local エラーを surface。出所: verifier(M6.0 #2)。

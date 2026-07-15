@@ -14,8 +14,9 @@
 //!     [`WorkerTable`], the file-server stats, and the CAS size into one
 //!     `GetStatus` snapshot for the GUI.
 //!
-//! Like LocalIntake this plane is **loopback-only** (the daemon binds it through
-//! [`crate::intake::require_loopback`]): it exposes operational state to a
+//! This plane is **loopback-only** (the daemon binds it through
+//! [`crate::intake::require_loopback`]) and remains separate from the production
+//! LocalIntake authenticated named pipe. It exposes operational state to a
 //! same-machine GUI, never to workers, so it stays off the LAN-reachable
 //! Coordination port and the GUI needs no cluster token (ADR 0008 §4). Read-only
 //! in M9.1; the config/eviction admin RPCs arrive with M9.2/M9.3.
@@ -150,23 +151,24 @@ pub struct StatusState {
     /// write (M9.3a). The GUI edits this file; the daemon applies it on next start.
     pub config_path: PathBuf,
     /// Whether the **mutating** Status RPCs (`SetConfig`, `TriggerEviction`) are
-    /// allowed (SEC-001 interim, ADR 0016). Default **false**: the Status plane is
+    /// allowed (SEC-001, ADR 0016). Default **false**: the Status plane is
     /// loopback-TCP with no caller authentication, so a low-privilege local user
     /// could otherwise call `SetConfig` to clear the cluster token (disabling LAN
     /// auth) or rewrite listen addresses. Read-only RPCs (`GetStatus`/`GetConfig`)
-    /// stay open. An operator opts in via `SEMBAZURU_STATUS_ADMIN=1` /
-    /// `status_admin = true` until the named-pipe + caller-SID transport lands (the
-    /// full SEC-001 fix). The read/admin pipe split is the durable replacement.
+    /// stay open. Unlike the production LocalIntake authenticated named pipe,
+    /// Status remains a separate loopback-TCP plane, so mutating RPCs are denied
+    /// by default and require an operator to opt in via
+    /// `SEMBAZURU_STATUS_ADMIN=1` / `status_admin = true`.
     pub admin_enabled: bool,
 }
 
 impl StatusState {
-    /// Gate for the mutating Status RPCs (SEC-001 interim, ADR 0016). The Status
+    /// Gate for the mutating Status RPCs (SEC-001, ADR 0016). The Status
     /// plane is loopback-TCP with no caller authentication, so `SetConfig`
     /// (which can clear the cluster token / rewrite listen addresses) and
-    /// `TriggerEviction` are refused unless an operator explicitly opts in. Until
-    /// the named-pipe + caller-SID transport lands, this is the cheap interim that
-    /// closes the "a local low-priv user disables LAN auth via SetConfig" path.
+    /// `TriggerEviction` are refused unless an operator explicitly opts in.
+    /// LocalIntake uses its production authenticated named pipe; this independent
+    /// Status admin boundary remains opt-in and default-deny.
     fn require_admin(&self) -> Result<(), Status> {
         if self.admin_enabled {
             Ok(())

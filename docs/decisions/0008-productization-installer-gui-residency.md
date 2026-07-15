@@ -110,15 +110,19 @@ Admin RPC はこの config.toml を書く。反映は単純化のため**サー�
 
 ### (4) GUI↔daemon＝新規 loopback 限定 Status/Admin gRPC サービス
 
+> **後続決定との境界:** 本節の loopback transport は `Status`／opt-in `StatusAdmin` に限って現行である。
+> LocalIntake は [ADR 0016](0016-local-privilege-separation.md) と commit `68e5422` により authenticated named pipe
+> へ移行した。Status/Admin を同じ pipe へ統合せず、管理 API 分離を維持する。
+
 **daemon に loopback 限定の新 gRPC サービス `Status`（read-only）＋ admin 操作を追加する**（既定
-`127.0.0.1:50073`、env `SEMBAZURU_STATUS`、LocalIntake と同じく loopback バインドを強制）。tonic 既存スタックを
-流用し、GUI は生成クライアントで接続する。
+`127.0.0.1:50073`、env `SEMBAZURU_STATUS`、loopback バインドを強制）。tonic 既存スタックを流用し、GUI は生成
+クライアントで接続する。
 
 **既存 Coordination を拡張しない理由:** Coordination は worker 向けで、ネット公開され `SEMBAZURU_CLUSTER_TOKEN`
 認証が掛かる（ADR 0006）。ここに status/admin を相乗りさせると責務が混ざり、ローカル GUI に cluster token を
 要求してしまう。loopback 限定の別サービスに分離することで、admin 面をネット公開ポートから外し、ローカル GUI は
-無認証（loopback 信頼）で読める。gRPC 以外のローカル IPC（named pipe 等）は tonic 生成資産を流用できず保守対象が
-増えるため採らない。
+無認証（loopback 信頼）で読める。named pipe を採らない判断は Status/Admin 面に限る。任意コマンドを受ける
+LocalIntake には同じ信頼仮定を適用しない。
 
 最小 RPC:
 - `GetStatus() → { workers[]{id, caps, running, idle, last_ping_age, healthy}, cache{size_bytes, hits, misses, hit_rate}, in_flight, fallback{remote, local, fallback}, fileserver{read_ops, read_bytes} }`（read-only）

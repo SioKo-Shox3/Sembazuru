@@ -10,6 +10,11 @@
 - 判定基準: 正確性 > 速度（非交渉 #1）、ローカルフォールバック常時（#2）、UBA コード非取り込み（#3）、
   clang-cl ファーストクラス（#4）。
 
+> **後続決定:** この ADR の M6.0 時点では LocalIntake を loopback TCP としたが、local caller を識別できず
+> LocalSystem service の権限で fallback できるため、[ADR 0016](0016-local-privilege-separation.md) と
+> commit `68e5422` が Windows production transport を machine-wide authenticated named pipe へ置換した。
+> 以下の loopback 記述は M6 当時の履歴であり、サービス／RPC セマンティクスだけが現行である。
+
 ## 決定
 
 ### 1. 横取り方式＝ビルドシステム別の使い分け（CMake/Ninja はランチャ優先）
@@ -26,7 +31,7 @@ Detours 横取りを足す（出典: CMake docs `<LANG>_COMPILER_LAUNCHER`、scc
 Incredibuild Process Virtualization Flow＝CreateProcess インターセプト）。取り込みは Apache の Reclient・
 MIT の BuildXL・sccache の設計のみ。UBA は設計観察。
 
-### 2. ランチャ↔daemon 受付口＝ループバック gRPC の新 `LocalIntake` サービス
+### 2. ランチャ↔daemon 受付口＝ローカル gRPC の新 `LocalIntake` サービス（M6 当時は loopback）
 
 ランチャは短命（ビルドツールが TU ごとに起動）、daemon は WorkerTable/fileserver/Scheduler を所有する
 長寿命プロセス。両者の受付口は **ローカル専用 gRPC サービス `LocalIntake`**（`control.proto`）:
@@ -47,10 +52,12 @@ service LocalIntake {
 - daemon は受けたアクションを `Scheduler::dispatch` に流し、結果（remote / local fallback）を exit にミラー。
   `session_id` は daemon が採番し fileserver セッションに束縛（M6.1 で実供給に結線）。
 
-**セキュリティ不変条件（M6.0 で実装）:** LocalIntake は提出された任意コマンドを実行し無認証（認証は M7）。
+**M6.0 当時のセキュリティ不変条件:** LocalIntake は提出された任意コマンドを実行し無認証（認証は M7）。
 よって daemon は **非ループバックアドレスへの intake bind を起動時に拒否**（`resolve_loopback_intake`）。
 ランチャは常に `127.0.0.1` を叩くため loopback 限定は無コスト。Coordination/fileserver は worker 用 LAN 到達が
 要るため非ガード（intake のみが「任意コマンド実行」で結果が重い）。出所: security-reviewer(M6.0 MEDIUM)。
+現行 Windows production は ADR 0016 の DACL／caller SID／restricted token 境界を使い、TCP は明示した test fixture
+だけに残す。
 
 ### 3. MSVC ライセンス境界への非依存設計（clang-cl ファーストクラス）
 

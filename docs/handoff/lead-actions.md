@@ -63,12 +63,13 @@ running checklist です。AI セッションは push・実機 SCM 操作・管�
 - [ ] **proto トークン reader 統一。** `sembazuru_proto::auth::cluster_token_from_env` を `var_os` 化し、
       daemon/worker/データプレーンの全 reader を**非 UTF-8 トークンでも一致**させる。M9.3c の verifier が
       検出した既存差異（ASCII では無影響）。**chip 起票済み: `task_eba5301f`**（ワンクリックで別 worktree 着手可）。
-- [ ] **SEC-001 本格策（local 特権分離・ADR 0016 の (2)(3)(5)）。** 暫定緩和の Status 書込みゲートは実装済み
-      （ADR 0016 PARTIAL）。残る**主経路**＝ LocalIntake→`run_local`→**SYSTEM 実行**の閉鎖は、(2) LocalIntake/
-      Status を **named-pipe transport＋明示 DACL** 化、(3) `run_local` を **`ImpersonateNamedPipeClient`/複製
-      トークンで caller として実行**、(5) daemon 既定アカウントを **非 LocalSystem** 化＋installer ACL。これらは
-      **Windows サービス／2 ユーザー／SID assertion の実機検証**（M9.5 installer・M10 実機）が必須のため AI
-      セッションでは未着手。実機ゲートで一周すること。`security-reviewer`(opus) も必須（impersonation/EDR 光学）。
+- [ ] **SEC-001 clean Windows A/B 検証。** 本格策は commit `68e5422` で実装済み。production LocalIntake は
+      protected machine-wide named pipe、双方向 SID 検証、caller impersonation、restricted primary token、
+      `CreateProcessAsUserW`、ambient-token retry 禁止を使う。Status/Admin は別の loopback 面と既定 deny gateを維持。
+      ローカル unit/workspace/fmt/clippy/release/cargo-deny と二重レビューは成功したが、現開発機には既存 service が
+      あるため安全ゲートが変更なしで拒否した。clean Windows CI の `local-intake-security` で、標準ユーザーが
+      LocalSystem marker を作れない negative case と正規 launcher fallback の caller SID positive caseを通し、
+      証拠を ADR 0016／元レビューbacklogへ記録してから `RESOLVED` にする。
 
 ## 4. リリース（M9.6・GitHub Release・ADR 0008、**手動配布**）
 

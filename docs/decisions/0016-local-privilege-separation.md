@@ -1,61 +1,76 @@
-# 0016 — local 特権分離（named pipe＋impersonation・read/admin 分離・非 LocalSystem 既定）
+# 0016 — LocalIntake 特権分離（authenticated named pipe＋caller restricted token）
 
-- ステータス: **一部実装（PARTIAL）。** 起案: 2026-06-24。決定者承認: 保留（プロジェクトリード）。
-  出所: コードレビュー（SEC-001・最も危険な P0＝local EoP→SYSTEM）。
-  **実装済み**: (1) 暫定緩和のうち **Status 書込み RPC のゲート**（`set_config`/`trigger_eviction`
-  を `status_admin`/`SEMBAZURU_STATUS_ADMIN` の opt-in・既定 deny。無認証 loopback から cluster
-  token をクリアして LAN auth を無効化する経路を閉鎖。`config_rpc.rs` で deny を実証）。
-  **未実装（本格策・lead/実機ゲート）**: LocalIntake→`run_local`→SYSTEM の主経路（= (2)named-pipe
-  transport＋DACL／(3)caller impersonation／(5)非 LocalSystem 既定＋installer ACL）。これらは Windows
-  サービス/2 ユーザー/SID assertion の実機検証（M9.5/M10）が要るため当環境では未着手。
-- 決めること: local IPC を**どの境界で守るか**。**(1) 暫定緩和（先行）**、**(2) named-pipe transport＋DACL**、
-  **(3) caller impersonation で local fallback**、**(4) Status の read/admin 分離**、**(5) 非 LocalSystem 既定**。
-- 判定基準: 非交渉（**正しさ>速度**／**ローカルフォールバック常時**）。署名/EDR は [ADR 0009 撤回](0009-app-self-update-github-releases.md)で任意降格だが、
-  named pipe＋impersonation は EDR シグナル化しうる＝`security-reviewer`(opus) 必須。
-- 関連: [ADR 0006](0006-trust-and-auth.md)（LAN auth・local は対象外だった）、[ADR 0008](0008-productization-installer-gui-residency.md)（常駐/installer）、
-  `crates/agent/src/{intake,status,lib,service}.rs`、`crates/agent/src/bin/sembazuru_daemon.rs`、
-  `installer/sembazuru.wxs`、`crates/agent/src/bin/sembazuru_launcher.rs`、`crates/gui/src/client.rs`。
+- ステータス: **ローカル実装済み・clean Windows CI 未確認。** 起案: 2026-06-24。
+  実装: commit `68e5422`（2026-07-15）。SEC-001 のバックログは clean Windows の標準ユーザー／LocalSystem
+  統合ゲートが緑になるまで `OPEN` のまま維持する。
+- 出所: コードレビュー（SEC-001・最も危険な P0＝local EoP→SYSTEM）。
+- 決めたこと: Windows production LocalIntake を **machine-wide authenticated named pipe** とし、DACL、server
+  SID 検証、caller impersonation、restricted primary token、管理 API 分離を一つの境界として維持する。
+- 判定基準: **標準ユーザーから SYSTEM 権限の任意コマンドを実行できないこと**、かつ正規 launcher の local
+  fallback が caller 権限で完走すること。認証／token 準備に失敗した場合は daemon token へ retry せず fail closed。
+- 関連: [ADR 0006](0006-trust-and-auth.md)（LAN auth）、
+  [ADR 0008](0008-productization-installer-gui-residency.md)（Status/Admin と installer）、
+  `crates/agent/src/{intake_pipe,intake,lib,service}.rs`、`crates/agent/src/bin/sembazuru_launcher.rs`、
+  `hooks/test/m6_local_intake_security.ps1`。
 
 ## 背景
 
-local IPC が「同一マシン」境界しか持たず「同一ユーザー」境界を持たないため、**標準ユーザーが SYSTEM 実行に到達**できる（SEC-001）:
+commit `68e5422` より前は LocalIntake (`127.0.0.1:50071`) が無認証 loopback TCP で、caller identity を確認せず、
+local fallback を daemon の token で spawn していた。installer の daemon は LocalSystem なので、標準ユーザーが
+任意コマンドを submit して SYSTEM 実行へ到達できた。loopback は「同一マシン」しか保証せず、権限境界にならない。
 
-- **LocalIntake**(`127.0.0.1:50071`)/**Status**(`:50073`) は loopback-TCP・**無認証**。`require_loopback`(`intake.rs:417-439`) は **bind アドレス制限のみ**で caller identity を見ない。loopback TCP は「同一マシン」境界＝任意の local プロセスが connect 可。
-- `run_local`(`lib.rs:275-292`) は **daemon プロセスのトークン**で `tokio::process::Command` を spawn・**impersonation なし**。daemon は installer で **LocalSystem**（`sembazuru.wxs:121`、`daemon.rs:81` 既定 `System`）。⇒ 標準ユーザーが submit→無 worker/route-away で local fallback→**SYSTEM 実行**。
-- Status `set_config`(`status.rs:282-318`) が **cluster token クリア・listen addr 書換**を無認証で永続化（次回起動で外部公開しうる）。`trigger_eviction` も無認証。
-
-[ADR 0006](0006-trust-and-auth.md) の共有トークン auth は worker→agent の **LAN プレーン専用**で、LocalIntake/Status は対象外（`status.rs:17-21`）。
-
-### 実装前提（現状調査で確定）
-- worker は既に最小権限 Virtual(`NT SERVICE\SembazuruWorker`)＝**daemon の既定だけが問題**。
-- `windows-sys` は依存済（svcctl で `Win32::Foundation`/`Threading`/`Shell` を使用）＝pipe DACL/`ImpersonateNamedPipeClient` の Win32 面は新 crate 不要。
-- 既存 named pipe は worker VFS pipe(`vfs_pipe.rs`)のみで **DACL/impersonation なし**（再利用は framing のみ、security は net-new）。
-- クライアント: launcher→intake `50071`、GUI Status→`50073`（pipe 移行で動作維持要）。GUI svcctl は SCM 直＝無関係。
+Status (`127.0.0.1:50073`) は別サービスである。書込み RPC は既に `status_admin`／
+`SEMBAZURU_STATUS_ADMIN` の opt-in・既定 deny とし、LocalIntake のコマンド実行面と分離している。
 
 ## 決定
 
-### (1) 暫定緩和（先行・安価）
-daemon 既定を `System` から外す（`daemon.rs:81`＋`sembazuru.wxs:121`）。Status write RPC（`set_config`/`trigger_eviction`）を **build feature か Administrators SID** で gate。本格策完了まで service install を開発者 opt-in。
+### (1) production transport と DACL
 
-### (2) named-pipe transport＋DACL
-`LocalIntakeTransport` 抽象を作り TCP を **test-only** へ。**Windows named-pipe transport** を追加（pipe 名に user SID、**明示 DACL** で現ユーザー/Administrators 限定）。Status も pipe 化。
+Windows production endpoint は `\\.\pipe\Sembazuru.LocalIntake.v1` に固定する。first-instance と remote-client reject
+を有効にし、再 arm する全 instance に protected DACL を適用する。SYSTEM／Administrators は GA、Authenticated
+Users は `0x00120083`（read/write data と接続に必要な標準権限。`FILE_CREATE_PIPE_INSTANCE` `0x4` は含めない）、
+daemon の具体的 process SID だけは再 arm に必要な `0x0012019f` を得る。production TCP は廃止し、明示 endpoint の
+test fixture だけに残す。
 
-### (3) caller impersonation で local fallback
-`run_local` を **`ImpersonateNamedPipeClient`/複製トークンで caller として実行**（`run_local_as_caller`）＝daemon が SYSTEM でも submitted process は **caller SID**。caller token を `SubmissionContext` に保持。
+### (2) client からの server 認証
 
-### (4) Status の read/admin 分離
-Status を `StatusRead`（get_status/get_config）と `StatusAdmin`（set_config/trigger_eviction）に分離。admin pipe は **Administrators SID 限定**の DACL。
+launcher は HTTP/2 bytes を送る前に pipe server PID の process token SID を検証し、LocalSystem または launcher
+自身の SID だけを許可する。具体的 read/write data access と `SecurityImpersonation` を要求し、偽 server、低い
+impersonation level、remote pipe は拒否する。
 
-### (5) 非 LocalSystem 既定 + installer
-service 既定アカウント再決定（user-session agent ＋ machine service の分離が目標形）。installer ACL/service account 更新。
+### (3) caller 認証と local fallback
 
-## 影響
+server は最初の request bytes を読む前に専用 OS thread で `ImpersonateNamedPipeClient` を実行し、impersonation
+level と caller SID を取得する。primary token を複製して `CreateRestrictedToken(DISABLE_MAX_PRIVILEGE)` を適用後、
+必ず `RevertToSelf` する。この caller context を intake→scheduler→local fallback へ明示的に渡す。
 
-- `crates/agent/src/intake.rs`（LocalIntakeTransport・pipe）、`status.rs`（read/admin 分離・SID gate）、`lib.rs`（run_local_as_caller・impersonation）、`service.rs`＋`bin/sembazuru_daemon.rs`（既定アカウント）、`installer/sembazuru.wxs`（Account/ACL）、`gui/src/client.rs`＋`bin/sembazuru_launcher.rs`（pipe クライアント）。
-- 検証: 標準ユーザー A の daemon へ B が submit 不可／非管理者が `SetConfig`/`TriggerEviction` 不可／local fallback の process token SID が caller と一致／daemon が SYSTEM でも submitted process は SYSTEM でない／production build で TCP loopback が listen しない／2 ユーザー pipe access 拒否の Windows 統合テスト。**`security-reviewer`(opus) 必須**（impersonation/EDR 光学）。
+fallback は caller の環境と実行ファイル解決結果を使い、`CreateProcessAsUserW` で suspended 起動する。既存 Job
+Object へ割り当てて guardian を seed した後に resume する。token、環境、Job 割当て、process 起動のどれかが失敗
+した場合も daemon の ambient token では再試行しない。これにより正規 launcher の fallback とプロセスツリー kill
+を保ちながら、LocalSystem への昇格を遮断する。
+
+### (4) Status/Admin 分離
+
+Status は read-only loopback `127.0.0.1:50073`、変更操作は opt-in `StatusAdmin` のまま維持する。LocalIntake pipe
+には Status/Admin RPC を載せない。caller 実行認証を管理 API の認可代わりに使わない。
+
+### (5) service identity
+
+installer の daemon は現時点で LocalSystem を維持する。安全性は「service が非 LocalSystem」という弱い前提では
+なく、DACL＋双方向 SID 検証＋caller restricted token＋fail-closed 起動で担保する。user-session agent と machine
+service の完全分離は別設計とし、この境界を弱める理由にはしない。
+
+## 検証状況
+
+- ローカル: `intake_pipe::tests` 7件、`tests::caller_` 9件、`service::tests` 5件、workspace test／fmt／clippy／
+  release build／`cargo deny check` が成功。統合差分は Codex と Claude の第2ラウンドで blocking なし。
+- clean Windows CI: `local-intake-security` job に、標準ユーザーから LocalSystem service の SYSTEM marker を作れない
+  negative case と、正規 launcher fallback の caller SID marker／終了コード／出力を確認する positive caseを配線済み。
+- 現ローカル機には既存の canonical `SembazuruDaemon` service があるため、ゲートは service/config/account を変更せず
+  exit 1 で拒否した。したがって実機 A/B 証拠が得られるまで SEC-001 を `RESOLVED` としない。
 
 ## 繰延・未決
 
-- user-session agent と machine service の完全分離（目標形）の段階導入。
-- pipe SDDL の正確な DACL 設計（現ユーザー/Administrators/SYSTEM の許可セット）。
-- Windows 実機統合テスト（2 ユーザー・SID assertion・impersonation 失敗系）は実機ゲート（[ADR 0008](0008-productization-installer-gui-residency.md) 系）と同枠。
+- clean Windows CI の標準ユーザー／LocalSystem A/B 証拠と、実 2 ユーザー環境での追加確認。
+- user-session agent と machine service の完全分離、ProgramData の最小権限化（別 OPEN 項目）。
+- signing／EDR allowlist の実運用確認。
