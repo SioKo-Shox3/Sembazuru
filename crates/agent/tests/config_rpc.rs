@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use sembazuru_agent::config::{
     DEFAULT_COORD, DEFAULT_FILESERVER, DEFAULT_INTAKE, DEFAULT_STATUS, DaemonConfig,
+    DaemonConfigLocation,
 };
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::fileserver::ServerStats;
@@ -38,7 +39,7 @@ async fn start_status_with_config_admin(config_path: std::path::PathBuf, admin: 
         metrics: Arc::new(Metrics::default()),
         tracker: sembazuru_agent::action_tracker::ActionTracker::default(),
         auth_enabled: false,
-        config_path,
+        config_location: DaemonConfigLocation::Override(config_path),
         admin_enabled: admin, // ADR 0016: mutating Status RPCs are opt-in
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

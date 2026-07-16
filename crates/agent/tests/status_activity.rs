@@ -42,7 +42,9 @@ async fn start_status_with_tracker() -> (String, ActionTracker, Arc<ManualClock>
         metrics: Arc::new(Metrics::default()),
         tracker: tracker.clone(),
         auth_enabled: false,
-        config_path: std::env::temp_dir().join("sbz-status-activity-unused.toml"),
+        config_location: sembazuru_agent::config::DaemonConfigLocation::Override(
+            std::env::temp_dir().join("sbz-status-activity-unused.toml"),
+        ),
         admin_enabled: false,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

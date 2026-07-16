@@ -18,8 +18,8 @@
 //!   SEMBAZURU_COORD / _INTAKE / _FILESERVER / _STATUS   listen addresses
 //!   SEMBAZURU_CACHE_ROOT / _TRACE_ROOT / _CLUSTER_TOKEN / _CACHE_MAX_BYTES
 
-use sembazuru_agent::config::DaemonConfig;
-use sembazuru_agent::run::run_daemon;
+use sembazuru_agent::config::{DaemonConfig, DaemonConfigLocation};
+use sembazuru_agent::run::run_daemon_at;
 use tokio_util::sync::CancellationToken;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -61,8 +61,9 @@ fn main() -> Result<(), BoxError> {
 /// Idempotent (never overwrites an operator-edited file) and never writes the
 /// cluster token.
 fn seed_config() -> Result<(), BoxError> {
-    let path = DaemonConfig::path_from_env();
-    let wrote = DaemonConfig::installer_seed().seed_if_absent(&path)?;
+    let location = DaemonConfigLocation::from_env();
+    let path = location.path();
+    let wrote = DaemonConfig::installer_seed().seed_at_location(&location)?;
     eprintln!(
         "sembazuru-daemon: seed-config {} {}",
         if wrote { "wrote" } else { "kept existing" },
@@ -105,14 +106,15 @@ fn run_cli() -> Result<(), BoxError> {
     // CFG-001/SEC-001: a present-but-unreadable/invalid config must NOT silently
     // fall back to auth-disabling defaults — refuse to start so the operator fixes
     // it (an absent file still uses defaults, the common dev case).
-    let config = match DaemonConfig::load_effective_checked(&DaemonConfig::path_from_env()) {
+    let location = DaemonConfigLocation::from_env();
+    let config = match location.load_effective_checked() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("sembazuru-daemon: {e}");
             return Err(e.into());
         }
     };
-    let result = runtime.block_on(run_daemon(config, shutdown));
+    let result = runtime.block_on(run_daemon_at(config, location, shutdown));
     drop(runtime);
     result
 }

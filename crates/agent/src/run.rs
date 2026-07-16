@@ -22,7 +22,7 @@ use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::action_cache::AgentCache;
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, DaemonConfigLocation};
 use crate::coordination::{DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination_with_token};
 use crate::fileserver::{ServerStats, serve_files_with_stats_token_tracked};
 #[cfg(windows)]
@@ -358,6 +358,16 @@ fn refuse_unauthenticated_lan(
 /// loopback Status surface — until `shutdown` is cancelled or the LocalIntake
 /// server exits. `config` is the already-resolved effective config (file + env).
 pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Result<(), BoxError> {
+    run_daemon_at(config, DaemonConfigLocation::from_env(), shutdown).await
+}
+
+/// Runs the daemon with the already-selected persisted config identity retained
+/// for the Status GetConfig/SetConfig surface.
+pub async fn run_daemon_at(
+    config: DaemonConfig,
+    config_location: DaemonConfigLocation,
+    shutdown: CancellationToken,
+) -> Result<(), BoxError> {
     #[cfg(test)]
     let submission_deadline = SUBMISSION_DEADLINES
         .lock()
@@ -548,7 +558,7 @@ pub async fn run_daemon(config: DaemonConfig, shutdown: CancellationToken) -> Re
             metrics: intake.metrics(),
             tracker,
             auth_enabled: cluster_token.is_some(),
-            config_path: DaemonConfig::path_from_env(),
+            config_location,
             // SEC-001 interim (ADR 0016): mutating Status RPCs are opt-in.
             admin_enabled: config.status_admin,
         };

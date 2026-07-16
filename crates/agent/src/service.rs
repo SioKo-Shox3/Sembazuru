@@ -24,8 +24,8 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use crate::config::DaemonConfig;
-use crate::run::run_daemon;
+use crate::config::{DaemonConfig, DaemonConfigLocation};
+use crate::run::run_daemon_at;
 
 /// The service's registered name (used by the SCM and `sc.exe`).
 pub const SERVICE_NAME: &str = "SembazuruDaemon";
@@ -48,6 +48,10 @@ fn daemon_service_exit_code<E>(result: Result<(), E>) -> ServiceExitCode {
         Ok(()) => ServiceExitCode::Win32(0),
         Err(_) => fatal_service_exit_code(),
     }
+}
+
+fn load_service_config(location: &DaemonConfigLocation) -> Result<DaemonConfig, String> {
+    location.load_effective_checked()
 }
 
 /// SCM entry point (runs on a background thread). There is no console in service
@@ -118,6 +122,21 @@ fn run_service() -> windows_service::Result<()> {
         }
     };
 
+    let config_location = DaemonConfigLocation::from_env();
+    let config = match load_service_config(&config_location) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("sembazuru-daemon: config load failed: {e}");
+            set(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                Duration::default(),
+                fatal_service_exit_code(),
+            )?;
+            return Ok(());
+        }
+    };
+
     set(
         ServiceState::Running,
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
@@ -125,8 +144,7 @@ fn run_service() -> windows_service::Result<()> {
         ServiceExitCode::Win32(0),
     )?;
 
-    let config = DaemonConfig::load_effective(&DaemonConfig::path_from_env());
-    let result = runtime.block_on(run_daemon(config, shutdown));
+    let result = runtime.block_on(run_daemon_at(config, config_location, shutdown));
     // Dropping the runtime stops the spawned servers.
     drop(runtime);
     let exit_code = daemon_service_exit_code(result.as_ref().map(|_| ()));
@@ -357,5 +375,29 @@ mod tests {
             ServiceExitCode::Win32(0)
         );
         assert_ne!(fatal_service_exit_code(), ServiceExitCode::Win32(0));
+    }
+
+    #[test]
+    fn service_config_invalid_override_is_rejected_and_maps_to_non_zero_exit() {
+        let path = std::env::temp_dir().join(format!(
+            "sbz-service-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "this is = = not valid toml [[[").unwrap();
+        let location = DaemonConfigLocation::Override(path.clone());
+
+        let result = load_service_config(&location);
+        let exit_code = daemon_service_exit_code(result.as_ref().map(|_| ()));
+
+        assert!(
+            result.is_err(),
+            "a present invalid override must be refused"
+        );
+        assert_ne!(exit_code, ServiceExitCode::Win32(0));
+        std::fs::remove_file(path).unwrap();
     }
 }

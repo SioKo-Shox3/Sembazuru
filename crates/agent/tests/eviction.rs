@@ -97,7 +97,9 @@ fn status_state(cache: Option<Arc<AgentCache>>, cap: Option<u64>) -> StatusState
         metrics: Arc::new(Metrics::default()),
         tracker: sembazuru_agent::action_tracker::ActionTracker::default(),
         auth_enabled: false,
-        config_path: std::env::temp_dir().join("sbz-eviction-test-unused.toml"),
+        config_location: sembazuru_agent::config::DaemonConfigLocation::Override(
+            std::env::temp_dir().join("sbz-eviction-test-unused.toml"),
+        ),
         admin_enabled: true, // these tests exercise TriggerEviction (ADR 0016 gate)
     }
 }

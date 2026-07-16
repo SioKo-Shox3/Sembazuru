@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use sembazuru_config_store::{MachineConfigTarget, replace_machine_config, seed_machine_config};
 use serde::{Deserialize, Serialize};
 
 /// Default listen addresses — the daemon's historical hard-coded defaults, now in
@@ -29,6 +30,52 @@ pub const DEFAULT_STATUS: &str = "127.0.0.1:50073";
 /// `%ProgramData%\Sembazuru\daemon.toml` location (used by the service installer
 /// and by tests).
 pub const CONFIG_PATH_ENV: &str = "SEMBAZURU_CONFIG";
+
+/// Provenance of the daemon's persisted configuration identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonConfigLocation {
+    /// The fixed machine-wide `%ProgramData%\Sembazuru\daemon.toml` identity.
+    Canonical,
+    /// An explicit development/test path supplied by [`CONFIG_PATH_ENV`].
+    Override(PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigDispatch<'a> {
+    Daemon,
+    Override(&'a Path),
+}
+
+impl DaemonConfigLocation {
+    /// Selects the location once while preserving whether the environment variable
+    /// was absent or explicitly present (including empty/canonical-equal values).
+    pub fn from_env() -> Self {
+        match std::env::var_os(CONFIG_PATH_ENV) {
+            Some(path) => Self::Override(PathBuf::from(path)),
+            None => Self::Canonical,
+        }
+    }
+
+    /// Resolves the path used for reads and operator-facing display.
+    pub fn path(&self) -> PathBuf {
+        match self {
+            Self::Canonical => DaemonConfig::default_path(),
+            Self::Override(path) => path.clone(),
+        }
+    }
+
+    /// Loads the effective startup config without losing the selected provenance.
+    pub fn load_effective_checked(&self) -> Result<DaemonConfig, String> {
+        DaemonConfig::load_effective_checked(&self.path())
+    }
+
+    fn dispatch(&self) -> ConfigDispatch<'_> {
+        match self {
+            Self::Canonical => ConfigDispatch::Daemon,
+            Self::Override(path) => ConfigDispatch::Override(path),
+        }
+    }
+}
 
 /// The daemon's persisted configuration. Field names are the TOML keys; every
 /// field has a default (via [`Default`]) so a partial or absent file still yields
@@ -128,9 +175,7 @@ impl DaemonConfig {
     /// The config file path to use: `$SEMBAZURU_CONFIG` if set, else
     /// [`default_path`](Self::default_path).
     pub fn path_from_env() -> PathBuf {
-        std::env::var_os(CONFIG_PATH_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::default_path)
+        DaemonConfigLocation::from_env().path()
     }
 
     /// Loads the config from `path`, or returns defaults when the file is absent
@@ -290,6 +335,20 @@ impl DaemonConfig {
         }
     }
 
+    /// Replaces the selected persisted config. Canonical writes are constrained to
+    /// the config-store's fixed daemon identity; explicit overrides retain the
+    /// existing path-based development/test behavior.
+    pub fn save_to_location(&self, location: &DaemonConfigLocation) -> std::io::Result<()> {
+        match location.dispatch() {
+            ConfigDispatch::Daemon => {
+                let contents = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
+                replace_machine_config(MachineConfigTarget::Daemon, contents.as_bytes())
+                    .map_err(std::io::Error::other)
+            }
+            ConfigDispatch::Override(path) => self.save_to(path),
+        }
+    }
+
     /// Builds the installer's default `daemon.toml` (M9.5d) — just the defaults. The
     /// daemon needs no wiring to be useful (it binds its loopback + LAN listeners
     /// from the built-in defaults); the file is seeded only so it exists for
@@ -308,6 +367,19 @@ impl DaemonConfig {
         }
         self.save_to(path)?;
         Ok(true)
+    }
+
+    /// Seeds the selected persisted config without falling back from a canonical
+    /// machine-store error to a path write.
+    pub fn seed_at_location(&self, location: &DaemonConfigLocation) -> std::io::Result<bool> {
+        match location.dispatch() {
+            ConfigDispatch::Daemon => {
+                let contents = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
+                seed_machine_config(MachineConfigTarget::Daemon, contents.as_bytes())
+                    .map_err(std::io::Error::other)
+            }
+            ConfigDispatch::Override(path) => self.seed_if_absent(path),
+        }
     }
 }
 
@@ -336,6 +408,61 @@ mod tests {
         std::env::temp_dir()
             .join(format!("sbz-cfg-{}-{run_id}-{seq}", std::process::id()))
             .join("daemon.toml")
+    }
+
+    #[test]
+    fn config_location_absent_env_is_canonical() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os(CONFIG_PATH_ENV);
+        unsafe { std::env::remove_var(CONFIG_PATH_ENV) };
+
+        assert_eq!(
+            DaemonConfigLocation::from_env(),
+            DaemonConfigLocation::Canonical
+        );
+
+        if let Some(value) = previous {
+            unsafe { std::env::set_var(CONFIG_PATH_ENV, value) };
+        }
+    }
+
+    #[test]
+    fn config_location_explicit_override_preserves_exact_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os(CONFIG_PATH_ENV);
+        let canonical = DaemonConfig::default_path();
+
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, &canonical) };
+        assert_eq!(
+            DaemonConfigLocation::from_env(),
+            DaemonConfigLocation::Override(canonical.clone()),
+            "an explicit canonical-equal path remains an override"
+        );
+
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, "") };
+        assert_eq!(
+            DaemonConfigLocation::from_env(),
+            DaemonConfigLocation::Override(PathBuf::new()),
+            "a present empty value remains an exact override"
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var(CONFIG_PATH_ENV, value) },
+            None => unsafe { std::env::remove_var(CONFIG_PATH_ENV) },
+        }
+    }
+
+    #[test]
+    fn config_location_dispatch_is_fixed_daemon_or_exact_override() {
+        let path = tmp_file();
+        assert_eq!(
+            DaemonConfigLocation::Canonical.dispatch(),
+            ConfigDispatch::Daemon
+        );
+        assert_eq!(
+            DaemonConfigLocation::Override(path.clone()).dispatch(),
+            ConfigDispatch::Override(path.as_path())
+        );
     }
 
     #[test]

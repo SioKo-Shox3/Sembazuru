@@ -39,6 +39,22 @@ function Assert-StaticLifecycleSource {
     $namespaces.AddNamespace('w', 'http://wixtoolset.org/schemas/v4/wxs')
     $failures = [Collections.Generic.List[string]]::new()
 
+    $repoRoot = Split-Path (Split-Path $Path -Parent) -Parent
+    $agentConfigSource = Get-Content -LiteralPath (Join-Path $repoRoot 'crates\agent\src\config.rs') -Raw
+    $workerConfigSource = Get-Content -LiteralPath (Join-Path $repoRoot 'crates\worker\src\config.rs') -Raw
+    foreach ($expectation in @(
+        [pscustomobject]@{ Source = $agentConfigSource; Name = 'daemon'; Target = 'MachineConfigTarget::Daemon' },
+        [pscustomobject]@{ Source = $workerConfigSource; Name = 'worker'; Target = 'MachineConfigTarget::Worker' }
+    )) {
+        if ($expectation.Source -notmatch 'seed_machine_config' -or
+            $expectation.Source -notmatch [regex]::Escape($expectation.Target)) {
+            $failures.Add("$($expectation.Name) canonical seed must dispatch through $($expectation.Target)")
+        }
+    }
+    if ($agentConfigSource -notmatch 'replace_machine_config') {
+        $failures.Add('daemon canonical replace must dispatch through replace_machine_config')
+    }
+
     $binary = @($document.SelectNodes("//w:Binary[@Id='MachineStoreCtlBinary']", $namespaces))
     if ($binary.Count -ne 1 -or $binary[0].GetAttribute('SourceFile') -cne '$(var.StoreCtl)') {
         $failures.Add('MachineStoreCtlBinary must appear exactly once with SourceFile=$(var.StoreCtl)')
@@ -527,10 +543,26 @@ function Assert-ExactAclRules {
         [bool]$ExpectedProtected,
         [bool]$ExpectedInherited,
         [int64]$WorkerMask,
-        [bool]$RequireContainerInheritance
+        [bool]$RequireContainerInheritance,
+        [string]$ExpectedOwnerSid = '',
+        [string]$ExpectedGroupSid = ''
     )
 
     $acl = Get-Acl -LiteralPath $Path
+    if ($ExpectedOwnerSid) {
+        $ownerSid = ([Security.Principal.NTAccount]$acl.Owner).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        if ($ownerSid -ne $ExpectedOwnerSid) {
+            throw "ACL owner mismatch for ${Path}: got $ownerSid, want $ExpectedOwnerSid"
+        }
+    }
+    if ($ExpectedGroupSid) {
+        $groupSid = ([Security.Principal.NTAccount]$acl.Group).Translate(
+            [Security.Principal.SecurityIdentifier]).Value
+        if ($groupSid -ne $ExpectedGroupSid) {
+            throw "ACL group mismatch for ${Path}: got $groupSid, want $ExpectedGroupSid"
+        }
+    }
     if ($acl.AreAccessRulesProtected -ne $ExpectedProtected) {
         throw "ACL protection mismatch for ${Path}: got $($acl.AreAccessRulesProtected), want $ExpectedProtected"
     }
@@ -1014,10 +1046,11 @@ try {
         if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
             throw "seeded config is missing: $config"
         }
-        Assert-ExactAclRules -Path $config -ExpectedProtected $false -ExpectedInherited $true `
-            -WorkerMask 0x1200a9 -RequireContainerInheritance $false
+        Assert-ExactAclRules -Path $config -ExpectedProtected $true -ExpectedInherited $false `
+            -WorkerMask 0x1200a9 -RequireContainerInheritance $false `
+            -ExpectedOwnerSid 'S-1-5-18' -ExpectedGroupSid 'S-1-5-18'
     }
-    Write-Host 'CONFIG ACL PASS: daemon.toml/worker.toml inherit SY/BA Full + worker RX only.'
+    Write-Host 'CONFIG ACL PASS: daemon.toml/worker.toml owner+group SYSTEM, protected non-inherited exact SY/BA Full + worker RX only.'
 
     foreach ($probeRoot in @($scratchRoot, $casRoot)) {
         $probeDir = Join-Path $probeRoot 'm9-acl-probe-dir'

@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
+use sembazuru_config_store::{MachineConfigTarget, seed_machine_config};
 use serde::{Deserialize, Serialize};
 
 use crate::WorkerVfsConfig;
@@ -33,6 +34,47 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:50061";
 /// and by tests). Distinct from the daemon's `SEMBAZURU_CONFIG` so the two services
 /// read separate files on the same host.
 pub const CONFIG_PATH_ENV: &str = "SEMBAZURU_WORKER_CONFIG";
+
+/// Provenance of the worker's persisted configuration identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerConfigLocation {
+    /// The fixed machine-wide `%ProgramData%\Sembazuru\worker.toml` identity.
+    Canonical,
+    /// An explicit development/test path supplied by [`CONFIG_PATH_ENV`].
+    Override(PathBuf),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigDispatch<'a> {
+    Worker,
+    Override(&'a Path),
+}
+
+impl WorkerConfigLocation {
+    /// Selects the location once while preserving explicit empty/canonical-equal
+    /// override values.
+    pub fn from_env() -> Self {
+        match std::env::var_os(CONFIG_PATH_ENV) {
+            Some(path) => Self::Override(PathBuf::from(path)),
+            None => Self::Canonical,
+        }
+    }
+
+    /// Resolves the path used for reads and operator-facing display.
+    pub fn path(&self) -> PathBuf {
+        match self {
+            Self::Canonical => WorkerConfig::default_path(),
+            Self::Override(path) => path.clone(),
+        }
+    }
+
+    fn dispatch(&self) -> ConfigDispatch<'_> {
+        match self {
+            Self::Canonical => ConfigDispatch::Worker,
+            Self::Override(path) => ConfigDispatch::Override(path),
+        }
+    }
+}
 
 /// Default idle headroom kept for the local user, in percent of the machine
 /// (ADR 0010). A gentle "good neighbour" default; tunable on real LAN data (M10).
@@ -247,9 +289,7 @@ impl WorkerConfig {
     /// The config file path to use: `$SEMBAZURU_WORKER_CONFIG` if set, else
     /// [`default_path`](Self::default_path).
     pub fn path_from_env() -> PathBuf {
-        std::env::var_os(CONFIG_PATH_ENV)
-            .map(PathBuf::from)
-            .unwrap_or_else(Self::default_path)
+        WorkerConfigLocation::from_env().path()
     }
 
     /// Loads the config from `path`, or returns defaults when the file is absent
@@ -526,6 +566,19 @@ impl WorkerConfig {
         self.save_to(path)?;
         Ok(true)
     }
+
+    /// Seeds the selected persisted config. Canonical dispatch is fixed to the
+    /// worker identity; explicit overrides preserve the path-based behavior.
+    pub fn seed_at_location(&self, location: &WorkerConfigLocation) -> std::io::Result<bool> {
+        match location.dispatch() {
+            ConfigDispatch::Worker => {
+                let contents = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
+                seed_machine_config(MachineConfigTarget::Worker, contents.as_bytes())
+                    .map_err(std::io::Error::other)
+            }
+            ConfigDispatch::Override(path) => self.seed_if_absent(path),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +606,61 @@ mod tests {
         std::env::temp_dir()
             .join(format!("sbz-wcfg-{}-{run_id}-{seq}", std::process::id()))
             .join("worker.toml")
+    }
+
+    #[test]
+    fn config_location_absent_env_is_canonical() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os(CONFIG_PATH_ENV);
+        unsafe { std::env::remove_var(CONFIG_PATH_ENV) };
+
+        assert_eq!(
+            WorkerConfigLocation::from_env(),
+            WorkerConfigLocation::Canonical
+        );
+
+        if let Some(value) = previous {
+            unsafe { std::env::set_var(CONFIG_PATH_ENV, value) };
+        }
+    }
+
+    #[test]
+    fn config_location_explicit_override_preserves_exact_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os(CONFIG_PATH_ENV);
+        let canonical = WorkerConfig::default_path();
+
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, &canonical) };
+        assert_eq!(
+            WorkerConfigLocation::from_env(),
+            WorkerConfigLocation::Override(canonical.clone()),
+            "an explicit canonical-equal path remains an override"
+        );
+
+        unsafe { std::env::set_var(CONFIG_PATH_ENV, "") };
+        assert_eq!(
+            WorkerConfigLocation::from_env(),
+            WorkerConfigLocation::Override(PathBuf::new()),
+            "a present empty value remains an exact override"
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var(CONFIG_PATH_ENV, value) },
+            None => unsafe { std::env::remove_var(CONFIG_PATH_ENV) },
+        }
+    }
+
+    #[test]
+    fn config_location_dispatch_is_fixed_worker_or_exact_override() {
+        let path = tmp_file();
+        assert_eq!(
+            WorkerConfigLocation::Canonical.dispatch(),
+            ConfigDispatch::Worker
+        );
+        assert_eq!(
+            WorkerConfigLocation::Override(path.clone()).dispatch(),
+            ConfigDispatch::Override(path.as_path())
+        );
     }
 
     #[test]

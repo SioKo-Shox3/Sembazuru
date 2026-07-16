@@ -21,7 +21,6 @@
 //! Coordination port and the GUI needs no cluster token (ADR 0008 §4). Read-only
 //! in M9.1; the config/eviction admin RPCs arrive with M9.2/M9.3.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -39,7 +38,7 @@ use tonic::{Request, Response, Status};
 use crate::Execution;
 use crate::action_cache::AgentCache;
 use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, DaemonConfigLocation};
 use crate::coordination::WorkerTable;
 use crate::fileserver::ServerStats;
 
@@ -147,9 +146,9 @@ pub struct StatusState {
     /// Whether the daemon requires a cluster token (ADR 0006) — surfaced so the
     /// GUI can show the cluster's auth posture.
     pub auth_enabled: bool,
-    /// Path of the persisted daemon config the GetConfig/SetConfig RPCs read and
-    /// write (M9.3a). The GUI edits this file; the daemon applies it on next start.
-    pub config_path: PathBuf,
+    /// Persisted daemon config identity the GetConfig/SetConfig RPCs read and
+    /// write (M9.3a), including canonical-vs-override provenance.
+    pub config_location: DaemonConfigLocation,
     /// Whether the **mutating** Status RPCs (`SetConfig`, `TriggerEviction`) are
     /// allowed (SEC-001, ADR 0016). Default **false**: the Status plane is
     /// loopback-TCP with no caller authentication, so a low-privilege local user
@@ -336,7 +335,7 @@ impl StatusRpc for StatusState {
         &self,
         _request: Request<GetConfigRequest>,
     ) -> Result<Response<GetConfigResponse>, Status> {
-        let path = self.config_path.clone();
+        let path = self.config_location.path();
         // Read off the runtime (file I/O). The token is deliberately reduced to a
         // presence bool here — never echo the secret over the wire (M9.3a).
         let (cfg, file_exists) = tokio::task::spawn_blocking(move || {
@@ -347,7 +346,7 @@ impl StatusRpc for StatusState {
         .map_err(|e| Status::internal(format!("config read failed: {e}")))?
         .map_err(Status::failed_precondition)?;
         Ok(Response::new(GetConfigResponse {
-            config_path: self.config_path.to_string_lossy().into_owned(),
+            config_path: self.config_location.path().to_string_lossy().into_owned(),
             file_exists,
             coord_addr: cfg.coord_addr,
             intake_addr: cfg.intake_addr,
@@ -365,7 +364,8 @@ impl StatusRpc for StatusState {
         request: Request<SetConfigRequest>,
     ) -> Result<Response<SetConfigResponse>, Status> {
         self.require_admin()?;
-        let path = self.config_path.clone();
+        let location = self.config_location.clone();
+        let path = location.path();
         let req = request.into_inner();
         enum SetConfigError {
             Load(String),
@@ -390,7 +390,7 @@ impl StatusRpc for StatusState {
             if let Some(t) = req.cluster_token {
                 cfg.cluster_token = empty_to_none(t);
             }
-            cfg.save_to(&path)
+            cfg.save_to_location(&location)
                 .map(|()| path)
                 .map_err(|e| SetConfigError::Save(e.to_string()))
         })

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use sembazuru_agent::config::DaemonConfigLocation;
 use sembazuru_agent::coordination::WorkerTable;
 use sembazuru_agent::fileserver::ServerStats;
 use sembazuru_agent::status::{Metrics, StatusState, serve_status_service};
@@ -52,7 +53,7 @@ async fn start_status_with_admin(
         metrics: Arc::new(Metrics::default()),
         tracker: sembazuru_agent::action_tracker::ActionTracker::default(),
         auth_enabled: false,
-        config_path,
+        config_location: DaemonConfigLocation::Override(config_path),
         admin_enabled,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

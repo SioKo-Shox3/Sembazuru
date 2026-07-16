@@ -25,7 +25,7 @@
 
 use std::path::Path;
 
-use sembazuru_worker::config::WorkerConfig;
+use sembazuru_worker::config::{WorkerConfig, WorkerConfigLocation};
 use sembazuru_worker::run::run_worker;
 use tokio_util::sync::CancellationToken;
 
@@ -68,7 +68,8 @@ fn main() -> Result<(), BoxError> {
 /// manual setup. Idempotent (never overwrites an operator-edited file) and never
 /// writes the cluster token.
 fn seed_config() -> Result<(), BoxError> {
-    let path = WorkerConfig::path_from_env();
+    let location = WorkerConfigLocation::from_env();
+    let path = location.path();
     let install_dir = std::env::current_exe()?
         .parent()
         .map(Path::to_path_buf)
@@ -79,7 +80,8 @@ fn seed_config() -> Result<(), BoxError> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or("cannot resolve the data directory")?;
-    let wrote = WorkerConfig::installer_seed(&install_dir, &data_dir).seed_if_absent(&path)?;
+    let wrote =
+        WorkerConfig::installer_seed(&install_dir, &data_dir).seed_at_location(&location)?;
     eprintln!(
         "sembazuru-worker: seed-config {} {}",
         if wrote { "wrote" } else { "kept existing" },
