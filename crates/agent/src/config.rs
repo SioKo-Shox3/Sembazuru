@@ -31,6 +31,15 @@ pub const DEFAULT_STATUS: &str = "127.0.0.1:50073";
 /// and by tests).
 pub const CONFIG_PATH_ENV: &str = "SEMBAZURU_CONFIG";
 
+#[cfg(windows)]
+const LEGACY_TOKEN_DIAGNOSTIC: &str = "canonical daemon config contains legacy cluster_token; stop SembazuruDaemon and SembazuruWorker, then run `sembazuru-storectl migrate-token`";
+#[cfg(windows)]
+const SECRET_READ_DIAGNOSTIC: &str =
+    "canonical machine cluster token could not be read; refusing to start";
+#[cfg(windows)]
+const SECRET_UTF8_DIAGNOSTIC: &str =
+    "canonical machine cluster token is not valid UTF-8; refusing to start";
+
 /// Provenance of the daemon's persisted configuration identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonConfigLocation {
@@ -65,8 +74,27 @@ impl DaemonConfigLocation {
     }
 
     /// Loads the effective startup config without losing the selected provenance.
+    #[cfg(windows)]
+    pub fn load_effective_checked(&self) -> Result<DaemonConfig, String> {
+        self.load_effective_checked_with_reader(sembazuru_config_store::read_machine_cluster_token)
+    }
+
+    #[cfg(not(windows))]
     pub fn load_effective_checked(&self) -> Result<DaemonConfig, String> {
         DaemonConfig::load_effective_checked(&self.path())
+    }
+
+    #[cfg(windows)]
+    fn load_effective_checked_with_reader<S: AsRef<[u8]>, E>(
+        &self,
+        read_secret: impl FnOnce() -> Result<Option<S>, E>,
+    ) -> Result<DaemonConfig, String> {
+        match self {
+            Self::Canonical => {
+                DaemonConfig::load_canonical_with_reader(&DaemonConfig::default_path(), read_secret)
+            }
+            Self::Override(path) => DaemonConfig::load_effective_checked(path),
+        }
     }
 
     fn dispatch(&self) -> ConfigDispatch<'_> {
@@ -263,6 +291,12 @@ impl DaemonConfig {
     /// a present-but-bad file; the daemon refuses to start (the operator fixes or
     /// removes it). Env overrides are applied by [`load_effective_checked`].
     pub fn load_or_refuse(path: &Path) -> Result<Self, String> {
+        Self::load_or_refuse_impl(path, false)
+    }
+
+    fn load_or_refuse_impl(path: &Path, reject_legacy_token: bool) -> Result<Self, String> {
+        #[cfg(not(windows))]
+        let _ = reject_legacy_token;
         // Lead with a confirmed-absent check so the common dev case (no file, or a
         // missing parent dir) uses defaults — and is distinguished from a file that
         // is genuinely PRESENT but unreadable. `try_exists() == Ok(false)` is the
@@ -280,21 +314,50 @@ impl DaemonConfig {
                 path.display()
             )),
             Ok(bytes) => {
-                let s = String::from_utf8(bytes).map_err(|_| {
+                let s = std::str::from_utf8(&bytes).map_err(|_| {
                     format!(
                         "config {} is not valid UTF-8; refusing to start.",
                         path.display()
                     )
                 })?;
-                toml::from_str(&s).map_err(|e| {
-                    format!(
-                        "config {} is invalid TOML ({e}); refusing to start with auth-disabling \
-                         defaults (CFG-001/SEC-001). Fix or remove it.",
-                        path.display()
-                    )
+                let table: toml::Table = toml::from_str(s).map_err(|e| {
+                    if reject_legacy_token {
+                        "canonical daemon config is invalid TOML; refusing to start".into()
+                    } else {
+                        format!(
+                            "config {} is invalid TOML ({e}); refusing to start with auth-disabling \
+                             defaults (CFG-001/SEC-001). Fix or remove it.",
+                            path.display()
+                        )
+                    }
+                })?;
+                #[cfg(windows)]
+                if reject_legacy_token && table.contains_key("cluster_token") {
+                    return Err(LEGACY_TOKEN_DIAGNOSTIC.into());
+                }
+                table.try_into().map_err(|e| {
+                    format!("config {} is invalid TOML ({e}); refusing to start with auth-disabling defaults (CFG-001/SEC-001). Fix or remove it.", path.display())
                 })
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn load_canonical_with_reader<S: AsRef<[u8]>, E>(
+        path: &Path,
+        read_secret: impl FnOnce() -> Result<Option<S>, E>,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::load_or_refuse_impl(path, true)?;
+        cfg.cluster_token = match read_secret().map_err(|_| SECRET_READ_DIAGNOSTIC)? {
+            None => None,
+            Some(secret) => Some(
+                std::str::from_utf8(secret.as_ref())
+                    .map_err(|_| SECRET_UTF8_DIAGNOSTIC)?
+                    .to_owned(),
+            ),
+        };
+        cfg.apply_env_overrides();
+        Ok(cfg)
     }
 
     /// The daemon's effective STARTUP config: [`load_or_refuse`] then env
@@ -408,6 +471,121 @@ mod tests {
         std::env::temp_dir()
             .join(format!("sbz-cfg-{}-{run_id}-{seq}", std::process::id()))
             .join("daemon.toml")
+    }
+
+    #[cfg(windows)]
+    fn write_test_config(contents: &str) -> PathBuf {
+        let path = tmp_file();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_canonical_startup_rejects_legacy_toml_before_machine_secret_read() {
+        for legacy in [
+            "cluster_token = \"do-not-echo\"\n",
+            "cluster_token = \"\"\n",
+            "cluster_token = 1\n",
+            "[cluster_token]\nvalue = \"do-not-echo\"\n",
+        ] {
+            let path = write_test_config(legacy);
+            let calls = std::cell::Cell::new(0);
+            let err = DaemonConfig::load_canonical_with_reader(&path, || {
+                calls.set(calls.get() + 1);
+                Ok::<Option<Vec<u8>>, &'static str>(Some(b"machine-secret".to_vec()))
+            })
+            .unwrap_err();
+            assert_eq!(calls.get(), 0, "legacy TOML must win before secret read");
+            assert!(err.contains("sembazuru-storectl migrate-token"));
+            assert!(!err.contains("do-not-echo"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_canonical_startup_loads_strict_utf8_machine_secret_and_env_wins_last() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = write_test_config("coord_addr = \"127.0.0.1:6000\"\n");
+        let previous = std::env::var_os("SEMBAZURU_CLUSTER_TOKEN");
+        let read = || Ok::<_, &'static str>(Some(b"machine-token".as_slice()));
+        unsafe { std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN") };
+        let loaded = DaemonConfig::load_canonical_with_reader(&path, read).unwrap();
+        assert_eq!(loaded.cluster_token.as_deref(), Some("machine-token"));
+
+        unsafe { std::env::set_var("SEMBAZURU_CLUSTER_TOKEN", "  env-token  ") };
+        let loaded = DaemonConfig::load_canonical_with_reader(&path, read).unwrap();
+        assert_eq!(loaded.cluster_token.as_deref(), Some("  env-token  "));
+
+        unsafe { std::env::set_var("SEMBAZURU_CLUSTER_TOKEN", "") };
+        let loaded = DaemonConfig::load_canonical_with_reader(&path, read).unwrap();
+        assert!(loaded.cluster_token.is_none());
+        match previous {
+            Some(value) => unsafe { std::env::set_var("SEMBAZURU_CLUSTER_TOKEN", value) },
+            None => unsafe { std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN") },
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_canonical_startup_rejects_non_utf8_or_reader_error_without_echo() {
+        let path = write_test_config("");
+        let invalid = DaemonConfig::load_canonical_with_reader(&path, || {
+            Ok::<_, &'static str>(Some(vec![0xff, 0x80]))
+        })
+        .unwrap_err();
+        assert!(invalid.contains("valid UTF-8"));
+        assert!(!invalid.contains("255"));
+
+        let failed = DaemonConfig::load_canonical_with_reader(&path, || {
+            Err::<Option<Vec<u8>>, _>("reader-source-do-not-echo")
+        })
+        .unwrap_err();
+        assert!(!failed.contains("reader-source-do-not-echo"));
+
+        std::fs::write(&path, "cluster_token = \"malformed-sentinel").unwrap();
+        let malformed = DaemonConfig::load_canonical_with_reader(
+            &path,
+            || -> Result<Option<Vec<u8>>, &'static str> {
+                panic!("malformed canonical TOML must win before secret read")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            malformed,
+            "canonical daemon config is invalid TOML; refusing to start"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn daemon_override_startup_preserves_toml_token_and_skips_machine_secret() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous_program_data = std::env::var_os("ProgramData");
+        let previous_token = std::env::var_os("SEMBAZURU_CLUSTER_TOKEN");
+        let test_program_data = tmp_file().parent().unwrap().to_owned();
+        unsafe {
+            std::env::set_var("ProgramData", test_program_data);
+            std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN");
+        }
+        let canonical_equal = DaemonConfig::default_path();
+        std::fs::create_dir_all(canonical_equal.parent().unwrap()).unwrap();
+        std::fs::write(&canonical_equal, "cluster_token = \"override-token\"\n").unwrap();
+        let loaded = DaemonConfigLocation::Override(canonical_equal)
+            .load_effective_checked_with_reader(|| -> Result<Option<Vec<u8>>, &'static str> {
+                panic!("override must not read the machine secret")
+            })
+            .unwrap();
+        assert_eq!(loaded.cluster_token.as_deref(), Some("override-token"));
+        match previous_program_data {
+            Some(value) => unsafe { std::env::set_var("ProgramData", value) },
+            None => unsafe { std::env::remove_var("ProgramData") },
+        }
+        match previous_token {
+            Some(value) => unsafe { std::env::set_var("SEMBAZURU_CLUSTER_TOKEN", value) },
+            None => unsafe { std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN") },
+        }
     }
 
     #[test]

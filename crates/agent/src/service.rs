@@ -60,6 +60,15 @@ fn acquire_service_runtime_guard_for_location<T, E>(
     }
 }
 
+fn acquire_guard_then_load<G, GE, C, LE>(
+    location: &DaemonConfigLocation,
+    acquire: impl FnOnce() -> Result<G, GE>,
+    load: impl FnOnce() -> Result<C, LE>,
+) -> Result<(Option<G>, Result<C, LE>), GE> {
+    let guard = acquire_service_runtime_guard_for_location(location, acquire)?;
+    Ok((guard, load()))
+}
+
 fn report_stopped_before_releasing<G, E>(
     guard: Option<G>,
     report_stopped: impl FnOnce() -> Result<(), E>,
@@ -123,9 +132,10 @@ fn run_service() -> windows_service::Result<()> {
     )?;
 
     let config_location = DaemonConfigLocation::from_env();
-    let service_runtime_guard = match acquire_service_runtime_guard_for_location(
+    let (service_runtime_guard, loaded_config) = match acquire_guard_then_load(
         &config_location,
         sembazuru_config_store::enter_machine_service_runtime,
+        || load_service_config(&config_location),
     ) {
         Ok(guard) => guard,
         Err(e) => {
@@ -160,7 +170,7 @@ fn run_service() -> windows_service::Result<()> {
         }
     };
 
-    let config = match load_service_config(&config_location) {
+    let config = match loaded_config {
         Ok(config) => config,
         Err(e) => {
             eprintln!("sembazuru-daemon: config load failed: {e}");
@@ -496,6 +506,51 @@ mod tests {
             assert_eq!(&*events.borrow(), &["reported", "dropped"]);
             assert_eq!(result.is_ok(), report_succeeds);
         }
+    }
+
+    #[test]
+    fn daemon_service_guard_holds_across_failed_load_until_stopped() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (guard, loaded) = acquire_guard_then_load(
+            &DaemonConfigLocation::Canonical,
+            || {
+                events.borrow_mut().push("enter");
+                Ok::<_, &'static str>(DropSpy(Rc::clone(&events)))
+            },
+            || {
+                events.borrow_mut().push("load");
+                Err::<u8, _>("load-failed")
+            },
+        )
+        .unwrap();
+        assert_eq!(loaded, Err("load-failed"));
+        report_stopped_before_releasing(guard, || {
+            events.borrow_mut().push("reported");
+            Ok::<_, &'static str>(())
+        })
+        .unwrap();
+        assert_eq!(&*events.borrow(), &["enter", "load", "reported", "dropped"]);
+
+        let loads = Cell::new(0);
+        let failed = acquire_guard_then_load(
+            &DaemonConfigLocation::Canonical,
+            || Err::<u8, _>("guard-entry-failed"),
+            || {
+                loads.set(loads.get() + 1);
+                Ok::<_, &'static str>(7)
+            },
+        );
+        assert_eq!(failed.unwrap_err(), "guard-entry-failed");
+        assert_eq!(loads.get(), 0);
+
+        let (guard, loaded) = acquire_guard_then_load(
+            &DaemonConfigLocation::Override(DaemonConfig::default_path()),
+            || -> Result<u8, &'static str> { panic!("override entered guard") },
+            || Ok::<_, &'static str>(9),
+        )
+        .unwrap();
+        assert!(guard.is_none());
+        assert_eq!(loaded, Ok(9));
     }
 
     #[test]

@@ -32,7 +32,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use crate::config::{WorkerConfig, WorkerConfigLocation};
+use crate::config::WorkerConfigLocation;
 use crate::run::run_worker;
 
 /// The service's registered name (used by the SCM and `sc.exe`). Distinct from the
@@ -67,6 +67,15 @@ fn acquire_service_runtime_guard_for_location<T, E>(
         WorkerConfigLocation::Canonical => acquire().map(Some),
         WorkerConfigLocation::Override(_) => Ok(None),
     }
+}
+
+fn acquire_guard_then_load<G, GE, C, LE>(
+    location: &WorkerConfigLocation,
+    acquire: impl FnOnce() -> Result<G, GE>,
+    load: impl FnOnce() -> Result<C, LE>,
+) -> Result<(Option<G>, Result<C, LE>), GE> {
+    let guard = acquire_service_runtime_guard_for_location(location, acquire)?;
+    Ok((guard, load()))
 }
 
 fn report_stopped_before_releasing<G, E>(
@@ -128,9 +137,10 @@ fn run_service() -> windows_service::Result<()> {
     )?;
 
     let config_location = WorkerConfigLocation::from_env();
-    let service_runtime_guard = match acquire_service_runtime_guard_for_location(
+    let (service_runtime_guard, loaded_config) = match acquire_guard_then_load(
         &config_location,
         sembazuru_config_store::enter_machine_service_runtime,
+        || config_location.load_effective_checked(),
     ) {
         Ok(guard) => guard,
         Err(e) => {
@@ -150,7 +160,7 @@ fn run_service() -> windows_service::Result<()> {
     // Refuse to run on a present-but-corrupt config (CFG-001): a service silently
     // defaulting (no agent/token/VFS) is the scariest variant — it has no shell to
     // notice the warning. Report Stopped to the SCM so the failure is visible.
-    let config = match WorkerConfig::load_effective_checked(&config_location.path()) {
+    let config = match loaded_config {
         Ok(c) => c,
         Err(e) => {
             eprintln!("sembazuru-worker: {e}");
@@ -345,6 +355,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
+    use crate::config::WorkerConfig;
 
     struct DropSpy(Rc<RefCell<Vec<&'static str>>>);
 
@@ -442,6 +453,51 @@ mod tests {
             assert_eq!(&*events.borrow(), &["reported", "dropped"]);
             assert_eq!(result.is_ok(), report_succeeds);
         }
+    }
+
+    #[test]
+    fn worker_service_guard_holds_across_failed_load_until_stopped() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let (guard, loaded) = acquire_guard_then_load(
+            &WorkerConfigLocation::Canonical,
+            || {
+                events.borrow_mut().push("enter");
+                Ok::<_, &'static str>(DropSpy(Rc::clone(&events)))
+            },
+            || {
+                events.borrow_mut().push("load");
+                Err::<u8, _>("load-failed")
+            },
+        )
+        .unwrap();
+        assert_eq!(loaded, Err("load-failed"));
+        report_stopped_before_releasing(guard, || {
+            events.borrow_mut().push("reported");
+            Ok::<_, &'static str>(())
+        })
+        .unwrap();
+        assert_eq!(&*events.borrow(), &["enter", "load", "reported", "dropped"]);
+
+        let loads = Cell::new(0);
+        let failed = acquire_guard_then_load(
+            &WorkerConfigLocation::Canonical,
+            || Err::<u8, _>("guard-entry-failed"),
+            || {
+                loads.set(loads.get() + 1);
+                Ok::<_, &'static str>(7)
+            },
+        );
+        assert_eq!(failed.unwrap_err(), "guard-entry-failed");
+        assert_eq!(loads.get(), 0);
+
+        let (guard, loaded) = acquire_guard_then_load(
+            &WorkerConfigLocation::Override(WorkerConfig::default_path()),
+            || -> Result<u8, &'static str> { panic!("override entered guard") },
+            || Ok::<_, &'static str>(9),
+        )
+        .unwrap();
+        assert!(guard.is_none());
+        assert_eq!(loaded, Ok(9));
     }
 
     #[test]

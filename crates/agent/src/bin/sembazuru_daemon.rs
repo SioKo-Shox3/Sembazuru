@@ -90,6 +90,44 @@ fn parse_account(args: &[String]) -> sembazuru_agent::service::ServiceAccount {
 /// Foreground/CLI mode: build a Tokio runtime, run the daemon, and stop it
 /// gracefully on Ctrl-C. Dropping the runtime stops the spawned servers.
 fn run_cli() -> Result<(), BoxError> {
+    let location = DaemonConfigLocation::from_env();
+    #[cfg(windows)]
+    {
+        with_runtime_guard_for_location(
+            &location,
+            sembazuru_config_store::enter_machine_service_runtime,
+            || run_cli_at(&location),
+        )?
+    }
+    #[cfg(not(windows))]
+    {
+        run_cli_at(&location)
+    }
+}
+
+#[cfg(windows)]
+fn with_runtime_guard_for_location<G, E, T>(
+    location: &DaemonConfigLocation,
+    enter: impl FnOnce() -> Result<G, E>,
+    run: impl FnOnce() -> T,
+) -> Result<T, E> {
+    let _guard = match location {
+        DaemonConfigLocation::Canonical => Some(enter()?),
+        DaemonConfigLocation::Override(_) => None,
+    };
+    Ok(run())
+}
+
+fn run_cli_at(location: &DaemonConfigLocation) -> Result<(), BoxError> {
+    // Refuse a present-but-bad config before constructing runtime state. Canonical
+    // startup reads the guarded machine secret here; an absent file still defaults.
+    let config = match location.load_effective_checked() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("sembazuru-daemon: {e}");
+            return Err(e.into());
+        }
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -103,18 +141,59 @@ fn run_cli() -> Result<(), BoxError> {
             }
         });
     }
-    // CFG-001/SEC-001: a present-but-unreadable/invalid config must NOT silently
-    // fall back to auth-disabling defaults — refuse to start so the operator fixes
-    // it (an absent file still uses defaults, the common dev case).
-    let location = DaemonConfigLocation::from_env();
-    let config = match location.load_effective_checked() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("sembazuru-daemon: {e}");
-            return Err(e.into());
-        }
-    };
-    let result = runtime.block_on(run_daemon_at(config, location, shutdown));
+    let result = runtime.block_on(run_daemon_at(config, location.clone(), shutdown));
     drop(runtime);
     result
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    struct DropSpy(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("drop");
+        }
+    }
+
+    #[test]
+    fn foreground_runtime_guard_wraps_canonical_run_and_skips_override() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        with_runtime_guard_for_location(
+            &DaemonConfigLocation::Canonical,
+            || {
+                events.borrow_mut().push("enter");
+                Ok::<_, &'static str>(DropSpy(Rc::clone(&events)))
+            },
+            || events.borrow_mut().push("run"),
+        )
+        .unwrap();
+        assert_eq!(&*events.borrow(), &["enter", "run", "drop"]);
+
+        let runs = Cell::new(0);
+        assert_eq!(
+            with_runtime_guard_for_location(
+                &DaemonConfigLocation::Canonical,
+                || Err::<DropSpy, _>("entry-failed"),
+                || runs.set(runs.get() + 1),
+            )
+            .unwrap_err(),
+            "entry-failed"
+        );
+        assert_eq!(runs.get(), 0);
+
+        with_runtime_guard_for_location(
+            &DaemonConfigLocation::Override(DaemonConfig::default_path()),
+            || -> Result<DropSpy, &'static str> { panic!("override entered guard") },
+            || runs.set(runs.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(runs.get(), 1);
+    }
 }

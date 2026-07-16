@@ -109,9 +109,38 @@ fn parse_account(args: &[String]) -> sembazuru_worker::service::ServiceAccount {
 /// the worker's capacity, run the worker, and stop it gracefully on Ctrl-C. Dropping
 /// the runtime stops the Execution server.
 fn run_cli() -> Result<(), BoxError> {
+    let location = WorkerConfigLocation::from_env();
+    #[cfg(windows)]
+    {
+        with_runtime_guard_for_location(
+            &location,
+            sembazuru_config_store::enter_machine_service_runtime,
+            || run_cli_at(&location),
+        )?
+    }
+    #[cfg(not(windows))]
+    {
+        run_cli_at(&location)
+    }
+}
+
+#[cfg(windows)]
+fn with_runtime_guard_for_location<G, E, T>(
+    location: &WorkerConfigLocation,
+    enter: impl FnOnce() -> Result<G, E>,
+    run: impl FnOnce() -> T,
+) -> Result<T, E> {
+    let _guard = match location {
+        WorkerConfigLocation::Canonical => Some(enter()?),
+        WorkerConfigLocation::Override(_) => None,
+    };
+    Ok(run())
+}
+
+fn run_cli_at(location: &WorkerConfigLocation) -> Result<(), BoxError> {
     // Refuse to start on a present-but-corrupt config (CFG-001): silently defaulting
     // would drop the operator's agent/token/VFS settings. An absent file is fine.
-    let mut config = WorkerConfig::load_effective_checked(&WorkerConfig::path_from_env())?;
+    let mut config = location.load_effective_checked()?;
     // A positional CLI arg overrides the configured listen address (dev convenience;
     // the service has no argv and uses the file/env value).
     if let Some(addr) = std::env::args().nth(1) {
@@ -143,4 +172,56 @@ fn run_cli() -> Result<(), BoxError> {
     let result = runtime.block_on(run_worker(config, shutdown));
     drop(runtime);
     result
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    struct DropSpy(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("drop");
+        }
+    }
+
+    #[test]
+    fn foreground_runtime_guard_wraps_canonical_run_and_skips_override() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        with_runtime_guard_for_location(
+            &WorkerConfigLocation::Canonical,
+            || {
+                events.borrow_mut().push("enter");
+                Ok::<_, &'static str>(DropSpy(Rc::clone(&events)))
+            },
+            || events.borrow_mut().push("run"),
+        )
+        .unwrap();
+        assert_eq!(&*events.borrow(), &["enter", "run", "drop"]);
+
+        let runs = Cell::new(0);
+        assert_eq!(
+            with_runtime_guard_for_location(
+                &WorkerConfigLocation::Canonical,
+                || Err::<DropSpy, _>("entry-failed"),
+                || runs.set(runs.get() + 1),
+            )
+            .unwrap_err(),
+            "entry-failed"
+        );
+        assert_eq!(runs.get(), 0);
+
+        with_runtime_guard_for_location(
+            &WorkerConfigLocation::Override(WorkerConfig::default_path()),
+            || -> Result<DropSpy, &'static str> { panic!("override entered guard") },
+            || runs.set(runs.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(runs.get(), 1);
+    }
 }
