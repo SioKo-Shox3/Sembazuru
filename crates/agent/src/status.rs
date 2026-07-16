@@ -38,7 +38,7 @@ use tonic::{Request, Response, Status};
 use crate::Execution;
 use crate::action_cache::AgentCache;
 use crate::action_tracker::{ActionTracker, ActivityState, ExecutionKind};
-use crate::config::{DaemonConfig, DaemonConfigLocation};
+use crate::config::{DaemonConfig, DaemonConfigLocation, load_canonical_persisted_without_token};
 use crate::coordination::WorkerTable;
 use crate::fileserver::ServerStats;
 
@@ -272,6 +272,107 @@ fn clamp_u128(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusTokenStorage {
+    Machine,
+    Toml,
+}
+
+impl StatusTokenStorage {
+    fn for_location(location: &DaemonConfigLocation) -> Self {
+        match location {
+            DaemonConfigLocation::Override(_) => Self::Toml,
+            DaemonConfigLocation::Canonical => {
+                #[cfg(windows)]
+                {
+                    Self::Machine
+                }
+                #[cfg(not(windows))]
+                {
+                    Self::Toml
+                }
+            }
+        }
+    }
+}
+
+const MACHINE_TOKEN_READ_DIAGNOSTIC: &str =
+    "canonical machine cluster token could not be read; refusing to report auth state";
+const MACHINE_TOKEN_SET_DIAGNOSTIC: &str = "canonical cluster token changes are offline-only; stop SembazuruDaemon and SembazuruWorker, then run elevated `sembazuru-storectl rotate-token` with the new token redirected to stdin";
+const MACHINE_TOKEN_CLEAR_DIAGNOSTIC: &str = "canonical cluster token changes are offline-only; stop SembazuruDaemon and SembazuruWorker, then run elevated `sembazuru-storectl clear-token`";
+
+fn read_status_config(
+    path: &std::path::Path,
+    storage: StatusTokenStorage,
+    read_machine_presence: impl FnOnce() -> Result<bool, String>,
+) -> Result<(DaemonConfig, bool, bool), Status> {
+    let file_exists = path.try_exists().map_err(|_| {
+        Status::failed_precondition("persisted daemon config presence could not be checked")
+    })?;
+    let cfg = match storage {
+        StatusTokenStorage::Machine => load_canonical_persisted_without_token(path),
+        StatusTokenStorage::Toml => DaemonConfig::load_or_refuse(path),
+    }
+    .map_err(Status::failed_precondition)?;
+    let token_set = match storage {
+        StatusTokenStorage::Machine => read_machine_presence()
+            .map_err(|_| Status::failed_precondition(MACHINE_TOKEN_READ_DIAGNOSTIC))?,
+        StatusTokenStorage::Toml => cfg.cluster_token.is_some(),
+    };
+    Ok((cfg, file_exists, token_set))
+}
+
+fn write_status_config(
+    path: &std::path::Path,
+    storage: StatusTokenStorage,
+    req: SetConfigRequest,
+    save: impl FnOnce(&DaemonConfig) -> Result<(), String>,
+) -> Result<(), Status> {
+    if storage == StatusTokenStorage::Machine
+        && let Some(token) = req.cluster_token.as_deref()
+    {
+        return Err(Status::failed_precondition(if token.is_empty() {
+            MACHINE_TOKEN_CLEAR_DIAGNOSTIC
+        } else {
+            MACHINE_TOKEN_SET_DIAGNOSTIC
+        }));
+    }
+    let mut cfg = match storage {
+        StatusTokenStorage::Machine => load_canonical_persisted_without_token(path),
+        StatusTokenStorage::Toml => DaemonConfig::load_or_refuse(path),
+    }
+    .map_err(Status::failed_precondition)?;
+    let keep = |new: String, old: String| if new.trim().is_empty() { old } else { new };
+    cfg.coord_addr = keep(req.coord_addr, cfg.coord_addr);
+    cfg.intake_addr = keep(req.intake_addr, cfg.intake_addr);
+    cfg.fileserver_addr = keep(req.fileserver_addr, cfg.fileserver_addr);
+    cfg.status_addr = keep(req.status_addr, cfg.status_addr);
+    cfg.cache_root = empty_to_none(req.cache_root);
+    cfg.trace_root = empty_to_none(req.trace_root);
+    cfg.cache_max_bytes = (req.cache_max_bytes > 0).then_some(req.cache_max_bytes);
+    match storage {
+        StatusTokenStorage::Machine => cfg.cluster_token = None,
+        StatusTokenStorage::Toml => {
+            if let Some(token) = req.cluster_token {
+                cfg.cluster_token = empty_to_none(token);
+            }
+        }
+    }
+    save(&cfg).map_err(|msg| Status::internal(format!("config write failed: {msg}")))
+}
+
+#[cfg(windows)]
+fn read_machine_token_presence() -> Result<bool, String> {
+    sembazuru_config_store::read_machine_cluster_token()
+        .map(|secret| secret.is_some())
+        .map_err(|_| MACHINE_TOKEN_READ_DIAGNOSTIC.into())
+}
+
+#[cfg(not(windows))]
+fn read_machine_token_presence() -> Result<bool, String> {
+    Ok(false)
+}
+
 #[tonic::async_trait]
 impl StatusRpc for StatusState {
     async fn get_status(
@@ -336,15 +437,14 @@ impl StatusRpc for StatusState {
         _request: Request<GetConfigRequest>,
     ) -> Result<Response<GetConfigResponse>, Status> {
         let path = self.config_location.path();
+        let storage = StatusTokenStorage::for_location(&self.config_location);
         // Read off the runtime (file I/O). The token is deliberately reduced to a
         // presence bool here — never echo the secret over the wire (M9.3a).
-        let (cfg, file_exists) = tokio::task::spawn_blocking(move || {
-            let exists = path.exists();
-            DaemonConfig::load_or_refuse(&path).map(|cfg| (cfg, exists))
+        let (cfg, file_exists, cluster_token_set) = tokio::task::spawn_blocking(move || {
+            read_status_config(&path, storage, read_machine_token_presence)
         })
         .await
-        .map_err(|e| Status::internal(format!("config read failed: {e}")))?
-        .map_err(Status::failed_precondition)?;
+        .map_err(|e| Status::internal(format!("config read failed: {e}")))??;
         Ok(Response::new(GetConfigResponse {
             config_path: self.config_location.path().to_string_lossy().into_owned(),
             file_exists,
@@ -355,7 +455,7 @@ impl StatusRpc for StatusState {
             cache_root: cfg.cache_root.unwrap_or_default(),
             trace_root: cfg.trace_root.unwrap_or_default(),
             cache_max_bytes: cfg.cache_max_bytes.unwrap_or(0),
-            cluster_token_set: cfg.cluster_token.is_some(),
+            cluster_token_set,
         }))
     }
 
@@ -364,42 +464,19 @@ impl StatusRpc for StatusState {
         request: Request<SetConfigRequest>,
     ) -> Result<Response<SetConfigResponse>, Status> {
         self.require_admin()?;
-        let location = self.config_location.clone();
-        let path = location.path();
         let req = request.into_inner();
-        enum SetConfigError {
-            Load(String),
-            Save(String),
-        }
+        let location = self.config_location.clone();
+        let storage = StatusTokenStorage::for_location(&location);
+        let path = location.path();
 
         let written_path = tokio::task::spawn_blocking(move || {
-            // Start from the existing persisted config so an absent optional field
-            // (cluster_token unchanged) and empty addresses keep their stored
-            // values — a GUI editing one knob need not re-send everything.
-            let mut cfg = DaemonConfig::load_or_refuse(&path).map_err(SetConfigError::Load)?;
-            let keep = |new: String, old: String| if new.trim().is_empty() { old } else { new };
-            cfg.coord_addr = keep(req.coord_addr, cfg.coord_addr);
-            cfg.intake_addr = keep(req.intake_addr, cfg.intake_addr);
-            cfg.fileserver_addr = keep(req.fileserver_addr, cfg.fileserver_addr);
-            cfg.status_addr = keep(req.status_addr, cfg.status_addr);
-            // Optional fields: an empty value clears them (unset).
-            cfg.cache_root = empty_to_none(req.cache_root);
-            cfg.trace_root = empty_to_none(req.trace_root);
-            cfg.cache_max_bytes = (req.cache_max_bytes > 0).then_some(req.cache_max_bytes);
-            // Token: absent = unchanged; present-empty = clear; present-value = set.
-            if let Some(t) = req.cluster_token {
-                cfg.cluster_token = empty_to_none(t);
-            }
-            cfg.save_to_location(&location)
-                .map(|()| path)
-                .map_err(|e| SetConfigError::Save(e.to_string()))
+            write_status_config(&path, storage, req, |cfg| {
+                cfg.save_to_location(&location).map_err(|e| e.to_string())
+            })?;
+            Ok::<_, Status>(path)
         })
         .await
-        .map_err(|e| Status::internal(format!("config write failed: {e}")))?
-        .map_err(|e| match e {
-            SetConfigError::Load(msg) => Status::failed_precondition(msg),
-            SetConfigError::Save(msg) => Status::internal(format!("config write failed: {msg}")),
-        })?;
+        .map_err(|e| Status::internal(format!("config write failed: {e}")))??;
         Ok(Response::new(SetConfigResponse {
             ok: true,
             detail: format!(
@@ -456,6 +533,178 @@ pub async fn serve_status_service(
 mod tests {
     use super::*;
     use crate::ActionOutcome;
+    use std::sync::atomic::AtomicU64;
+
+    static CONFIG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    fn status_config_path() -> std::path::PathBuf {
+        let seq = CONFIG_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("sbz-status-unit-{}-{seq}", std::process::id()))
+            .join("daemon.toml")
+    }
+
+    fn write_status_bytes(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn blank_set() -> SetConfigRequest {
+        SetConfigRequest {
+            coord_addr: String::new(),
+            intake_addr: String::new(),
+            fileserver_addr: String::new(),
+            status_addr: String::new(),
+            cache_root: String::new(),
+            trace_root: String::new(),
+            cache_max_bytes: 0,
+            cluster_token: None,
+        }
+    }
+
+    #[test]
+    fn canonical_status_get_uses_machine_presence_not_toml() {
+        let path = status_config_path();
+        write_status_bytes(&path, b"coord_addr = '127.0.0.1:1'\n");
+
+        let (_, _, token_set) =
+            read_status_config(&path, StatusTokenStorage::Machine, || Ok(true)).unwrap();
+        assert!(token_set);
+        let (_, _, token_set) =
+            read_status_config(&path, StatusTokenStorage::Machine, || Ok(false)).unwrap();
+        assert!(!token_set);
+    }
+
+    #[test]
+    fn canonical_status_get_rejects_every_legacy_token_form_before_machine_read() {
+        for legacy in [
+            "cluster_token = 'secret'\n",
+            "cluster_token = ''\n",
+            "cluster_token = 1\n",
+            "[cluster_token]\nvalue = 'secret'\n",
+        ] {
+            let path = status_config_path();
+            write_status_bytes(&path, legacy.as_bytes());
+            let reads = AtomicU64::new(0);
+            let err = read_status_config(&path, StatusTokenStorage::Machine, || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            })
+            .unwrap_err();
+            assert_eq!(reads.load(Ordering::Relaxed), 0);
+            assert_eq!(err.message(), crate::config::LEGACY_TOKEN_DIAGNOSTIC);
+        }
+    }
+
+    #[test]
+    fn canonical_status_get_fails_closed_on_non_utf8_invalid_toml_read_and_machine_errors() {
+        for bytes in [b"\xff".as_slice(), b"coord_addr = [".as_slice()] {
+            let path = status_config_path();
+            write_status_bytes(&path, bytes);
+            assert!(read_status_config(&path, StatusTokenStorage::Machine, || Ok(false)).is_err());
+        }
+        let unreadable = status_config_path();
+        std::fs::create_dir_all(&unreadable).unwrap();
+        let err =
+            read_status_config(&unreadable, StatusTokenStorage::Machine, || Ok(false)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let invalid = std::path::Path::new("presence\0error");
+        let err =
+            read_status_config(invalid, StatusTokenStorage::Machine, || Ok(false)).unwrap_err();
+        assert_eq!(
+            err.message(),
+            "persisted daemon config presence could not be checked"
+        );
+        let path = status_config_path();
+        write_status_bytes(&path, b"coord_addr = '127.0.0.1:1'\n");
+        let err = read_status_config(&path, StatusTokenStorage::Machine, || {
+            Err("machine-secret-source-sentinel".into())
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(!err.message().contains("sentinel"));
+    }
+
+    #[test]
+    fn canonical_status_keep_saves_only_nonsecret_config() {
+        let path = status_config_path();
+        write_status_bytes(&path, b"coord_addr = '127.0.0.1:1'\n");
+        let mut request = blank_set();
+        request.coord_addr = "127.0.0.1:9".into();
+
+        write_status_config(&path, StatusTokenStorage::Machine, request, |cfg| {
+            cfg.save_to(&path).map_err(|e| e.to_string())
+        })
+        .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("127.0.0.1:9"));
+        assert!(!text.contains("cluster_token"));
+    }
+
+    #[test]
+    fn canonical_status_set_and_clear_reject_mixed_requests_without_byte_change() {
+        for token in ["new-secret", ""] {
+            let path = status_config_path();
+            let original = b"\xff unreadable-before-reject";
+            write_status_bytes(&path, original);
+            let mut request = blank_set();
+            request.coord_addr = "127.0.0.1:9".into();
+            request.cluster_token = Some(token.into());
+
+            let err = write_status_config(&path, StatusTokenStorage::Machine, request, |_| {
+                panic!("rejected token operation must not save")
+            })
+            .unwrap_err();
+
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                if token.is_empty() {
+                    MACHINE_TOKEN_CLEAR_DIAGNOSTIC
+                } else {
+                    MACHINE_TOKEN_SET_DIAGNOSTIC
+                }
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn canonical_status_keep_rejects_legacy_without_rewrite() {
+        let path = status_config_path();
+        let original = b"cluster_token = 'legacy-secret'\n";
+        write_status_bytes(&path, original);
+
+        let err = write_status_config(&path, StatusTokenStorage::Machine, blank_set(), |_| {
+            panic!("legacy config must not save")
+        })
+        .unwrap_err();
+
+        assert_eq!(err.message(), crate::config::LEGACY_TOKEN_DIAGNOSTIC);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn status_token_storage_uses_provenance_not_path_equality() {
+        assert_eq!(
+            StatusTokenStorage::for_location(&DaemonConfigLocation::Override(
+                DaemonConfig::default_path()
+            )),
+            StatusTokenStorage::Toml
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            StatusTokenStorage::for_location(&DaemonConfigLocation::Canonical),
+            StatusTokenStorage::Machine
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            StatusTokenStorage::for_location(&DaemonConfigLocation::Canonical),
+            StatusTokenStorage::Toml
+        );
+    }
 
     fn metrics() -> Arc<Metrics> {
         Arc::new(Metrics::default())

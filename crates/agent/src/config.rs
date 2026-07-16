@@ -31,8 +31,7 @@ pub const DEFAULT_STATUS: &str = "127.0.0.1:50073";
 /// and by tests).
 pub const CONFIG_PATH_ENV: &str = "SEMBAZURU_CONFIG";
 
-#[cfg(windows)]
-const LEGACY_TOKEN_DIAGNOSTIC: &str = "canonical daemon config contains legacy cluster_token; stop SembazuruDaemon and SembazuruWorker, then run `sembazuru-storectl migrate-token`";
+pub(crate) const LEGACY_TOKEN_DIAGNOSTIC: &str = "canonical daemon config contains legacy cluster_token; stop SembazuruDaemon and SembazuruWorker, then run `sembazuru-storectl migrate-token`";
 #[cfg(windows)]
 const SECRET_READ_DIAGNOSTIC: &str =
     "canonical machine cluster token could not be read; refusing to start";
@@ -295,8 +294,6 @@ impl DaemonConfig {
     }
 
     fn load_or_refuse_impl(path: &Path, reject_legacy_token: bool) -> Result<Self, String> {
-        #[cfg(not(windows))]
-        let _ = reject_legacy_token;
         // Lead with a confirmed-absent check so the common dev case (no file, or a
         // missing parent dir) uses defaults — and is distinguished from a file that
         // is genuinely PRESENT but unreadable. `try_exists() == Ok(false)` is the
@@ -331,7 +328,6 @@ impl DaemonConfig {
                         )
                     }
                 })?;
-                #[cfg(windows)]
                 if reject_legacy_token && table.contains_key("cluster_token") {
                     return Err(LEGACY_TOKEN_DIAGNOSTIC.into());
                 }
@@ -347,7 +343,7 @@ impl DaemonConfig {
         path: &Path,
         read_secret: impl FnOnce() -> Result<Option<S>, E>,
     ) -> Result<Self, String> {
-        let mut cfg = Self::load_or_refuse_impl(path, true)?;
+        let mut cfg = load_canonical_persisted_without_token(path)?;
         cfg.cluster_token = match read_secret().map_err(|_| SECRET_READ_DIAGNOSTIC)? {
             None => None,
             Some(secret) => Some(
@@ -444,6 +440,15 @@ impl DaemonConfig {
             ConfigDispatch::Override(path) => self.seed_if_absent(path),
         }
     }
+}
+
+/// Loads only canonical persisted non-secret settings. Legacy plaintext token
+/// keys are rejected before typed deserialization; DPAPI and environment
+/// overrides are deliberately outside this parser.
+pub(crate) fn load_canonical_persisted_without_token(path: &Path) -> Result<DaemonConfig, String> {
+    let mut cfg = DaemonConfig::load_or_refuse_impl(path, true)?;
+    cfg.cluster_token = None;
+    Ok(cfg)
 }
 
 #[cfg(test)]
