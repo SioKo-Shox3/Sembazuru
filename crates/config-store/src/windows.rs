@@ -281,7 +281,7 @@ pub(super) fn seed_config_canonical(
 pub(super) fn read_machine_secret_canonical() -> Result<Option<MachineSecret>, MachineStoreError> {
     let program_data = program_data_path()?;
     let parent = open_config_parent_path_nofollow(&program_data)?;
-    read_machine_secret_at(
+    read_machine_secret_service_safe_at(
         &parent,
         OsStr::new(ROOT_NAME),
         &SecurityPolicy::production(),
@@ -1269,14 +1269,33 @@ fn unprotect_machine_secret(blob: &[u8]) -> Result<MachineSecret, MachineStoreEr
     decode_machine_secret_envelope(&plaintext_copy)
 }
 
+#[cfg(test)]
 fn read_machine_secret_at(
     parent: &File,
     root_name: &OsStr,
     policy: &SecurityPolicy,
 ) -> Result<Option<MachineSecret>, MachineStoreError> {
     let root = reopen_validated_committed(parent, root_name, policy)?;
+    read_machine_secret_on_held_root(&root, policy)
+}
+
+fn read_machine_secret_service_safe_at(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<Option<MachineSecret>, MachineStoreError> {
+    let guard = enter_service_runtime_at(parent, root_name, policy)?;
+    // Keep the validated shared lease live through the handle-relative secret read so an
+    // exclusive updater cannot publish or clear state between validation and consumption.
+    read_machine_secret_on_held_root(&guard._root, policy)
+}
+
+fn read_machine_secret_on_held_root(
+    root: &File,
+    policy: &SecurityPolicy,
+) -> Result<Option<MachineSecret>, MachineStoreError> {
     let descriptor = SecurityDescriptor::from_sddl(policy.config_sddl())?;
-    let Some(mut file) = open_fixed_file_optional(&root, OsStr::new(MACHINE_SECRET_LEAF), false)?
+    let Some(mut file) = open_fixed_file_optional(root, OsStr::new(MACHINE_SECRET_LEAF), false)?
     else {
         return Ok(None);
     };
@@ -3315,6 +3334,13 @@ mod machine_secret_tests {
         read_machine_secret_at(&parent, OsStr::new(ROOT_NAME), &fixture.policy)
     }
 
+    fn run_service_safe_read(
+        fixture: &SecretFixture,
+    ) -> Result<Option<crate::MachineSecret>, MachineStoreError> {
+        let parent = open_config_parent_path_nofollow(&fixture.parent)?;
+        read_machine_secret_service_safe_at(&parent, OsStr::new(ROOT_NAME), &fixture.policy)
+    }
+
     fn run_replace(
         fixture: &SecretFixture,
         token: &[u8],
@@ -3454,13 +3480,62 @@ mod machine_secret_tests {
     }
 
     #[test]
+    fn machine_secret_service_safe_read_accepts_provisioned_then_committed_store() {
+        let fixture = SecretFixture::provisioned();
+        assert!(run_service_safe_read(&fixture).unwrap().is_none());
+
+        let parent = open_directory_path_nofollow(&fixture.parent).unwrap();
+        commit_at_handle(&parent, OsStr::new(ROOT_NAME), &fixture.policy).unwrap();
+        drop(parent);
+        assert!(run_service_safe_read(&fixture).unwrap().is_none());
+
+        run_replace(&fixture, TOKEN, &[nonce(2)], ConfigWriteFault::None).unwrap();
+        assert_eq!(
+            run_service_safe_read(&fixture).unwrap().unwrap().as_ref(),
+            TOKEN
+        );
+        let blob = fs::read(fixture.final_path()).unwrap();
+        assert!(!blob.windows(TOKEN.len()).any(|window| window == TOKEN));
+    }
+
+    #[test]
+    fn machine_secret_service_safe_read_rejects_pending_update_journal() {
+        let fixture = SecretFixture::committed();
+        let parent = open_config_parent_path_nofollow(&fixture.parent).unwrap();
+        let mut guard =
+            begin_token_update_at_for_test(&parent, OsStr::new(ROOT_NAME), &fixture.policy)
+                .unwrap();
+        assert_eq!(
+            crate::prepare_machine_cluster_token_update(
+                &mut guard,
+                crate::MachineTokenUpdate {
+                    cluster_token: crate::MachineTokenUpdateValue::Replace(TOKEN),
+                    daemon_config: crate::MachineTokenUpdateValue::Preserve,
+                    worker_config: crate::MachineTokenUpdateValue::Preserve,
+                },
+            )
+            .unwrap(),
+            crate::MachineTokenUpdatePreparation::JournalReady
+        );
+        drop(guard);
+
+        assert_eq!(
+            run_service_safe_read(&fixture)
+                .unwrap_err()
+                .classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+    }
+
+    #[test]
     fn machine_secret_lifecycle_and_root_mismatch_fail_closed() {
         let provisioned = SecretFixture::provisioned();
-        for result in [
+        let committed_only_results = [
             run_read(&provisioned).map(drop),
             run_replace(&provisioned, TOKEN, &[nonce(3)], ConfigWriteFault::None).map(drop),
             run_clear(&provisioned).map(drop),
-        ] {
+        ];
+        for result in committed_only_results {
             assert_eq!(
                 result.unwrap_err().classification(),
                 MachineStoreErrorClass::IntegrityViolation

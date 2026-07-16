@@ -143,7 +143,7 @@ impl fmt::Debug for MachineSecret {
     }
 }
 
-/// Reads the fixed `%ProgramData%\Sembazuru\cluster-token.dpapi` secret.
+/// Reads the fixed secret under a service-safe lease on a provisioned or committed store.
 pub fn read_machine_cluster_token() -> Result<Option<MachineSecret>, MachineStoreError> {
     platform::read_machine_secret()
 }
