@@ -54,7 +54,13 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass};
+use crate::{
+    MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass,
+    MachineTokenUpdate, MachineTokenUpdatePreparation,
+};
+
+#[path = "token_update.rs"]
+mod token_update;
 
 const ROOT_NAME: &str = "Sembazuru";
 const SCRATCH_NAME: &str = "scratch";
@@ -295,6 +301,45 @@ pub(super) fn clear_machine_secret_canonical() -> Result<bool, MachineStoreError
         &parent,
         OsStr::new(ROOT_NAME),
         &SecurityPolicy::production(),
+    )
+}
+
+pub(super) fn prepare_machine_token_update_canonical(
+    update: MachineTokenUpdate<'_>,
+) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+    let program_data = program_data_path()?;
+    let parent = open_config_parent_path_nofollow(&program_data)?;
+    let mut nonce = random_nonce;
+    token_update::prepare_update_at(
+        &parent,
+        OsStr::new(ROOT_NAME),
+        &SecurityPolicy::production(),
+        update,
+        &mut nonce,
+        token_update::PrepareFault::None,
+    )
+}
+
+pub(super) fn machine_token_update_pending_canonical() -> Result<bool, MachineStoreError> {
+    let program_data = program_data_path()?;
+    let parent = open_config_parent_path_nofollow(&program_data)?;
+    token_update::update_pending_at(
+        &parent,
+        OsStr::new(ROOT_NAME),
+        &SecurityPolicy::production(),
+    )
+}
+
+pub(super) fn apply_machine_token_update_canonical() -> Result<(), MachineStoreError> {
+    let program_data = program_data_path()?;
+    let parent = open_config_parent_path_nofollow(&program_data)?;
+    let mut nonce = random_nonce;
+    token_update::apply_update_at(
+        &parent,
+        OsStr::new(ROOT_NAME),
+        &SecurityPolicy::production(),
+        &mut nonce,
+        token_update::ApplyFault::None,
     )
 }
 
@@ -1020,6 +1065,7 @@ fn clear_machine_secret_at(
 enum FixedFile {
     Config(MachineConfigTarget),
     MachineSecret,
+    TokenUpdateJournal,
 }
 
 impl FixedFile {
@@ -1027,6 +1073,7 @@ impl FixedFile {
         match self {
             Self::Config(target) => config_leaf(target),
             Self::MachineSecret => MACHINE_SECRET_LEAF,
+            Self::TokenUpdateJournal => token_update::JOURNAL_LEAF,
         }
     }
 }

@@ -151,6 +151,47 @@ pub fn clear_machine_cluster_token() -> Result<bool, MachineStoreError> {
     platform::clear_machine_secret()
 }
 
+/// One fixed target directive in a machine cluster-token transaction.
+pub enum MachineTokenUpdateValue<'a> {
+    /// Assert and retain the target's current safe state, including absence.
+    Preserve,
+    /// Atomically publish the supplied bytes for the fixed target.
+    Replace(&'a [u8]),
+}
+
+/// The complete fixed machine cluster-token transaction.
+pub struct MachineTokenUpdate<'a> {
+    pub cluster_token: MachineTokenUpdateValue<'a>,
+    pub daemon_config: MachineTokenUpdateValue<'a>,
+    pub worker_config: MachineTokenUpdateValue<'a>,
+}
+
+/// Result of preparing an immutable machine cluster-token update journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineTokenUpdatePreparation {
+    /// Every replacement was byte-identical to the current safe state.
+    NoChange,
+    /// The immutable journal is published and retained for apply or resume.
+    JournalReady,
+}
+
+/// Prepares one fixed, whole machine cluster-token update transaction.
+pub fn prepare_machine_cluster_token_update(
+    update: MachineTokenUpdate<'_>,
+) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+    platform::prepare_token_update(update)
+}
+
+/// Reports whether a fully validated machine cluster-token journal exists.
+pub fn machine_cluster_token_update_pending() -> Result<bool, MachineStoreError> {
+    platform::token_update_pending()
+}
+
+/// Applies or resumes the one pending fixed machine cluster-token transaction.
+pub fn apply_or_resume_machine_cluster_token_update() -> Result<(), MachineStoreError> {
+    platform::apply_token_update()
+}
+
 #[cfg(test)]
 mod machine_config_api_tests {
     use super::*;
@@ -272,9 +313,86 @@ mod machine_secret_api_tests {
     }
 }
 
+#[cfg(test)]
+mod machine_token_update_api_tests {
+    use super::*;
+
+    #[test]
+    fn machine_token_update_public_api_is_fixed_and_transactional() {
+        let _: fn(
+            MachineTokenUpdate<'_>,
+        ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> =
+            prepare_machine_cluster_token_update;
+        let _: fn() -> Result<bool, MachineStoreError> = machine_cluster_token_update_pending;
+        let _: fn() -> Result<(), MachineStoreError> = apply_or_resume_machine_cluster_token_update;
+
+        let update = MachineTokenUpdate {
+            cluster_token: MachineTokenUpdateValue::Preserve,
+            daemon_config: MachineTokenUpdateValue::Replace(b"daemon"),
+            worker_config: MachineTokenUpdateValue::Preserve,
+        };
+        assert!(matches!(
+            update.cluster_token,
+            MachineTokenUpdateValue::Preserve
+        ));
+
+        let source = include_str!("lib.rs");
+        for name in [
+            "prepare_machine_cluster_token_update",
+            "machine_cluster_token_update_pending",
+            "apply_or_resume_machine_cluster_token_update",
+        ] {
+            let start = source
+                .find(&format!("pub fn {name}"))
+                .expect("public machine-token update declaration");
+            let declaration = source[start..]
+                .split_once(" {")
+                .expect("complete public machine-token update declaration")
+                .0;
+            for forbidden in [
+                "Path", "leaf", "root", "Identity", "hash", "journal", "Sddl", "Policy", "mode",
+                "fault", "delete",
+            ] {
+                assert!(!declaration.contains(forbidden), "{declaration}");
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn machine_token_update_is_unsupported_without_side_effects_off_windows() {
+        let update = MachineTokenUpdate {
+            cluster_token: MachineTokenUpdateValue::Preserve,
+            daemon_config: MachineTokenUpdateValue::Preserve,
+            worker_config: MachineTokenUpdateValue::Preserve,
+        };
+        assert_eq!(
+            prepare_machine_cluster_token_update(update)
+                .unwrap_err()
+                .classification(),
+            MachineStoreErrorClass::Unsupported
+        );
+        assert_eq!(
+            machine_cluster_token_update_pending()
+                .unwrap_err()
+                .classification(),
+            MachineStoreErrorClass::Unsupported
+        );
+        assert_eq!(
+            apply_or_resume_machine_cluster_token_update()
+                .unwrap_err()
+                .classification(),
+            MachineStoreErrorClass::Unsupported
+        );
+    }
+}
+
 #[cfg(windows)]
 mod platform {
-    use super::{MachineConfigTarget, MachineSecret, MachineStoreError, windows};
+    use super::{
+        MachineConfigTarget, MachineSecret, MachineStoreError, MachineTokenUpdate,
+        MachineTokenUpdatePreparation, windows,
+    };
 
     pub(super) fn provision() -> Result<(), MachineStoreError> {
         windows::provision_canonical()
@@ -317,11 +435,28 @@ mod platform {
     pub(super) fn clear_machine_secret() -> Result<bool, MachineStoreError> {
         windows::clear_machine_secret_canonical()
     }
+
+    pub(super) fn prepare_token_update(
+        update: MachineTokenUpdate<'_>,
+    ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+        windows::prepare_machine_token_update_canonical(update)
+    }
+
+    pub(super) fn token_update_pending() -> Result<bool, MachineStoreError> {
+        windows::machine_token_update_pending_canonical()
+    }
+
+    pub(super) fn apply_token_update() -> Result<(), MachineStoreError> {
+        windows::apply_machine_token_update_canonical()
+    }
 }
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass};
+    use super::{
+        MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass,
+        MachineTokenUpdate, MachineTokenUpdatePreparation,
+    };
 
     fn unsupported<T>() -> Result<T, MachineStoreError> {
         Err(MachineStoreError::new(
@@ -369,6 +504,20 @@ mod platform {
     }
 
     pub(super) fn clear_machine_secret() -> Result<bool, MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn prepare_token_update(
+        _update: MachineTokenUpdate<'_>,
+    ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn token_update_pending() -> Result<bool, MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn apply_token_update() -> Result<(), MachineStoreError> {
         unsupported()
     }
 }
