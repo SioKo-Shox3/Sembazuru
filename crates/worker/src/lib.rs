@@ -16,6 +16,8 @@ pub mod fileclient;
 mod job;
 pub mod run;
 #[cfg(windows)]
+mod sandbox;
+#[cfg(windows)]
 pub mod service;
 pub mod vfs_pipe;
 
