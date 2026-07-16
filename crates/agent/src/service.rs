@@ -50,6 +50,25 @@ fn daemon_service_exit_code<E>(result: Result<(), E>) -> ServiceExitCode {
     }
 }
 
+fn acquire_service_runtime_guard_for_location<T, E>(
+    location: &DaemonConfigLocation,
+    acquire: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    match location {
+        DaemonConfigLocation::Canonical => acquire().map(Some),
+        DaemonConfigLocation::Override(_) => Ok(None),
+    }
+}
+
+fn report_stopped_before_releasing<G, E>(
+    guard: Option<G>,
+    report_stopped: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let result = report_stopped();
+    drop(guard);
+    result
+}
+
 fn load_service_config(location: &DaemonConfigLocation) -> Result<DaemonConfig, String> {
     location.load_effective_checked()
 }
@@ -103,6 +122,24 @@ fn run_service() -> windows_service::Result<()> {
         ServiceExitCode::Win32(0),
     )?;
 
+    let config_location = DaemonConfigLocation::from_env();
+    let service_runtime_guard = match acquire_service_runtime_guard_for_location(
+        &config_location,
+        sembazuru_config_store::enter_machine_service_runtime,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("sembazuru-daemon: service runtime guard entry failed: {e}");
+            set(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                Duration::default(),
+                fatal_service_exit_code(),
+            )?;
+            return Ok(());
+        }
+    };
+
     // A multi-thread Tokio runtime on this SCM thread runs the daemon. A service
     // has no per-shell env, so config comes from the file (+ any env), M9.3a.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -112,37 +149,51 @@ fn run_service() -> windows_service::Result<()> {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("sembazuru-daemon: runtime build failed: {e}");
-            set(
-                ServiceState::Stopped,
-                ServiceControlAccept::empty(),
-                Duration::default(),
-                fatal_service_exit_code(),
-            )?;
-            return Ok(());
+            return report_stopped_before_releasing(service_runtime_guard, || {
+                set(
+                    ServiceState::Stopped,
+                    ServiceControlAccept::empty(),
+                    Duration::default(),
+                    fatal_service_exit_code(),
+                )
+            });
         }
     };
 
-    let config_location = DaemonConfigLocation::from_env();
     let config = match load_service_config(&config_location) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("sembazuru-daemon: config load failed: {e}");
+            return report_stopped_before_releasing(service_runtime_guard, || {
+                set(
+                    ServiceState::Stopped,
+                    ServiceControlAccept::empty(),
+                    Duration::default(),
+                    fatal_service_exit_code(),
+                )
+            });
+        }
+    };
+
+    if let Err(running_error) = set(
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        Duration::default(),
+        ServiceExitCode::Win32(0),
+    ) {
+        let stopped = report_stopped_before_releasing(service_runtime_guard, || {
             set(
                 ServiceState::Stopped,
                 ServiceControlAccept::empty(),
                 Duration::default(),
                 fatal_service_exit_code(),
-            )?;
-            return Ok(());
-        }
-    };
-
-    set(
-        ServiceState::Running,
-        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-        Duration::default(),
-        ServiceExitCode::Win32(0),
-    )?;
+            )
+        });
+        return match stopped {
+            Ok(()) => Err(running_error),
+            Err(stopped_error) => Err(stopped_error),
+        };
+    }
 
     let result = runtime.block_on(run_daemon_at(config, config_location, shutdown));
     // Dropping the runtime stops the spawned servers.
@@ -152,13 +203,14 @@ fn run_service() -> windows_service::Result<()> {
         eprintln!("sembazuru-daemon: daemon exited with error: {e}");
     }
 
-    set(
-        ServiceState::Stopped,
-        ServiceControlAccept::empty(),
-        Duration::default(),
-        exit_code,
-    )?;
-    Ok(())
+    report_stopped_before_releasing(service_runtime_guard, || {
+        set(
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            Duration::default(),
+            exit_code,
+        )
+    })
 }
 
 /// Runs the SCM dispatcher; called when the SCM launches the binary with
@@ -295,7 +347,19 @@ pub fn uninstall() -> windows_service::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
     use super::*;
+
+    struct DropSpy(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("dropped");
+        }
+    }
 
     #[test]
     fn account_parsing_and_names() {
@@ -375,6 +439,63 @@ mod tests {
             ServiceExitCode::Win32(0)
         );
         assert_ne!(fatal_service_exit_code(), ServiceExitCode::Win32(0));
+    }
+
+    #[test]
+    fn daemon_service_runtime_guard_enters_only_for_canonical_location() {
+        let calls = Cell::new(0);
+        let guard = acquire_service_runtime_guard_for_location(
+            &DaemonConfigLocation::Canonical,
+            || -> Result<u8, &'static str> {
+                calls.set(calls.get() + 1);
+                Ok(7)
+            },
+        )
+        .unwrap();
+        assert_eq!(guard, Some(7));
+        assert_eq!(calls.get(), 1);
+
+        for location in [
+            DaemonConfigLocation::Override(PathBuf::new()),
+            DaemonConfigLocation::Override(DaemonConfig::default_path()),
+        ] {
+            let guard: Result<Option<u8>, &'static str> =
+                acquire_service_runtime_guard_for_location(&location, || {
+                    calls.set(calls.get() + 1);
+                    Ok(9)
+                });
+            assert_eq!(guard.unwrap(), None);
+        }
+        assert_eq!(calls.get(), 1, "override provenance must bypass the guard");
+    }
+
+    #[test]
+    fn daemon_service_runtime_guard_propagates_entry_failure() {
+        let error =
+            acquire_service_runtime_guard_for_location(&DaemonConfigLocation::Canonical, || {
+                Err::<u8, _>("guard-entry-failed")
+            })
+            .unwrap_err();
+        assert_eq!(error, "guard-entry-failed");
+    }
+
+    #[test]
+    fn daemon_service_runtime_guard_is_released_after_stopped_report() {
+        for report_succeeds in [true, false] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let guard = DropSpy(Rc::clone(&events));
+            let result = report_stopped_before_releasing(Some(guard), || {
+                events.borrow_mut().push("reported");
+                if report_succeeds {
+                    Ok(())
+                } else {
+                    Err("stopped-report-failed")
+                }
+            });
+
+            assert_eq!(&*events.borrow(), &["reported", "dropped"]);
+            assert_eq!(result.is_ok(), report_succeeds);
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use crate::config::WorkerConfig;
+use crate::config::{WorkerConfig, WorkerConfigLocation};
 use crate::run::run_worker;
 
 /// The service's registered name (used by the SCM and `sc.exe`). Distinct from the
@@ -47,6 +47,36 @@ pub const SERVICE_ARG: &str = "--service";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 define_windows_service!(ffi_service_main, service_main);
+
+fn fatal_service_exit_code() -> ServiceExitCode {
+    ServiceExitCode::ServiceSpecific(1)
+}
+
+fn worker_service_exit_code<E>(result: Result<(), E>) -> ServiceExitCode {
+    match result {
+        Ok(()) => ServiceExitCode::Win32(0),
+        Err(_) => fatal_service_exit_code(),
+    }
+}
+
+fn acquire_service_runtime_guard_for_location<T, E>(
+    location: &WorkerConfigLocation,
+    acquire: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    match location {
+        WorkerConfigLocation::Canonical => acquire().map(Some),
+        WorkerConfigLocation::Override(_) => Ok(None),
+    }
+}
+
+fn report_stopped_before_releasing<G, E>(
+    guard: Option<G>,
+    report_stopped: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    let result = report_stopped();
+    drop(guard);
+    result
+}
 
 /// SCM entry point (runs on a background thread). There is no console in service
 /// context; diagnostics go to stderr (Event Log integration is a future refinement).
@@ -76,12 +106,12 @@ fn run_service() -> windows_service::Result<()> {
     };
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
-    let set = |state, accept, wait_hint| {
+    let set = |state, accept, wait_hint, exit_code| {
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
             current_state: state,
             controls_accepted: accept,
-            exit_code: ServiceExitCode::Win32(0),
+            exit_code,
             checkpoint: 0,
             wait_hint,
             process_id: None,
@@ -94,23 +124,44 @@ fn run_service() -> windows_service::Result<()> {
         ServiceState::StartPending,
         ServiceControlAccept::empty(),
         Duration::from_secs(10),
+        ServiceExitCode::Win32(0),
     )?;
+
+    let config_location = WorkerConfigLocation::from_env();
+    let service_runtime_guard = match acquire_service_runtime_guard_for_location(
+        &config_location,
+        sembazuru_config_store::enter_machine_service_runtime,
+    ) {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("sembazuru-worker: service runtime guard entry failed: {e}");
+            set(
+                ServiceState::Stopped,
+                ServiceControlAccept::empty(),
+                Duration::default(),
+                fatal_service_exit_code(),
+            )?;
+            return Ok(());
+        }
+    };
 
     // A service has no per-shell env, so config comes from the file (+ any env),
     // M9.3c. Load it first because the runtime is sized to the worker's capacity.
     // Refuse to run on a present-but-corrupt config (CFG-001): a service silently
     // defaulting (no agent/token/VFS) is the scariest variant — it has no shell to
     // notice the warning. Report Stopped to the SCM so the failure is visible.
-    let config = match WorkerConfig::load_effective_checked(&WorkerConfig::path_from_env()) {
+    let config = match WorkerConfig::load_effective_checked(&config_location.path()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("sembazuru-worker: {e}");
-            set(
-                ServiceState::Stopped,
-                ServiceControlAccept::empty(),
-                Duration::default(),
-            )?;
-            return Ok(());
+            return report_stopped_before_releasing(service_runtime_guard, || {
+                set(
+                    ServiceState::Stopped,
+                    ServiceControlAccept::empty(),
+                    Duration::default(),
+                    fatal_service_exit_code(),
+                )
+            });
         }
     };
     let worker_threads = config.capacity.unwrap_or(2).clamp(2, 64) as usize;
@@ -122,34 +173,53 @@ fn run_service() -> windows_service::Result<()> {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("sembazuru-worker: runtime build failed: {e}");
+            return report_stopped_before_releasing(service_runtime_guard, || {
+                set(
+                    ServiceState::Stopped,
+                    ServiceControlAccept::empty(),
+                    Duration::default(),
+                    fatal_service_exit_code(),
+                )
+            });
+        }
+    };
+
+    if let Err(running_error) = set(
+        ServiceState::Running,
+        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        Duration::default(),
+        ServiceExitCode::Win32(0),
+    ) {
+        let stopped = report_stopped_before_releasing(service_runtime_guard, || {
             set(
                 ServiceState::Stopped,
                 ServiceControlAccept::empty(),
                 Duration::default(),
-            )?;
-            return Ok(());
-        }
-    };
-
-    set(
-        ServiceState::Running,
-        ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
-        Duration::default(),
-    )?;
+                fatal_service_exit_code(),
+            )
+        });
+        return match stopped {
+            Ok(()) => Err(running_error),
+            Err(stopped_error) => Err(stopped_error),
+        };
+    }
 
     let result = runtime.block_on(run_worker(config, shutdown));
     // Dropping the runtime stops the Execution server.
     drop(runtime);
+    let exit_code = worker_service_exit_code(result.as_ref().map(|_| ()));
     if let Err(e) = result {
         eprintln!("sembazuru-worker: worker exited with error: {e}");
     }
 
-    set(
-        ServiceState::Stopped,
-        ServiceControlAccept::empty(),
-        Duration::default(),
-    )?;
-    Ok(())
+    report_stopped_before_releasing(service_runtime_guard, || {
+        set(
+            ServiceState::Stopped,
+            ServiceControlAccept::empty(),
+            Duration::default(),
+            exit_code,
+        )
+    })
 }
 
 /// Runs the SCM dispatcher; called when the SCM launches the binary with
@@ -270,7 +340,19 @@ pub fn uninstall() -> windows_service::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::path::PathBuf;
+    use std::rc::Rc;
+
     use super::*;
+
+    struct DropSpy(Rc<RefCell<Vec<&'static str>>>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("dropped");
+        }
+    }
 
     #[test]
     fn account_parsing_and_names() {
@@ -303,5 +385,105 @@ mod tests {
             ServiceAccount::NetworkService.account_name(),
             Some(OsString::from("NT AUTHORITY\\NetworkService"))
         );
+    }
+
+    #[test]
+    fn worker_service_runtime_guard_enters_only_for_canonical_location() {
+        let calls = Cell::new(0);
+        let guard = acquire_service_runtime_guard_for_location(
+            &WorkerConfigLocation::Canonical,
+            || -> Result<u8, &'static str> {
+                calls.set(calls.get() + 1);
+                Ok(7)
+            },
+        )
+        .unwrap();
+        assert_eq!(guard, Some(7));
+        assert_eq!(calls.get(), 1);
+
+        for location in [
+            WorkerConfigLocation::Override(PathBuf::new()),
+            WorkerConfigLocation::Override(WorkerConfig::default_path()),
+        ] {
+            let guard: Result<Option<u8>, &'static str> =
+                acquire_service_runtime_guard_for_location(&location, || {
+                    calls.set(calls.get() + 1);
+                    Ok(9)
+                });
+            assert_eq!(guard.unwrap(), None);
+        }
+        assert_eq!(calls.get(), 1, "override provenance must bypass the guard");
+    }
+
+    #[test]
+    fn worker_service_runtime_guard_propagates_entry_failure() {
+        let error =
+            acquire_service_runtime_guard_for_location(&WorkerConfigLocation::Canonical, || {
+                Err::<u8, _>("guard-entry-failed")
+            })
+            .unwrap_err();
+        assert_eq!(error, "guard-entry-failed");
+    }
+
+    #[test]
+    fn worker_service_runtime_guard_is_released_after_stopped_report() {
+        for report_succeeds in [true, false] {
+            let events = Rc::new(RefCell::new(Vec::new()));
+            let guard = DropSpy(Rc::clone(&events));
+            let result = report_stopped_before_releasing(Some(guard), || {
+                events.borrow_mut().push("reported");
+                if report_succeeds {
+                    Ok(())
+                } else {
+                    Err("stopped-report-failed")
+                }
+            });
+
+            assert_eq!(&*events.borrow(), &["reported", "dropped"]);
+            assert_eq!(result.is_ok(), report_succeeds);
+        }
+    }
+
+    #[test]
+    fn worker_service_exit_code_maps_success_to_win32_zero() {
+        assert_eq!(
+            worker_service_exit_code(Ok::<(), &'static str>(())),
+            ServiceExitCode::Win32(0)
+        );
+    }
+
+    #[test]
+    fn worker_service_exit_code_maps_failure_to_non_zero() {
+        for failure in ["guard", "config", "runtime", "run"] {
+            assert_ne!(
+                worker_service_exit_code(Err::<(), _>(failure)),
+                ServiceExitCode::Win32(0),
+                "{failure} failure must be fatal"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_service_exit_code_maps_invalid_override_config_to_non_zero() {
+        let path = std::env::temp_dir().join(format!(
+            "sbz-worker-service-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, "this is = = not valid toml [[[").unwrap();
+        let location = WorkerConfigLocation::Override(path.clone());
+
+        let result = WorkerConfig::load_effective_checked(&location.path());
+        let exit_code = worker_service_exit_code(result.as_ref().map(|_| ()));
+
+        assert!(
+            result.is_err(),
+            "a present invalid override must be refused"
+        );
+        assert_ne!(exit_code, ServiceExitCode::Win32(0));
+        std::fs::remove_file(path).unwrap();
     }
 }
