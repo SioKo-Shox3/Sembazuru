@@ -25,12 +25,29 @@
 
 ## High
 
-### OPEN: ProgramData ACL・平文トークン・安全な設定保存
+### RESOLVED (2026-07-16): ProgramData ACL・平文トークン・安全な設定保存
 
-- 根拠: `installer/sembazuru.wxs:215-241`、`crates/agent/src/config.rs:52,260-284`、`crates/worker/src/config.rs:137,418-444`。
-- 現状: `%ProgramData%\Sembazuru`の継承ACLを閉じず、`cluster_token`を平文TOMLへ保存する。PID固定名の一時ファイルを`write`しており、先置きやreparse pointへの防御がない。
-- 修正方向: SYSTEM／Administrators／必要なservice SIDだけのprivate DACL、DPAPI等による秘密保護、ランダム名＋`create_new`、所有者とreparse point検証、既存トークンのローテーションを実装する。
-- Done: 標準Usersが設定・CAS・scratchを読めず作れず、秘密が平文保存されず、先置き／reparse回帰テストがfail closedする。
+- 対応（安全なstore／秘密）: `22b71f2`（handle相対・原子的な設定保存）、`b29b832`（canonical machine-store結線）、
+  `53d15da`（DPAPI LocalMachineと固定identity）、`73331a1`・`6724bcf`・`6449e34`（前進回復journal、原子的削除、平文token移行）。
+- 対応（競合／consumer）: `d598c3a`・`b4e521a`・`a53bff4`・`6ed779a`（service shared leaseとtoken-update exclusive lease、
+  provision／commit両立、guard下secret read）、`3f48f57`（agent／worker canonical起動のguard→legacy全型拒否→DPAPI strict UTF-8→env適用）、
+  `fefc745`（storectl認可、認可前stdin禁止、bounded／zeroized入力）、`e6f88e2`（Statusはpresenceのみ、Set／Clearはoffline保守、Keepは非secretのみ）。
+- 統合追補: `941dcad`（cache成立後にworker停止）、`8e6ac87`・`df620f3`・`f60cbfe`（production境界を弱めず、直接起動testを明示Override identityへ移行）。
+- 境界: `%ProgramData%\Sembazuru`は継承を遮断し、SYSTEM／Administrators／必要なservice SIDだけに限定する。
+  store操作は保持handle相対、no-follow、owner／DACL／lifecycle／identity再検証、ランダム`create_new` tempと原子的replace／deleteを用いる。
+  canonical tokenはDPAPI blobだけで、TOMLの全`cluster_token`型を移行案内付きで拒否する。
+- ローカル検証: config-storeのmachine config／secret／token-update fault・collision・reparse・wrong-owner・resume tests、storectl認可7件、
+  agent／worker canonical consumer tests、canonical Status `6 passed; 0 failed`、Override `config_rpc` `8 passed; 0 failed`、workspace、fmt、clippy、scopeが成功。
+- clean CI: [run 29487785441](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29487785441) の
+  [Rust](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29487785441/job/87586296817)、
+  [installer ACL](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29487785441/job/87586296828)、
+  [Windows 2022](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29487785441/job/87586296854)、
+  [Windows 2025](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29487785441/job/87586296882) が成功し、
+  [CodeQL run 29487785427](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/29487785427) も成功。
+- レビュー: orchestratorの統合行レビューは完了。direct Codex／Claude read-only統合レビューは各304秒でtimeoutし出力なしだったため、
+  同一儀式を再実行せず、上記ローカル反証testとclean CIを出口証拠とした。
+- Done: 標準Usersは設定・CAS・scratchのprivate ACLを通れず、秘密は平文保存されない。先置き、hardlink／reparse、wrong owner／DACL、
+  root／journal置換、途中faultはfail closedまたはjournalから前進回復し、canonical serviceとtoken保守は同時に成立しない。
 
 ### OPEN: workerのプロセス・scratch分離の残部
 
