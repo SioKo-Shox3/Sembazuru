@@ -114,20 +114,12 @@ impl Drop for ActionSid {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired by following sandbox phases")
-)]
 pub(crate) struct ActionToken {
     token: OwnedHandle,
     action_sid: ActionSid,
     broker_user: Vec<usize>,
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "wired by following sandbox phases")
-)]
 impl ActionToken {
     pub(crate) fn create() -> io::Result<Self> {
         let token = current_token(
@@ -240,10 +232,8 @@ fn sid_string(sid: *mut c_void) -> io::Result<String> {
     Ok(unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(value, length)) })
 }
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 pub(crate) struct PrivateScratch(Option<PathBuf>);
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 impl PrivateScratch {
     pub(crate) fn create(root: &Path, leaf: &str, token: &ActionToken) -> io::Result<Self> {
         let components: Vec<_> = Path::new(leaf).components().collect();
@@ -281,15 +271,21 @@ impl Drop for PrivateScratch {
     }
 }
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 pub(crate) struct PrivateRuntime {
+    #[allow(
+        dead_code,
+        reason = "read by sandbox tests that verify the staged runtime ACL"
+    )]
     path: PathBuf,
     launcher: PathBuf,
     interceptor64: PathBuf,
+    #[allow(
+        dead_code,
+        reason = "read by sandbox tests that verify optional 32-bit staging"
+    )]
     interceptor32: Option<PathBuf>,
 }
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 impl PrivateRuntime {
     pub(crate) fn stage(
         scratch: &PrivateScratch,
@@ -373,6 +369,10 @@ impl PrivateRuntime {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "sandbox tests inspect the staged runtime ACL through this path"
+    )]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -385,6 +385,10 @@ impl PrivateRuntime {
         &self.interceptor64
     }
 
+    #[allow(
+        dead_code,
+        reason = "sandbox tests verify optional 32-bit interceptor staging"
+    )]
     pub(crate) fn interceptor32(&self) -> Option<&Path> {
         self.interceptor32.as_deref()
     }
@@ -396,7 +400,6 @@ pub(crate) struct ActionPipeSecurity(String);
 pub(crate) const ACTION_PIPE_CLIENT_ACCESS: u32 = 0x0012_0083;
 
 impl ActionPipeSecurity {
-    #[allow(dead_code, reason = "wired by sandbox integration phase")]
     pub(crate) fn new(token: &ActionToken) -> io::Result<Self> {
         Ok(Self(format!(
             "O:{}D:P(A;;FA;;;{})(A;;0x{ACTION_PIPE_CLIENT_ACCESS:08x};;;{})",
@@ -552,7 +555,6 @@ fn set_medium_integrity(token: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 pub(crate) struct RestrictedCommand {
     application: PathBuf,
     cwd: PathBuf,
@@ -560,7 +562,6 @@ pub(crate) struct RestrictedCommand {
     environment: Vec<(OsString, OsString)>,
 }
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 impl RestrictedCommand {
     pub(crate) fn new(application: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
         Self {
@@ -796,7 +797,6 @@ impl Drop for SuspendedGuardian {
     }
 }
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 pub(crate) struct RestrictedProcess {
     process: Option<OwnedHandle>,
     stdout: Option<OwnedHandle>,
@@ -804,7 +804,6 @@ pub(crate) struct RestrictedProcess {
     job: Arc<JobObject>,
 }
 
-#[allow(dead_code, reason = "wired by sandbox integration phase")]
 impl RestrictedProcess {
     pub(crate) fn spawn(token: &ActionToken, command: &RestrictedCommand) -> io::Result<Self> {
         Self::spawn_inner(
@@ -894,6 +893,10 @@ impl RestrictedProcess {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "sandbox tests verify suspended assignment before execution"
+    )]
     pub(crate) fn is_in_job(&self) -> io::Result<bool> {
         let process = self
             .process
@@ -986,6 +989,10 @@ impl RestrictedProcess {
     }
 
     /// Concurrently drains both pipes, then kills descendants as soon as the top process exits.
+    #[allow(
+        dead_code,
+        reason = "sandbox tests exercise the owned concurrent-drain convenience path"
+    )]
     pub(crate) async fn wait_with_output(mut self) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
         async fn drain(mut file: tokio::fs::File) -> io::Result<Vec<u8>> {
             use tokio::io::AsyncReadExt;
