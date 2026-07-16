@@ -175,6 +175,24 @@ impl ActionToken {
         // SAFETY: broker_user owns a complete, aligned TOKEN_USER for self's lifetime.
         unsafe { (*(self.broker_user.as_ptr().cast::<TOKEN_USER>())).User.Sid }
     }
+
+    #[cfg(test)]
+    pub(crate) fn impersonated<T>(
+        &self,
+        operation: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        struct Revert;
+        impl Drop for Revert {
+            fn drop(&mut self) {
+                unsafe { windows_sys::Win32::Security::RevertToSelf() };
+            }
+        }
+        if unsafe { windows_sys::Win32::Security::ImpersonateLoggedOnUser(self.handle()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _revert = Revert;
+        operation()
+    }
 }
 
 struct LocalAllocation(*mut c_void);
@@ -229,6 +247,160 @@ impl PrivateScratch {
 
     pub(crate) fn into_path(self) -> PathBuf {
         self.0
+    }
+}
+
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+pub(crate) struct PrivateRuntime {
+    path: PathBuf,
+    launcher: PathBuf,
+    interceptor64: PathBuf,
+    interceptor32: Option<PathBuf>,
+}
+
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+impl PrivateRuntime {
+    pub(crate) fn stage(
+        scratch: &PrivateScratch,
+        launcher: &Path,
+        interceptor64: &Path,
+        token: &ActionToken,
+    ) -> io::Result<Self> {
+        fn copy_file(source: &Path, target: &Path) -> io::Result<()> {
+            let mut source = File::open(source)?;
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target)?;
+            io::copy(&mut source, &mut target)?;
+            target.sync_all()
+        }
+
+        fn source_name(path: &Path) -> io::Result<&std::ffi::OsStr> {
+            if !path.is_file() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+            path.file_name()
+                .ok_or_else(|| io::ErrorKind::InvalidInput.into())
+        }
+        let launcher_name = source_name(launcher)?;
+        let interceptor64_name = source_name(interceptor64)?;
+        let interceptor32_source = interceptor64
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join("sbz_interceptor32.dll");
+        let interceptor32_name = interceptor32_source
+            .is_file()
+            .then(|| interceptor32_source.file_name().unwrap());
+        let mut names = vec![
+            launcher_name.to_string_lossy().to_ascii_lowercase(),
+            interceptor64_name.to_string_lossy().to_ascii_lowercase(),
+        ];
+        if let Some(name) = interceptor32_name {
+            names.push(name.to_string_lossy().to_ascii_lowercase());
+        }
+        names.sort_unstable();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "runtime source file names collide",
+            ));
+        }
+
+        let path = scratch.path().join(".runtime");
+        let sddl = format!(
+            "O:{}D:P(A;OICI;FA;;;{})(A;OICI;GRGX;;;{})",
+            sid_string(token.broker_sid())?,
+            sid_string(token.broker_sid())?,
+            sid_string(token.action_sid.0)?
+        );
+        create_secured_directory(&path, &sddl)?;
+        let launcher_staged = path.join(launcher_name);
+        let interceptor64_staged = path.join(interceptor64_name);
+        let interceptor32_staged = interceptor32_name.map(|name| path.join(name));
+        let copy_result = (|| {
+            copy_file(launcher, &launcher_staged)?;
+            copy_file(interceptor64, &interceptor64_staged)?;
+            if let Some(target) = &interceptor32_staged {
+                copy_file(&interceptor32_source, target)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = copy_result {
+            if let Err(cleanup) = std::fs::remove_dir_all(&path) {
+                return Err(io::Error::other(format!(
+                    "runtime staging failed ({error}); cleanup failed ({cleanup})"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            path,
+            launcher: launcher_staged,
+            interceptor64: interceptor64_staged,
+            interceptor32: interceptor32_staged,
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn launcher(&self) -> &Path {
+        &self.launcher
+    }
+
+    pub(crate) fn interceptor64(&self) -> &Path {
+        &self.interceptor64
+    }
+
+    pub(crate) fn interceptor32(&self) -> Option<&Path> {
+        self.interceptor32.as_deref()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ActionPipeSecurity(String);
+
+pub(crate) const ACTION_PIPE_CLIENT_ACCESS: u32 = 0x0012_0083;
+
+impl ActionPipeSecurity {
+    #[allow(dead_code, reason = "wired by sandbox integration phase")]
+    pub(crate) fn new(token: &ActionToken) -> io::Result<Self> {
+        Ok(Self(format!(
+            "O:{}D:P(A;;FA;;;{})(A;;0x{ACTION_PIPE_CLIENT_ACCESS:08x};;;{})",
+            sid_string(token.broker_sid())?,
+            sid_string(token.broker_sid())?,
+            sid_string(token.action_sid.0)?
+        )))
+    }
+
+    /// Builds a fresh descriptor for one synchronous CreateNamedPipe call. The raw
+    /// pointer must not be retained by `operation` and never crosses an await point.
+    pub(crate) fn with_attributes<T>(
+        &self,
+        operation: impl FnOnce(*mut c_void) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let wide: Vec<u16> = self.0.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = LocalAllocation(descriptor);
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        operation((&mut attributes as *mut SECURITY_ATTRIBUTES).cast())
     }
 }
 
@@ -901,15 +1073,6 @@ mod tests {
                 Err(error) => Err(error),
             }
         }
-
-        fn impersonated<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
-            // SAFETY: handle is live and RevertGuard restores the prior thread token.
-            if unsafe { ImpersonateLoggedOnUser(self.handle()) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let _guard = RevertGuard;
-            operation()
-        }
     }
 
     fn token_groups_contain(token: HANDLE, class: i32, sid: *mut c_void) -> io::Result<bool> {
@@ -1079,6 +1242,27 @@ mod tests {
         }
     }
 
+    fn can_open_file(path: &Path, access: u32) -> bool {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                FILE_SHARE_READ,
+                null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            false
+        } else {
+            drop(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) });
+            true
+        }
+    }
+
     #[test]
     fn action_token_identity_and_limits() {
         let a = ActionToken::create().unwrap();
@@ -1213,6 +1397,130 @@ mod tests {
         })
         .unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_runtime_stages_read_execute_only_tools() {
+        let action = ActionToken::create().unwrap();
+        let other = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "runtime-action", &action).unwrap();
+        let source = root.join("runtime-source");
+        std::fs::create_dir(&source).unwrap();
+        let launcher = source.join("launcher-test.exe");
+        let dll64 = source.join("sbz_interceptor64.dll");
+        let dll32 = source.join("sbz_interceptor32.dll");
+        std::fs::write(&launcher, b"launcher").unwrap();
+        std::fs::write(&dll64, b"dll64").unwrap();
+        std::fs::write(&dll32, b"dll32").unwrap();
+
+        let runtime = PrivateRuntime::stage(&scratch, &launcher, &dll64, &action).unwrap();
+        assert_eq!(std::fs::read(runtime.launcher()).unwrap(), b"launcher");
+        assert_eq!(std::fs::read(runtime.interceptor64()).unwrap(), b"dll64");
+        assert_eq!(
+            std::fs::read(runtime.interceptor32().unwrap()).unwrap(),
+            b"dll32"
+        );
+        let (owner, control, aces) = scratch_acl(runtime.path()).unwrap();
+        assert_eq!(owner, sid_string(action.broker_sid()).unwrap());
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        let inherit = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        assert_eq!(
+            aces,
+            vec![
+                (
+                    sid_string(action.broker_sid()).unwrap(),
+                    inherit,
+                    FILE_ALL_ACCESS
+                ),
+                (
+                    sid_string(action.action_sid.0).unwrap(),
+                    inherit,
+                    FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+                )
+            ]
+        );
+        action
+            .impersonated(|| {
+                assert_eq!(std::fs::read(runtime.launcher())?, b"launcher");
+                assert!(can_open_file(runtime.launcher(), FILE_GENERIC_EXECUTE));
+                assert!(!can_open_file(runtime.launcher(), FILE_GENERIC_WRITE));
+                assert!(!can_open_file(runtime.launcher(), DELETE));
+                assert!(!can_open_directory(runtime.path(), FILE_GENERIC_WRITE));
+                assert!(!can_open_directory(runtime.path(), DELETE));
+                assert!(!can_open_directory(runtime.path(), WRITE_DAC));
+                assert!(!can_open_directory(runtime.path(), WRITE_OWNER));
+                assert!(std::fs::write(runtime.launcher(), b"replace").is_err());
+                assert!(std::fs::remove_file(runtime.launcher()).is_err());
+                assert!(File::create(runtime.path().join("new")).is_err());
+                assert!(std::fs::remove_dir(runtime.path()).is_err());
+                assert!(
+                    std::fs::rename(runtime.path(), scratch.path().join(".runtime-renamed"))
+                        .is_err()
+                );
+                assert!(runtime.path().is_dir());
+                assert_eq!(std::fs::read(runtime.launcher())?, b"launcher");
+                assert_eq!(std::fs::read(runtime.interceptor64())?, b"dll64");
+                assert_eq!(std::fs::read(runtime.interceptor32().unwrap())?, b"dll32");
+                Ok(())
+            })
+            .unwrap();
+        other
+            .impersonated(|| {
+                assert_eq!(
+                    std::fs::read(runtime.launcher()).unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(runtime.path().join("broker"), b"ok").unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_runtime_failures_leave_no_partial_tree() {
+        let action = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "runtime-fail", &action).unwrap();
+        let source = root.join("failure-source");
+        std::fs::create_dir(&source).unwrap();
+        let launcher = source.join("same.bin");
+        let dll = root.join("other").join("same.bin");
+        std::fs::create_dir(dll.parent().unwrap()).unwrap();
+        std::fs::write(&launcher, b"launcher").unwrap();
+        std::fs::write(&dll, b"dll").unwrap();
+        assert!(PrivateRuntime::stage(&scratch, &launcher, &dll, &action).is_err());
+        assert!(!scratch.path().join(".runtime").exists());
+        assert!(
+            PrivateRuntime::stage(&scratch, &launcher, &source.join("missing"), &action).is_err()
+        );
+        assert!(!scratch.path().join(".runtime").exists());
+        let distinct = source.join("distinct.dll");
+        std::fs::write(&distinct, b"distinct").unwrap();
+        std::fs::create_dir(scratch.path().join(".runtime")).unwrap();
+        assert!(PrivateRuntime::stage(&scratch, &launcher, &distinct, &action).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn action_pipe_security_contains_only_broker_and_action() {
+        let action = ActionToken::create().unwrap();
+        let security = ActionPipeSecurity::new(&action).unwrap();
+        assert_eq!(
+            security.0,
+            format!(
+                "O:{}D:P(A;;FA;;;{})(A;;0x00120083;;;{})",
+                sid_string(action.broker_sid()).unwrap(),
+                sid_string(action.broker_sid()).unwrap(),
+                sid_string(action.action_sid.0).unwrap()
+            )
+        );
+        assert_eq!(
+            ACTION_PIPE_CLIENT_ACCESS
+                & windows_sys::Win32::Storage::FileSystem::FILE_CREATE_PIPE_INSTANCE,
+            0
+        );
     }
 
     #[test]

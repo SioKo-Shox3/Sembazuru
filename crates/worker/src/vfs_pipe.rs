@@ -43,6 +43,7 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{Mutex, Notify, OnceCell};
 
 use crate::fileclient::FileClient;
+use crate::sandbox::ActionPipeSecurity;
 
 const STATUS_OK: u8 = 0;
 const STATUS_NOT_FOUND: u8 = 1;
@@ -50,6 +51,49 @@ const STATUS_ERROR: u8 = 2;
 const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 const PREFETCH_CONCURRENCY: usize = 32;
 static HYDRATE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+struct ActionPipeFactory {
+    full: String,
+    security: ActionPipeSecurity,
+}
+
+impl ActionPipeFactory {
+    fn new(full: String, security: ActionPipeSecurity) -> Self {
+        Self { full, security }
+    }
+
+    fn create(&self, first: bool) -> io::Result<NamedPipeServer> {
+        let mut options = ServerOptions::new();
+        options
+            .first_pipe_instance(first)
+            .reject_remote_clients(true);
+        self.security.with_attributes(|attributes| {
+            // SAFETY: ActionPipeSecurity keeps the descriptor and SECURITY_ATTRIBUTES live
+            // for this synchronous create call and destroys them before returning.
+            unsafe { options.create_with_security_attributes_raw(&self.full, attributes) }
+        })
+    }
+}
+
+enum PipeInstanceFactory {
+    Legacy(String),
+    Secured(ActionPipeFactory),
+}
+
+impl PipeInstanceFactory {
+    fn create(&self, first: bool) -> io::Result<NamedPipeServer> {
+        match self {
+            Self::Legacy(full) => {
+                let mut options = ServerOptions::new();
+                options
+                    .first_pipe_instance(first)
+                    .reject_remote_clients(true);
+                options.create(full)
+            }
+            Self::Secured(factory) => factory.create(first),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum BlockingWorkKind {
@@ -566,6 +610,41 @@ pub async fn start_action_vfs(
     .await
 }
 
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) async fn start_secured_action_vfs(
+    pipe_name: String,
+    agent_addr: SocketAddr,
+    scratch_root: PathBuf,
+    cas_root: PathBuf,
+    rtt: Duration,
+    predicted_paths: Vec<String>,
+    vfs_root: String,
+    session_id: String,
+    auth_token: String,
+    security: ActionPipeSecurity,
+) -> io::Result<ActionVfsServer> {
+    start_action_vfs_owner(move |materializations, ready_tx| async move {
+        serve_vfs_with_prefetch_ready_tracked_factory(
+            PipeInstanceFactory::Secured(ActionPipeFactory::new(
+                format!(r"\\.\pipe\{pipe_name}"),
+                security,
+            )),
+            agent_addr,
+            scratch_root,
+            cas_root,
+            rtt,
+            predicted_paths,
+            ready_tx,
+            vfs_root,
+            session_id,
+            auth_token,
+            materializations,
+        )
+        .await
+    })
+    .await
+}
+
 async fn start_action_vfs_owner<Start, Serve>(start: Start) -> io::Result<ActionVfsServer>
 where
     Start: FnOnce(MaterializationTracker, tokio::sync::oneshot::Sender<()>) -> Serve,
@@ -604,6 +683,36 @@ async fn serve_vfs_with_prefetch_ready_tracked(
     materializations: MaterializationTracker,
 ) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
+    serve_vfs_with_prefetch_ready_tracked_factory(
+        PipeInstanceFactory::Legacy(full),
+        agent_addr,
+        scratch_root,
+        cas_root,
+        rtt,
+        predicted_paths,
+        ready,
+        vfs_root,
+        session_id,
+        auth_token,
+        materializations,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_vfs_with_prefetch_ready_tracked_factory(
+    factory: PipeInstanceFactory,
+    agent_addr: SocketAddr,
+    scratch_root: PathBuf,
+    cas_root: PathBuf,
+    rtt: Duration,
+    predicted_paths: Vec<String>,
+    ready: tokio::sync::oneshot::Sender<()>,
+    vfs_root: String,
+    session_id: String,
+    auth_token: String,
+    materializations: MaterializationTracker,
+) -> io::Result<()> {
     let state = Arc::new(VfsState {
         scratch_root,
         hydrated: Mutex::new(HashMap::new()),
@@ -623,23 +732,21 @@ async fn serve_vfs_with_prefetch_ready_tracked(
     // Create the first instance synchronously, THEN signal readiness: once
     // `create()` returns the pipe is in the namespace and a client dial will
     // connect (or wait), never miss. Only after this do we let the caller launch.
-    let server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&full)?;
+    let server = factory.create(true)?;
     let _ = ready.send(());
 
     // Keep warm and connected-client work inside this future so cancelling the
     // pipe server synchronously drops every in-flight hydrate.
     let warm_state = Arc::clone(&state);
     let warm = warm_state.prefetch_warm(&predicted_paths);
-    serve_pipe_with_owned_futures(&full, server, warm, move |connected| {
+    serve_pipe_with_owned_futures(factory, server, warm, move |connected| {
         handle_client(connected, Arc::clone(&state))
     })
     .await
 }
 
 async fn serve_pipe_with_owned_futures<Warm, Handle, Client>(
-    full: &str,
+    factory: PipeInstanceFactory,
     mut server: NamedPipeServer,
     warm: Warm,
     mut handle_client: Handle,
@@ -660,7 +767,7 @@ where
                 result?;
                 let connected = server;
                 // Pre-create immediately so a client never races a missing pipe.
-                server = ServerOptions::new().create(full)?;
+                server = factory.create(false)?;
                 clients.push(handle_client(connected));
             }
             Some(_result) = clients.next(), if !clients.is_empty() => {}
@@ -861,6 +968,8 @@ mod tests {
     use sembazuru_dataplane::wire::{FrameHeader, OpCode};
     use tokio::net::{TcpListener, TcpStream};
 
+    use crate::sandbox::{ActionPipeSecurity, ActionToken};
+
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     struct HydrateActivityGuard(Arc<AtomicUsize>);
@@ -905,6 +1014,69 @@ mod tests {
             session_id: String::new(),
             client: OnceCell::new(),
             materializations: MaterializationTracker::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn action_pipe_first_and_later_instances_enforce_action_identity() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::RawHandle;
+
+        use tokio::net::windows::named_pipe::NamedPipeClient;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_DATA, FILE_WRITE_DATA, OPEN_EXISTING,
+        };
+
+        fn open_client(name: &str) -> io::Result<NamedPipeClient> {
+            let wide: Vec<u16> = std::ffi::OsStr::new(name)
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_READ_DATA | FILE_WRITE_DATA,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { NamedPipeClient::from_raw_handle(handle as RawHandle) }
+        }
+
+        let action = ActionToken::create().unwrap();
+        let other = ActionToken::create().unwrap();
+        let name = format!(
+            r"\\.\pipe\sbz-action-pipe-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let factory =
+            ActionPipeFactory::new(name.clone(), ActionPipeSecurity::new(&action).unwrap());
+        for first in [true, false] {
+            let mut server = factory.create(first).unwrap();
+            let create_error = action
+                .impersonated(|| ServerOptions::new().create(&name))
+                .unwrap_err();
+            assert_eq!(create_error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(other.impersonated(|| open_client(&name)).is_err());
+            let mut client = action.impersonated(|| open_client(&name)).unwrap();
+            server.connect().await.unwrap();
+            client.write_all(b"C").await.unwrap();
+            let mut byte = [0];
+            server.read_exact(&mut byte).await.unwrap();
+            assert_eq!(&byte, b"C");
+            server.write_all(b"S").await.unwrap();
+            client.read_exact(&mut byte).await.unwrap();
+            assert_eq!(&byte, b"S");
+            drop(client);
+            drop(server);
         }
     }
 
@@ -1995,21 +2167,26 @@ mod tests {
         let client_started = started_tx.clone();
         let serve_full = full.clone();
         let outer = tokio::spawn(async move {
-            serve_pipe_with_owned_futures(&serve_full, server, warm, move |pipe| {
-                let active = Arc::clone(&client_active);
-                let writes = Arc::clone(&client_writes);
-                let release = Arc::clone(&client_release);
-                let started_tx = client_started.clone();
-                async move {
-                    let _pipe = pipe;
-                    active.fetch_add(1, Ordering::SeqCst);
-                    let _guard = HydrateActivityGuard(active);
-                    started_tx.send(()).unwrap();
-                    release.notified().await;
-                    writes.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                }
-            })
+            serve_pipe_with_owned_futures(
+                PipeInstanceFactory::Legacy(serve_full),
+                server,
+                warm,
+                move |pipe| {
+                    let active = Arc::clone(&client_active);
+                    let writes = Arc::clone(&client_writes);
+                    let release = Arc::clone(&client_release);
+                    let started_tx = client_started.clone();
+                    async move {
+                        let _pipe = pipe;
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _guard = HydrateActivityGuard(active);
+                        started_tx.send(()).unwrap();
+                        release.notified().await;
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
             .await
         });
 
