@@ -19,9 +19,9 @@ use std::os::windows::io::RawHandle;
 
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_UILIMIT_DESKTOP,
-    JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -111,6 +111,25 @@ impl JobObject {
             }
         }
         Ok(())
+    }
+
+    /// Assigns a suspended process and verifies membership in this exact job.
+    pub fn assign_verified(&self, process: RawHandle) -> io::Result<()> {
+        self.assign(process)?;
+        if !self.contains(process)? {
+            return Err(io::Error::other("job membership verification failed"));
+        }
+        Ok(())
+    }
+
+    /// Returns whether `process` belongs to this exact job.
+    pub fn contains(&self, process: RawHandle) -> io::Result<bool> {
+        let mut result = 0;
+        // SAFETY: both handles remain live and result is a valid out pointer.
+        if unsafe { IsProcessInJob(process as _, self.0 as _, &mut result) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(result != 0)
     }
 
     /// Actively terminates every process in the job now (an explicit `Abort`),

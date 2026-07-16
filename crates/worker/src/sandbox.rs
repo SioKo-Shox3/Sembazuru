@@ -1,12 +1,17 @@
-use std::ffi::c_void;
-use std::io;
+use std::ffi::{OsString, c_void};
+use std::fs::File;
+use std::io::{self, Read};
+use std::marker::PhantomData;
 use std::mem::{size_of, size_of_val};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
+use windows_sys::Win32::Foundation::{
+    HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
+};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
@@ -17,15 +22,25 @@ use windows_sys::Win32::Security::{
     AllocateAndInitializeSid, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
     FreeSid, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
     SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES,
-    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TOKEN_USER, TokenIntegrityLevel, TokenIsRestricted, TokenUser, WinAuthenticatedUserSid,
-    WinBuiltinUsersSid, WinMediumLabelSid, WinRestrictedCodeSid, WinWorldSid,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenIsRestricted,
+    TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinMediumLabelSid,
+    WinRestrictedCodeSid, WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+};
+
+use crate::job::JobObject;
 
 struct ActionSid(*mut c_void);
 
@@ -93,7 +108,9 @@ pub(crate) struct ActionToken {
 )]
 impl ActionToken {
     pub(crate) fn create() -> io::Result<Self> {
-        let token = current_token(TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT)?;
+        let token = current_token(
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+        )?;
         Self::create_from_token(token.as_raw_handle() as HANDLE)
     }
 
@@ -331,14 +348,412 @@ fn set_medium_integrity(token: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+pub(crate) struct RestrictedCommand {
+    application: PathBuf,
+    cwd: PathBuf,
+    arguments: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+}
+
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+impl RestrictedCommand {
+    pub(crate) fn new(application: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            application: application.into(),
+            cwd: cwd.into(),
+            arguments: Vec::new(),
+            environment: Vec::new(),
+        }
+    }
+
+    pub(crate) fn arg(mut self, value: impl Into<OsString>) -> Self {
+        self.arguments.push(value.into());
+        self
+    }
+
+    pub(crate) fn env(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.environment.push((name.into(), value.into()));
+        self
+    }
+}
+
+struct PreparedCommand {
+    application: Vec<u16>,
+    command_line: Vec<u16>,
+    cwd: Vec<u16>,
+    environment: Vec<u16>,
+}
+
+fn prepare_command(command: &RestrictedCommand) -> io::Result<PreparedCommand> {
+    fn path(value: &Path) -> io::Result<Vec<u16>> {
+        if !value.is_absolute() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let mut wide: Vec<_> = value.as_os_str().encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+    let application = path(&command.application)?;
+    let cwd = path(&command.cwd)?;
+    let mut command_line = Vec::new();
+    append_quoted(&mut command_line, &application[..application.len() - 1]);
+    for argument in &command.arguments {
+        let wide: Vec<_> = argument.encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        command_line.push(b' ' as u16);
+        append_quoted(&mut command_line, &wide);
+    }
+    command_line.push(0);
+    if command_line.len() > 32_767 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut entries = Vec::new();
+    for (name, value) in &command.environment {
+        let name: Vec<_> = name.encode_wide().collect();
+        let value: Vec<_> = value.encode_wide().collect();
+        if name.is_empty()
+            || name.contains(&0)
+            || name.contains(&(b'=' as u16))
+            || value.contains(&0)
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        entries.push((name, value));
+    }
+    entries.sort_by_key(|(name, _)| String::from_utf16_lossy(name).to_lowercase());
+    if entries.windows(2).any(|pair| {
+        String::from_utf16_lossy(&pair[0].0).to_lowercase()
+            == String::from_utf16_lossy(&pair[1].0).to_lowercase()
+    }) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut environment = Vec::new();
+    for (name, value) in entries {
+        environment.extend(name);
+        environment.push(b'=' as u16);
+        environment.extend(value);
+        environment.push(0);
+    }
+    environment.push(0);
+    if environment.len() == 1 {
+        environment.push(0);
+    }
+    Ok(PreparedCommand {
+        application,
+        command_line,
+        cwd,
+        environment,
+    })
+}
+
+fn append_quoted(output: &mut Vec<u16>, argument: &[u16]) {
+    let quote = argument.is_empty()
+        || argument
+            .iter()
+            .any(|value| matches!(*value, 0x20 | 0x09 | 0x22));
+    if !quote {
+        output.extend_from_slice(argument);
+        return;
+    }
+    output.push(b'"' as u16);
+    let mut slashes = 0;
+    for &value in argument {
+        if value == b'\\' as u16 {
+            slashes += 1;
+        } else {
+            output.extend(std::iter::repeat_n(
+                b'\\' as u16,
+                slashes * (1 + usize::from(value == b'"' as u16)),
+            ));
+            if value == b'"' as u16 {
+                output.push(b'\\' as u16);
+            }
+            output.push(value);
+            slashes = 0;
+        }
+    }
+    output.extend(std::iter::repeat_n(b'\\' as u16, slashes * 2));
+    output.push(b'"' as u16);
+}
+
+struct AttributeList<'a> {
+    storage: Vec<usize>,
+    initialized: bool,
+    _handles: PhantomData<&'a [HANDLE]>,
+}
+
+impl<'a> AttributeList<'a> {
+    fn handles(handles: &'a [HANDLE]) -> io::Result<Self> {
+        let mut bytes = 0;
+        // SAFETY: the null first call is the documented size query.
+        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut bytes) };
+        if bytes == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut result = Self {
+            storage: vec![0; bytes.div_ceil(size_of::<usize>())],
+            initialized: false,
+            _handles: PhantomData,
+        };
+        // SAFETY: usize storage is aligned and has the queried capacity.
+        if unsafe { InitializeProcThreadAttributeList(result.ptr(), 1, 0, &mut bytes) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        result.initialized = true;
+        if unsafe {
+            UpdateProcThreadAttribute(
+                result.ptr(),
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr().cast(),
+                size_of_val(handles),
+                null_mut(),
+                null(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(result)
+    }
+
+    fn ptr(&mut self) -> *mut c_void {
+        self.storage.as_mut_ptr().cast()
+    }
+}
+
+impl Drop for AttributeList<'_> {
+    fn drop(&mut self) {
+        if self.initialized {
+            // SAFETY: initialized records the single successful initialization.
+            unsafe { DeleteProcThreadAttributeList(self.ptr()) };
+        }
+    }
+}
+
+fn stdio_pipe(child_reads: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 1,
+    };
+    let (mut read, mut write) = (null_mut(), null_mut());
+    // SAFETY: out pointers and attributes are valid; both returned handles are owned below.
+    if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: CreatePipe returned two unique live handles.
+    let read = unsafe { OwnedHandle::from_raw_handle(read as RawHandle) };
+    let write = unsafe { OwnedHandle::from_raw_handle(write as RawHandle) };
+    let (child, parent) = if child_reads {
+        (read, write)
+    } else {
+        (write, read)
+    };
+    // SAFETY: parent is live and must never be inherited by the child.
+    if unsafe { SetHandleInformation(parent.as_raw_handle() as HANDLE, HANDLE_FLAG_INHERIT, 0) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((child, parent))
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+enum SpawnFailure {
+    AfterCreate,
+    BeforeResume,
+}
+
+struct SuspendedGuardian(Option<OwnedHandle>);
+
+impl SuspendedGuardian {
+    fn disarm(mut self) -> OwnedHandle {
+        self.0.take().unwrap()
+    }
+}
+
+impl Drop for SuspendedGuardian {
+    fn drop(&mut self) {
+        if let Some(process) = &self.0 {
+            // SAFETY: a suspended child is still live; terminate then synchronously reap it.
+            unsafe {
+                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
+                WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE);
+            }
+        }
+    }
+}
+
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+pub(crate) struct RestrictedProcess {
+    process: Option<OwnedHandle>,
+    stdout: Option<OwnedHandle>,
+    stderr: Option<OwnedHandle>,
+    job: Arc<JobObject>,
+}
+
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+impl RestrictedProcess {
+    pub(crate) fn spawn(token: &ActionToken, command: &RestrictedCommand) -> io::Result<Self> {
+        Self::spawn_inner(
+            token,
+            command,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn spawn_inner(
+        token: &ActionToken,
+        command: &RestrictedCommand,
+        #[cfg(test)] failure: Option<SpawnFailure>,
+    ) -> io::Result<Self> {
+        let mut prepared = prepare_command(command)?;
+        let job = Arc::new(JobObject::new_kill_on_close()?);
+        let (stdin, stdin_parent) = stdio_pipe(true)?;
+        let (stdout, stdout_parent) = stdio_pipe(false)?;
+        let (stderr, stderr_parent) = stdio_pipe(false)?;
+        drop(stdin_parent); // EOF is explicit; actions cannot wait on ambient broker input.
+        let inherited = [
+            stdin.as_raw_handle() as HANDLE,
+            stdout.as_raw_handle() as HANDLE,
+            stderr.as_raw_handle() as HANDLE,
+        ];
+        let mut attributes = AttributeList::handles(&inherited)?;
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = inherited[0];
+        startup.StartupInfo.hStdOutput = inherited[1];
+        startup.StartupInfo.hStdError = inherited[2];
+        startup.lpAttributeList = attributes.ptr();
+        let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: all UTF-16 buffers are NUL-terminated and live; command_line is mutable;
+        // only the three inheritable stdio handles in the attribute list can cross the boundary.
+        if unsafe {
+            CreateProcessAsUserW(
+                token.handle(),
+                prepared.application.as_ptr(),
+                prepared.command_line.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                prepared.environment.as_ptr().cast(),
+                prepared.cwd.as_ptr(),
+                &startup.StartupInfo,
+                &mut info,
+            )
+        } == 0
+        {
+            return Err(io::Error::other(format!(
+                "create_process: OS error {}",
+                io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            )));
+        }
+        // SAFETY: CreateProcessAsUserW returned unique live process/thread handles.
+        let guardian = SuspendedGuardian(Some(unsafe {
+            OwnedHandle::from_raw_handle(info.hProcess as RawHandle)
+        }));
+        let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread as RawHandle) };
+        #[cfg(test)]
+        if failure == Some(SpawnFailure::AfterCreate) {
+            return Err(io::Error::other("after_create: injected failure"));
+        }
+        job.assign_verified(guardian.0.as_ref().unwrap().as_raw_handle())?;
+        #[cfg(test)]
+        if failure == Some(SpawnFailure::BeforeResume) {
+            return Err(io::Error::other("before_resume: injected failure"));
+        }
+        drop(attributes);
+        drop((stdin, stdout, stderr));
+        // This is deliberately the final fallible setup step: no child instruction ran earlier.
+        let prior = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
+        if prior != 1 {
+            return Err(io::Error::other(format!(
+                "resume_thread: unexpected count {prior}"
+            )));
+        }
+        Ok(Self {
+            process: Some(guardian.disarm()),
+            stdout: Some(stdout_parent),
+            stderr: Some(stderr_parent),
+            job,
+        })
+    }
+
+    pub(crate) fn is_in_job(&self) -> io::Result<bool> {
+        self.job
+            .contains(self.process.as_ref().unwrap().as_raw_handle())
+    }
+
+    /// Concurrently drains both pipes, then kills descendants as soon as the top process exits.
+    pub(crate) async fn wait_with_output(mut self) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
+        fn drain(handle: OwnedHandle) -> io::Result<Vec<u8>> {
+            let mut file = File::from(handle);
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        }
+        let stdout_handle = self.stdout.take().unwrap();
+        let stderr_handle = self.stderr.take().unwrap();
+        let stdout = tokio::task::spawn_blocking(move || drain(stdout_handle));
+        let stderr = tokio::task::spawn_blocking(move || drain(stderr_handle));
+        let code = tokio::task::spawn_blocking(move || {
+            let handle = self.process.as_ref().unwrap().as_raw_handle() as HANDLE;
+            if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut code = 0;
+            if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.job.terminate();
+            Ok(code)
+        })
+        .await
+        .map_err(|_| io::Error::other("process waiter failed"))??;
+        let stdout = stdout
+            .await
+            .map_err(|_| io::Error::other("stdout reader failed"))??;
+        let stderr = stderr
+            .await
+            .map_err(|_| io::Error::other("stderr reader failed"))??;
+        Ok((code, stdout, stderr))
+    }
+}
+
+impl Drop for RestrictedProcess {
+    fn drop(&mut self) {
+        self.job.terminate();
+        if let Some(process) = &self.process {
+            // SAFETY: process is owned here; direct terminate covers pre/post-job teardown.
+            unsafe {
+                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
+                WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::fs::File;
+    use std::io::Write;
     use std::os::windows::ffi::OsStrExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LUID, LocalFree};
+    use windows_sys::Win32::Foundation::{
+        GENERIC_WRITE, GetHandleInformation, INVALID_HANDLE_VALUE, LUID, LocalFree,
+    };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
@@ -357,6 +772,7 @@ mod tests {
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    use windows_sys::Win32::System::Threading::CreateEventW;
 
     use super::*;
 
@@ -731,6 +1147,146 @@ mod tests {
             Ok(())
         })
         .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restricted_process_command_contract() {
+        let quoted = |value: &str| {
+            let mut output = Vec::new();
+            append_quoted(&mut output, &value.encode_utf16().collect::<Vec<_>>());
+            String::from_utf16(&output).unwrap()
+        };
+        assert_eq!(quoted(""), "\"\"");
+        assert_eq!(quoted("a b"), "\"a b\"");
+        assert_eq!(quoted("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quoted("a \\"), "\"a \\\\\"");
+        let command = RestrictedCommand::new("C:\\Program Files\\tool.exe", "C:\\work")
+            .arg("plain")
+            .arg("")
+            .env("z", "1")
+            .env("A", "2");
+        let prepared = prepare_command(&command).unwrap();
+        assert_eq!(
+            String::from_utf16(&prepared.command_line[..prepared.command_line.len() - 1]).unwrap(),
+            "\"C:\\Program Files\\tool.exe\" plain \"\""
+        );
+        assert_eq!(
+            String::from_utf16_lossy(&prepared.environment),
+            "A=2\0z=1\0\0"
+        );
+        assert!(prepare_command(&RestrictedCommand::new("tool.exe", "C:\\work")).is_err());
+        assert!(prepare_command(&RestrictedCommand::new("C:\\tool.exe", "work")).is_err());
+        for (name, value) in [("", "v"), ("A=B", "v"), ("A\0B", "v"), ("A", "v\0x")] {
+            assert!(
+                prepare_command(
+                    &RestrictedCommand::new("C:\\tool.exe", "C:\\work").env(name, value)
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            prepare_command(
+                &RestrictedCommand::new("C:\\tool.exe", "C:\\work")
+                    .env("Path", "a")
+                    .env("PATH", "b")
+            )
+            .is_err()
+        );
+        assert!(
+            prepare_command(
+                &RestrictedCommand::new("C:\\tool.exe", "C:\\work").arg("x".repeat(32_767))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn restricted_process_child_probe() {
+        assert_eq!(std::env::var("SBZ_CHILD_PROBE").unwrap(), "1");
+        let handle = std::env::var("SBZ_EVENT_HANDLE")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap() as HANDLE;
+        let mut flags = 0;
+        // SAFETY: this only probes whether the excluded numeric handle exists in this process.
+        assert_eq!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+        println!(
+            "EVENT_INHERITED=0\nOUT:{}\n{}",
+            std::env::var("SBZ_TEST").unwrap(),
+            std::env::current_dir().unwrap().display()
+        );
+        std::io::stdout().write_all(&vec![b'X'; 131_072]).unwrap();
+        eprintln!("ERR");
+    }
+
+    #[tokio::test]
+    async fn restricted_process_runs_suspended_in_job_with_only_stdio_handles() {
+        let token = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "process", &token).unwrap();
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let probe = scratch.path().join("probe.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: null_mut(),
+            bInheritHandle: 1,
+        };
+        let event = unsafe { CreateEventW(&attributes, 0, 0, null()) };
+        assert!(!event.is_null());
+        let event_value = event as usize;
+        let event = unsafe { OwnedHandle::from_raw_handle(event as RawHandle) };
+        let command = RestrictedCommand::new(probe, scratch.path())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("sandbox::tests::restricted_process_child_probe")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("SBZ_CHILD_PROBE", "1")
+            .env("SBZ_EVENT_HANDLE", event_value.to_string())
+            .env("SBZ_TEST", "VALUE")
+            .env("SystemRoot", system_root);
+        let process = RestrictedProcess::spawn(&token, &command).unwrap();
+        assert!(process.is_in_job().unwrap());
+        drop(event);
+        let (code, out, err) = process.wait_with_output().await.unwrap();
+        let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
+        assert_eq!(code, 0, "out={out:?} err={err:?}");
+        assert!(
+            out.contains("EVENT_INHERITED=0")
+                && out.contains("OUT:VALUE")
+                && out
+                    .to_ascii_lowercase()
+                    .contains(&scratch.path().display().to_string().to_ascii_lowercase())
+        );
+        assert!(out.chars().filter(|&value| value == 'X').count() >= 131_072);
+        assert!(err.contains("ERR"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restricted_process_setup_failures_never_resume_child() {
+        let token = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "failures", &token).unwrap();
+        let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
+        for (index, failure) in [SpawnFailure::AfterCreate, SpawnFailure::BeforeResume]
+            .into_iter()
+            .enumerate()
+        {
+            let marker = scratch.path().join(format!("marker-{index}"));
+            let command = RestrictedCommand::new(&cmd, scratch.path())
+                .arg("/d")
+                .arg("/c")
+                .arg(format!("echo ran>\"{}\"", marker.display()));
+            assert!(RestrictedProcess::spawn_inner(&token, &command, Some(failure)).is_err());
+            assert!(
+                !marker.exists(),
+                "suspended child executed its first instruction"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 }
