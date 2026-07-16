@@ -45,6 +45,27 @@ use crate::job::JobObject;
 
 struct ActionSid(*mut c_void);
 
+// SAFETY: the allocation is uniquely owned, is never dereferenced without the
+// owning `ActionToken`, and Windows permits SID inspection/freeing on any thread.
+unsafe impl Send for ActionSid {}
+
+pub(crate) fn secure_random_hex() -> io::Result<String> {
+    let mut nonce = [0u8; 16];
+    // SAFETY: a null algorithm plus SYSTEM_PREFERRED uses the OS CSPRNG and nonce is writable.
+    if unsafe {
+        BCryptGenRandom(
+            null_mut(),
+            nonce.as_mut_ptr(),
+            nonce.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    } != 0
+    {
+        return Err(io::Error::other("secure random generator unavailable"));
+    }
+    Ok(nonce.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 impl ActionSid {
     fn random() -> io::Result<Self> {
         let mut nonce = [0u32; 4];
@@ -176,7 +197,6 @@ impl ActionToken {
         unsafe { (*(self.broker_user.as_ptr().cast::<TOKEN_USER>())).User.Sid }
     }
 
-    #[cfg(test)]
     pub(crate) fn impersonated<T>(
         &self,
         operation: impl FnOnce() -> io::Result<T>,
@@ -221,7 +241,7 @@ fn sid_string(sid: *mut c_void) -> io::Result<String> {
 }
 
 #[allow(dead_code, reason = "wired by sandbox integration phase")]
-pub(crate) struct PrivateScratch(PathBuf);
+pub(crate) struct PrivateScratch(Option<PathBuf>);
 
 #[allow(dead_code, reason = "wired by sandbox integration phase")]
 impl PrivateScratch {
@@ -238,15 +258,26 @@ impl PrivateScratch {
             sid_string(token.action_sid.0)?
         );
         create_secured_directory(&path, &sddl)?;
-        Ok(Self(path))
+        Ok(Self(Some(path)))
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.0
+        self.0.as_deref().expect("private scratch path is owned")
     }
 
-    pub(crate) fn into_path(self) -> PathBuf {
-        self.0
+    /// Transfers cleanup ownership to an asynchronous caller. Setup failures keep
+    /// ownership here and are cleaned synchronously by `Drop`; a successfully
+    /// launched action calls this only after its process tree and VFS server stop.
+    pub(crate) fn into_path(mut self) -> PathBuf {
+        self.0.take().expect("private scratch path is owned")
+    }
+}
+
+impl Drop for PrivateScratch {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
     }
 }
 
@@ -904,25 +935,28 @@ impl RestrictedProcess {
             .process
             .as_ref()
             .ok_or_else(|| io::Error::other("process already reaped"))?;
-        let mut duplicate = null_mut();
-        // SAFETY: source and both pseudo-process handles are live. Success transfers one
-        // process-handle reference into `duplicate`, which becomes OwnedHandle below.
-        if unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                source.as_raw_handle() as HANDLE,
-                GetCurrentProcess(),
-                &mut duplicate,
-                0,
-                0,
-                DUPLICATE_SAME_ACCESS,
-            )
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: DuplicateHandle returned a unique owned handle.
-        let duplicate = unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) };
+        let duplicate = {
+            let mut duplicate = null_mut();
+            // SAFETY: source and both pseudo-process handles are live. Success transfers one
+            // process-handle reference into `duplicate`, which becomes OwnedHandle below.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    source.as_raw_handle() as HANDLE,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: DuplicateHandle returned a unique owned handle. Keep the raw pointer
+            // inside this synchronous scope so the async future remains `Send`.
+            unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) }
+        };
         let code = tokio::task::spawn_blocking(move || {
             let handle = duplicate.as_raw_handle() as HANDLE;
             if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {

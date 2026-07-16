@@ -11,6 +11,10 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$StoreCtl,
 
+    [Parameter(Mandatory = $true, ParameterSetName = 'Full')]
+    [ValidateNotNullOrEmpty()]
+    [string]$ExecVfs,
+
     [string]$Source
 )
 
@@ -659,6 +663,146 @@ function Assert-ServicesRunning {
     }
 }
 
+function Get-ServiceStatusSummary {
+    $summaries = foreach ($name in @('SembazuruDaemon', 'SembazuruWorker')) {
+        try {
+            $service = Get-Service -Name $name -ErrorAction Stop
+            $cim = Get-CimInstance Win32_Service -Filter "Name='$name'" -ErrorAction Stop
+            "${name}:status=$($service.Status),account=$($cim.StartName),pid=$($cim.ProcessId)"
+        }
+        catch {
+            "${name}:unavailable=$($_.Exception.Message)"
+        }
+    }
+    return ($summaries -join '; ')
+}
+
+function Wait-ForWorkerExecutionEndpoint {
+    param([int]$TimeoutSeconds = 30)
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $lastError = 'no connection attempt completed'
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $client = [Net.Sockets.TcpClient]::new()
+        try {
+            $connect = $client.ConnectAsync('127.0.0.1', 50061)
+            if ($connect.Wait(1000) -and $client.Connected) {
+                Write-Host "WORKER ENDPOINT READY: 127.0.0.1:50061; $(Get-ServiceStatusSummary)"
+                return
+            }
+            $lastError = 'connection attempt timed out'
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        finally {
+            $client.Dispose()
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "worker endpoint 127.0.0.1:50061 did not become ready in ${TimeoutSeconds}s; services=$(Get-ServiceStatusSummary); last=$lastError"
+}
+
+function Get-InstalledWorkerIdentity {
+    $computer = $env:COMPUTERNAME
+    if ([string]::IsNullOrWhiteSpace($computer)) {
+        throw 'COMPUTERNAME is unavailable for the installed worker identity'
+    }
+    $worker = Get-CimInstance Win32_Service -Filter "Name='SembazuruWorker'" `
+        -ErrorAction Stop
+    if ($worker.State -ne 'Running' -or [uint32]$worker.ProcessId -eq 0) {
+        throw "SembazuruWorker has no live process identity: state=$($worker.State) pid=$($worker.ProcessId)"
+    }
+    return "${computer}#$($worker.ProcessId)"
+}
+
+function Invoke-InstalledWorkerVfsGate {
+    param(
+        [string]$Driver,
+        [string]$RepoRoot,
+        [string]$ScratchRoot,
+        [string]$Tag
+    )
+
+    $traceDestination = Join-Path $ScratchRoot "m9-installed-vfs-trace-$Tag"
+    $whereExe = Join-Path ([Environment]::SystemDirectory) 'where.exe'
+    $cmdExe = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+    if (-not (Test-Path -LiteralPath $whereExe -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $cmdExe -PathType Leaf)) {
+        throw "System32 VFS probe command is missing: where=$whereExe cmd=$cmdExe"
+    }
+
+    $output = ''
+    $exitCode = $null
+    $gateError = $null
+    try {
+        New-Item -ItemType Directory -Path $traceDestination -ErrorAction Stop | Out-Null
+        $hadNativePreference = Test-Path Variable:\PSNativeCommandUseErrorActionPreference
+        if ($hadNativePreference) {
+            $oldNativePreference = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        Push-Location $RepoRoot
+        try {
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+                # Read immediately before launching the driver: default_worker_id is
+                # COMPUTERNAME#PID, and a service restart invalidates the capability.
+                $workerId = Get-InstalledWorkerIdentity
+                $output = & $Driver 'http://127.0.0.1:50061' '127.0.0.1:50072' `
+                    $RepoRoot $traceDestination --worker-id $workerId -- $whereExe /R `
+                    ([Environment]::SystemDirectory) 'cmd.exe' 2>&1 | Out-String
+                $exitCode = $LASTEXITCODE
+                $identityChanged = $exitCode -eq 86 -and $output.Contains(
+                    'exec_vfs: worker identity changed before action admission')
+                if ($identityChanged -and $attempt -eq 1) {
+                    Write-Host 'INSTALLED WORKER VFS RETRY: service PID changed before action admission; refreshing worker identity once.'
+                    continue
+                }
+                break
+            }
+        }
+        finally {
+            Pop-Location
+            if ($hadNativePreference) {
+                $PSNativeCommandUseErrorActionPreference = $oldNativePreference
+            }
+        }
+
+        $traceFiles = @(Get-ChildItem -LiteralPath $traceDestination -Filter '*.sbzt' `
+            -File -ErrorAction Stop)
+        $services = Get-ServiceStatusSummary
+        if ($exitCode -ne 0 -or $traceFiles.Count -eq 0) {
+            throw "installed worker VFS action failed: exit=$exitCode traces=$($traceFiles.Count) services=$services stdout/stderr=$output"
+        }
+        Write-Host "INSTALLED WORKER VFS PASS: restricted VFS action through staged launcher/DLL exit=$exitCode traces=$($traceFiles.Count)"
+        Write-Host "INSTALLED WORKER VFS COMMAND: $whereExe /R $([Environment]::SystemDirectory) cmd.exe"
+        Write-Host "INSTALLED WORKER VFS SERVICES: $services"
+        Write-Host "INSTALLED WORKER VFS STDOUT/STDERR: $($output.Trim())"
+    }
+    catch {
+        $gateError = $_
+    }
+
+    $cleanupError = $null
+    if (Test-Path -LiteralPath $traceDestination) {
+        try {
+            Remove-Item -LiteralPath $traceDestination -Recurse -Force -ErrorAction Stop
+        }
+        catch {
+            $cleanupError = $_
+        }
+    }
+    if ($null -ne $gateError) {
+        if ($null -ne $cleanupError) {
+            throw "installed worker VFS gate failed: $($gateError.Exception.Message); trace cleanup also failed: $($cleanupError.Exception.Message)"
+        }
+        throw $gateError
+    }
+    if ($null -ne $cleanupError) {
+        throw "installed worker VFS trace cleanup failed: $($cleanupError.Exception.Message)"
+    }
+}
+
 function Get-StoreSnapshot {
     param([string]$DataRoot)
 
@@ -1009,8 +1153,13 @@ if ($Static) { return }
 
 $Msi = (Resolve-Path -LiteralPath $Msi -ErrorAction Stop).Path
 $StoreCtl = (Resolve-Path -LiteralPath $StoreCtl -ErrorAction Stop).Path
+if (-not (Test-Path -LiteralPath $ExecVfs -PathType Leaf)) {
+    throw "exec_vfs driver is not a file: $ExecVfs"
+}
+$ExecVfs = (Resolve-Path -LiteralPath $ExecVfs -ErrorAction Stop).Path
 Assert-MsiLifecycleTables -Path $Msi
 Assert-Administrator
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..') -ErrorAction Stop).Path
 $commonData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
 $dataRoot = Join-Path $commonData 'Sembazuru'
@@ -1049,6 +1198,7 @@ try {
 
     Assert-ServiceSidAntiDrift
     Assert-ServicesRunning
+    Wait-ForWorkerExecutionEndpoint
     if (Test-Path -LiteralPath $provisionMarker) {
         throw "fresh install left the fixed provision marker behind: $provisionMarker"
     }
@@ -1124,7 +1274,9 @@ try {
     Assert-ServicesRunning
     Write-Host "MSI REPAIR PASS: exit=$($repair.ExitCode) store/config/ACL unchanged; services running; log=$repairLog"
 
-    Write-Host 'WORKER CAPABILITY EVIDENCE: SembazuruWorker is Running under its virtual account; exact worker SID grants worker.toml RX and scratch/cas Modify. The packaged worker exposes no minimal self-probe for isolated filesystem operations.'
+    Invoke-InstalledWorkerVfsGate -Driver $ExecVfs -RepoRoot $repoRoot `
+        -ScratchRoot $scratchRoot -Tag $tag
+    Write-Host 'WORKER CAPABILITY EVIDENCE: the installed virtual-account worker accepted a direct VFS Execute and ran the System32 probe through its restricted-token, pre-Job-assigned staged launcher/DLL path.'
 }
 catch {
     $primaryError = $_

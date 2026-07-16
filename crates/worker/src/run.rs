@@ -55,12 +55,25 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
     eprintln!("sembazuru-worker: Execution service on {local}");
     let worker_id = default_worker_id();
 
+    let scratch_root = config
+        .scratch_root
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let scratch_root = if scratch_root.is_absolute() {
+        scratch_root
+    } else {
+        std::env::current_dir()?.join(scratch_root)
+    };
+    tokio::fs::create_dir_all(&scratch_root).await?;
+
     let service = match config.capacity {
         Some(c) => WorkerService::with_capacity(c),
         None => WorkerService::new(),
     }
     .with_action_capability_auth(config.cluster_token.clone(), worker_id.clone())
-    .with_action_timeout_secs(config.action_timeout_secs);
+    .with_action_timeout_secs(config.action_timeout_secs)
+    .with_scratch_root(scratch_root);
     // Enable read-VFS execution (M6.1) when all four install paths are configured.
     let service = match config.vfs() {
         Some(cfg) => {

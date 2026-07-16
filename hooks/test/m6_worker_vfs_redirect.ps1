@@ -72,17 +72,30 @@ New-Item -ItemType Directory -Force $WorkRoot | Out-Null
 #   6 = GetFileAttributesW failed before CreateFileW hydrated the file
 #   7 = wildcard enumeration unexpectedly reached the real filesystem
 #   8 = SetCurrentDirectoryW failed
+#   9 = process token was not restricted (or could not be queried)
+#  10 = process was not assigned to a Job (or membership could not be queried)
 # Static CRT (/MT) so it needs no runtime DLL beyond the cleared+rebuilt env.
 $probeSrc = @'
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
 #include <wchar.h>
+#pragma comment(lib, "advapi32.lib")
 static int WideArgToAcp(const wchar_t* src, char* dst, int cap) {
     int n = WideCharToMultiByte(CP_ACP, 0, src, -1, dst, cap, nullptr, nullptr);
     return n > 0 && n <= cap ? n : 0;
 }
 int wmain(int argc, wchar_t** argv) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 9;
+    BOOL restricted = FALSE;
+    DWORD tokenInfoSize = 0;
+    BOOL tokenOk = GetTokenInformation(token, TokenIsRestricted, &restricted,
+                                       sizeof(restricted), &tokenInfoSize);
+    CloseHandle(token);
+    if (!tokenOk || !restricted) return 9;
+    BOOL inJob = FALSE;
+    if (!IsProcessInJob(GetCurrentProcess(), nullptr, &inJob) || !inJob) return 10;
     if (argc >= 3 && wcscmp(argv[1], L"--chdir") == 0) {
         return SetCurrentDirectoryW(argv[2]) ? 0 : 8;
     }
@@ -385,6 +398,8 @@ switch ($exit) {
     4 { $failures += 'GetCurrentDirectoryW returned the scratch cwd instead of the logical submitted cwd (exit 4)' }
     5 { $failures += 'GetFullPathNameW resolved the relative input outside the logical submitted cwd (exit 5)' }
     6 { $failures += 'GetFileAttributesW failed before CreateFileW hydrated the VFS input (exit 6)' }
+    9 { $failures += 'the target entered without a restricted token (exit 9)' }
+    10 { $failures += 'the target entered outside the worker Job object (exit 10)' }
     default { $failures += "the VFS-mode Execute failed (exit=$exit)" }
 }
 if ($verbatimExit -ne 0) {

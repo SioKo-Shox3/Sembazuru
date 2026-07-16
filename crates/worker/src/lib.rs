@@ -21,11 +21,14 @@ mod sandbox;
 pub mod service;
 pub mod vfs_pipe;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
+use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,11 +48,17 @@ use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::{Request, Response, Status};
+use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
-use crate::vfs_pipe::{ActionVfsServer, start_action_vfs};
+use crate::sandbox::{
+    ActionPipeSecurity, ActionToken, PrivateRuntime, PrivateScratch, RestrictedCommand,
+    RestrictedProcess, secure_random_hex,
+};
+use crate::vfs_pipe::{ActionVfsServer, start_secured_action_vfs};
 
 /// Disambiguates per-action VFS pipe/scratch names within a worker process.
-static EXEC_SEQ: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static EXEC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum VfsChildCwd {
@@ -213,6 +222,7 @@ pub struct WorkerService {
     accept: Arc<Semaphore>,
     capacity: u32,
     ceiling: std::time::Duration,
+    scratch_root: Arc<PathBuf>,
     /// Read-VFS install config; `None` → the worker only plain-spawns and
     /// rejects VFS-mode requests (M5 scale worker). Set via [`with_vfs`].
     vfs: Option<Arc<WorkerVfsConfig>>,
@@ -251,6 +261,7 @@ impl WorkerService {
             accept: Arc::new(Semaphore::new((capacity * QUEUE_FACTOR) as usize)),
             capacity,
             ceiling: default_action_ceiling(),
+            scratch_root: Arc::new(std::env::temp_dir()),
             vfs: None,
             aborts: Arc::new(Mutex::new(HashMap::new())),
             cluster_token: None,
@@ -342,6 +353,12 @@ impl WorkerService {
         self
     }
 
+    /// Selects an already-provisioned parent for per-action private scratch leaves.
+    pub fn with_scratch_root(mut self, root: PathBuf) -> Self {
+        self.scratch_root = Arc::new(root);
+        self
+    }
+
     /// Overrides the per-action wall-clock ceiling from configuration (M9.3c). A
     /// service has no per-shell environment, so the timeout must be settable from
     /// `worker.toml`, not only `SEMBAZURU_ACTION_TIMEOUT_SECS`. `None` (or a zero
@@ -404,33 +421,6 @@ fn setup_err(category: &'static str, detail: impl std::fmt::Display) -> String {
     category.to_string()
 }
 
-fn resolved_tool_digest(cmd: &Command) -> String {
-    // Extract PATH the SAME way the agent does for the weak key, so the two sides
-    // can never resolve a different binary from an equivalent env and spuriously
-    // mismatch (COR-005 symmetry; a mismatch is always safe — a lost cache record,
-    // never a false hit). The agent sorts the env before reading PATH
-    // (`intake.rs` → `weak_key_and_tool`); a proto `map` can carry distinct
-    // case-variant keys ("PATH" vs "Path") with different values, so without the
-    // sort the worker would pick by HashMap iteration order. Sorting makes both
-    // sides deterministic and identical.
-    let mut env: Vec<(String, String)> = cmd
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    env.sort();
-    let path_env = env
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
-        .map(|(_, v)| v.as_str());
-    sembazuru_cas::toolchain::toolchain_digest(
-        cmd.argv.first().map(String::as_str).unwrap_or(""),
-        path_env,
-        &cmd.cwd,
-    )
-    .to_string()
-}
-
 fn cap_predicted_paths(mut predicted_paths: Vec<String>) -> Vec<String> {
     predicted_paths.truncate(MAX_PREDICTED_PATHS);
     predicted_paths
@@ -485,6 +475,268 @@ where
     })
 }
 
+const BASELINE_ENV: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "SystemDrive",
+    "ComSpec",
+    "WINDIR",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "NUMBER_OF_PROCESSORS",
+];
+
+const VFS_RESERVED_ENV: &[&str] = &[
+    "SEMBAZURU_MODE",
+    "SEMBAZURU_VFS_ROOT",
+    "SEMBAZURU_VFS_CWD",
+    "SEMBAZURU_VFS_PIPE",
+    "SEMBAZURU_VFS_SCRATCH",
+    "SEMBAZURU_VFS_STRICT",
+    "SEMBAZURU_TRACE_DIR",
+];
+
+struct VfsEnvironment<'a> {
+    root: &'a str,
+    logical_cwd: Option<&'a str>,
+    pipe: &'a str,
+    scratch: &'a Path,
+    strict: bool,
+    trace: Option<&'a Path>,
+}
+
+fn effective_environment(
+    cmd: &Command,
+    scratch: &Path,
+    vfs: Option<VfsEnvironment<'_>>,
+) -> Result<Vec<(OsString, OsString)>, String> {
+    let mut values: BTreeMap<String, (OsString, OsString)> = BTreeMap::new();
+    if vfs.is_none() {
+        for &name in BASELINE_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                values.insert(name.to_ascii_lowercase(), (OsString::from(name), value));
+            }
+        }
+    }
+    let mut submitted = BTreeMap::new();
+    for (name, value) in &cmd.env {
+        let folded = name.to_lowercase();
+        if name.is_empty() || name.contains(['=', '\0']) || value.contains('\0') {
+            return Err("invalid command environment".into());
+        }
+        if submitted.insert(folded.clone(), ()).is_some() {
+            return Err("duplicate command environment key".into());
+        }
+        if vfs.is_some()
+            && VFS_RESERVED_ENV
+                .iter()
+                .any(|reserved| reserved.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        values.insert(folded, (OsString::from(name), OsString::from(value)));
+    }
+    for name in ["TEMP", "TMP"] {
+        values.insert(
+            name.to_ascii_lowercase(),
+            (OsString::from(name), scratch.as_os_str().to_os_string()),
+        );
+    }
+    if let Some(vfs) = vfs {
+        let mut authoritative = vec![
+            ("SEMBAZURU_MODE", OsString::from("vfs")),
+            ("SEMBAZURU_VFS_ROOT", OsString::from(vfs.root)),
+            ("SEMBAZURU_VFS_PIPE", OsString::from(vfs.pipe)),
+            (
+                "SEMBAZURU_VFS_SCRATCH",
+                vfs.scratch.as_os_str().to_os_string(),
+            ),
+            (
+                "SEMBAZURU_VFS_STRICT",
+                OsString::from(if vfs.strict { "1" } else { "0" }),
+            ),
+        ];
+        if let Some(cwd) = vfs.logical_cwd {
+            authoritative.push(("SEMBAZURU_VFS_CWD", OsString::from(cwd)));
+        }
+        if let Some(trace) = vfs.trace {
+            authoritative.push(("SEMBAZURU_TRACE_DIR", trace.as_os_str().to_os_string()));
+        }
+        for (name, value) in authoritative {
+            values.insert(name.to_ascii_lowercase(), (OsString::from(name), value));
+        }
+    }
+    Ok(values.into_values().collect())
+}
+
+fn environment_value<'a>(environment: &'a [(OsString, OsString)], name: &str) -> Option<&'a str> {
+    environment
+        .iter()
+        .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.to_str())
+}
+
+struct ObservedTool {
+    application: Option<PathBuf>,
+    digest: String,
+}
+
+fn observe_tool(
+    token: &ActionToken,
+    cmd: &Command,
+    environment: &[(OsString, OsString)],
+    cwd: &Path,
+    require_content: bool,
+) -> Result<ObservedTool, String> {
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| setup_err("command cwd is not Unicode", cwd.display()))?;
+    let path = environment_value(environment, "PATH");
+    let identity = token
+        .impersonated(|| {
+            Ok(sembazuru_cas::toolchain::toolchain_identity(
+                &cmd.argv[0],
+                path,
+                cwd,
+            ))
+        })
+        .map_err(|error| setup_err("command executable observation failed", error))?;
+    match identity {
+        sembazuru_cas::toolchain::ToolchainIdentity::Content { digest, path } => Ok(ObservedTool {
+            application: Some(path),
+            digest: digest.to_string(),
+        }),
+        sembazuru_cas::toolchain::ToolchainIdentity::NameOnly { digest, .. }
+            if !require_content =>
+        {
+            Ok(ObservedTool {
+                application: None,
+                digest: digest.to_string(),
+            })
+        }
+        sembazuru_cas::toolchain::ToolchainIdentity::NameOnly { .. } => Err(setup_err(
+            "command executable could not be resolved",
+            &cmd.argv[0],
+        )),
+    }
+}
+
+struct TracePublish {
+    stage: PathBuf,
+    destination: PathBuf,
+}
+
+struct BuiltChild {
+    process: RestrictedProcess,
+    stdout: tokio::fs::File,
+    stderr: tokio::fs::File,
+    vfs_server: Option<ActionVfsServer>,
+    scratch: PrivateScratch,
+    unvirt_marker: Option<PathBuf>,
+    unsafe_output_marker: Option<PathBuf>,
+    trace: Option<TracePublish>,
+    resolved_tool_digest: String,
+}
+
+fn move_file_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both paths are NUL-terminated and live. Zero flags intentionally
+    // omit MOVEFILE_REPLACE_EXISTING, so a racing destination wins unchanged.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(80 | 183) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "trace destination already exists",
+            )),
+            _ => Err(error),
+        };
+    }
+    Ok(())
+}
+
+fn publish_trace_file(
+    source: &Path,
+    final_path: &Path,
+    before_move: impl FnOnce(&Path),
+) -> io::Result<()> {
+    if std::fs::symlink_metadata(final_path).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "trace destination already exists",
+        ));
+    }
+    let destination = final_path
+        .parent()
+        .ok_or_else(|| io::Error::other("trace destination has no parent"))?;
+    let temp = destination.join(format!(".sbz-publish-{}.tmp", secure_random_hex()?));
+    let result = (|| {
+        let mut input = std::fs::File::open(source)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        io::copy(&mut input, &mut output)?;
+        output.flush()?;
+        output.sync_all()?;
+        drop(output);
+        before_move(&temp);
+        move_file_no_replace(&temp, final_path)
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn publish_trace_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    const REPARSE: u32 = windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    let source_meta = std::fs::symlink_metadata(source)?;
+    if !source_meta.is_dir() || source_meta.file_attributes() & REPARSE != 0 {
+        return Err(io::Error::other(
+            "trace staging directory is not a regular directory",
+        ));
+    }
+    std::fs::create_dir_all(destination)?;
+    let destination_meta = std::fs::symlink_metadata(destination)?;
+    if !destination_meta.is_dir() || destination_meta.file_attributes() & REPARSE != 0 {
+        return Err(io::Error::other(
+            "trace destination is not a regular directory",
+        ));
+    }
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sbzt"))
+        {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_attributes() & REPARSE != 0 {
+            return Err(io::Error::other("trace source is not a regular file"));
+        }
+        publish_trace_file(&path, &destination.join(entry.file_name()), |_| {})?;
+    }
+    Ok(())
+}
+
 /// Drives one action to completion, emitting lifecycle events into `tx`.
 ///
 /// Admission: the action is `QUEUED` until it acquires a permit from `limit`,
@@ -511,6 +763,7 @@ async fn run_action(
     running: Arc<AtomicU32>,
     served: Arc<std::sync::atomic::AtomicU64>,
     ceiling: std::time::Duration,
+    scratch_root: Arc<PathBuf>,
     // Held for the whole task (queued + running) so the accepted-work backlog
     // stays bounded; released on drop when the action leaves the worker.
     _accept: tokio::sync::OwnedSemaphorePermit,
@@ -567,164 +820,142 @@ async fn run_action(
     };
 
     let start = Instant::now();
-    // For VFS mode, `vfs_server` keeps the per-action pipe server alive for the
-    // run; `job` is the process-tree kill handle; `scratch_dir` is the hydrated
-    // input tree to remove after the run (deferred #8 / M9.2). All are cleaned up
-    // after the child exits.
-    let (mut child, vfs_server, job, unvirt_marker, unsafe_output_marker, scratch_dir) =
-        match build_child(&cmd, vfs_plan, predicted_paths, session_id).await {
-            Ok(parts) => parts,
-            Err(detail) => {
-                let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
-                return;
-            }
-        };
+    let BuiltChild {
+        mut process,
+        stdout,
+        stderr,
+        vfs_server,
+        scratch,
+        unvirt_marker,
+        unsafe_output_marker,
+        trace,
+        resolved_tool_digest,
+    } = match build_child(&cmd, vfs_plan, predicted_paths, session_id, &scratch_root).await {
+        Ok(parts) => parts,
+        Err(detail) => {
+            let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
+            return;
+        }
+    };
 
-    // Register the job so `Abort` (or a reassign that drops the stream) kills the
-    // whole tree. Both the map and this scope hold an Arc; the action's processes
-    // die only once BOTH are gone, so the entry is removed at the end below.
-    if let Some(j) = job {
-        aborts
-            .lock()
-            .expect("aborts map poisoned")
-            .insert(action_id.clone(), Arc::new(j));
-    }
+    // Every production process is already suspended-assigned-resumed by this
+    // point. Abort keeps only another reference to that same kill-on-close Job.
+    aborts
+        .lock()
+        .expect("aborts map poisoned")
+        .insert(action_id.clone(), process.job());
 
-    // Stream the child's console output to the agent. Reading continuously also
-    // stops the child from blocking on a full pipe buffer (M6.1).
-    let mut stdout_reader = child
-        .stdout
-        .take()
-        .map(|s| spawn_stdio_reader(s, false, tx.clone()));
-    let mut stderr_reader = child
-        .stderr
-        .take()
-        .map(|s| spawn_stdio_reader(s, true, tx.clone()));
+    // Drain both pipes continuously. Waiting first can deadlock once either pipe
+    // exceeds the Windows pipe buffer, so readers start before RUNNING is sent.
+    let stdout_reader = spawn_stdio_reader(stdout, false, tx.clone());
+    let stderr_reader = spawn_stdio_reader(stderr, true, tx.clone());
 
     let _ = tx.send(state_event(ActionState::Running, "")).await;
 
-    tokio::select! {
-        // The agent cancelled or disconnected: the receiver is gone, so nobody
-        // will read further events. Return; `child` drops here and `kill_on_drop`
-        // terminates it rather than leaving an orphan.
-        _ = tx.closed() => {}
-        // Runaway/hung-process backstop: a process the agent never reaps (no
-        // budget on the direct-Execute path) must not pin its slot forever.
-        // `child` drops on return and `kill_on_drop` terminates it.
+    enum Finish {
+        Exited(io::Result<u32>),
+        Cancelled,
+        Ceiling,
+    }
+    let finish = tokio::select! {
+        _ = tx.closed() => {
+            process.terminate();
+            let _ = process.wait().await;
+            Finish::Cancelled
+        }
         _ = tokio::time::sleep(ceiling) => {
-            let _ = tx
-                .send(state_event(ActionState::Failed, "exceeded execution ceiling"))
-                .await;
+            process.terminate();
+            let _ = process.wait().await;
+            Finish::Ceiling
         }
-        result = child.wait() => match result {
-            Ok(status) => {
-                // Flush all console output BEFORE the exit event, so the launcher
-                // has the full diagnostics in hand when it sees the exit code.
-                if let Some(h) = stdout_reader.take() { let _ = h.await; }
-                if let Some(h) = stderr_reader.take() { let _ = h.await; }
-                // Fail-closed: if the DLL marked an unsupported VFS access, the
-                // process did not complete against a trustworthy remote view.
-                // Report NOT-completed (Failed, no exit) so the agent re-runs the
-                // whole action locally. This is the sanctioned fallback channel:
-                // the agent treats "no exit status" as a fallback trigger (a
-                // nonzero exit would NOT fall back).
-                if unvirt_marker.as_ref().is_some_and(|m| m.exists()) {
-                    let _ = tx
-                        .send(state_event(
-                            ActionState::Failed,
-                            "unsupported VFS access under vfs_root: re-run locally",
-                        ))
-                        .await;
-                } else if unsafe_output_marker.as_ref().is_some_and(|m| m.exists()) {
-                    let _ = tx
-                        .send(state_event(
-                            ActionState::Failed,
-                            "output under virtual cwd requires WriteBack: re-run locally",
-                        ))
-                        .await;
-                } else {
-                    // On Windows a process always has an exit code; unwrap_or
-                    // guards the signal-terminated case that does not occur here.
-                    let code = status.code().unwrap_or(-1);
-                    // Saturate explicitly rather than let `as u64` wrap; this is
-                    // the pattern that will be copied for user/kernel time
-                    // accounting later, where the values are not bounded by a wall
-                    // clock.
-                    let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    let tool_digest = resolved_tool_digest(&cmd);
-                    let _ = tx.send(exit_event(code, wall, tool_digest)).await;
-                    let _ = tx.send(state_event(ActionState::Completed, "")).await;
-                }
-            }
-            Err(e) => {
-                let _ = tx
-                    .send(state_event(ActionState::Failed, &setup_err("wait failed", e)))
-                    .await;
-            }
-        }
+        result = process.wait() => Finish::Exited(result),
+    };
+
+    if matches!(&finish, Finish::Exited(Err(_))) {
+        process.terminate();
+        let _ = process.wait().await;
     }
 
-    // Abort any stdio readers still running (the non-wait exits: cancel/ceiling).
-    // On the normal wait path they were already awaited and taken.
-    if let Some(h) = stdout_reader.take() {
-        h.abort();
-    }
-    if let Some(h) = stderr_reader.take() {
-        h.abort();
-    }
-    // Stop the per-action VFS pipe server (if any). The serve loop runs forever
-    // by design, so it must be aborted once the action is done or it leaks one
-    // task (and one listening pipe instance) per action.
+    // `wait` has observed the direct process and terminated the complete Job.
+    // Only then can EOF prove that descendants no longer own either stdio pipe.
+    let _ = stdout_reader.await;
+    let _ = stderr_reader.await;
+
+    // The VFS broker owns CAS and cluster-token access. Stop it before consulting
+    // or publishing action-controlled files from private scratch.
     if let Some(server) = vfs_server {
         server.shutdown().await;
     }
-    // Drop the Job Object handle (removing the last Arc): closing it kills any
-    // process still in the job — so a normal completion reaps stragglers and a
-    // cancelled action (stream dropped / Abort) kills the whole compiler tree.
     aborts
         .lock()
         .expect("aborts map poisoned")
         .remove(&action_id);
-    // Make sure the action's process tree is fully gone before removing its
-    // scratch. On the normal path the child already exited; on the cancel/ceiling
-    // paths closing the Job Object above kills the tree, and the launcher (which
-    // WaitForSingleObject's the compiler) exits once the compiler dies — so
-    // awaiting the launcher here means no surviving process still holds a scratch
-    // file open. This makes the cleanup reliable on EVERY path, not just normal
-    // exit. A second wait on an already-exited child returns immediately, and a
-    // killed tree exits promptly, so this never hangs.
-    let _ = child.wait().await;
-    // Remove the per-action hydrated scratch tree (deferred #8 / M9.2). Best-effort:
-    // a residual lock just leaves one tree behind (a later run with the same suffix
-    // cannot occur — EXEC_SEQ is monotonic), never a wrong result, so a failure is
-    // logged, not fatal. This is what bounds a long-lived worker's disk: previously
-    // every action's scratch was left forever ("left for now").
-    if let Some(dir) = scratch_dir
-        && let Err(e) = tokio::fs::remove_dir_all(&dir).await
-        && dir.exists()
+
+    match finish {
+        Finish::Exited(Ok(code)) => {
+            let publish = if let Some(trace) = trace {
+                tokio::task::spawn_blocking(move || {
+                    publish_trace_directory(&trace.stage, &trace.destination)
+                })
+                .await
+                .map_err(|_| io::Error::other("trace publisher failed"))
+                .and_then(|result| result)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = publish {
+                let detail = setup_err("trace publish failed", error);
+                let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
+            } else if unvirt_marker.as_ref().is_some_and(|marker| marker.exists()) {
+                let _ = tx
+                    .send(state_event(
+                        ActionState::Failed,
+                        "unsupported VFS access under vfs_root: re-run locally",
+                    ))
+                    .await;
+            } else if unsafe_output_marker
+                .as_ref()
+                .is_some_and(|marker| marker.exists())
+            {
+                let _ = tx
+                    .send(state_event(
+                        ActionState::Failed,
+                        "output under virtual cwd requires WriteBack: re-run locally",
+                    ))
+                    .await;
+            } else {
+                let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let _ = tx
+                    .send(exit_event(code as i32, wall, resolved_tool_digest))
+                    .await;
+                let _ = tx.send(state_event(ActionState::Completed, "")).await;
+            }
+        }
+        Finish::Exited(Err(error)) => {
+            let detail = setup_err("wait failed", error);
+            let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
+        }
+        Finish::Ceiling => {
+            let _ = tx
+                .send(state_event(
+                    ActionState::Failed,
+                    "exceeded execution ceiling",
+                ))
+                .await;
+        }
+        Finish::Cancelled => {}
+    }
+
+    let scratch = scratch.into_path();
+    if let Err(error) = tokio::fs::remove_dir_all(&scratch).await
+        && scratch.exists()
     {
         eprintln!(
             "sembazuru-worker: failed to remove scratch {}: {e}",
-            dir.display()
+            scratch.display(),
+            e = error,
         );
     }
-}
-
-async fn create_trace_dir_or_cleanup_scratch(
-    trace_dir: &Path,
-    scratch: &Path,
-) -> Result<(), String> {
-    if let Err(error) = tokio::fs::create_dir_all(trace_dir).await {
-        let _ = tokio::fs::remove_dir_all(scratch).await;
-        return Err(setup_err("create trace dir failed", error));
-    }
-    Ok(())
-}
-
-async fn stop_unassigned_launcher(child: &mut tokio::process::Child, vfs_server: ActionVfsServer) {
-    let _ = child.kill().await;
-    let _ = child.wait().await;
-    vfs_server.shutdown().await;
 }
 
 /// Builds the child process for an action. Plain mode spawns the command
@@ -740,234 +971,187 @@ async fn build_child(
     // The agent-minted session id (ADR 0013); moved onto the VFS data-plane
     // handshake. Empty/unused on the plain path (it has no data plane).
     session_id: String,
-) -> Result<
-    (
-        tokio::process::Child,
-        Option<ActionVfsServer>,
-        Option<JobObject>,
-        // VFS local-rerun marker path to check after exit; `None` in plain mode.
-        Option<std::path::PathBuf>,
-        // Scratch-cwd output-mutation marker path to check after exit; `None`
-        // when the child ran in its submitted cwd or in plain mode.
-        Option<std::path::PathBuf>,
-        // Per-action hydrated scratch dir to remove after the run (deferred #8 /
-        // M9.2); `None` in plain mode, where no scratch tree is created.
-        Option<std::path::PathBuf>,
-    ),
-    String,
-> {
-    let Some((v, cfg)) = vfs_plan else {
-        // Plain spawn (M5 scale path): the child inherits the worker service env
-        // (it needs OS basics like SystemRoot/PATH/ComSpec that the action's own
-        // env may not carry — a full `env_clear` here breaks bare commands such as
-        // `cmd /c ping`), with the action's `cmd.env` overlaid on top.
-        //
-        // But the worker service process holds its own secrets — above all
-        // SEMBAZURU_CLUSTER_TOKEN (config.rs reads it from the env), plus
-        // SEMBAZURU_AGENT/_CAPACITY and other SEMBAZURU_* internals — and the
-        // child's stdout/stderr are streamed straight back to the requesting agent.
-        // So strip every inherited SEMBAZURU_* var before overlaying `cmd.env`,
-        // otherwise an Execute of e.g. `cmd /c set` would exfiltrate the cluster
-        // token (SEC-002). The VFS branch below `env_clear`s instead because it
-        // runs through launcher.exe with a fully curated compiler env.
-        //
-        // LOAD-BEARING INVARIANT (else this leaks): the worker service env must
-        // carry secrets ONLY under the `SEMBAZURU_*` prefix. This is a denylist,
-        // not an allowlist — every non-`SEMBAZURU_` var (PATH, SystemRoot, …) is
-        // inherited so the bare command can run, so any non-`SEMBAZURU_` secret
-        // placed in the service env (an `AWS_*`/proxy cred, …) WOULD reach the
-        // child. The worker runs as a minimal-env service account, so today this
-        // holds; a future deployment that injects other secrets must extend this.
-        let mut command = tokio::process::Command::new(&cmd.argv[0]);
-        command.args(&cmd.argv[1..]);
-        if !cmd.cwd.is_empty() {
-            command.current_dir(&cmd.cwd);
-        }
-        for (key, _) in std::env::vars_os() {
-            if key
-                .to_string_lossy()
-                .to_ascii_uppercase()
-                .starts_with("SEMBAZURU_")
-            {
-                command.env_remove(&key);
+    scratch_root: &Path,
+) -> Result<BuiltChild, String> {
+    if !scratch_root.is_absolute() {
+        return Err(setup_err(
+            "private scratch root is not absolute",
+            scratch_root.display(),
+        ));
+    }
+    let token =
+        ActionToken::create().map_err(|error| setup_err("action token setup failed", error))?;
+    let leaf = format!(
+        "action-{}",
+        secure_random_hex().map_err(|error| setup_err("scratch identity failed", error))?
+    );
+    let scratch = PrivateScratch::create(scratch_root, &leaf, &token)
+        .map_err(|error| setup_err("private scratch setup failed", error))?;
+
+    let finish_process = |mut process: RestrictedProcess,
+                          vfs_server: Option<ActionVfsServer>,
+                          scratch: PrivateScratch,
+                          unvirt_marker: Option<PathBuf>,
+                          unsafe_output_marker: Option<PathBuf>,
+                          trace: Option<TracePublish>,
+                          resolved_tool_digest: String| async move {
+        let output = process.take_output();
+        match output {
+            Ok((stdout, stderr)) => Ok(BuiltChild {
+                process,
+                stdout,
+                stderr,
+                vfs_server,
+                scratch,
+                unvirt_marker,
+                unsafe_output_marker,
+                trace,
+                resolved_tool_digest,
+            }),
+            Err(error) => {
+                process.terminate();
+                let _ = process.wait().await;
+                if let Some(server) = vfs_server {
+                    server.shutdown().await;
+                }
+                Err(setup_err("stdio setup failed", error))
             }
         }
-        for (k, val) in &cmd.env {
-            command.env(k, val);
-        }
-        command.stdin(Stdio::null());
-        // Capture stdout/stderr so they can be streamed to the agent (M6.1).
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
-        // Kill the child if its task is dropped (agent gave up / fallback), so
-        // the worker never leaks an orphan holding an admission slot.
-        command.kill_on_drop(true);
-        let child = command.spawn().map_err(|e| setup_err("spawn failed", e))?;
-        // Sandbox this child too (M7.4, security HIGH-1): the plain path has no
-        // grandchild to orphan, but the Job Object's UI restrictions and
-        // die-on-unhandled-exception still apply, so whatever the agent asked us
-        // to run is sandboxed UNIFORMLY with the VFS path — not left bare. (The
-        // small spawn->assign window is the same documented residual as the VFS
-        // path; kill_on_drop covers the direct child meanwhile.)
-        let job = JobObject::new_kill_on_close()
-            .and_then(|j| match child.raw_handle() {
-                Some(h) => j.assign(h).map(|()| j),
-                None => Ok(j), // already exited; nothing to assign
-            })
-            .map_err(|e| setup_err("job object setup failed", e))?;
-        return Ok((child, None, Some(job), None, None, None));
     };
 
-    // VFS mode. Per-action unique pipe + scratch so concurrent actions never
-    // collide (their traces/scratch must not cross-contaminate).
-    let suffix = format!(
-        "{}-{}",
-        std::process::id(),
-        EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
-    );
-    let pipe_name = format!("sbz-exec-{suffix}");
-    let scratch = cfg.scratch_root.join(&suffix);
-    // Keep a copy of the scratch path so the action removes the hydrated input
-    // tree after the run (deferred #8 / M9.2); `scratch` itself is moved into the
-    // per-action pipe server task below.
-    let scratch_for_cleanup = scratch.clone();
+    let Some((v, cfg)) = vfs_plan else {
+        let environment = effective_environment(cmd, scratch.path(), None)?;
+        let cwd = if cmd.cwd.is_empty() {
+            scratch.path().to_path_buf()
+        } else {
+            PathBuf::from(&cmd.cwd)
+        };
+        if !cwd.is_absolute() {
+            return Err(setup_err("command cwd is not absolute", &cmd.cwd));
+        }
+        let observed = observe_tool(&token, cmd, &environment, &cwd, true)?;
+        let application = observed
+            .application
+            .expect("content-required observation has an application path");
+        let mut command = RestrictedCommand::new(application, cwd);
+        for argument in &cmd.argv[1..] {
+            command = command.arg(argument);
+        }
+        for (name, value) in environment {
+            command = command.env(name, value);
+        }
+        let process = RestrictedProcess::spawn(&token, &command)
+            .map_err(|error| setup_err("spawn failed", error))?;
+        return finish_process(process, None, scratch, None, None, None, observed.digest).await;
+    };
+
     let agent_addr: SocketAddr = v
         .agent_fileserver
         .parse()
         .map_err(|e| setup_err("invalid agent fileserver address", e))?;
-    tokio::fs::create_dir_all(&scratch)
-        .await
-        .map_err(|e| setup_err("create scratch dir failed", e))?;
-    if !v.trace_dir.is_empty() {
-        create_trace_dir_or_cleanup_scratch(Path::new(&v.trace_dir), &scratch_for_cleanup).await?;
-    }
-    let child_cwd = vfs_child_cwd(&cmd.cwd, &v.vfs_root, &scratch, v.allow_original_cwd);
+    let runtime = PrivateRuntime::stage(&scratch, &cfg.launcher, &cfg.dll, &token)
+        .map_err(|error| setup_err("private runtime staging failed", error))?;
+    let suffix = secure_random_hex().map_err(|error| setup_err("pipe identity failed", error))?;
+    let pipe_name = format!("sbz-exec-{suffix}");
+    let child_cwd = vfs_child_cwd(&cmd.cwd, &v.vfs_root, scratch.path(), v.allow_original_cwd);
     if let VfsChildCwd::Scratch(path) = &child_cwd {
-        match tokio::fs::create_dir_all(path).await {
-            Ok(()) => {}
-            Err(e) => {
-                let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
-                return Err(setup_err("create child cwd failed", e));
-            }
-        }
+        tokio::fs::create_dir_all(path)
+            .await
+            .map_err(|error| setup_err("create child cwd failed", error))?;
     }
-    let scratch_str = scratch.to_string_lossy().into_owned();
-
-    // Start the pipe server and WAIT for readiness before launching, so the
-    // compiler cannot dial the pipe before it exists (Plan risk 1). A create
-    // failure drops `ready_tx`, so `ready_rx.await` errors and we fail closed.
-    let cas = cfg.cas_root.clone();
-    let auth_token = cfg.cluster_token.clone().unwrap_or_default();
-    // Declare the action's input root so the agent scopes file supply to it
-    // (M7.1): the worker only legitimately reads under vfs_root (the hook
-    // redirects exactly that subtree), so a request outside it is illegitimate.
-    let vfs_root = v.vfs_root.clone();
-    let vfs_server = match start_action_vfs(
+    let trace = if v.trace_dir.is_empty() {
+        None
+    } else {
+        let stage = scratch.path().join(".trace");
+        std::fs::create_dir(&stage)
+            .map_err(|error| setup_err("create trace stage failed", error))?;
+        Some(TracePublish {
+            stage,
+            destination: PathBuf::from(&v.trace_dir),
+        })
+    };
+    let security = ActionPipeSecurity::new(&token)
+        .map_err(|error| setup_err("VFS pipe security failed", error))?;
+    let vfs_server = start_secured_action_vfs(
         pipe_name.clone(),
         agent_addr,
-        scratch,
-        cas,
+        scratch.path().to_path_buf(),
+        cfg.cas_root.clone(),
         Duration::ZERO,
         predicted_paths,
-        vfs_root,
+        v.vfs_root.clone(),
         session_id,
-        auth_token,
+        cfg.cluster_token.clone().unwrap_or_default(),
+        security,
     )
     .await
-    {
-        Ok(server) => server,
-        Err(_) => {
-            let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
-            return Err("VFS pipe server failed to start".to_string());
+    .map_err(|error| setup_err("VFS pipe server failed to start", error))?;
+
+    let trace_stage = trace.as_ref().map(|publish| publish.stage.as_path());
+    let logical_cwd = matches!(child_cwd, VfsChildCwd::Scratch(_)).then_some(cmd.cwd.as_str());
+    let environment = match effective_environment(
+        cmd,
+        scratch.path(),
+        Some(VfsEnvironment {
+            root: &v.vfs_root,
+            logical_cwd,
+            pipe: &pipe_name,
+            scratch: scratch.path(),
+            strict: v.strict,
+            trace: trace_stage,
+        }),
+    ) {
+        Ok(environment) => environment,
+        Err(error) => {
+            vfs_server.shutdown().await;
+            return Err(error);
         }
     };
-
-    // Inject the DLL via launcher.exe. Env is set EXPLICITLY (env_clear first):
-    // launcher.cpp passes no env block, so the compiler inherits the launcher's
-    // environment — which is what we set here. Clearing first stops worker-
-    // internal vars (SEMBAZURU_AGENT/CAPACITY) and any stale SEMBAZURU_VFS_* from
-    // a prior action from leaking into the compiler and perturbing its output.
-    let mut command = tokio::process::Command::new(&cfg.launcher);
-    command.arg(&cfg.dll);
-    command.args(&cmd.argv);
-    if let Some(cwd) = child_cwd.path() {
-        command.current_dir(cwd);
+    let cwd = child_cwd
+        .path()
+        .unwrap_or_else(|| scratch.path())
+        .to_path_buf();
+    if !cwd.is_absolute() {
+        vfs_server.shutdown().await;
+        return Err(setup_err("command cwd is not absolute", cwd.display()));
     }
-    command.env_clear();
-    for (k, val) in &cmd.env {
-        command.env(k, val);
+    let observed = match observe_tool(&token, cmd, &environment, &cwd, false) {
+        Ok(observed) => observed,
+        Err(error) => {
+            vfs_server.shutdown().await;
+            return Err(error);
+        }
+    };
+    let mut command = RestrictedCommand::new(runtime.launcher(), cwd).arg(runtime.interceptor64());
+    for argument in &cmd.argv {
+        command = command.arg(argument);
     }
-    // Authoritative VFS cwd: cmd.env must not smuggle fake logical cwd remaps
-    // when this action is not intentionally running from scratch.
-    command.env_remove("SEMBAZURU_VFS_CWD");
-    // Authoritative trace destination: only the worker-selected trace dir may
-    // collect hook traces for this action.
-    command.env_remove("SEMBAZURU_TRACE_DIR");
-    command.env("SEMBAZURU_MODE", "vfs");
-    command.env("SEMBAZURU_VFS_ROOT", &v.vfs_root);
-    if let VfsChildCwd::Scratch(_) = &child_cwd {
-        command.env("SEMBAZURU_VFS_CWD", &cmd.cwd);
+    for (name, value) in environment {
+        command = command.env(name, value);
     }
-    command.env("SEMBAZURU_VFS_PIPE", &pipe_name);
-    command.env("SEMBAZURU_VFS_SCRATCH", &scratch_str);
-    if !v.trace_dir.is_empty() {
-        command.env("SEMBAZURU_TRACE_DIR", &v.trace_dir);
-    }
-    // Strict virtualization (M8.2 ②): tell the DLL to FAIL an unsuppliable
-    // read under vfs_root (and drop UNVIRT_MARKER) instead of opening the local
-    // file. Default off keeps the compiler fail-open behavior (all M3-M7 gates).
-    // Set it AUTHORITATIVELY ("1"/"0") like SEMBAZURU_MODE/_ROOT/_PIPE, so the
-    // action's cmd.env cannot smuggle strict on and desync the DLL from this
-    // worker's marker check (security M8.2 MEDIUM-1).
-    command.env("SEMBAZURU_VFS_STRICT", if v.strict { "1" } else { "0" });
-    let unvirt_marker = Some(std::path::PathBuf::from(&scratch_str).join(UNVIRT_MARKER));
+    let unvirt_marker = Some(scratch.path().join(UNVIRT_MARKER));
     let unsafe_output_marker = if matches!(&child_cwd, VfsChildCwd::Scratch(_)) {
-        Some(std::path::PathBuf::from(&scratch_str).join(UNSAFE_OUTPUT_MARKER))
+        Some(scratch.path().join(UNSAFE_OUTPUT_MARKER))
     } else {
         None
     };
-    command.stdin(Stdio::null());
-    // Capture the launcher's stdout/stderr — which are the injected compiler's,
-    // since launcher.exe forwards its std handles — to stream to the agent (M6.1).
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    command.kill_on_drop(true);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
+    let process = match RestrictedProcess::spawn(&token, &command) {
+        Ok(process) => process,
+        Err(error) => {
             vfs_server.shutdown().await;
-            let _ = tokio::fs::remove_dir_all(&scratch_for_cleanup).await;
-            return Err(setup_err("launcher spawn failed", e));
+            return Err(setup_err("launcher spawn failed", error));
         }
     };
-
-    // Assign the launcher to a kill-on-close Job Object so the grandchild (the
-    // real compiler the launcher injects into) dies with it — kill_on_drop alone
-    // would orphan it (M6.1e). The grandchild auto-joins the job. A small window
-    // exists between spawn and assign; the launcher resolves the DLL path before
-    // it spawns the compiler, so assignment normally wins.
-    let job = match JobObject::new_kill_on_close().and_then(|j| {
-        match child.raw_handle() {
-            Some(h) => j.assign(h).map(|()| j),
-            None => Ok(j), // child already exited; nothing to assign
-        }
-    }) {
-        Ok(j) => j,
-        Err(e) => {
-            stop_unassigned_launcher(&mut child, vfs_server).await;
-            // Assignment never established process-tree ownership. Preserve the
-            // scratch tree because an unowned grandchild cannot be disproved.
-            return Err(setup_err("job object setup failed", e));
-        }
-    };
-    Ok((
-        child,
+    finish_process(
+        process,
         Some(vfs_server),
-        Some(job),
+        scratch,
         unvirt_marker,
         unsafe_output_marker,
-        Some(scratch_for_cleanup),
-    ))
+        trace,
+        observed.digest,
+    )
+    .await
 }
 
 #[tonic::async_trait]
@@ -1036,6 +1220,7 @@ impl Execution for WorkerService {
             Arc::clone(&self.running),
             Arc::clone(&self.served),
             self.ceiling,
+            Arc::clone(&self.scratch_root),
             accept,
         ));
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -1048,9 +1233,8 @@ impl Execution for WorkerService {
         // M6.1e: real cancellation. Terminate the action's Job Object, killing
         // the whole process tree (launcher + the injected compiler grandchild).
         // The run_action select then observes the child exit and cleans up. A
-        // plain (non-VFS) action has no job; its stream-drop + kill_on_drop still
-        // covers it, and the reassign path drops the stream rather than calling
-        // Abort, so this acknowledges either way.
+        // Both plain and VFS actions register the restricted process's Job; the
+        // reassign path can also cancel by dropping the execution stream.
         let req = request.into_inner();
         self.verify_abort_capability(&req.action_capability, &req.action_id)?;
         let action_id = req.action_id;
@@ -1112,22 +1296,6 @@ mod tests {
         // Zero clamps up to 1 (admit at least one action); a normal value passes.
         assert_eq!(WorkerService::with_capacity(0).capacity(), 1);
         assert_eq!(WorkerService::with_capacity(4).capacity(), 4);
-    }
-
-    #[test]
-    fn resolved_tool_digest_wiring_reports_non_empty_digest() {
-        let current_exe = std::env::current_exe().unwrap();
-        let cwd = std::env::current_dir().unwrap();
-        let cmd = Command {
-            argv: vec![current_exe.to_string_lossy().into_owned()],
-            env: Default::default(),
-            cwd: cwd.to_string_lossy().into_owned(),
-        };
-
-        assert!(
-            !resolved_tool_digest(&cmd).is_empty(),
-            "worker tool digest wiring should report a non-empty digest"
-        );
     }
 
     #[test]
@@ -1269,130 +1437,200 @@ mod tests {
         );
     }
 
+    fn test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sembazuru-worker-{label}-{}-{}",
+            std::process::id(),
+            EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
     #[test]
-    #[ignore]
-    fn job_assignment_failure_child_fixture() {
-        let ready = std::env::var_os("SEMBAZURU_TEST_CHILD_READY")
-            .expect("fixture requires a readiness marker path");
-        std::fs::write(ready, b"ready").expect("fixture should publish readiness");
-        std::thread::sleep(Duration::from_secs(30));
-    }
-
-    #[tokio::test]
-    async fn job_assignment_failure_reaps_launcher_and_vfs_but_preserves_scratch() {
-        let scratch = std::env::temp_dir().join(format!(
-            "sembazuru-job-assignment-failure-{}-{}",
-            std::process::id(),
-            EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&scratch).expect("scratch fixture should be created");
-        let sentinel = scratch.join("sentinel");
-        std::fs::write(&sentinel, b"keep").expect("scratch sentinel should be created");
-        let child_ready = scratch.join("child-ready");
-        let cas = scratch.with_extension("cas");
-        let pipe_name = format!(
-            "sbz-job-failure-{}-{}",
-            std::process::id(),
-            EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
-        );
-
-        let mut command = tokio::process::Command::new(
-            std::env::current_exe().expect("test executable should be available"),
-        );
-        command
-            .args([
-                "--ignored",
-                "--exact",
-                "tests::job_assignment_failure_child_fixture",
-            ])
-            .env("SEMBAZURU_TEST_CHILD_READY", &child_ready)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        let mut child = command.spawn().expect("fixture child should start");
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !child_ready.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("fixture child should publish readiness");
-        assert!(
-            child
-                .try_wait()
-                .expect("child status should be readable")
-                .is_none(),
-            "fixture child should still be running"
-        );
-
-        let vfs_server = start_action_vfs(
-            pipe_name.clone(),
-            "127.0.0.1:1".parse().unwrap(),
-            scratch.clone(),
-            cas.clone(),
-            Duration::ZERO,
-            Vec::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        )
-        .await
-        .expect("production VFS owner should start");
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            stop_unassigned_launcher(&mut child, vfs_server),
-        )
-        .await
-        .expect("job-assignment cleanup should not hang");
-
-        assert!(
-            child
-                .try_wait()
-                .expect("child status should be readable")
-                .is_some(),
-            "helper must reap the launcher before returning"
-        );
-        let full_pipe_name = format!(r"\\.\pipe\{pipe_name}");
-        assert!(
-            tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&full_pipe_name)
-                .is_err(),
-            "production VFS owner must be shut down before helper returns"
-        );
+    fn effective_environment_is_case_insensitive_and_authoritative() {
+        let scratch = Path::new(r"C:\private\action");
+        let cmd = Command {
+            argv: vec!["tool.exe".into()],
+            env: [
+                ("Path".into(), r"C:\submitted\bin".into()),
+                ("temp".into(), r"C:\escape".into()),
+                ("sembazuru_vfs_pipe".into(), "attacker".into()),
+            ]
+            .into_iter()
+            .collect(),
+            cwd: String::new(),
+        };
+        let plain = effective_environment(&cmd, scratch, None).unwrap();
+        assert_eq!(environment_value(&plain, "PATH"), Some(r"C:\submitted\bin"));
         assert_eq!(
-            std::fs::read(&sentinel).expect("scratch sentinel must be preserved"),
-            b"keep"
+            environment_value(&plain, "TEMP"),
+            Some(r"C:\private\action")
         );
-        std::fs::remove_dir_all(&scratch).expect("fixture scratch should be removable");
-        std::fs::remove_dir_all(&cas).expect("fixture CAS should be removable");
+        assert_eq!(environment_value(&plain, "TMP"), Some(r"C:\private\action"));
+
+        let vfs = effective_environment(
+            &cmd,
+            scratch,
+            Some(VfsEnvironment {
+                root: r"C:\src",
+                logical_cwd: Some(r"C:\src\project"),
+                pipe: "private-pipe",
+                scratch,
+                strict: true,
+                trace: Some(Path::new(r"C:\private\action\.trace")),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            environment_value(&vfs, "SEMBAZURU_VFS_PIPE"),
+            Some("private-pipe")
+        );
+        assert_eq!(environment_value(&vfs, "SEMBAZURU_VFS_STRICT"), Some("1"));
+        assert_eq!(environment_value(&vfs, "TEMP"), Some(r"C:\private\action"));
+        assert_eq!(
+            environment_value(&vfs, "NUMBER_OF_PROCESSORS"),
+            None,
+            "VFS must not inherit an unsubmitted broker baseline variable"
+        );
+
+        let mut submitted_vfs = cmd.clone();
+        submitted_vfs
+            .env
+            .insert("NUMBER_OF_PROCESSORS".into(), "submitted-value".into());
+        let submitted = effective_environment(
+            &submitted_vfs,
+            scratch,
+            Some(VfsEnvironment {
+                root: r"C:\src",
+                logical_cwd: None,
+                pipe: "private-pipe",
+                scratch,
+                strict: false,
+                trace: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            environment_value(&submitted, "NUMBER_OF_PROCESSORS"),
+            Some("submitted-value")
+        );
+
+        let duplicate = Command {
+            argv: vec!["tool.exe".into()],
+            env: [("Key".into(), "one".into()), ("KEY".into(), "two".into())]
+                .into_iter()
+                .collect(),
+            cwd: String::new(),
+        };
+        assert!(effective_environment(&duplicate, scratch, None).is_err());
     }
 
-    #[tokio::test]
-    async fn trace_directory_failure_removes_new_scratch_tree() {
-        let root = std::env::temp_dir().join(format!(
-            "sembazuru-trace-setup-failure-{}-{}",
-            std::process::id(),
-            EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&root).expect("fixture root should be created");
-        let blocking_file = root.join("not-a-directory");
-        std::fs::write(&blocking_file, b"file").expect("blocking file should be created");
-        let trace_dir = blocking_file.join("trace");
-        let scratch = root.join("scratch");
-        std::fs::create_dir_all(&scratch).expect("scratch should exist before trace setup");
+    #[test]
+    fn trace_publish_accepts_only_regular_sbzt_files_and_leaves_no_temp() {
+        let root = test_path("trace-publish");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("read.sbzt"), b"trace").unwrap();
+        std::fs::write(source.join("ignored.txt"), b"ignore").unwrap();
 
-        let error = create_trace_dir_or_cleanup_scratch(&trace_dir, &scratch)
-            .await
-            .expect_err("trace setup through a file must fail");
+        publish_trace_directory(&source, &destination).unwrap();
 
-        assert!(error.contains("create trace dir failed"));
-        assert!(
-            !scratch.exists(),
-            "trace setup failure must remove the scratch tree created earlier"
+        assert_eq!(
+            std::fs::read(destination.join("read.sbzt")).unwrap(),
+            b"trace"
         );
-        std::fs::remove_dir_all(&root).expect("fixture root should be removable");
+        assert!(!destination.join("ignored.txt").exists());
+        assert!(std::fs::read_dir(&destination).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sbz-publish-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trace_publish_rejects_reparse_source_directory() {
+        let root = test_path("trace-reparse");
+        let real = root.join("real");
+        let source = root.join("source-junction");
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("read.sbzt"), b"trace").unwrap();
+        let status = std::process::Command::new("cmd.exe")
+            .args([
+                "/d",
+                "/c",
+                &format!(r#"mklink /J {} {} >nul"#, source.display(), real.display()),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "junction fixture must be available");
+
+        assert!(publish_trace_directory(&source, &destination).is_err());
+        assert!(!destination.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn trace_publish_race_never_replaces_existing_target_and_cleans_temp() {
+        let root = test_path("trace-no-replace");
+        let source = root.join("source.sbzt");
+        let destination = root.join("destination");
+        let target = destination.join("source.sbzt");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(&source, b"new trace").unwrap();
+
+        let error = publish_trace_file(&source, &target, |_| {
+            std::fs::write(&target, b"existing trace").unwrap();
+        })
+        .expect_err("a target created after the pre-check must win");
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"existing trace");
+        assert!(std::fs::read_dir(&destination).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".sbz-publish-")
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tool_observation_uses_the_restricted_action_token() {
+        let root = test_path("tool-observation");
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = ActionToken::create().unwrap();
+        let caller = ActionToken::create().unwrap();
+        let protected = PrivateScratch::create(&root, "protected", &owner).unwrap();
+        let protected_tool = protected.path().join("broker-only.exe");
+        std::fs::write(&protected_tool, b"not executable, but hashable by broker").unwrap();
+        let cmd = Command {
+            argv: vec![protected_tool.to_string_lossy().into_owned()],
+            env: Default::default(),
+            cwd: protected.path().to_string_lossy().into_owned(),
+        };
+        let environment = effective_environment(&cmd, protected.path(), None).unwrap();
+        assert!(
+            observe_tool(&caller, &cmd, &environment, protected.path(), true).is_err(),
+            "a broker-readable but action-inaccessible executable must not resolve as Content"
+        );
+
+        let caller_scratch = PrivateScratch::create(&root, "caller", &caller).unwrap();
+        let system = Command {
+            argv: vec!["cmd.exe".into()],
+            env: Default::default(),
+            cwd: String::new(),
+        };
+        let environment = effective_environment(&system, caller_scratch.path(), None).unwrap();
+        let observed = observe_tool(&caller, &system, &environment, caller_scratch.path(), true)
+            .expect("the restricted action can execute and hash the system command processor");
+        assert!(observed.application.is_some());
+        assert!(!observed.digest.is_empty());
+        drop((caller_scratch, protected));
+        std::fs::remove_dir(root).unwrap();
     }
 }

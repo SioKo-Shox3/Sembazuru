@@ -225,6 +225,7 @@ jobs:
         run: New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force | Out-Null
       # Four installed Rust binaries plus the embedded machine-store lifecycle helper.
       - run: cargo build --release -p sembazuru-agent -p sembazuru-worker -p sembazuru-gui -p sembazuru-config-store
+      - run: cargo build --release -p sembazuru-worker --example exec_vfs
       # The C++ hooks, both bitnesses, staged together (mirrors the hooks job) so the
       # MSI finds launcher.exe + sbz_interceptor{64,32}.dll side by side.
       - run: cmake -S hooks -B hooks/build -A x64
@@ -238,7 +239,7 @@ jobs:
       - name: Build MSI (unsigned)
         run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64
       - name: ProgramData ACLs (protected root, worker-only write, clean uninstall)
-        run: pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 -Msi installer/bin/x64/Release/Sembazuru.msi -StoreCtl target/release/sembazuru-storectl.exe
+        run: pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 -Msi installer/bin/x64/Release/Sembazuru.msi -StoreCtl target/release/sembazuru-storectl.exe -ExecVfs target/release/examples/exec_vfs.exe
       - name: ProgramData pre-positioning fails closed before services
         run: pwsh -NoProfile -File hooks/test/m9_programdata_preposition.ps1 -PackagePath installer/bin/x64/Release/Sembazuru.msi
       # Build-time-only fault injection proves the provision rollback transaction.

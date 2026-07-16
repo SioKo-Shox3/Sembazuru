@@ -499,12 +499,16 @@ bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
     }
     DWORD payloadLen = static_cast<DWORD>(u8len - 1);  // drop NUL
 
-    HANDLE pipe = TrueCreateFileW(g_vfsPipe, GENERIC_READ | GENERIC_WRITE, 0,
+    // Ask only for pipe data I/O. GENERIC_WRITE expands to
+    // FILE_CREATE_PIPE_INSTANCE (0x4); that create-instance bit is intentionally
+    // not requested by a client, and the worker's action DACL withholds it.
+    HANDLE pipe = TrueCreateFileW(g_vfsPipe, FILE_READ_DATA | FILE_WRITE_DATA, 0,
                                   nullptr, OPEN_EXISTING, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
         if (GetLastError() == ERROR_PIPE_BUSY &&
             WaitNamedPipeW(g_vfsPipe, 5000)) {
-            pipe = TrueCreateFileW(g_vfsPipe, GENERIC_READ | GENERIC_WRITE, 0,
+            pipe = TrueCreateFileW(g_vfsPipe,
+                                   FILE_READ_DATA | FILE_WRITE_DATA, 0,
                                    nullptr, OPEN_EXISTING, 0, nullptr);
         }
         if (pipe == INVALID_HANDLE_VALUE) {

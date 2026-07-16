@@ -16,6 +16,7 @@ use sembazuru_worker::WorkerService;
 #[tokio::test]
 async fn plain_child_does_not_inherit_worker_secrets() {
     const SECRET: &str = "super-secret-cluster-token-DO-NOT-LEAK-42";
+    const AMBIENT_SECRET: &str = "ambient-aws-secret-DO-NOT-LEAK-17";
     // Simulate the worker service environment holding its auth secret plus an
     // internal var. `build_child` reads the process env at spawn time.
     // SAFETY: this is the only test in this binary, so no other thread races on
@@ -23,9 +24,14 @@ async fn plain_child_does_not_inherit_worker_secrets() {
     unsafe {
         std::env::set_var("SEMBAZURU_CLUSTER_TOKEN", SECRET);
         std::env::set_var("SEMBAZURU_AGENT", "http://10.0.0.1:50051");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", AMBIENT_SECRET);
     }
 
-    let service = WorkerService::with_capacity(2);
+    let scratch_root =
+        std::env::temp_dir().join(format!("sbz-env-isolation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    std::fs::create_dir(&scratch_root).unwrap();
+    let service = WorkerService::with_capacity(2).with_scratch_root(scratch_root.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -39,7 +45,9 @@ async fn plain_child_does_not_inherit_worker_secrets() {
     // (secret-stripped) inherited worker env only.
     let cmd = Command {
         argv: ["cmd", "/c", "set"].iter().map(|s| s.to_string()).collect(),
-        env: Default::default(),
+        env: [("CALLER_EXPLICIT".to_string(), "preserved".to_string())]
+            .into_iter()
+            .collect(),
         cwd: String::new(),
     };
     let outcome =
@@ -53,6 +61,7 @@ async fn plain_child_does_not_inherit_worker_secrets() {
     unsafe {
         std::env::remove_var("SEMBAZURU_CLUSTER_TOKEN");
         std::env::remove_var("SEMBAZURU_AGENT");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
     }
 
     assert!(
@@ -63,6 +72,23 @@ async fn plain_child_does_not_inherit_worker_secrets() {
         !dumped.to_ascii_uppercase().contains("SEMBAZURU_"),
         "no SEMBAZURU_* internal var may reach a plain child (SEC-002):\n{dumped}"
     );
+    assert!(
+        !dumped.contains(AMBIENT_SECRET),
+        "ambient secret leaked:\n{dumped}"
+    );
+    assert!(dumped.contains("CALLER_EXPLICIT=preserved"), "{dumped}");
+    for name in ["TEMP", "TMP"] {
+        let value = dumped
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .expect("authoritative private temp variable");
+        assert!(
+            value
+                .to_ascii_lowercase()
+                .starts_with(&scratch_root.to_string_lossy().to_ascii_lowercase()),
+            "{name} escaped private scratch: {value}"
+        );
+    }
     // Sanity: the child still ran with a real environment (SystemRoot present),
     // proving we stripped only secrets, not the OS env the command needs — a full
     // env_clear here would break bare commands like this one.
@@ -70,4 +96,6 @@ async fn plain_child_does_not_inherit_worker_secrets() {
         dumped.to_ascii_uppercase().contains("SYSTEMROOT="),
         "the plain child must still inherit OS-essential env (SystemRoot):\n{dumped}"
     );
+    assert_eq!(std::fs::read_dir(&scratch_root).unwrap().count(), 0);
+    std::fs::remove_dir(scratch_root).unwrap();
 }

@@ -7,31 +7,77 @@
 //! timing: under a burst of slow actions the count must reach capacity (proving
 //! admission lets work through) but never exceed it (proving the bound holds).
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use sembazuru_agent::ExecuteError;
+use sembazuru_agent::{ActionOutcome, ExecuteError};
 use sembazuru_proto::v0::Command;
 use sembazuru_worker::WorkerService;
 use tokio::task::JoinSet;
 
-fn slow_cmd() -> Command {
-    // `ping -n 4 127.0.0.1` waits ~3 s without needing a console or extra tools.
+type RpcOutcome = Result<ActionOutcome, ExecuteError>;
+
+fn blocking_cmd() -> Command {
+    // cmd creates the readiness marker inside this action's private %TEMP%; the
+    // action cwd is the same private directory, so it can wait on a release
+    // marker without accessing another action's synchronization files. WAITFOR
+    // signal names accept alphanumerics here (no underscore): exit 0 means the
+    // release event arrived, while exit 3 diagnoses exhausted backoff iterations.
     Command {
-        argv: ["cmd", "/c", "ping", "-n", "4", "127.0.0.1"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
+        argv: vec![
+            "cmd.exe".into(),
+            "/d".into(),
+            "/q".into(),
+            "/s".into(),
+            "/c".into(),
+            concat!(
+                "type nul > ready & ",
+                "(for /L %i in (1,1,600) do @if exist release (exit /b 0) else ",
+                "(waitfor /t 1 SembazuruAdmissionNeverSignal7f6d29a4c31e >nul 2>nul)) ",
+                "& exit /b 3"
+            )
+            .into(),
+        ],
         env: Default::default(),
         cwd: String::new(),
+    }
+}
+
+fn ready_scratch_dirs(root: &Path) -> HashSet<PathBuf> {
+    std::fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("ready").is_file())
+        .collect()
+}
+
+fn drain_finished(
+    actions: &mut JoinSet<(usize, RpcOutcome)>,
+    outcomes: &mut Vec<(usize, RpcOutcome)>,
+) {
+    while let Some(result) = actions.try_join_next() {
+        match result {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(error) => panic!("admission RPC task failed to join: {error}"),
+        }
     }
 }
 
 #[tokio::test]
 async fn admission_caps_concurrent_actions_at_capacity() {
     const CAP: u32 = 2;
-    let service = WorkerService::with_capacity(CAP);
+    const ACTIONS: usize = 4;
+    let scratch_root =
+        std::env::temp_dir().join(format!("sbz-admission-events-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    std::fs::create_dir(&scratch_root).unwrap();
+
+    let service = WorkerService::with_capacity(CAP).with_scratch_root(scratch_root.clone());
     let running = service.running_handle();
+    let served = service.served_handle();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -41,42 +87,153 @@ async fn admission_caps_concurrent_actions_at_capacity() {
             .unwrap();
     });
 
-    // Fire a burst of 4 slow actions at a capacity-2 worker.
-    for i in 0..4 {
+    // Fire four event-blocked actions at a capacity-2 worker. Keep every task so
+    // an early RPC or child failure cannot be mistaken for an admission result.
+    let mut actions = JoinSet::new();
+    for i in 0..ACTIONS {
         let ep = endpoint.clone();
-        tokio::spawn(async move {
-            let _ = sembazuru_agent::execute_remote(
+        actions.spawn(async move {
+            let result = sembazuru_agent::execute_remote(
                 ep,
-                slow_cmd(),
+                blocking_cmd(),
                 format!("admit-{i}"),
                 "sess".into(),
             )
             .await;
+            (i, result)
         });
     }
 
-    // Sample the in-flight gauge while the actions run; it must reach CAP and
-    // never exceed it.
+    // Wait for exactly CAP private ready markers. This is an action event, not a
+    // guess based on how long a particular executable usually runs.
     let mut max_seen = 0u32;
-    for _ in 0..40 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut outcomes: Vec<(usize, RpcOutcome)> = Vec::new();
+    let first_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let first_ready = loop {
+        let ready = ready_scratch_dirs(&scratch_root);
         let now = running.load(Ordering::SeqCst);
         max_seen = max_seen.max(now);
+        drain_finished(&mut actions, &mut outcomes);
         assert!(
             now <= CAP,
             "in-flight actions {now} exceeded capacity {CAP} — admission semaphore breached"
         );
+        assert!(
+            ready.len() <= CAP as usize,
+            "more actions became ready than capacity permits: {ready:?}"
+        );
+        if ready.len() == CAP as usize {
+            break ready;
+        }
+        assert!(
+            outcomes.is_empty() && tokio::time::Instant::now() < first_deadline,
+            "actions failed before capacity became ready: served={}, running={now}, ready={ready:?}, outcomes={outcomes:#?}",
+            served.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    // With neither ready action released, queued actions must remain unable to
+    // create their own ready marker throughout a short stability window.
+    let stable_until = tokio::time::Instant::now() + Duration::from_millis(200);
+    while tokio::time::Instant::now() < stable_until {
+        let ready = ready_scratch_dirs(&scratch_root);
+        let now = running.load(Ordering::SeqCst);
+        max_seen = max_seen.max(now);
+        drain_finished(&mut actions, &mut outcomes);
+        assert_eq!(
+            ready,
+            first_ready,
+            "a queued action became ready before capacity was released: served={}, running={now}, outcomes={outcomes:#?}",
+            served.load(Ordering::SeqCst)
+        );
+        assert!(
+            outcomes.is_empty(),
+            "a blocked action exited early: {outcomes:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(
-        max_seen, CAP,
-        "the burst should have saturated the worker to its capacity"
+    assert_eq!(served.load(Ordering::SeqCst), u64::from(CAP));
+
+    for path in &first_ready {
+        std::fs::write(path.join("release"), b"release").unwrap();
+    }
+
+    // Releasing the first batch must allow the remaining actions to reach their
+    // own private ready markers. Preserve paths already seen because completed
+    // actions' scratch directories are removed promptly.
+    let mut all_ready = first_ready.clone();
+    let remaining_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while all_ready.len() < ACTIONS {
+        all_ready.extend(ready_scratch_dirs(&scratch_root));
+        let now = running.load(Ordering::SeqCst);
+        max_seen = max_seen.max(now);
+        drain_finished(&mut actions, &mut outcomes);
+        assert!(
+            now <= CAP,
+            "in-flight actions {now} exceeded capacity {CAP} after release"
+        );
+        assert!(
+            tokio::time::Instant::now() < remaining_deadline,
+            "remaining actions never became ready: served={}, running={now}, ready={all_ready:?}, outcomes={outcomes:#?}",
+            served.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let remaining_ready: Vec<_> = all_ready.difference(&first_ready).cloned().collect();
+    assert_eq!(remaining_ready.len(), ACTIONS - CAP as usize);
+    for path in &remaining_ready {
+        std::fs::write(path.join("release"), b"release").unwrap();
+    }
+
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while outcomes.len() < ACTIONS {
+        let result = tokio::time::timeout_at(completion_deadline, actions.join_next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "RPC completion timed out: served={}, running={}, outcomes={outcomes:#?}",
+                    served.load(Ordering::SeqCst),
+                    running.load(Ordering::SeqCst)
+                )
+            })
+            .expect("JoinSet ended before every RPC completed")
+            .expect("admission RPC task failed to join");
+        outcomes.push(result);
+    }
+    outcomes.sort_by_key(|(i, _)| *i);
+    for (i, result) in &outcomes {
+        let outcome = result
+            .as_ref()
+            .unwrap_or_else(|error| panic!("action {i} RPC failed: {error:?}"));
+        assert_eq!(
+            outcome.exit_code,
+            Some(0),
+            "action {i} did not complete successfully: {outcome:?}"
+        );
+    }
+    eprintln!(
+        "admission events: served={}, max_running={max_seen}, outcomes={outcomes:#?}",
+        served.load(Ordering::SeqCst)
     );
+    assert_eq!(served.load(Ordering::SeqCst), ACTIONS as u64);
+    assert_eq!(max_seen, CAP);
+
+    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while std::fs::read_dir(&scratch_root).unwrap().next().is_some() {
+        assert!(
+            tokio::time::Instant::now() < cleanup_deadline,
+            "private scratch was not cleaned after all actions completed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::remove_dir(scratch_root).unwrap();
 }
 
 #[tokio::test]
 async fn flood_past_backlog_is_rejected_with_resource_exhausted() {
     // capacity 1 → accepted backlog cap = QUEUE_FACTOR(8) × 1 = 8. A flood of 12
-    // concurrent slow actions must see at least the overflow rejected with
+    // concurrent blocked actions must see at least the overflow rejected with
     // RESOURCE_EXHAUSTED rather than pinning unbounded queued tasks (DoS: H1).
     let service = WorkerService::with_capacity(1);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -87,14 +244,13 @@ async fn flood_past_backlog_is_rejected_with_resource_exhausted() {
             .unwrap();
     });
 
-    // JoinSet aborts the still-running (accepted, slow) actions on drop, so the
-    // test does not wait for 8 serial 3 s pings — and dropping their streams
-    // kills the worker children (kill_on_drop), leaving no orphans.
+    // Dropping the still-running RPC streams cancels their worker actions, so the
+    // test does not need to release every accepted fixture action.
     let mut set = JoinSet::new();
     for i in 0..12 {
         let ep = endpoint.clone();
         set.spawn(async move {
-            sembazuru_agent::execute_remote(ep, slow_cmd(), format!("flood-{i}"), "sess".into())
+            sembazuru_agent::execute_remote(ep, blocking_cmd(), format!("flood-{i}"), "sess".into())
                 .await
         });
     }
