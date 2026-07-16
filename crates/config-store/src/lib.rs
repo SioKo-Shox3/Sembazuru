@@ -166,7 +166,7 @@ pub struct MachineTokenUpdate<'a> {
     pub worker_config: MachineTokenUpdateValue<'a>,
 }
 
-/// Shared lease proving that one service runtime may use the committed store.
+/// Shared lease proving that one service runtime may use an exact provisioned or committed store.
 pub struct MachineServiceRuntimeGuard {
     _inner: platform::MachineServiceRuntimeGuard,
 }
@@ -188,7 +188,7 @@ impl fmt::Debug for MachineTokenUpdateGuard {
     }
 }
 
-/// Enters the fixed service-runtime lease after proving no update is pending.
+/// Enters the fixed service-runtime lease after proving an exact lifecycle and no pending update.
 pub fn enter_machine_service_runtime() -> Result<MachineServiceRuntimeGuard, MachineStoreError> {
     platform::enter_service_runtime().map(|inner| MachineServiceRuntimeGuard { _inner: inner })
 }

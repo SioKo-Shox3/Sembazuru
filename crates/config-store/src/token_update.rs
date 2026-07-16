@@ -404,9 +404,19 @@ pub(super) fn require_service_safe_journal_absence(
     root_identity: FileIdentity,
     policy: &SecurityPolicy,
 ) -> Result<(), MachineStoreError> {
-    let store = UpdateStore::from_held_root(root, root_identity, policy)?;
-    store.revalidate()?;
-    match read_journal(&store, false)? {
+    if validate_service_runtime_root_handle(root, policy)? != root_identity {
+        return Err(integrity(
+            "service runtime root identity changed before journal validation",
+        ));
+    }
+    let descriptor = SecurityDescriptor::from_sddl(policy.config_sddl())?;
+    let journal = read_journal_from_held_root(root, &descriptor, false);
+    if validate_service_runtime_root_handle(root, policy)? != root_identity {
+        return Err(integrity(
+            "service runtime root identity or lifecycle changed during journal validation",
+        ));
+    }
+    match journal? {
         None => Ok(()),
         Some(_) => Err(integrity(
             "service runtime is blocked by a pending machine token update journal",
@@ -732,11 +742,19 @@ fn read_journal(
     store: &UpdateStore<'_>,
     delete_access: bool,
 ) -> Result<Option<OpenedJournal>, MachineStoreError> {
-    let Some(file) = open_fixed_file_optional(store.root, OsStr::new(JOURNAL_LEAF), delete_access)?
+    read_journal_from_held_root(store.root, &store.config_descriptor, delete_access)
+}
+
+fn read_journal_from_held_root(
+    root: &File,
+    config_descriptor: &SecurityDescriptor,
+    delete_access: bool,
+) -> Result<Option<OpenedJournal>, MachineStoreError> {
+    let Some(file) = open_fixed_file_optional(root, OsStr::new(JOURNAL_LEAF), delete_access)?
     else {
         return Ok(None);
     };
-    let identity = verify_config_file(&file, &store.config_descriptor)?;
+    let identity = verify_config_file(&file, config_descriptor)?;
     let encoded = read_held_journal(&file)?;
     let journal = decode_journal(&encoded)?;
     if journal.identity != identity {
@@ -1151,7 +1169,7 @@ mod tests {
     }
 
     impl Fixture {
-        fn committed() -> Self {
+        fn provisioned() -> Self {
             let temp = tempfile::tempdir().expect("create token-update test directory");
             let parent = temp.path().join("parent");
             fs::create_dir(&parent).expect("create token-update parent");
@@ -1159,13 +1177,18 @@ mod tests {
             let policy = current_user_test_policy().expect("current-user policy").0;
             let parent_handle = open_directory_path_nofollow(&parent).unwrap();
             provision_at_handle(&parent_handle, OsStr::new(ROOT_NAME), &policy).unwrap();
-            commit_at_handle(&parent_handle, OsStr::new(ROOT_NAME), &policy).unwrap();
             Self {
                 _temp: temp,
                 parent,
                 root,
                 policy,
             }
+        }
+
+        fn committed() -> Self {
+            let fixture = Self::provisioned();
+            fixture.commit().unwrap();
+            fixture
         }
 
         fn parent(&self) -> File {
@@ -1178,6 +1201,14 @@ mod tests {
 
         fn update_guard(&self) -> Result<crate::MachineTokenUpdateGuard, MachineStoreError> {
             begin_token_update_at_for_test(&self.parent(), OsStr::new(ROOT_NAME), &self.policy)
+        }
+
+        fn commit(&self) -> Result<(), MachineStoreError> {
+            commit_at_handle(&self.parent(), OsStr::new(ROOT_NAME), &self.policy)
+        }
+
+        fn rollback(&self) -> Result<(), MachineStoreError> {
+            rollback_at_handle(&self.parent(), OsStr::new(ROOT_NAME), &self.policy)
         }
 
         fn replace(&self, target: UpdateTarget, bytes: &[u8]) {
@@ -1212,6 +1243,40 @@ mod tests {
                 ConfigWriteFault::None,
             )
             .unwrap();
+        }
+
+        fn replace_provisioned_journal_safely(&self, bytes: &[u8]) {
+            let root = reopen_validated_provision_for_config(
+                &self.parent(),
+                OsStr::new(ROOT_NAME),
+                &self.policy,
+            )
+            .unwrap();
+            let mut next = nonce_source(0x90);
+            write_fixed_file_at_handle(
+                &root,
+                FixedFile::TokenUpdateJournal,
+                bytes,
+                &self.policy,
+                ConfigWriteMode::Replace,
+                &mut next,
+                ConfigWriteFault::None,
+            )
+            .unwrap();
+        }
+
+        fn install_valid_provisioned_journal(&self) {
+            self.replace_provisioned_journal_safely(&sample_journal_bytes_for_test());
+            let identity = inspect_path_nofollow_for_test(&self.journal_path())
+                .unwrap()
+                .identity;
+            let mut encoded = sample_journal_bytes_for_test();
+            encoded[JOURNAL_IDENTITY_OFFSET..JOURNAL_IDENTITY_OFFSET + 8]
+                .copy_from_slice(&identity.volume.to_le_bytes());
+            encoded[JOURNAL_IDENTITY_OFFSET + 8..JOURNAL_IDENTITY_OFFSET + IDENTITY_BYTES]
+                .copy_from_slice(&identity.file_id);
+            refresh_journal_checksum_for_test(&mut encoded);
+            fs::write(self.journal_path(), encoded).unwrap();
         }
 
         fn prepare(
@@ -1251,6 +1316,10 @@ mod tests {
 
         fn journal_path(&self) -> PathBuf {
             self.root.join(JOURNAL_LEAF)
+        }
+
+        fn marker_path(&self) -> PathBuf {
+            self.root.join(MARKER_NAME)
         }
 
         fn bytes(&self, target: UpdateTarget) -> Option<Vec<u8>> {
@@ -1796,6 +1865,105 @@ mod tests {
             fixture.bytes(UpdateTarget::Daemon).as_deref(),
             Some(b"winner-a") | Some(b"winner-b")
         ));
+    }
+
+    #[test]
+    fn machine_token_lease_install_transition_allows_service_then_commit() {
+        let fixture = Fixture::provisioned();
+        assert!(fixture.marker_path().is_file());
+
+        let service_a = fixture.service_guard().unwrap();
+        let service_b = fixture.service_guard().unwrap();
+        assert!(fixture.update_guard().is_err());
+
+        fixture.commit().unwrap();
+        assert!(!fixture.marker_path().exists());
+        assert!(fixture.update_guard().is_err());
+
+        drop(service_a);
+        assert!(fixture.update_guard().is_err());
+        drop(service_b);
+        fixture.update_guard().unwrap();
+    }
+
+    #[test]
+    fn machine_token_lease_provisioned_service_blocks_rollback_until_release() {
+        let fixture = Fixture::provisioned();
+        let service = fixture.service_guard().unwrap();
+
+        assert!(fixture.rollback().is_err());
+        assert!(fixture.root.is_dir());
+
+        drop(service);
+        fixture.rollback().unwrap();
+        assert!(!fixture.root.exists());
+    }
+
+    #[test]
+    fn machine_token_lease_provisioned_service_rejects_unsafe_state() {
+        let malformed_marker = Fixture::provisioned();
+        let sentinel = malformed_marker.parent.join("malformed-marker-sentinel");
+        fs::write(&sentinel, b"outside-malformed-marker").unwrap();
+        fs::write(malformed_marker.marker_path(), b"malformed-marker").unwrap();
+        assert!(malformed_marker.service_guard().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-malformed-marker");
+
+        let mismatched_marker = Fixture::provisioned();
+        let sentinel = mismatched_marker.parent.join("mismatched-marker-sentinel");
+        fs::write(&sentinel, b"outside-mismatched-marker").unwrap();
+        let mut marker = parse_marker(&fs::read(mismatched_marker.marker_path()).unwrap()).unwrap();
+        marker.root.volume ^= 1;
+        fs::write(mismatched_marker.marker_path(), encode_marker(marker)).unwrap();
+        assert!(mismatched_marker.service_guard().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-mismatched-marker");
+
+        let mismatched_scratch = Fixture::provisioned();
+        let original_scratch = mismatched_scratch.parent.join("original-scratch");
+        let sentinel = mismatched_scratch.root.join(SCRATCH_NAME).join("sentinel");
+        fs::write(&sentinel, b"outside-replacement-scratch").unwrap();
+        fs::rename(
+            mismatched_scratch.root.join(SCRATCH_NAME),
+            &original_scratch,
+        )
+        .unwrap();
+        fs::create_dir(mismatched_scratch.root.join(SCRATCH_NAME)).unwrap();
+        assert!(mismatched_scratch.service_guard().is_err());
+        assert_eq!(
+            fs::read(original_scratch.join("sentinel")).unwrap(),
+            b"outside-replacement-scratch"
+        );
+
+        let valid_journal = Fixture::provisioned();
+        let sentinel = valid_journal.parent.join("valid-journal-sentinel");
+        fs::write(&sentinel, b"outside-valid-journal").unwrap();
+        valid_journal.install_valid_provisioned_journal();
+        assert!(valid_journal.service_guard().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-valid-journal");
+
+        let corrupt_journal = Fixture::provisioned();
+        let sentinel = corrupt_journal.parent.join("corrupt-journal-sentinel");
+        fs::write(&sentinel, b"outside-corrupt-journal").unwrap();
+        corrupt_journal.replace_provisioned_journal_safely(b"corrupt-journal");
+        assert!(corrupt_journal.service_guard().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-corrupt-journal");
+
+        let hardlink_journal = Fixture::provisioned();
+        let sentinel = hardlink_journal.parent.join("hardlink-journal-sentinel");
+        fs::write(&sentinel, b"outside-hardlink-journal").unwrap();
+        fs::hard_link(&sentinel, hardlink_journal.journal_path()).unwrap();
+        assert!(hardlink_journal.service_guard().is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-hardlink-journal");
+
+        let reparse_journal = Fixture::provisioned();
+        let external = reparse_journal.parent.join("reparse-journal-sentinel");
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("sentinel"), b"outside-reparse-journal").unwrap();
+        create_junction(&reparse_journal.journal_path(), &external);
+        assert!(reparse_journal.service_guard().is_err());
+        assert_eq!(
+            fs::read(external.join("sentinel")).unwrap(),
+            b"outside-reparse-journal"
+        );
     }
 
     #[test]

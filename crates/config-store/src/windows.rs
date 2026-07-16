@@ -375,12 +375,7 @@ fn enter_service_runtime_at(
     root_name: &OsStr,
     policy: &SecurityPolicy,
 ) -> Result<MachineServiceRuntimeGuard, MachineStoreError> {
-    let (root, root_identity) = acquire_committed_root_lease(
-        parent,
-        root_name,
-        policy,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-    )?;
+    let (root, root_identity) = acquire_service_runtime_root_lease(parent, root_name, policy)?;
     token_update::require_service_safe_journal_absence(&root, root_identity, policy)?;
     Ok(MachineServiceRuntimeGuard { _root: root })
 }
@@ -835,6 +830,27 @@ fn reopen_validated_provision(
     Ok(ValidatedProvision { root, marker })
 }
 
+fn reopen_validated_provision_for_commit(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<ValidatedProvision, MachineStoreError> {
+    let root_sd = SecurityDescriptor::from_sddl(policy.root_sddl())?;
+    let child_sd = SecurityDescriptor::from_sddl(policy.child_sddl())?;
+    let root = open_config_relative_with_share(
+        parent,
+        root_name,
+        true,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+    .map_err(|_| integrity("provisioned machine-store root is unavailable for commit"))?;
+    let root_identity = verify_directory(&root, &root_sd)?;
+    let mut marker = open_relative(&root, OsStr::new(MARKER_NAME), false)
+        .map_err(|_| integrity("machine-store provision marker is unavailable for commit"))?;
+    validate_provision_marker_and_children(&root, root_identity, &mut marker, &root_sd, &child_sd)?;
+    Ok(ValidatedProvision { root, marker })
+}
+
 fn reopen_validated_committed(
     parent: &File,
     root_name: &OsStr,
@@ -858,6 +874,22 @@ fn acquire_committed_root_lease(
     Ok((root, identity))
 }
 
+fn acquire_service_runtime_root_lease(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<(File, FileIdentity), MachineStoreError> {
+    let root = open_config_relative_with_share(
+        parent,
+        root_name,
+        true,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )
+    .map_err(|_| integrity("service runtime root lease is unavailable or unsafe"))?;
+    let identity = validate_service_runtime_root_handle(&root, policy)?;
+    Ok((root, identity))
+}
+
 fn validate_committed_root_handle(
     root: &File,
     policy: &SecurityPolicy,
@@ -877,6 +909,74 @@ fn validate_committed_root_handle(
     verify_directory(&scratch, &child_sd)?;
     verify_directory(&cas, &child_sd)?;
     Ok(identity)
+}
+
+fn validate_service_runtime_root_handle(
+    root: &File,
+    policy: &SecurityPolicy,
+) -> Result<FileIdentity, MachineStoreError> {
+    let root_sd = SecurityDescriptor::from_sddl(policy.root_sddl())?;
+    let child_sd = SecurityDescriptor::from_sddl(policy.child_sddl())?;
+    let root_identity = verify_directory(root, &root_sd)?;
+    match open_config_relative_optional(root, OsStr::new(MARKER_NAME), false)? {
+        Some(mut marker) => validate_provision_marker_and_children(
+            root,
+            root_identity,
+            &mut marker,
+            &root_sd,
+            &child_sd,
+        )?,
+        None => validate_committed_children(root, &child_sd)?,
+    }
+    Ok(root_identity)
+}
+
+fn validate_provision_marker_and_children(
+    root: &File,
+    root_identity: FileIdentity,
+    marker: &mut File,
+    root_sd: &SecurityDescriptor,
+    child_sd: &SecurityDescriptor,
+) -> Result<(), MachineStoreError> {
+    verify_plain_file(marker, root_sd)?;
+    let mut bytes = Vec::new();
+    marker
+        .read_to_end(&mut bytes)
+        .map_err(|error| map_io("read machine-store provision marker", error))?;
+    let recorded = parse_marker(&bytes)?;
+    if recorded.root != root_identity {
+        return Err(integrity(
+            "machine-store root identity differs from provision marker",
+        ));
+    }
+    let scratch = open_config_relative(root, OsStr::new(SCRATCH_NAME), true)
+        .map_err(|_| integrity("machine-store scratch directory is missing"))?;
+    let cas = open_config_relative(root, OsStr::new(CAS_NAME), true)
+        .map_err(|_| integrity("machine-store CAS directory is missing"))?;
+    if verify_directory(&scratch, child_sd)? != recorded.scratch {
+        return Err(integrity(
+            "machine-store scratch identity differs from provision marker",
+        ));
+    }
+    if verify_directory(&cas, child_sd)? != recorded.cas {
+        return Err(integrity(
+            "machine-store CAS identity differs from provision marker",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_committed_children(
+    root: &File,
+    child_sd: &SecurityDescriptor,
+) -> Result<(), MachineStoreError> {
+    let scratch = open_config_relative(root, OsStr::new(SCRATCH_NAME), true)
+        .map_err(|_| integrity("committed machine-store scratch directory is missing"))?;
+    let cas = open_config_relative(root, OsStr::new(CAS_NAME), true)
+        .map_err(|_| integrity("committed machine-store CAS directory is missing"))?;
+    verify_directory(&scratch, child_sd)?;
+    verify_directory(&cas, child_sd)?;
+    Ok(())
 }
 
 fn reopen_validated_provision_for_config(
@@ -1641,10 +1741,10 @@ fn commit_at_handle(
     root_name: &OsStr,
     policy: &SecurityPolicy,
 ) -> Result<(), MachineStoreError> {
-    let validated = reopen_validated_provision(parent, root_name, policy)?;
+    let validated = reopen_validated_provision_for_commit(parent, root_name, policy)?;
     delete_held_handle(&validated.marker)?;
     drop(validated.marker);
-    if open_relative_optional(&validated.root, OsStr::new(MARKER_NAME), false)?.is_some() {
+    if open_config_relative_optional(&validated.root, OsStr::new(MARKER_NAME), false)?.is_some() {
         return Err(integrity("machine-store marker remained after commit"));
     }
     Ok(())

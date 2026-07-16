@@ -1016,6 +1016,7 @@ $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::Progra
 $dataRoot = Join-Path $commonData 'Sembazuru'
 $scratchRoot = Join-Path $dataRoot 'scratch'
 $casRoot = Join-Path $dataRoot 'cas'
+$provisionMarker = Join-Path $dataRoot '.provisioning-v1'
 $daemonConfig = Join-Path $dataRoot 'daemon.toml'
 $workerConfig = Join-Path $dataRoot 'worker.toml'
 $installRoot = Join-Path $programFiles 'Sembazuru'
@@ -1048,6 +1049,10 @@ try {
 
     Assert-ServiceSidAntiDrift
     Assert-ServicesRunning
+    if (Test-Path -LiteralPath $provisionMarker) {
+        throw "fresh install left the fixed provision marker behind: $provisionMarker"
+    }
+    Write-Host 'PROVISION COMMIT PASS: services are running and the fixed provision marker is absent.'
     Assert-ExactAclRules -Path $dataRoot -ExpectedProtected $true -ExpectedInherited $false `
         -WorkerMask 0x1200a9 -DaemonMask 0x1200a9 -RequireContainerInheritance $true
     Assert-ExactAclRules -Path $scratchRoot -ExpectedProtected $true -ExpectedInherited $false `
