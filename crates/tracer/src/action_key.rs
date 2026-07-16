@@ -284,8 +284,8 @@ pub enum InputKind {
     /// gone unreadable on a later build, that is a meaningful change — the key
     /// moves and the lookup misses. Its content is *never* dropped from the key.
     Content,
-    /// A stable absent dependency (an include-search miss outside the root):
-    /// folds an `absent` marker. If the file later appears, the key moves.
+    /// A stable absent dependency (an observed include-search miss): folds an
+    /// `absent` marker. If the file later appears, the key moves.
     Absent,
 }
 
@@ -375,10 +375,10 @@ fn is_cache_blocking_warning(w: &str) -> bool {
 ///
 /// Classification (using the trace's access kinds, `graph.rs`):
 ///   * anchors and is readable now → [`InputKind::Content`] (its bytes key);
-///   * anchors but is unreadable and *outside* the root → [`InputKind::Absent`]
-///     (a stable include-search miss);
-///   * anchors but is unreadable and *under* the root → a build transient
-///     (a renamed-away temp) → dropped, as before;
+///   * anchors but is unreadable and was a failed probe → [`InputKind::Absent`]
+///     (a stable include-search miss), regardless of its root-relative location;
+///   * anchors but is unreadable without failed-probe evidence → the action is
+///     marked uncacheable, because an observed content read may have vanished;
 ///   * does **not** anchor *and was a real content read* → the action is marked
 ///     uncacheable (`cacheable = false`), because the strong key cannot be
 ///     guaranteed to cover that source's content (input-side fail-closed).
@@ -444,14 +444,18 @@ pub fn input_manifest_with_policy(
                     {
                         continue;
                     }
-                    if is_under_build_root(&logical) {
-                        continue; // build transient with a run-varying name
+                    if inp.kinds.contains(&AccessKind::ProbeMiss) {
+                        inputs.push(InputEntry {
+                            logical,
+                            absolute,
+                            kind: InputKind::Absent,
+                        });
+                    } else {
+                        // Location is not proof that an unreadable input was a
+                        // self-produced transient. graph.rs removes those from
+                        // the surviving input set using their event sequence.
+                        cacheable = false;
                     }
-                    inputs.push(InputEntry {
-                        logical,
-                        absolute,
-                        kind: InputKind::Absent,
-                    });
                 }
             },
             None => {
@@ -585,6 +589,13 @@ mod action_cache_tests {
         PathAccess {
             path: path.to_string(),
             kinds: BTreeSet::from([AccessKind::Enumerate]),
+            pids: BTreeSet::from([1]),
+        }
+    }
+    fn probe_access(path: &str) -> PathAccess {
+        PathAccess {
+            path: path.to_string(),
+            kinds: BTreeSet::from([AccessKind::Probe]),
             pids: BTreeSet::from([1]),
         }
     }
@@ -937,7 +948,7 @@ mod action_cache_tests {
         std::fs::create_dir_all(root.join("incdir")).unwrap();
         let rs = root_str(&root);
         // A real file read + a probe of an existing directory.
-        let g = graph_with(vec![read_access("a.cpp"), read_access("incdir")]);
+        let g = graph_with(vec![read_access("a.cpp"), probe_access("incdir")]);
         let m = input_manifest(&g, &rs);
         assert!(
             m.cacheable,
@@ -1045,6 +1056,47 @@ mod action_cache_tests {
         );
 
         let _ = std::fs::remove_file(&missing);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn absent_probe_under_build_root_is_keyed_until_it_appears() {
+        let root = tmp_dir("root-absent-appears");
+        let rs = root_str(&root);
+        let missing = root.join("generated\\missing.h");
+        let g = graph_with(vec![probe_miss_access("generated\\missing.h")]);
+
+        let m = input_manifest(&g, &rs);
+        assert!(m.cacheable);
+        assert_eq!(m.inputs.len(), 1, "the in-root miss must remain keyed");
+        assert_eq!(m.inputs[0].kind, InputKind::Absent);
+
+        let while_absent = manifest_hash(&m).unwrap();
+        std::fs::create_dir_all(missing.parent().unwrap()).unwrap();
+        std::fs::write(&missing, b"#pragma once\n").unwrap();
+        assert_ne!(
+            while_absent,
+            manifest_hash(&m).unwrap(),
+            "creating an in-root missing header must move the key"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn vanished_non_probe_read_fails_closed() {
+        let root = tmp_dir("vanished-non-probe");
+        let rs = root_str(&root);
+        let g = graph_with(vec![read_access("vanished.h")]);
+
+        let m = input_manifest(&g, &rs);
+        assert!(
+            !m.cacheable,
+            "an unreadable content read must not be mistaken for an absent probe"
+        );
+        assert!(
+            m.inputs.is_empty(),
+            "a non-probe read must not be recorded as an Absent dependency"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
