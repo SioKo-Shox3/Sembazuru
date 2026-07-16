@@ -17,8 +17,9 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$daemonSid = 'S-1-5-80-1935860780-3819908813-1334579252-621723184-2190217863'
 $workerSid = 'S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795'
-$rootSddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;$workerSid)"
+$rootSddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;$workerSid)(A;;0x1200a9;;;$daemonSid)"
 $workerWriteSddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;$workerSid)"
 $safeUpgradeMessage = 'Automatic upgrade is blocked until a safe legacy migration is available. The earlier installation was left unchanged.'
 
@@ -543,6 +544,7 @@ function Assert-ExactAclRules {
         [bool]$ExpectedProtected,
         [bool]$ExpectedInherited,
         [int64]$WorkerMask,
+        [int64]$DaemonMask = -1,
         [bool]$RequireContainerInheritance,
         [string]$ExpectedOwnerSid = '',
         [string]$ExpectedGroupSid = ''
@@ -566,14 +568,17 @@ function Assert-ExactAclRules {
     if ($acl.AreAccessRulesProtected -ne $ExpectedProtected) {
         throw "ACL protection mismatch for ${Path}: got $($acl.AreAccessRulesProtected), want $ExpectedProtected"
     }
-    $rules = @($acl.Access)
-    if ($rules.Count -ne 3) {
-        throw "ACL rule count mismatch for ${Path}: got $($rules.Count), want 3"
-    }
     $expectedMasks = @{
         'S-1-5-18' = [int64]0x1f01ff
         'S-1-5-32-544' = [int64]0x1f01ff
         $workerSid = $WorkerMask
+    }
+    if ($DaemonMask -ge 0) {
+        $expectedMasks[$daemonSid] = $DaemonMask
+    }
+    $rules = @($acl.Access)
+    if ($rules.Count -ne $expectedMasks.Count) {
+        throw "ACL rule count mismatch for ${Path}: got $($rules.Count), want $($expectedMasks.Count)"
     }
     $seen = @{}
     $expectedInheritance = [Security.AccessControl.InheritanceFlags]::None
@@ -597,7 +602,11 @@ function Assert-ExactAclRules {
         if ([int64]$rule.FileSystemRights -ne $expectedMasks[$sid]) {
             throw "ACL rights mismatch on ${Path}: $sid mask=0x$(([int64]$rule.FileSystemRights).ToString('x')) want=0x$($expectedMasks[$sid].ToString('x'))"
         }
-        if ($rule.InheritanceFlags -ne $expectedInheritance) {
+        $ruleExpectedInheritance = $expectedInheritance
+        if ($sid -eq $daemonSid) {
+            $ruleExpectedInheritance = [Security.AccessControl.InheritanceFlags]::None
+        }
+        if ($rule.InheritanceFlags -ne $ruleExpectedInheritance) {
             throw "ACL propagation mismatch on ${Path}: $sid flags=$($rule.InheritanceFlags)"
         }
         if ($rule.PropagationFlags -ne [Security.AccessControl.PropagationFlags]::None) {
@@ -612,16 +621,21 @@ function Assert-ExactAclRules {
 }
 
 function Assert-ServiceSidAntiDrift {
-    $output = & sc.exe showsid SembazuruWorker 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
-        throw "sc.exe showsid SembazuruWorker failed ($LASTEXITCODE): $output"
+    foreach ($expectation in @(
+        [pscustomobject]@{ Name = 'SembazuruDaemon'; Sid = $daemonSid },
+        [pscustomobject]@{ Name = 'SembazuruWorker'; Sid = $workerSid }
+    )) {
+        $output = & sc.exe showsid $expectation.Name 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            throw "sc.exe showsid $($expectation.Name) failed ($LASTEXITCODE): $output"
+        }
+        $reported = @([regex]::Matches($output, 'S-1-5-80-(?:\d+-){4}\d+') |
+            ForEach-Object { $_.Value } | Sort-Object -Unique)
+        if ($reported.Count -ne 1 -or $reported[0] -ne $expectation.Sid) {
+            throw "$($expectation.Name) service SID drift: embedded=$($expectation.Sid) sc.exe=$($reported -join ',') output=$output"
+        }
+        Write-Host "SERVICE SID PASS: $($expectation.Name) embedded SDDL SID matches sc.exe showsid: $($expectation.Sid)"
     }
-    $reported = @([regex]::Matches($output, 'S-1-5-80-(?:\d+-){4}\d+') |
-        ForEach-Object { $_.Value } | Sort-Object -Unique)
-    if ($reported.Count -ne 1 -or $reported[0] -ne $workerSid) {
-        throw "worker service SID drift: embedded=$workerSid sc.exe=$($reported -join ',') output=$output"
-    }
-    Write-Host "SERVICE SID PASS: embedded SDDL SID matches sc.exe showsid: $workerSid"
 }
 
 function Assert-ServicesRunning {
@@ -1035,22 +1049,22 @@ try {
     Assert-ServiceSidAntiDrift
     Assert-ServicesRunning
     Assert-ExactAclRules -Path $dataRoot -ExpectedProtected $true -ExpectedInherited $false `
-        -WorkerMask 0x1200a9 -RequireContainerInheritance $true
+        -WorkerMask 0x1200a9 -DaemonMask 0x1200a9 -RequireContainerInheritance $true
     Assert-ExactAclRules -Path $scratchRoot -ExpectedProtected $true -ExpectedInherited $false `
         -WorkerMask 0x1301bf -RequireContainerInheritance $true
     Assert-ExactAclRules -Path $casRoot -ExpectedProtected $true -ExpectedInherited $false `
         -WorkerMask 0x1301bf -RequireContainerInheritance $true
-    Write-Host 'DIRECTORY ACL PASS: protected, non-inherited, exact SY/BA/worker masks; no Users/AU/Everyone.'
+    Write-Host 'DIRECTORY ACL PASS: root has exact non-inherited daemon RX; scratch/cas remain exact SY/BA/worker only; no Users/AU/Everyone.'
 
     foreach ($config in @($daemonConfig, $workerConfig)) {
         if (-not (Test-Path -LiteralPath $config -PathType Leaf)) {
             throw "seeded config is missing: $config"
         }
         Assert-ExactAclRules -Path $config -ExpectedProtected $true -ExpectedInherited $false `
-            -WorkerMask 0x1200a9 -RequireContainerInheritance $false `
+            -WorkerMask 0x1200a9 -DaemonMask 0x1200a9 -RequireContainerInheritance $false `
             -ExpectedOwnerSid 'S-1-5-18' -ExpectedGroupSid 'S-1-5-18'
     }
-    Write-Host 'CONFIG ACL PASS: daemon.toml/worker.toml owner+group SYSTEM, protected non-inherited exact SY/BA Full + worker RX only.'
+    Write-Host 'CONFIG ACL PASS: daemon.toml/worker.toml owner+group SYSTEM, protected non-inherited exact SY/BA Full + worker/daemon RX only.'
 
     foreach ($probeRoot in @($scratchRoot, $casRoot)) {
         $probeDir = Join-Path $probeRoot 'm9-acl-probe-dir'

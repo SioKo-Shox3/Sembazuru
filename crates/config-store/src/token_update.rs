@@ -166,38 +166,33 @@ struct TargetSnapshot {
 }
 
 struct UpdateStore<'a> {
-    parent: &'a File,
-    root_name: &'a OsStr,
+    root: &'a File,
     policy: &'a SecurityPolicy,
-    root: File,
     root_identity: FileIdentity,
     config_descriptor: SecurityDescriptor,
 }
 
 impl<'a> UpdateStore<'a> {
-    fn open(
-        parent: &'a File,
-        root_name: &'a OsStr,
+    fn from_held_root(
+        root: &'a File,
+        root_identity: FileIdentity,
         policy: &'a SecurityPolicy,
     ) -> Result<Self, MachineStoreError> {
-        let root = reopen_validated_committed(parent, root_name, policy)?;
-        let root_identity = inspect_handle(&root)?.identity;
+        if validate_committed_root_handle(root, policy)? != root_identity {
+            return Err(integrity(
+                "machine token update root identity changed before use",
+            ));
+        }
         Ok(Self {
-            parent,
-            root_name,
-            policy,
             root,
+            policy,
             root_identity,
             config_descriptor: SecurityDescriptor::from_sddl(policy.config_sddl())?,
         })
     }
 
     fn revalidate(&self) -> Result<(), MachineStoreError> {
-        let named = reopen_validated_committed(self.parent, self.root_name, self.policy)?;
-        let held_descriptor = SecurityDescriptor::from_sddl(self.policy.root_sddl())?;
-        if verify_directory(&self.root, &held_descriptor)? != self.root_identity
-            || inspect_handle(&named)?.identity != self.root_identity
-        {
+        if validate_committed_root_handle(self.root, self.policy)? != self.root_identity {
             return Err(integrity(
                 "machine token update root identity or lifecycle changed",
             ));
@@ -206,8 +201,7 @@ impl<'a> UpdateStore<'a> {
     }
 
     fn snapshot(&self, target: UpdateTarget) -> Result<TargetSnapshot, MachineStoreError> {
-        let Some(mut file) =
-            open_fixed_file_optional(&self.root, OsStr::new(target.leaf()), false)?
+        let Some(mut file) = open_fixed_file_optional(self.root, OsStr::new(target.leaf()), false)?
         else {
             return Ok(TargetSnapshot {
                 state: ExpectedState::Absent,
@@ -296,6 +290,7 @@ pub(super) enum ApplyFault {
     JournalAbsenceProof,
 }
 
+#[cfg(test)]
 pub(super) fn prepare_update_at(
     parent: &File,
     root_name: &OsStr,
@@ -304,7 +299,20 @@ pub(super) fn prepare_update_at(
     next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
     fault: PrepareFault,
 ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
-    let store = UpdateStore::open(parent, root_name, policy)?;
+    let root = reopen_validated_committed(parent, root_name, policy)?;
+    let root_identity = inspect_handle(&root)?.identity;
+    prepare_update_on_held_root(&root, root_identity, policy, update, next_nonce, fault)
+}
+
+pub(super) fn prepare_update_on_held_root(
+    root: &File,
+    root_identity: FileIdentity,
+    policy: &SecurityPolicy,
+    update: MachineTokenUpdate<'_>,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: PrepareFault,
+) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+    let store = UpdateStore::from_held_root(root, root_identity, policy)?;
     store.revalidate()?;
     if read_journal(&store, false)?.is_some() {
         return Err(integrity(
@@ -370,16 +378,43 @@ pub(super) fn prepare_update_at(
     Ok(MachineTokenUpdatePreparation::JournalReady)
 }
 
+#[cfg(test)]
 pub(super) fn update_pending_at(
     parent: &File,
     root_name: &OsStr,
     policy: &SecurityPolicy,
 ) -> Result<bool, MachineStoreError> {
-    let store = UpdateStore::open(parent, root_name, policy)?;
+    let root = reopen_validated_committed(parent, root_name, policy)?;
+    let root_identity = inspect_handle(&root)?.identity;
+    update_pending_on_held_root(&root, root_identity, policy)
+}
+
+pub(super) fn update_pending_on_held_root(
+    root: &File,
+    root_identity: FileIdentity,
+    policy: &SecurityPolicy,
+) -> Result<bool, MachineStoreError> {
+    let store = UpdateStore::from_held_root(root, root_identity, policy)?;
     store.revalidate()?;
     Ok(read_journal(&store, false)?.is_some())
 }
 
+pub(super) fn require_service_safe_journal_absence(
+    root: &File,
+    root_identity: FileIdentity,
+    policy: &SecurityPolicy,
+) -> Result<(), MachineStoreError> {
+    let store = UpdateStore::from_held_root(root, root_identity, policy)?;
+    store.revalidate()?;
+    match read_journal(&store, false)? {
+        None => Ok(()),
+        Some(_) => Err(integrity(
+            "service runtime is blocked by a pending machine token update journal",
+        )),
+    }
+}
+
+#[cfg(test)]
 pub(super) fn apply_update_at(
     parent: &File,
     root_name: &OsStr,
@@ -387,7 +422,19 @@ pub(super) fn apply_update_at(
     next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
     fault: ApplyFault,
 ) -> Result<(), MachineStoreError> {
-    let store = UpdateStore::open(parent, root_name, policy)?;
+    let root = reopen_validated_committed(parent, root_name, policy)?;
+    let root_identity = inspect_handle(&root)?.identity;
+    apply_update_on_held_root(&root, root_identity, policy, next_nonce, fault)
+}
+
+pub(super) fn apply_update_on_held_root(
+    root: &File,
+    root_identity: FileIdentity,
+    policy: &SecurityPolicy,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: ApplyFault,
+) -> Result<(), MachineStoreError> {
+    let store = UpdateStore::from_held_root(root, root_identity, policy)?;
     let journal = open_required_journal(&store, true)?;
     journal.revalidate(&store)?;
 
@@ -420,7 +467,7 @@ pub(super) fn apply_update_at(
                     _ => ConfigWriteFault::None,
                 };
                 write_fixed_file_at_handle(
-                    &store.root,
+                    store.root,
                     target.fixed_file(),
                     record
                         .payload
@@ -491,7 +538,7 @@ pub(super) fn apply_update_at(
     let identity = journal.identity;
     delete_held_handle(&journal.file)?;
     drop(journal);
-    match open_relative_any(&store.root, OsStr::new(JOURNAL_LEAF)) {
+    match open_relative_any(store.root, OsStr::new(JOURNAL_LEAF)) {
         Err(error) if is_not_found(&error) => Ok(()),
         Err(_) => Err(integrity(
             "machine token update journal absence cannot be proven",
@@ -583,7 +630,7 @@ fn publish_journal(
     #[cfg(not(test))]
     let _ = fault;
     let (temp_name, mut temp, temp_identity) = create_unique_fixed_temp(
-        &store.root,
+        store.root,
         FixedFile::TokenUpdateJournal,
         &store.config_descriptor,
         next_nonce,
@@ -595,7 +642,7 @@ fn publish_journal(
     let encoded = match encode_journal(&journal) {
         Ok(encoded) => encoded,
         Err(primary) => {
-            remove_temp_or_combine(&store.root, &temp_name, temp, temp_identity, Some(primary))?;
+            remove_temp_or_combine(store.root, &temp_name, temp, temp_identity, Some(primary))?;
             unreachable!("cleanup with a primary error always returns Err")
         }
     };
@@ -630,7 +677,7 @@ fn publish_journal(
                 "injected machine token update journal rename failure",
             ));
         }
-        rename_config_handle(&temp, &store.root, OsStr::new(JOURNAL_LEAF), false)
+        rename_config_handle(&temp, store.root, OsStr::new(JOURNAL_LEAF), false)
     })();
 
     match before_publish {
@@ -657,11 +704,11 @@ fn publish_journal(
         Ok(RenameResult::Collision) => {
             let primary =
                 integrity("machine token update journal publication lost create-new race");
-            remove_temp_or_combine(&store.root, &temp_name, temp, temp_identity, Some(primary))?;
+            remove_temp_or_combine(store.root, &temp_name, temp, temp_identity, Some(primary))?;
             unreachable!("cleanup with a primary error always returns Err")
         }
         Err(primary) => {
-            remove_temp_or_combine(&store.root, &temp_name, temp, temp_identity, Some(primary))?;
+            remove_temp_or_combine(store.root, &temp_name, temp, temp_identity, Some(primary))?;
             unreachable!("cleanup with a primary error always returns Err")
         }
     }
@@ -685,8 +732,7 @@ fn read_journal(
     store: &UpdateStore<'_>,
     delete_access: bool,
 ) -> Result<Option<OpenedJournal>, MachineStoreError> {
-    let Some(file) =
-        open_fixed_file_optional(&store.root, OsStr::new(JOURNAL_LEAF), delete_access)?
+    let Some(file) = open_fixed_file_optional(store.root, OsStr::new(JOURNAL_LEAF), delete_access)?
     else {
         return Ok(None);
     };
@@ -1067,7 +1113,7 @@ fn write_test_race(
     next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
 ) -> Result<(), MachineStoreError> {
     write_fixed_file_at_handle(
-        &store.root,
+        store.root,
         target.fixed_file(),
         bytes,
         store.policy,
@@ -1124,6 +1170,14 @@ mod tests {
 
         fn parent(&self) -> File {
             open_config_parent_path_nofollow(&self.parent).unwrap()
+        }
+
+        fn service_guard(&self) -> Result<crate::MachineServiceRuntimeGuard, MachineStoreError> {
+            enter_service_runtime_at_for_test(&self.parent(), OsStr::new(ROOT_NAME), &self.policy)
+        }
+
+        fn update_guard(&self) -> Result<crate::MachineTokenUpdateGuard, MachineStoreError> {
+            begin_token_update_at_for_test(&self.parent(), OsStr::new(ROOT_NAME), &self.policy)
         }
 
         fn replace(&self, target: UpdateTarget, bytes: &[u8]) {
@@ -1742,5 +1796,167 @@ mod tests {
             fixture.bytes(UpdateTarget::Daemon).as_deref(),
             Some(b"winner-a") | Some(b"winner-b")
         ));
+    }
+
+    #[test]
+    fn machine_token_lease_shared_and_exclusive_guards_conflict_and_release() {
+        let fixture = Fixture::committed();
+
+        let service_a = fixture.service_guard().unwrap();
+        let service_b = fixture.service_guard().unwrap();
+        for debug in [format!("{service_a:?}"), format!("{service_b:?}")] {
+            assert!(debug.contains("REDACTED"), "{debug}");
+            assert!(
+                !debug.contains(&fixture.root.display().to_string()),
+                "{debug}"
+            );
+        }
+        assert!(fixture.update_guard().is_err());
+
+        drop(service_a);
+        assert!(fixture.update_guard().is_err());
+        drop(service_b);
+
+        let update = fixture.update_guard().unwrap();
+        let debug = format!("{update:?}");
+        assert!(debug.contains("REDACTED"), "{debug}");
+        assert!(
+            !debug.contains(&fixture.root.display().to_string()),
+            "{debug}"
+        );
+        assert!(fixture.service_guard().is_err());
+        assert!(fixture.update_guard().is_err());
+
+        drop(update);
+        fixture.service_guard().unwrap();
+    }
+
+    #[test]
+    fn machine_token_lease_stress_never_allows_service_and_update_together() {
+        let fixture = Arc::new(Fixture::committed());
+
+        for _ in 0..32 {
+            let start = Arc::new(Barrier::new(3));
+            let release = Arc::new(Barrier::new(3));
+
+            let service_fixture = Arc::clone(&fixture);
+            let service_start = Arc::clone(&start);
+            let service_release = Arc::clone(&release);
+            let service = thread::spawn(move || {
+                service_start.wait();
+                let guard = service_fixture.service_guard();
+                let acquired = guard.is_ok();
+                service_release.wait();
+                acquired
+            });
+
+            let update_fixture = Arc::clone(&fixture);
+            let update_start = Arc::clone(&start);
+            let update_release = Arc::clone(&release);
+            let update = thread::spawn(move || {
+                update_start.wait();
+                let guard = update_fixture.update_guard();
+                let acquired = guard.is_ok();
+                update_release.wait();
+                acquired
+            });
+
+            start.wait();
+            release.wait();
+            let service_acquired = service.join().unwrap();
+            let update_acquired = update.join().unwrap();
+            assert_ne!(
+                service_acquired, update_acquired,
+                "service and update leases must have exactly one winner"
+            );
+        }
+    }
+
+    #[test]
+    fn machine_token_lease_service_rejects_pending_and_unsafe_journals() {
+        let valid = Fixture::committed();
+        let mut update = valid.update_guard().unwrap();
+        assert_eq!(
+            crate::prepare_machine_cluster_token_update(&mut update, full_update()).unwrap(),
+            MachineTokenUpdatePreparation::JournalReady
+        );
+        drop(update);
+        assert!(valid.service_guard().is_err());
+
+        let corrupt = Fixture::committed();
+        let mut update = corrupt.update_guard().unwrap();
+        crate::prepare_machine_cluster_token_update(&mut update, full_update()).unwrap();
+        drop(update);
+        fs::write(corrupt.journal_path(), b"corrupt-journal").unwrap();
+        assert!(corrupt.service_guard().is_err());
+
+        let wrong_dacl = Fixture::committed();
+        fs::write(wrong_dacl.journal_path(), sample_journal_bytes_for_test()).unwrap();
+        assert!(wrong_dacl.service_guard().is_err());
+
+        let hardlink = Fixture::committed();
+        let hardlink_sentinel = hardlink.parent.join("hardlink-sentinel");
+        fs::write(&hardlink_sentinel, b"hardlink-sentinel").unwrap();
+        fs::hard_link(&hardlink_sentinel, hardlink.journal_path()).unwrap();
+        assert!(hardlink.service_guard().is_err());
+        assert_eq!(fs::read(&hardlink_sentinel).unwrap(), b"hardlink-sentinel");
+
+        let reparse = Fixture::committed();
+        let reparse_sentinel = reparse.parent.join("reparse-sentinel");
+        fs::create_dir(&reparse_sentinel).unwrap();
+        fs::write(reparse_sentinel.join("sentinel"), b"outside").unwrap();
+        create_junction(&reparse.journal_path(), &reparse_sentinel);
+        assert!(reparse.service_guard().is_err());
+        assert_eq!(
+            fs::read(reparse_sentinel.join("sentinel")).unwrap(),
+            b"outside"
+        );
+    }
+
+    #[test]
+    fn machine_token_lease_update_fault_resume_releases_to_service() {
+        let fixture = Fixture::committed();
+        let mut update = fixture.update_guard().unwrap();
+        assert_eq!(
+            crate::prepare_machine_cluster_token_update(&mut update, full_update()).unwrap(),
+            MachineTokenUpdatePreparation::JournalReady
+        );
+        assert!(fixture.service_guard().is_err());
+
+        let mut next = nonce_source(0xa0);
+        assert!(
+            apply_update_guard_with_fault_for_test(
+                &mut update,
+                &mut next,
+                ApplyFault::AfterTarget(UpdateTarget::Secret),
+            )
+            .is_err()
+        );
+        assert!(crate::machine_cluster_token_update_pending(&mut update).unwrap());
+        crate::apply_or_resume_machine_cluster_token_update(&mut update).unwrap();
+        assert!(!crate::machine_cluster_token_update_pending(&mut update).unwrap());
+
+        drop(update);
+        fixture.service_guard().unwrap();
+        assert_intended(&fixture);
+    }
+
+    #[test]
+    fn machine_token_lease_daemon_sid_is_exact_read_only_and_not_in_children() {
+        const DAEMON_SID: &str = "S-1-5-80-1935860780-3819908813-1334579252-621723184-2190217863";
+        let policy = SecurityPolicy::production();
+        let read_only_ace = format!("(A;;0x1200a9;;;{DAEMON_SID})");
+        let inherited_read_only_ace = format!("(A;OICI;0x1200a9;;;{DAEMON_SID})");
+
+        assert!(policy.root_sddl().contains(&read_only_ace));
+        assert!(!policy.root_sddl().contains(&inherited_read_only_ace));
+        assert!(policy.config_sddl().contains(&read_only_ace));
+        assert!(!policy.config_sddl().contains(&inherited_read_only_ace));
+        assert!(!policy.child_sddl().contains(DAEMON_SID));
+
+        for broad_principal in [";;;BU)", ";;;AU)", ";;;WD)"] {
+            assert!(!policy.root_sddl().contains(broad_principal));
+            assert!(!policy.config_sddl().contains(broad_principal));
+        }
     }
 }

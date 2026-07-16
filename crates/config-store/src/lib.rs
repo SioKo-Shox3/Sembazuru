@@ -166,6 +166,38 @@ pub struct MachineTokenUpdate<'a> {
     pub worker_config: MachineTokenUpdateValue<'a>,
 }
 
+/// Shared lease proving that one service runtime may use the committed store.
+pub struct MachineServiceRuntimeGuard {
+    _inner: platform::MachineServiceRuntimeGuard,
+}
+
+impl fmt::Debug for MachineServiceRuntimeGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MachineServiceRuntimeGuard([REDACTED])")
+    }
+}
+
+/// Exclusive capability for one machine token-update transaction sequence.
+pub struct MachineTokenUpdateGuard {
+    inner: platform::MachineTokenUpdateGuard,
+}
+
+impl fmt::Debug for MachineTokenUpdateGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MachineTokenUpdateGuard([REDACTED])")
+    }
+}
+
+/// Enters the fixed service-runtime lease after proving no update is pending.
+pub fn enter_machine_service_runtime() -> Result<MachineServiceRuntimeGuard, MachineStoreError> {
+    platform::enter_service_runtime().map(|inner| MachineServiceRuntimeGuard { _inner: inner })
+}
+
+/// Begins the one exclusive fixed machine token-update lease.
+pub fn begin_machine_token_update() -> Result<MachineTokenUpdateGuard, MachineStoreError> {
+    platform::begin_token_update().map(|inner| MachineTokenUpdateGuard { inner })
+}
+
 /// Result of preparing an immutable machine cluster-token update journal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineTokenUpdatePreparation {
@@ -177,19 +209,24 @@ pub enum MachineTokenUpdatePreparation {
 
 /// Prepares one fixed, whole machine cluster-token update transaction.
 pub fn prepare_machine_cluster_token_update(
+    guard: &mut MachineTokenUpdateGuard,
     update: MachineTokenUpdate<'_>,
 ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
-    platform::prepare_token_update(update)
+    platform::prepare_token_update(&mut guard.inner, update)
 }
 
 /// Reports whether a fully validated machine cluster-token journal exists.
-pub fn machine_cluster_token_update_pending() -> Result<bool, MachineStoreError> {
-    platform::token_update_pending()
+pub fn machine_cluster_token_update_pending(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<bool, MachineStoreError> {
+    platform::token_update_pending(&mut guard.inner)
 }
 
 /// Applies or resumes the one pending fixed machine cluster-token transaction.
-pub fn apply_or_resume_machine_cluster_token_update() -> Result<(), MachineStoreError> {
-    platform::apply_token_update()
+pub fn apply_or_resume_machine_cluster_token_update(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<(), MachineStoreError> {
+    platform::apply_token_update(&mut guard.inner)
 }
 
 #[cfg(test)]
@@ -317,14 +354,30 @@ mod machine_secret_api_tests {
 mod machine_token_update_api_tests {
     use super::*;
 
+    trait AmbiguousIfImpl<A> {
+        fn probe() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+    impl<T: Clone> AmbiguousIfImpl<u8> for T {}
+
     #[test]
-    fn machine_token_update_public_api_is_fixed_and_transactional() {
+    fn machine_token_lease_public_api_is_fixed_transactional_and_non_cloneable() {
+        let _: fn() -> Result<MachineServiceRuntimeGuard, MachineStoreError> =
+            enter_machine_service_runtime;
+        let _: fn() -> Result<MachineTokenUpdateGuard, MachineStoreError> =
+            begin_machine_token_update;
         let _: fn(
+            &mut MachineTokenUpdateGuard,
             MachineTokenUpdate<'_>,
         ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> =
             prepare_machine_cluster_token_update;
-        let _: fn() -> Result<bool, MachineStoreError> = machine_cluster_token_update_pending;
-        let _: fn() -> Result<(), MachineStoreError> = apply_or_resume_machine_cluster_token_update;
+        let _: fn(&mut MachineTokenUpdateGuard) -> Result<bool, MachineStoreError> =
+            machine_cluster_token_update_pending;
+        let _: fn(&mut MachineTokenUpdateGuard) -> Result<(), MachineStoreError> =
+            apply_or_resume_machine_cluster_token_update;
+        let _ = <MachineServiceRuntimeGuard as AmbiguousIfImpl<_>>::probe;
+        let _ = <MachineTokenUpdateGuard as AmbiguousIfImpl<_>>::probe;
 
         let update = MachineTokenUpdate {
             cluster_token: MachineTokenUpdateValue::Preserve,
@@ -338,6 +391,22 @@ mod machine_token_update_api_tests {
 
         let source = include_str!("lib.rs");
         for name in [
+            "enter_machine_service_runtime",
+            "begin_machine_token_update",
+        ] {
+            let start = source
+                .find(&format!("pub fn {name}"))
+                .expect("public machine-token lease declaration");
+            let declaration = source[start..]
+                .split_once(" {")
+                .expect("complete public machine-token lease declaration")
+                .0;
+            assert!(declaration.contains("()"), "{declaration}");
+            for forbidden in ["Path", "root", "Sid", "Sddl", "Policy", "share", "mode"] {
+                assert!(!declaration.contains(forbidden), "{declaration}");
+            }
+        }
+        for name in [
             "prepare_machine_cluster_token_update",
             "machine_cluster_token_update_pending",
             "apply_or_resume_machine_cluster_token_update",
@@ -349,6 +418,10 @@ mod machine_token_update_api_tests {
                 .split_once(" {")
                 .expect("complete public machine-token update declaration")
                 .0;
+            assert!(
+                declaration.contains("&mut MachineTokenUpdateGuard"),
+                "{declaration}"
+            );
             for forbidden in [
                 "Path", "leaf", "root", "Identity", "hash", "journal", "Sddl", "Policy", "mode",
                 "fault", "delete",
@@ -356,32 +429,45 @@ mod machine_token_update_api_tests {
                 assert!(!declaration.contains(forbidden), "{declaration}");
             }
         }
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .map_or(source, |(production, _)| production);
+        for (start, _) in production_source.match_indices("impl MachineServiceRuntimeGuard {") {
+            let implementation = &production_source[start..];
+            let mut depth = 0usize;
+            let end = implementation
+                .char_indices()
+                .find_map(|(offset, character)| match character {
+                    '{' => {
+                        depth += 1;
+                        None
+                    }
+                    '}' => {
+                        depth -= 1;
+                        (depth == 0).then_some(offset + character.len_utf8())
+                    }
+                    _ => None,
+                })
+                .expect("complete MachineServiceRuntimeGuard implementation");
+            let implementation = &implementation[..end];
+            assert!(
+                !implementation.contains("pub fn "),
+                "service runtime guard must not expose public update authority: {implementation}"
+            );
+        }
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn machine_token_update_is_unsupported_without_side_effects_off_windows() {
-        let update = MachineTokenUpdate {
-            cluster_token: MachineTokenUpdateValue::Preserve,
-            daemon_config: MachineTokenUpdateValue::Preserve,
-            worker_config: MachineTokenUpdateValue::Preserve,
-        };
+    fn machine_token_lease_is_unsupported_without_side_effects_off_windows() {
         assert_eq!(
-            prepare_machine_cluster_token_update(update)
+            enter_machine_service_runtime()
                 .unwrap_err()
                 .classification(),
             MachineStoreErrorClass::Unsupported
         );
         assert_eq!(
-            machine_cluster_token_update_pending()
-                .unwrap_err()
-                .classification(),
-            MachineStoreErrorClass::Unsupported
-        );
-        assert_eq!(
-            apply_or_resume_machine_cluster_token_update()
-                .unwrap_err()
-                .classification(),
+            begin_machine_token_update().unwrap_err().classification(),
             MachineStoreErrorClass::Unsupported
         );
     }
@@ -393,6 +479,9 @@ mod platform {
         MachineConfigTarget, MachineSecret, MachineStoreError, MachineTokenUpdate,
         MachineTokenUpdatePreparation, windows,
     };
+
+    pub(super) type MachineServiceRuntimeGuard = windows::MachineServiceRuntimeGuard;
+    pub(super) type MachineTokenUpdateGuard = windows::MachineTokenUpdateGuard;
 
     pub(super) fn provision() -> Result<(), MachineStoreError> {
         windows::provision_canonical()
@@ -436,18 +525,31 @@ mod platform {
         windows::clear_machine_secret_canonical()
     }
 
+    pub(super) fn enter_service_runtime() -> Result<MachineServiceRuntimeGuard, MachineStoreError> {
+        windows::enter_machine_service_runtime_canonical()
+    }
+
+    pub(super) fn begin_token_update() -> Result<MachineTokenUpdateGuard, MachineStoreError> {
+        windows::begin_machine_token_update_canonical()
+    }
+
     pub(super) fn prepare_token_update(
+        guard: &mut MachineTokenUpdateGuard,
         update: MachineTokenUpdate<'_>,
     ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
-        windows::prepare_machine_token_update_canonical(update)
+        windows::prepare_machine_token_update(guard, update)
     }
 
-    pub(super) fn token_update_pending() -> Result<bool, MachineStoreError> {
-        windows::machine_token_update_pending_canonical()
+    pub(super) fn token_update_pending(
+        guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<bool, MachineStoreError> {
+        windows::machine_token_update_pending(guard)
     }
 
-    pub(super) fn apply_token_update() -> Result<(), MachineStoreError> {
-        windows::apply_machine_token_update_canonical()
+    pub(super) fn apply_token_update(
+        guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<(), MachineStoreError> {
+        windows::apply_machine_token_update(guard)
     }
 }
 
@@ -457,6 +559,9 @@ mod platform {
         MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass,
         MachineTokenUpdate, MachineTokenUpdatePreparation,
     };
+
+    pub(super) struct MachineServiceRuntimeGuard;
+    pub(super) struct MachineTokenUpdateGuard;
 
     fn unsupported<T>() -> Result<T, MachineStoreError> {
         Err(MachineStoreError::new(
@@ -507,17 +612,30 @@ mod platform {
         unsupported()
     }
 
+    pub(super) fn enter_service_runtime() -> Result<MachineServiceRuntimeGuard, MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn begin_token_update() -> Result<MachineTokenUpdateGuard, MachineStoreError> {
+        unsupported()
+    }
+
     pub(super) fn prepare_token_update(
+        _guard: &mut MachineTokenUpdateGuard,
         _update: MachineTokenUpdate<'_>,
     ) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
         unsupported()
     }
 
-    pub(super) fn token_update_pending() -> Result<bool, MachineStoreError> {
+    pub(super) fn token_update_pending(
+        _guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<bool, MachineStoreError> {
         unsupported()
     }
 
-    pub(super) fn apply_token_update() -> Result<(), MachineStoreError> {
+    pub(super) fn apply_token_update(
+        _guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<(), MachineStoreError> {
         unsupported()
     }
 }

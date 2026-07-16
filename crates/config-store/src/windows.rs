@@ -71,9 +71,9 @@ const MARKER_VERSION: u32 = 1;
 const IDENTITY_BYTES: usize = 24;
 const MARKER_BYTES: usize = MARKER_MAGIC.len() + 4 + IDENTITY_BYTES * 3;
 
-const ROOT_SDDL: &str = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)";
+const ROOT_SDDL: &str = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)(A;;0x1200a9;;;S-1-5-80-1935860780-3819908813-1334579252-621723184-2190217863)";
 const CHILD_SDDL: &str = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)";
-const CONFIG_SDDL: &str = "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)";
+const CONFIG_SDDL: &str = "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)(A;;0x1200a9;;;S-1-5-80-1935860780-3819908813-1334579252-621723184-2190217863)";
 const TEMP_CREATE_ATTEMPTS: usize = 8;
 const MACHINE_SECRET_LEAF: &str = "cluster-token.dpapi";
 const MACHINE_SECRET_MAGIC: &[u8; 8] = b"SBZTOKN\0";
@@ -89,6 +89,16 @@ struct SecurityPolicy {
     root: String,
     child: String,
     config: String,
+}
+
+pub(super) struct MachineServiceRuntimeGuard {
+    _root: File,
+}
+
+pub(super) struct MachineTokenUpdateGuard {
+    root: File,
+    root_identity: FileIdentity,
+    policy: SecurityPolicy,
 }
 
 #[cfg(test)]
@@ -304,43 +314,88 @@ pub(super) fn clear_machine_secret_canonical() -> Result<bool, MachineStoreError
     )
 }
 
-pub(super) fn prepare_machine_token_update_canonical(
-    update: MachineTokenUpdate<'_>,
-) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+pub(super) fn enter_machine_service_runtime_canonical()
+-> Result<MachineServiceRuntimeGuard, MachineStoreError> {
     let program_data = program_data_path()?;
     let parent = open_config_parent_path_nofollow(&program_data)?;
-    let mut nonce = random_nonce;
-    token_update::prepare_update_at(
+    enter_service_runtime_at(
         &parent,
         OsStr::new(ROOT_NAME),
         &SecurityPolicy::production(),
+    )
+}
+
+pub(super) fn begin_machine_token_update_canonical()
+-> Result<MachineTokenUpdateGuard, MachineStoreError> {
+    let program_data = program_data_path()?;
+    let parent = open_config_parent_path_nofollow(&program_data)?;
+    begin_token_update_at(
+        &parent,
+        OsStr::new(ROOT_NAME),
+        &SecurityPolicy::production(),
+    )
+}
+
+pub(super) fn prepare_machine_token_update(
+    guard: &mut MachineTokenUpdateGuard,
+    update: MachineTokenUpdate<'_>,
+) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+    let mut nonce = random_nonce;
+    token_update::prepare_update_on_held_root(
+        &guard.root,
+        guard.root_identity,
+        &guard.policy,
         update,
         &mut nonce,
         token_update::PrepareFault::None,
     )
 }
 
-pub(super) fn machine_token_update_pending_canonical() -> Result<bool, MachineStoreError> {
-    let program_data = program_data_path()?;
-    let parent = open_config_parent_path_nofollow(&program_data)?;
-    token_update::update_pending_at(
-        &parent,
-        OsStr::new(ROOT_NAME),
-        &SecurityPolicy::production(),
-    )
+pub(super) fn machine_token_update_pending(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<bool, MachineStoreError> {
+    token_update::update_pending_on_held_root(&guard.root, guard.root_identity, &guard.policy)
 }
 
-pub(super) fn apply_machine_token_update_canonical() -> Result<(), MachineStoreError> {
-    let program_data = program_data_path()?;
-    let parent = open_config_parent_path_nofollow(&program_data)?;
+pub(super) fn apply_machine_token_update(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<(), MachineStoreError> {
     let mut nonce = random_nonce;
-    token_update::apply_update_at(
-        &parent,
-        OsStr::new(ROOT_NAME),
-        &SecurityPolicy::production(),
+    token_update::apply_update_on_held_root(
+        &guard.root,
+        guard.root_identity,
+        &guard.policy,
         &mut nonce,
         token_update::ApplyFault::None,
     )
+}
+
+fn enter_service_runtime_at(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<MachineServiceRuntimeGuard, MachineStoreError> {
+    let (root, root_identity) = acquire_committed_root_lease(
+        parent,
+        root_name,
+        policy,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    )?;
+    token_update::require_service_safe_journal_absence(&root, root_identity, policy)?;
+    Ok(MachineServiceRuntimeGuard { _root: root })
+}
+
+fn begin_token_update_at(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<MachineTokenUpdateGuard, MachineStoreError> {
+    let (root, root_identity) = acquire_committed_root_lease(parent, root_name, policy, 0)?;
+    Ok(MachineTokenUpdateGuard {
+        root,
+        root_identity,
+        policy: policy.clone(),
+    })
 }
 
 fn program_data_path() -> Result<PathBuf, MachineStoreError> {
@@ -425,6 +480,26 @@ fn nt_relative(
     desired_access: u32,
     descriptor: Option<&SecurityDescriptor>,
 ) -> Result<File, CreateFailure> {
+    nt_relative_with_share(
+        parent,
+        name,
+        disposition,
+        is_directory,
+        desired_access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        descriptor,
+    )
+}
+
+fn nt_relative_with_share(
+    parent: &File,
+    name: &OsStr,
+    disposition: u32,
+    is_directory: Option<bool>,
+    desired_access: u32,
+    share_mode: u32,
+    descriptor: Option<&SecurityDescriptor>,
+) -> Result<File, CreateFailure> {
     let mut name = name.encode_wide().collect::<Vec<_>>();
     if name.is_empty()
         || name
@@ -476,7 +551,7 @@ fn nt_relative(
             io_status.as_mut_ptr(),
             std::ptr::null(),
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share_mode,
             disposition,
             kind_option | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),
@@ -572,6 +647,32 @@ fn open_config_relative(
         READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
     };
     match nt_relative(parent, name, FILE_OPEN, Some(is_directory), access, None) {
+        Ok(file) => Ok(file),
+        Err(CreateFailure::Collision) => unreachable!("FILE_OPEN cannot report create collision"),
+        Err(CreateFailure::Error(error)) => Err(error),
+    }
+}
+
+fn open_config_relative_with_share(
+    parent: &File,
+    name: &OsStr,
+    is_directory: bool,
+    share_mode: u32,
+) -> Result<File, MachineStoreError> {
+    let access = if is_directory {
+        READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE
+    } else {
+        READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    };
+    match nt_relative_with_share(
+        parent,
+        name,
+        FILE_OPEN,
+        Some(is_directory),
+        access,
+        share_mode,
+        None,
+    ) {
         Ok(file) => Ok(file),
         Err(CreateFailure::Collision) => unreachable!("FILE_OPEN cannot report create collision"),
         Err(CreateFailure::Error(error)) => Err(error),
@@ -739,23 +840,43 @@ fn reopen_validated_committed(
     root_name: &OsStr,
     policy: &SecurityPolicy,
 ) -> Result<File, MachineStoreError> {
-    let root_sd = SecurityDescriptor::from_sddl(policy.root_sddl())?;
-    let child_sd = SecurityDescriptor::from_sddl(policy.child_sddl())?;
     let root = open_config_relative(parent, root_name, true)
         .map_err(|_| integrity("committed machine-store root is missing or unsafe"))?;
-    verify_directory(&root, &root_sd)?;
-    if open_config_relative_optional(&root, OsStr::new(MARKER_NAME), false)?.is_some() {
+    validate_committed_root_handle(&root, policy)?;
+    Ok(root)
+}
+
+fn acquire_committed_root_lease(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+    share_mode: u32,
+) -> Result<(File, FileIdentity), MachineStoreError> {
+    let root = open_config_relative_with_share(parent, root_name, true, share_mode)
+        .map_err(|_| integrity("committed machine-store root lease is unavailable or unsafe"))?;
+    let identity = validate_committed_root_handle(&root, policy)?;
+    Ok((root, identity))
+}
+
+fn validate_committed_root_handle(
+    root: &File,
+    policy: &SecurityPolicy,
+) -> Result<FileIdentity, MachineStoreError> {
+    let root_sd = SecurityDescriptor::from_sddl(policy.root_sddl())?;
+    let child_sd = SecurityDescriptor::from_sddl(policy.child_sddl())?;
+    let identity = verify_directory(root, &root_sd)?;
+    if open_config_relative_optional(root, OsStr::new(MARKER_NAME), false)?.is_some() {
         return Err(integrity(
             "refusing configuration replacement in an uncommitted machine store",
         ));
     }
-    let scratch = open_config_relative(&root, OsStr::new(SCRATCH_NAME), true)
+    let scratch = open_config_relative(root, OsStr::new(SCRATCH_NAME), true)
         .map_err(|_| integrity("committed machine-store scratch directory is missing"))?;
-    let cas = open_config_relative(&root, OsStr::new(CAS_NAME), true)
+    let cas = open_config_relative(root, OsStr::new(CAS_NAME), true)
         .map_err(|_| integrity("committed machine-store CAS directory is missing"))?;
     verify_directory(&scratch, &child_sd)?;
     verify_directory(&cas, &child_sd)?;
-    Ok(root)
+    Ok(identity)
 }
 
 fn reopen_validated_provision_for_config(
@@ -1402,11 +1523,20 @@ enum RenameResult {
 
 fn rename_config_handle(
     temp: &File,
-    root: &File,
+    _root: &File,
     final_name: &OsStr,
     replace: bool,
 ) -> Result<RenameResult, MachineStoreError> {
     let wide = final_name.encode_wide().collect::<Vec<_>>();
+    if wide.is_empty()
+        || wide
+            .iter()
+            .any(|unit| *unit == b'\\' as u16 || *unit == b'/' as u16)
+    {
+        return Err(integrity(
+            "machine configuration final name is not a simple leaf",
+        ));
+    }
     let name_bytes = wide
         .len()
         .checked_mul(std::mem::size_of::<u16>())
@@ -1422,7 +1552,11 @@ fn rename_config_handle(
     // least header + exact UTF-16 payload bytes. Every written field fits.
     unsafe {
         (*information).Anonymous.ReplaceIfExists = u8::from(replace);
-        (*information).RootDirectory = root.as_raw_handle().cast();
+        // FILE_RENAME_INFORMATION permits a null RootDirectory with a simple
+        // leaf for a same-directory rename. A non-null destination directory
+        // is reopened by the kernel and conflicts with the share-zero update
+        // lease, so retain the validated held root and avoid that reopen.
+        (*information).RootDirectory = std::ptr::null_mut();
         (*information).FileNameLength = name_bytes;
         std::ptr::copy_nonoverlapping(
             wide.as_ptr(),
@@ -2012,6 +2146,41 @@ fn io_error(context: &'static str) -> MachineStoreError {
 
 fn map_io(context: &'static str, source: io::Error) -> MachineStoreError {
     MachineStoreError::with_io(MachineStoreErrorClass::Io, context, source)
+}
+
+#[cfg(test)]
+fn enter_service_runtime_at_for_test(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<crate::MachineServiceRuntimeGuard, MachineStoreError> {
+    enter_service_runtime_at(parent, root_name, policy)
+        .map(|inner| crate::MachineServiceRuntimeGuard { _inner: inner })
+}
+
+#[cfg(test)]
+fn begin_token_update_at_for_test(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<crate::MachineTokenUpdateGuard, MachineStoreError> {
+    begin_token_update_at(parent, root_name, policy)
+        .map(|inner| crate::MachineTokenUpdateGuard { inner })
+}
+
+#[cfg(test)]
+fn apply_update_guard_with_fault_for_test(
+    guard: &mut crate::MachineTokenUpdateGuard,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: token_update::ApplyFault,
+) -> Result<(), MachineStoreError> {
+    token_update::apply_update_on_held_root(
+        &guard.inner.root,
+        guard.inner.root_identity,
+        &guard.inner.policy,
+        next_nonce,
+        fault,
+    )
 }
 
 #[cfg(test)]
