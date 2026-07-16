@@ -1,6 +1,6 @@
 use std::ffi::{OsString, c_void};
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::marker::PhantomData;
 use std::mem::{size_of, size_of_val};
 use std::os::windows::ffi::OsStrExt;
@@ -10,7 +10,8 @@ use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{
-    HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, LocalFree,
+    SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -691,24 +692,67 @@ impl RestrictedProcess {
     }
 
     pub(crate) fn is_in_job(&self) -> io::Result<bool> {
-        self.job
-            .contains(self.process.as_ref().unwrap().as_raw_handle())
+        let process = self
+            .process
+            .as_ref()
+            .ok_or_else(|| io::Error::other("process already reaped"))?;
+        self.job.contains(process.as_raw_handle())
     }
 
-    /// Concurrently drains both pipes, then kills descendants as soon as the top process exits.
-    pub(crate) async fn wait_with_output(mut self) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
-        fn drain(handle: OwnedHandle) -> io::Result<Vec<u8>> {
-            let mut file = File::from(handle);
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            Ok(bytes)
+    pub(crate) fn job(&self) -> Arc<JobObject> {
+        Arc::clone(&self.job)
+    }
+
+    /// Transfers both output pipes exactly once. Callers must drain both concurrently with
+    /// [`wait`](Self::wait); waiting first can deadlock when either pipe buffer fills.
+    pub(crate) fn take_output(&mut self) -> io::Result<(tokio::fs::File, tokio::fs::File)> {
+        if self.stdout.is_none() || self.stderr.is_none() {
+            return Err(io::Error::other("output already taken"));
         }
-        let stdout_handle = self.stdout.take().unwrap();
-        let stderr_handle = self.stderr.take().unwrap();
-        let stdout = tokio::task::spawn_blocking(move || drain(stdout_handle));
-        let stderr = tokio::task::spawn_blocking(move || drain(stderr_handle));
+        let stdout = self
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("output already taken"))?;
+        let stderr = self
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("output already taken"))?;
+        Ok((
+            tokio::fs::File::from_std(File::from(stdout)),
+            tokio::fs::File::from_std(File::from(stderr)),
+        ))
+    }
+
+    /// Waits using an independently-owned process handle. Cancelling this future does not kill
+    /// the action or invalidate the detached blocking waiter; the caller must call
+    /// [`terminate`](Self::terminate) and then `wait` again on abort/timeout. Normal completion
+    /// terminates any descendants still alive in the Job after the top process exits.
+    pub(crate) async fn wait(&mut self) -> io::Result<u32> {
+        let source = self
+            .process
+            .as_ref()
+            .ok_or_else(|| io::Error::other("process already reaped"))?;
+        let mut duplicate = null_mut();
+        // SAFETY: source and both pseudo-process handles are live. Success transfers one
+        // process-handle reference into `duplicate`, which becomes OwnedHandle below.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                source.as_raw_handle() as HANDLE,
+                GetCurrentProcess(),
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: DuplicateHandle returned a unique owned handle.
+        let duplicate = unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) };
         let code = tokio::task::spawn_blocking(move || {
-            let handle = self.process.as_ref().unwrap().as_raw_handle() as HANDLE;
+            let handle = duplicate.as_raw_handle() as HANDLE;
             if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
                 return Err(io::Error::last_os_error());
             }
@@ -716,25 +760,44 @@ impl RestrictedProcess {
             if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
                 return Err(io::Error::last_os_error());
             }
-            self.job.terminate();
             Ok(code)
         })
         .await
         .map_err(|_| io::Error::other("process waiter failed"))??;
-        let stdout = stdout
-            .await
-            .map_err(|_| io::Error::other("stdout reader failed"))??;
-        let stderr = stderr
-            .await
-            .map_err(|_| io::Error::other("stderr reader failed"))??;
+        self.job.terminate();
+        self.process.take();
+        Ok(code)
+    }
+
+    /// Terminates the complete Job tree and the direct process as a fail-safe.
+    pub(crate) fn terminate(&self) {
+        self.job.terminate();
+        if let Some(process) = &self.process {
+            // SAFETY: the handle remains owned by self; this is a fail-safe if Job
+            // termination could not reach the direct process during teardown.
+            unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 1) };
+        }
+    }
+
+    /// Concurrently drains both pipes, then kills descendants as soon as the top process exits.
+    pub(crate) async fn wait_with_output(mut self) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
+        async fn drain(mut file: tokio::fs::File) -> io::Result<Vec<u8>> {
+            use tokio::io::AsyncReadExt;
+
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).await?;
+            Ok(bytes)
+        }
+        let (stdout, stderr) = self.take_output()?;
+        let (code, stdout, stderr) = tokio::try_join!(self.wait(), drain(stdout), drain(stderr))?;
         Ok((code, stdout, stderr))
     }
 }
 
 impl Drop for RestrictedProcess {
     fn drop(&mut self) {
-        self.job.terminate();
-        if let Some(process) = &self.process {
+        self.terminate();
+        if let Some(process) = self.process.take() {
             // SAFETY: process is owned here; direct terminate covers pre/post-job teardown.
             unsafe {
                 TerminateProcess(process.as_raw_handle() as HANDLE, 1);
@@ -752,7 +815,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use windows_sys::Win32::Foundation::{
-        GENERIC_WRITE, GetHandleInformation, INVALID_HANDLE_VALUE, LUID, LocalFree,
+        GENERIC_WRITE, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -772,7 +835,9 @@ mod tests {
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
-    use windows_sys::Win32::System::Threading::CreateEventW;
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
+    };
 
     use super::*;
 
@@ -1209,9 +1274,11 @@ mod tests {
             .unwrap()
             .parse::<usize>()
             .unwrap() as HANDLE;
-        let mut flags = 0;
-        // SAFETY: this only probes whether the excluded numeric handle exists in this process.
-        assert_eq!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+        // A numeric handle value can be reused for an unrelated child-local handle, so the
+        // return value is not evidence. Best-effort signaling leaves an observable mark only
+        // if this is the broker's inherited event; the parent makes the authoritative check.
+        // SAFETY: an invalid or non-event handle fails without changing the broker's event.
+        let _ = unsafe { SetEvent(handle) };
         println!(
             "EVENT_INHERITED=0\nOUT:{}\n{}",
             std::env::var("SBZ_TEST").unwrap(),
@@ -1219,6 +1286,137 @@ mod tests {
         );
         std::io::stdout().write_all(&vec![b'X'; 131_072]).unwrap();
         eprintln!("ERR");
+    }
+
+    #[test]
+    #[ignore]
+    fn restricted_process_wait_probe() {
+        if std::env::var_os("SBZ_GRANDCHILD").is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        if std::env::var_os("SBZ_SPAWN_GRANDCHILD").is_some() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "sandbox::tests::restricted_process_wait_probe",
+                ])
+                .env("SBZ_GRANDCHILD", "1")
+                .spawn()
+                .unwrap();
+            println!("GRANDCHILD_PID={}", child.id());
+            std::io::stdout().flush().unwrap();
+            let _ = child.wait_with_output();
+        } else {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+
+    fn restricted_process_wait_command(
+        token: &ActionToken,
+        scratch: &PrivateScratch,
+        spawn_grandchild: bool,
+    ) -> RestrictedProcess {
+        let probe = scratch.path().join("wait-probe.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        let mut command = RestrictedCommand::new(probe, scratch.path())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("sandbox::tests::restricted_process_wait_probe")
+            .arg("--nocapture")
+            .env("SystemRoot", std::env::var_os("SystemRoot").unwrap());
+        if spawn_grandchild {
+            command = command.env("SBZ_SPAWN_GRANDCHILD", "1");
+        }
+        RestrictedProcess::spawn(token, &command).unwrap()
+    }
+
+    #[tokio::test]
+    async fn restricted_process_cancelled_wait_can_be_retried() {
+        let token = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "cancel-wait", &token).unwrap();
+        let mut process = restricted_process_wait_command(&token, &scratch, false);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), process.wait())
+                .await
+                .is_err()
+        );
+        assert!(process.is_in_job().unwrap());
+        process.terminate();
+        assert_ne!(process.wait().await.unwrap(), 0);
+        drop(process);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_process_terminate_can_be_reaped() {
+        let token = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "terminate", &token).unwrap();
+        let mut process = restricted_process_wait_command(&token, &scratch, false);
+        process.terminate();
+        assert_ne!(process.wait().await.unwrap(), 0);
+        assert!(process.is_in_job().is_err());
+        drop(process);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_process_job_clone_retains_tree_kill() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let token = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "job-clone", &token).unwrap();
+        let mut process = restricted_process_wait_command(&token, &scratch, true);
+        let job = process.job();
+        let (stdout, mut stderr) = process.take_output().unwrap();
+        let mut stdout = BufReader::new(stdout);
+        let mut transcript = String::new();
+        let pid_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut line = String::new();
+                if stdout.read_line(&mut line).await? == 0 {
+                    return Err(io::Error::other("stdout closed before grandchild pid"));
+                }
+                transcript.push_str(&line);
+                if let Some((_, value)) = line.split_once("GRANDCHILD_PID=")
+                    && let Some(value) = value.split_whitespace().next()
+                    && let Ok(pid) = value.parse::<u32>()
+                {
+                    return Ok(pid);
+                }
+            }
+        })
+        .await;
+        let grandchild_pid = match pid_result {
+            Ok(Ok(pid)) => pid,
+            failure => {
+                process.terminate();
+                let _ = process.wait().await;
+                let _ = stdout.read_to_string(&mut transcript).await;
+                let mut error = String::new();
+                let _ = stderr.read_to_string(&mut error).await;
+                panic!(
+                    "grandchild pid missing: {failure:?}; stdout={transcript:?}; stderr={error:?}"
+                );
+            }
+        };
+        assert_ne!(grandchild_pid, 0);
+        let grandchild = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, grandchild_pid) };
+        assert!(!grandchild.is_null());
+        let grandchild = unsafe { OwnedHandle::from_raw_handle(grandchild as RawHandle) };
+        job.terminate();
+        assert_ne!(process.wait().await.unwrap(), 0);
+        assert_eq!(
+            unsafe { WaitForSingleObject(grandchild.as_raw_handle() as HANDLE, 5_000) },
+            WAIT_OBJECT_0
+        );
+        drop(job);
+        drop(process);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1250,7 +1448,6 @@ mod tests {
             .env("SystemRoot", system_root);
         let process = RestrictedProcess::spawn(&token, &command).unwrap();
         assert!(process.is_in_job().unwrap());
-        drop(event);
         let (code, out, err) = process.wait_with_output().await.unwrap();
         let (out, err) = (String::from_utf8_lossy(&out), String::from_utf8_lossy(&err));
         assert_eq!(code, 0, "out={out:?} err={err:?}");
@@ -1263,6 +1460,11 @@ mod tests {
         );
         assert!(out.chars().filter(|&value| value == 'X').count() >= 131_072);
         assert!(err.contains("ERR"));
+        assert_eq!(
+            unsafe { WaitForSingleObject(event.as_raw_handle() as HANDLE, 0) },
+            WAIT_TIMEOUT
+        );
+        drop(event);
         std::fs::remove_dir_all(root).unwrap();
     }
 
