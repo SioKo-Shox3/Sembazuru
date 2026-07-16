@@ -102,6 +102,8 @@ $workerExe = Join-Path $repo 'target\debug\sembazuru-worker.exe'
 $WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
 if (Test-Path $WorkRoot) { Remove-Item -Recurse -Force $WorkRoot }
 New-Item -ItemType Directory -Force $WorkRoot | Out-Null
+$daemonConfig = Join-Path $WorkRoot 'daemon-override.toml'
+$workerConfig = Join-Path $WorkRoot 'worker-override.toml'
 
 # A self-contained HLSL TU: a shader that #includes a project header, so every
 # read is under the VFS root (no SDK include needed on the worker side). The
@@ -138,24 +140,40 @@ $coord = '127.0.0.1:50190'; $fs = '127.0.0.1:50192'; $worker = '127.0.0.1:50161'
 $daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 
 function Start-Daemon {
-    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
-    $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
-    if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
-    $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
-    Remove-Item Env:\SEMBAZURU_COORD, Env:\SEMBAZURU_INTAKE, Env:\SEMBAZURU_FILESERVER, `
-        Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
-        -ErrorAction SilentlyContinue
+    $hadConfig = Test-Path Env:\SEMBAZURU_CONFIG
+    $oldConfig = $env:SEMBAZURU_CONFIG
+    try {
+        $env:SEMBAZURU_CONFIG = $daemonConfig
+        $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
+        $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
+        if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
+        $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
+    } finally {
+        Remove-Item Env:\SEMBAZURU_COORD, Env:\SEMBAZURU_INTAKE, Env:\SEMBAZURU_FILESERVER, `
+            Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+            -ErrorAction SilentlyContinue
+        if ($hadConfig) { $env:SEMBAZURU_CONFIG = $oldConfig }
+        else { Remove-Item Env:\SEMBAZURU_CONFIG -ErrorAction SilentlyContinue }
+    }
     $p
 }
 function Start-Worker {
-    $env:SEMBAZURU_AGENT = "http://$coord"
-    $env:SEMBAZURU_LAUNCHER = $launcherExe; $env:SEMBAZURU_DLL = $dll
-    $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot; $env:SEMBAZURU_CAS_ROOT = $casRoot
-    if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
-    $p = Start-Process -FilePath $workerExe -ArgumentList @($worker) -PassThru -WindowStyle Hidden
-    Remove-Item Env:\SEMBAZURU_AGENT, Env:\SEMBAZURU_LAUNCHER, Env:\SEMBAZURU_DLL, `
-        Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
-        -ErrorAction SilentlyContinue
+    $hadConfig = Test-Path Env:\SEMBAZURU_WORKER_CONFIG
+    $oldConfig = $env:SEMBAZURU_WORKER_CONFIG
+    try {
+        $env:SEMBAZURU_WORKER_CONFIG = $workerConfig
+        $env:SEMBAZURU_AGENT = "http://$coord"
+        $env:SEMBAZURU_LAUNCHER = $launcherExe; $env:SEMBAZURU_DLL = $dll
+        $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot; $env:SEMBAZURU_CAS_ROOT = $casRoot
+        if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
+        $p = Start-Process -FilePath $workerExe -ArgumentList @($worker) -PassThru -WindowStyle Hidden
+    } finally {
+        Remove-Item Env:\SEMBAZURU_AGENT, Env:\SEMBAZURU_LAUNCHER, Env:\SEMBAZURU_DLL, `
+            Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+            -ErrorAction SilentlyContinue
+        if ($hadConfig) { $env:SEMBAZURU_WORKER_CONFIG = $oldConfig }
+        else { Remove-Item Env:\SEMBAZURU_WORKER_CONFIG -ErrorAction SilentlyContinue }
+    }
     $p
 }
 # Run dxc through the launcher with STRICT VFS on (M8.2): an unsuppliable input

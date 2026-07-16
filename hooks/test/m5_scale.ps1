@@ -34,6 +34,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
+$WorkRoot = Join-Path ([System.IO.Path]::GetTempPath()) "sembazuru-m5-scale-$([guid]::NewGuid())"
+$workerConfig = Join-Path $WorkRoot 'worker-override.toml'
 Push-Location $repoRoot
 try {
     Write-Host "Building release binaries..."
@@ -57,6 +59,19 @@ try {
 
     # Runs one build phase with $w core-pinned workers; returns makespan_ms.
     function Invoke-Phase([int]$w) {
+        function Start-Worker([string]$listen) {
+            $hadConfig = Test-Path Env:\SEMBAZURU_WORKER_CONFIG
+            $oldConfig = $env:SEMBAZURU_WORKER_CONFIG
+            try {
+                $env:SEMBAZURU_WORKER_CONFIG = $workerConfig
+                Start-Process -FilePath $workerExe -ArgumentList @($listen) `
+                    -PassThru -NoNewWindow -RedirectStandardOutput ([System.IO.Path]::GetTempFileName()) `
+                    -RedirectStandardError ([System.IO.Path]::GetTempFileName())
+            } finally {
+                if ($hadConfig) { $env:SEMBAZURU_WORKER_CONFIG = $oldConfig }
+                else { Remove-Item Env:\SEMBAZURU_WORKER_CONFIG -ErrorAction SilentlyContinue }
+            }
+        }
         $procs = @()
         $outFile = [System.IO.Path]::GetTempFileName()
         $coordAddr = "127.0.0.1:$CoordPort"
@@ -74,9 +89,7 @@ try {
                 for ($c = 0; $c -lt $CoresPerWorker; $c++) { $mask = $mask -bor (1 -shl ($i * $CoresPerWorker + $c)) }
                 $env:SEMBAZURU_AGENT = "http://$coordAddr"
                 $env:SEMBAZURU_CAPACITY = "$CoresPerWorker"
-                $p = Start-Process -FilePath $workerExe -ArgumentList @("127.0.0.1:$port") `
-                    -PassThru -NoNewWindow -RedirectStandardOutput ([System.IO.Path]::GetTempFileName()) `
-                    -RedirectStandardError ([System.IO.Path]::GetTempFileName())
+                $p = Start-Worker "127.0.0.1:$port"
                 # Pin the worker (children inherit the mask on Windows).
                 try { $p.ProcessorAffinity = [IntPtr]$mask } catch {}
                 $procs += $p
