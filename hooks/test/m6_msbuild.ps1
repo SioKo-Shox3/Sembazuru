@@ -156,15 +156,29 @@ $daemon = Start-Daemon
 $workerProc = Start-Worker
 try {
     $r = $null
+    $remoteSeen = $false
+    $cachePopulated = $false
+    $outputsMissing = $false
+    $attempts = 0
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
         $r = Invoke-MSBuild
-        if ($r.out -match 'sembazuru: remote') { break }
+        $attempts = $i + 1
+        $remoteThisAttempt = [bool]($r.out -match 'sembazuru: remote')
+        $cacheHitThisAttempt = [bool]($r.out -match 'sembazuru: cache hit')
+        $outputsPresent = Outputs-Present
+        $remoteSeenBeforeAttempt = $remoteSeen
+        if ($remoteThisAttempt) { $remoteSeen = $true }
+        if ($remoteSeenBeforeAttempt -and $cacheHitThisAttempt) { $cachePopulated = $true }
+        if (-not $outputsPresent) { $outputsMissing = $true }
+        Write-Host "MSBUILD1 attempt=$attempts exit=$($r.exit) remote=$remoteThisAttempt remote-seen=$remoteSeen cache-hit=$cacheHitThisAttempt cache-populated=$cachePopulated outputs=$outputsPresent"
+        if ($r.exit -ne 0 -or $cachePopulated) { break }
     }
-    Write-Host "MSBUILD1 exit=$($r.exit) remote=$([bool]($r.out -match 'sembazuru: remote'))"
+    Write-Host "MSBUILD1 result attempts=$attempts exit=$($r.exit) remote-seen=$remoteSeen cache-populated=$cachePopulated outputs-missing=$outputsMissing"
     if ($r.exit -ne 0) { $failures += "msbuild via shim did not succeed (exit=$($r.exit))`n$($r.out)" }
-    if ($r.out -notmatch 'sembazuru: remote') { $failures += 'compile did not run through the daemon (no "remote" note)' }
-    if (-not (Outputs-Present)) { $failures += 'msbuild produced missing/empty outputs via the shim' }
+    if (-not $remoteSeen) { $failures += 'compile did not run through the daemon (no "remote" note in 40 attempts)' }
+    if (-not $cachePopulated) { $failures += 'phase 1 did not observe an action-cache HIT after remote execution in 40 attempts' }
+    if ($outputsMissing) { $failures += 'msbuild produced missing/empty outputs during phase 1 population' }
 } finally {
     foreach ($p in @($workerProc, $daemon)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
 }
