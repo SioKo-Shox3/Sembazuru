@@ -231,13 +231,10 @@ $fsProc = Start-Process -FilePath $fsHost -ArgumentList @($fsAddr, $logicalRoot,
 
 # Worker with VFS execution enabled (install paths via env). No SEMBAZURU_AGENT:
 # it just serves Execution; exec_vfs dials it directly.
-$env:SEMBAZURU_LAUNCHER = $launcher
-$env:SEMBAZURU_DLL = $dll
-$env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot
-$env:SEMBAZURU_CAS_ROOT = $casRoot
-$workerProc = Start-Process -FilePath $workerExe -ArgumentList @($workerAddr) `
-    -PassThru -WindowStyle Hidden
-
+$hadWorkerConfig = Test-Path Env:\SEMBAZURU_WORKER_CONFIG
+$oldWorkerConfig = $env:SEMBAZURU_WORKER_CONFIG
+$workerConfig = Join-Path $WorkRoot 'worker-override.toml'
+$workerProc = $null
 $exit = 99
 $verbatimExit = 99
 $verbatimFindExit = 99
@@ -253,6 +250,17 @@ $emptyTraceExit = 99
 $oldSmuggledVfsCwd = $env:SEMBAZURU_VFS_CWD
 $oldSmuggledTraceDir = $env:SEMBAZURU_TRACE_DIR
 try {
+    $env:SEMBAZURU_LAUNCHER = $launcher
+    $env:SEMBAZURU_DLL = $dll
+    $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot
+    $env:SEMBAZURU_CAS_ROOT = $casRoot
+    # An explicit absent path selects the development/test override identity. The
+    # worker then loads defaults plus the env overrides above without acquiring the
+    # canonical machine service-runtime guard used by production installations.
+    $env:SEMBAZURU_WORKER_CONFIG = $workerConfig
+    $workerProc = Start-Process -FilePath $workerExe -ArgumentList @($workerAddr) `
+        -PassThru -WindowStyle Hidden
+
     # Wait for the worker's Execution port to accept connections.
     $ready = $false
     for ($i = 0; $i -lt 100; $i++) {
@@ -345,6 +353,11 @@ try {
 } finally {
     Remove-Item Env:\SEMBAZURU_LAUNCHER, Env:\SEMBAZURU_DLL, Env:\SEMBAZURU_SCRATCH_ROOT, `
         Env:\SEMBAZURU_CAS_ROOT -ErrorAction SilentlyContinue
+    if ($hadWorkerConfig) {
+        $env:SEMBAZURU_WORKER_CONFIG = $oldWorkerConfig
+    } else {
+        Remove-Item Env:\SEMBAZURU_WORKER_CONFIG -ErrorAction SilentlyContinue
+    }
     if ($null -eq $oldSmuggledVfsCwd) {
         Remove-Item Env:\SEMBAZURU_VFS_CWD -ErrorAction SilentlyContinue
     } else {
