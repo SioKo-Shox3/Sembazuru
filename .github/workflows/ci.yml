@@ -72,8 +72,8 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (TEST-001: SHA-pinned supply-chain)
       - uses: dtolnay/rust-toolchain@stable
-      - name: Machine config store security gate
-        run: cargo test -p sembazuru-config-store machine_config_ -- --test-threads=1 --nocapture
+      - name: Machine store security gate
+        run: cargo test -p sembazuru-config-store machine_ -- --test-threads=1 --nocapture
       - run: cmake -S hooks -B hooks/build -A x64
       - run: cmake --build hooks/build --config Release
       # M7.3: also build the 32-bit interceptor (and the probe) and place the

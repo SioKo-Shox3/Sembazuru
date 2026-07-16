@@ -8,6 +8,7 @@ use std::os::windows::io::OwnedHandle;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
     FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
@@ -25,7 +26,8 @@ use windows_sys::Win32::Security::Authorization::{
     SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::Cryptography::{
-    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom, CRYPT_INTEGER_BLOB,
+    CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows_sys::Win32::Security::{
     DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
@@ -50,8 +52,9 @@ use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
 #[cfg(test)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
+use zeroize::{Zeroize, Zeroizing};
 
-use crate::{MachineConfigTarget, MachineStoreError, MachineStoreErrorClass};
+use crate::{MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass};
 
 const ROOT_NAME: &str = "Sembazuru";
 const SCRATCH_NAME: &str = "scratch";
@@ -66,6 +69,14 @@ const ROOT_SDDL: &str = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x12
 const CHILD_SDDL: &str = "O:SYG:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)";
 const CONFIG_SDDL: &str = "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;S-1-5-80-934400648-3059976913-1740392721-646658299-1483742795)";
 const TEMP_CREATE_ATTEMPTS: usize = 8;
+const MACHINE_SECRET_LEAF: &str = "cluster-token.dpapi";
+const MACHINE_SECRET_MAGIC: &[u8; 8] = b"SBZTOKN\0";
+const MACHINE_SECRET_VERSION: u32 = 1;
+const MACHINE_SECRET_DIGEST_BYTES: usize = 32;
+const MACHINE_SECRET_HEADER_BYTES: usize =
+    MACHINE_SECRET_MAGIC.len() + 4 + 4 + MACHINE_SECRET_DIGEST_BYTES;
+const MAX_MACHINE_SECRET_BYTES: usize = 64 * 1024;
+const MAX_MACHINE_SECRET_BLOB_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
 struct SecurityPolicy {
@@ -249,6 +260,42 @@ pub(super) fn seed_config_canonical(
     let policy = SecurityPolicy::production();
     let root = reopen_validated_provision_for_config(&parent, OsStr::new(ROOT_NAME), &policy)?;
     seed_config_at_handle(&root, target, contents, &policy)
+}
+
+pub(super) fn read_machine_secret_canonical() -> Result<Option<MachineSecret>, MachineStoreError> {
+    let program_data = program_data_path()?;
+    let parent = open_config_parent_path_nofollow(&program_data)?;
+    read_machine_secret_at(
+        &parent,
+        OsStr::new(ROOT_NAME),
+        &SecurityPolicy::production(),
+    )
+}
+
+pub(super) fn replace_machine_secret_canonical(token: &[u8]) -> Result<(), MachineStoreError> {
+    let program_data = program_data_path()?;
+    let parent = open_config_parent_path_nofollow(&program_data)?;
+    let policy = SecurityPolicy::production();
+    let mut nonce = random_nonce;
+    replace_machine_secret_at(
+        &parent,
+        OsStr::new(ROOT_NAME),
+        token,
+        &policy,
+        &mut nonce,
+        ConfigWriteFault::None,
+    )
+    .map(drop)
+}
+
+pub(super) fn clear_machine_secret_canonical() -> Result<bool, MachineStoreError> {
+    let program_data = program_data_path()?;
+    let parent = open_config_parent_path_nofollow(&program_data)?;
+    clear_machine_secret_at(
+        &parent,
+        OsStr::new(ROOT_NAME),
+        &SecurityPolicy::production(),
+    )
 }
 
 fn program_data_path() -> Result<PathBuf, MachineStoreError> {
@@ -707,6 +754,283 @@ fn reopen_validated_provision_for_config(
     Ok(root)
 }
 
+struct LocalBlob(CRYPT_INTEGER_BLOB);
+
+impl LocalBlob {
+    fn empty() -> Self {
+        Self(CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        })
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut CRYPT_INTEGER_BLOB {
+        &mut self.0
+    }
+
+    fn as_slice(&self) -> Result<&[u8], MachineStoreError> {
+        let length = self.0.cbData as usize;
+        if length == 0 || self.0.pbData.is_null() {
+            return Err(integrity("DPAPI returned an empty machine secret blob"));
+        }
+        // SAFETY: successful DPAPI output owns `cbData` initialized bytes at
+        // `pbData` until this wrapper drops and calls LocalFree.
+        Ok(unsafe { std::slice::from_raw_parts(self.0.pbData, length) })
+    }
+}
+
+impl Drop for LocalBlob {
+    fn drop(&mut self) {
+        if self.0.pbData.is_null() {
+            return;
+        }
+        // SAFETY: this is the still-owned DPAPI allocation. `zeroize` performs
+        // the clearing before the documented LocalFree allocator pair.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.0.pbData, self.0.cbData as usize).zeroize();
+            LocalFree(self.0.pbData.cast());
+        }
+        self.0.pbData = std::ptr::null_mut();
+        self.0.cbData = 0;
+    }
+}
+
+fn encode_machine_secret_envelope(token: &[u8]) -> Result<Zeroizing<Vec<u8>>, MachineStoreError> {
+    if token.is_empty() || token.len() > MAX_MACHINE_SECRET_BYTES {
+        return Err(integrity(
+            "machine cluster token length is outside the fixed bound",
+        ));
+    }
+    let token_length = u32::try_from(token.len())
+        .map_err(|_| integrity("machine cluster token length does not fit the envelope"))?;
+    let total = MACHINE_SECRET_HEADER_BYTES
+        .checked_add(token.len())
+        .ok_or_else(|| integrity("machine cluster token envelope length overflow"))?;
+    let digest = Sha256::digest(token);
+    let mut envelope = Zeroizing::new(Vec::with_capacity(total));
+    envelope.extend_from_slice(MACHINE_SECRET_MAGIC);
+    envelope.extend_from_slice(&MACHINE_SECRET_VERSION.to_le_bytes());
+    envelope.extend_from_slice(&token_length.to_le_bytes());
+    envelope.extend_from_slice(&digest);
+    envelope.extend_from_slice(token);
+    Ok(envelope)
+}
+
+fn decode_machine_secret_envelope(envelope: &[u8]) -> Result<MachineSecret, MachineStoreError> {
+    if envelope.len() < MACHINE_SECRET_HEADER_BYTES {
+        return Err(integrity("machine cluster token envelope is truncated"));
+    }
+    if &envelope[..MACHINE_SECRET_MAGIC.len()] != MACHINE_SECRET_MAGIC {
+        return Err(integrity("machine cluster token envelope magic is invalid"));
+    }
+    let version = u32::from_le_bytes(
+        envelope[8..12]
+            .try_into()
+            .map_err(|_| integrity("machine cluster token version is truncated"))?,
+    );
+    if version != MACHINE_SECRET_VERSION {
+        return Err(integrity(
+            "machine cluster token envelope version is invalid",
+        ));
+    }
+    let token_length = u32::from_le_bytes(
+        envelope[12..16]
+            .try_into()
+            .map_err(|_| integrity("machine cluster token length is truncated"))?,
+    ) as usize;
+    if token_length == 0 || token_length > MAX_MACHINE_SECRET_BYTES {
+        return Err(integrity(
+            "machine cluster token envelope length is invalid",
+        ));
+    }
+    let expected_total = MACHINE_SECRET_HEADER_BYTES
+        .checked_add(token_length)
+        .ok_or_else(|| integrity("machine cluster token envelope length overflow"))?;
+    if envelope.len() != expected_total {
+        return Err(integrity(
+            "machine cluster token envelope total length is invalid",
+        ));
+    }
+    let token = &envelope[MACHINE_SECRET_HEADER_BYTES..];
+    let digest = Sha256::digest(token);
+    if envelope[16..MACHINE_SECRET_HEADER_BYTES] != digest[..] {
+        return Err(integrity(
+            "machine cluster token envelope digest is invalid",
+        ));
+    }
+    Ok(MachineSecret::new(token.to_vec()))
+}
+
+fn protect_machine_secret(token: &[u8]) -> Result<Zeroizing<Vec<u8>>, MachineStoreError> {
+    let envelope = encode_machine_secret_envelope(token)?;
+    let input_length = u32::try_from(envelope.len())
+        .map_err(|_| integrity("machine cluster token envelope exceeds DPAPI input bounds"))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_length,
+        pbData: envelope.as_ptr().cast_mut(),
+    };
+    let mut output = LocalBlob::empty();
+    // SAFETY: input and output storage remain live for the synchronous call;
+    // optional entropy, reserved state, description, and UI prompt are absent.
+    let ok = unsafe {
+        CryptProtectData(
+            &input,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
+            output.as_mut_ptr(),
+        )
+    };
+    if ok == 0 {
+        return Err(MachineStoreError::with_io(
+            MachineStoreErrorClass::IntegrityViolation,
+            "protect machine cluster token with DPAPI",
+            io::Error::last_os_error(),
+        ));
+    }
+    let protected = output.as_slice()?;
+    if protected.len() > MAX_MACHINE_SECRET_BLOB_BYTES {
+        return Err(integrity(
+            "DPAPI machine cluster token blob exceeds the fixed bound",
+        ));
+    }
+    Ok(Zeroizing::new(protected.to_vec()))
+}
+
+fn unprotect_machine_secret(blob: &[u8]) -> Result<MachineSecret, MachineStoreError> {
+    if blob.is_empty() || blob.len() > MAX_MACHINE_SECRET_BLOB_BYTES {
+        return Err(integrity(
+            "machine cluster token DPAPI blob length is invalid",
+        ));
+    }
+    let input_length = u32::try_from(blob.len())
+        .map_err(|_| integrity("machine cluster token DPAPI blob exceeds DWORD bounds"))?;
+    let input = CRYPT_INTEGER_BLOB {
+        cbData: input_length,
+        pbData: blob.as_ptr().cast_mut(),
+    };
+    let mut output = LocalBlob::empty();
+    // SAFETY: input and output storage remain live for the synchronous call;
+    // no optional entropy, reserved state, description, or UI prompt is used.
+    let ok = unsafe {
+        CryptUnprotectData(
+            &input,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            output.as_mut_ptr(),
+        )
+    };
+    if ok == 0 {
+        return Err(MachineStoreError::with_io(
+            MachineStoreErrorClass::IntegrityViolation,
+            "unprotect machine cluster token with DPAPI",
+            io::Error::last_os_error(),
+        ));
+    }
+    let plaintext = output.as_slice()?;
+    if plaintext.len() > MACHINE_SECRET_HEADER_BYTES + MAX_MACHINE_SECRET_BYTES {
+        return Err(integrity(
+            "DPAPI plaintext envelope exceeds the fixed bound",
+        ));
+    }
+    let plaintext_copy = Zeroizing::new(plaintext.to_vec());
+    decode_machine_secret_envelope(&plaintext_copy)
+}
+
+fn read_machine_secret_at(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<Option<MachineSecret>, MachineStoreError> {
+    let root = reopen_validated_committed(parent, root_name, policy)?;
+    let descriptor = SecurityDescriptor::from_sddl(policy.config_sddl())?;
+    let Some(mut file) = open_fixed_file_optional(&root, OsStr::new(MACHINE_SECRET_LEAF), false)?
+    else {
+        return Ok(None);
+    };
+    verify_config_file(&file, &descriptor)?;
+    let mut blob = Zeroizing::new(Vec::new());
+    Read::by_ref(&mut file)
+        .take((MAX_MACHINE_SECRET_BLOB_BYTES + 1) as u64)
+        .read_to_end(&mut blob)
+        .map_err(|error| map_io("read machine cluster token DPAPI blob", error))?;
+    if blob.len() > MAX_MACHINE_SECRET_BLOB_BYTES {
+        return Err(integrity(
+            "machine cluster token DPAPI blob exceeds the fixed bound",
+        ));
+    }
+    unprotect_machine_secret(&blob).map(Some)
+}
+
+fn replace_machine_secret_at(
+    parent: &File,
+    root_name: &OsStr,
+    token: &[u8],
+    policy: &SecurityPolicy,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: ConfigWriteFault,
+) -> Result<FileIdentity, MachineStoreError> {
+    let root = reopen_validated_committed(parent, root_name, policy)?;
+    let protected = protect_machine_secret(token)?;
+    write_fixed_file_at_handle(
+        &root,
+        FixedFile::MachineSecret,
+        &protected,
+        policy,
+        ConfigWriteMode::Replace,
+        next_nonce,
+        fault,
+    )
+    .and_then(|(_, identity)| {
+        identity.ok_or_else(|| integrity("machine cluster token replacement lost its identity"))
+    })
+}
+
+fn clear_machine_secret_at(
+    parent: &File,
+    root_name: &OsStr,
+    policy: &SecurityPolicy,
+) -> Result<bool, MachineStoreError> {
+    let root = reopen_validated_committed(parent, root_name, policy)?;
+    let descriptor = SecurityDescriptor::from_sddl(policy.config_sddl())?;
+    let Some(file) = open_fixed_file_optional(&root, OsStr::new(MACHINE_SECRET_LEAF), true)? else {
+        return Ok(false);
+    };
+    let identity = verify_config_file(&file, &descriptor)?;
+    delete_held_handle(&file)?;
+    drop(file);
+    match open_relative_any(&root, OsStr::new(MACHINE_SECRET_LEAF)) {
+        Err(error) if is_not_found(&error) => Ok(true),
+        Err(_) => Err(integrity(
+            "machine cluster token absence cannot be proven after clear",
+        )),
+        Ok(entry) if inspect_handle(&entry)?.identity == identity => Err(integrity(
+            "machine cluster token remained after identity-bound clear",
+        )),
+        Ok(_) => Err(integrity("machine cluster token was replaced during clear")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FixedFile {
+    Config(MachineConfigTarget),
+    MachineSecret,
+}
+
+impl FixedFile {
+    fn leaf(self) -> &'static str {
+        match self {
+            Self::Config(target) => config_leaf(target),
+            Self::MachineSecret => MACHINE_SECRET_LEAF,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfigWriteMode {
     Replace,
@@ -771,9 +1095,29 @@ fn write_config_at_handle(
     next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
     fault: ConfigWriteFault,
 ) -> Result<(bool, Option<FileIdentity>), MachineStoreError> {
+    write_fixed_file_at_handle(
+        root,
+        FixedFile::Config(target),
+        contents,
+        policy,
+        mode,
+        next_nonce,
+        fault,
+    )
+}
+
+fn write_fixed_file_at_handle(
+    root: &File,
+    fixed_file: FixedFile,
+    contents: &[u8],
+    policy: &SecurityPolicy,
+    mode: ConfigWriteMode,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: ConfigWriteFault,
+) -> Result<(bool, Option<FileIdentity>), MachineStoreError> {
     #[cfg(not(test))]
     let _ = fault;
-    let final_name = config_leaf(target);
+    let final_name = fixed_file.leaf();
     let config_sd = SecurityDescriptor::from_sddl(policy.config_sddl())?;
     if let Some(existing) = open_config_optional(root, OsStr::new(final_name))? {
         verify_config_file(&existing, &config_sd)?;
@@ -783,7 +1127,7 @@ fn write_config_at_handle(
     }
 
     let (temp_name, mut temp, temp_identity) =
-        create_unique_config_temp(root, target, &config_sd, next_nonce)?;
+        create_unique_fixed_temp(root, fixed_file, &config_sd, next_nonce)?;
     let result = (|| {
         #[cfg(test)]
         if fault == ConfigWriteFault::PartialWrite {
@@ -878,23 +1222,33 @@ fn random_nonce() -> Result<[u8; 16], MachineStoreError> {
     Ok(nonce)
 }
 
+#[cfg(test)]
 fn config_temp_name(target: MachineConfigTarget, nonce: [u8; 16]) -> OsString {
+    fixed_temp_name(FixedFile::Config(target), nonce)
+}
+
+#[cfg(test)]
+fn machine_secret_temp_name(nonce: [u8; 16]) -> OsString {
+    fixed_temp_name(FixedFile::MachineSecret, nonce)
+}
+
+fn fixed_temp_name(fixed_file: FixedFile, nonce: [u8; 16]) -> OsString {
     let mut hex = String::with_capacity(32);
     for byte in nonce {
         use std::fmt::Write as _;
         write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
     }
-    OsString::from(format!(".{}.{hex}.tmp", config_leaf(target)))
+    OsString::from(format!(".{}.{hex}.tmp", fixed_file.leaf()))
 }
 
-fn create_unique_config_temp(
+fn create_unique_fixed_temp(
     root: &File,
-    target: MachineConfigTarget,
+    fixed_file: FixedFile,
     descriptor: &SecurityDescriptor,
     next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
 ) -> Result<(OsString, File, FileIdentity), MachineStoreError> {
     for _ in 0..TEMP_CREATE_ATTEMPTS {
-        let name = config_temp_name(target, next_nonce()?);
+        let name = fixed_temp_name(fixed_file, next_nonce()?);
         match nt_relative(
             root,
             &name,
@@ -956,14 +1310,20 @@ fn cleanup_unidentified_temp<T>(
 }
 
 fn open_config_optional(root: &File, name: &OsStr) -> Result<Option<File>, MachineStoreError> {
-    match nt_relative(
-        root,
-        name,
-        FILE_OPEN,
-        None,
-        READ_CONTROL | FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        None,
-    ) {
+    open_fixed_file_optional(root, name, false)
+}
+
+fn open_fixed_file_optional(
+    root: &File,
+    name: &OsStr,
+    delete_access: bool,
+) -> Result<Option<File>, MachineStoreError> {
+    let desired_access = READ_CONTROL
+        | FILE_READ_DATA
+        | FILE_READ_ATTRIBUTES
+        | SYNCHRONIZE
+        | if delete_access { DELETE } else { 0 };
+    match nt_relative(root, name, FILE_OPEN, None, desired_access, None) {
         Ok(file) => Ok(Some(file)),
         Err(CreateFailure::Collision) => unreachable!("FILE_OPEN cannot report create collision"),
         Err(CreateFailure::Error(error)) if is_not_found(&error) => Ok(None),
@@ -2501,5 +2861,362 @@ mod machine_config_tests {
             config_temp_name(MachineConfigTarget::Daemon, value),
             OsStr::new(".daemon.toml.000102031011121380818283fcfdfeff.tmp")
         );
+    }
+}
+
+#[cfg(test)]
+mod machine_secret_tests {
+    use std::collections::VecDeque;
+    use std::fs;
+
+    use super::*;
+    use tempfile::TempDir;
+
+    const TOKEN: &[u8] = b"opaque-machine-cluster-token-sentinel";
+
+    struct SecretFixture {
+        _temp: TempDir,
+        parent: PathBuf,
+        root: PathBuf,
+        policy: SecurityPolicy,
+    }
+
+    impl SecretFixture {
+        fn provisioned() -> Self {
+            let temp = tempfile::tempdir().expect("create machine-secret test directory");
+            let parent = temp.path().join("parent");
+            fs::create_dir(&parent).expect("create machine-secret parent");
+            let root = parent.join(ROOT_NAME);
+            let policy = current_user_test_policy().expect("current-user policy").0;
+            let parent_handle = open_directory_path_nofollow(&parent).unwrap();
+            provision_at_handle(&parent_handle, OsStr::new(ROOT_NAME), &policy).unwrap();
+            Self {
+                _temp: temp,
+                parent,
+                root,
+                policy,
+            }
+        }
+
+        fn committed() -> Self {
+            let fixture = Self::provisioned();
+            let parent = open_directory_path_nofollow(&fixture.parent).unwrap();
+            commit_at_handle(&parent, OsStr::new(ROOT_NAME), &fixture.policy).unwrap();
+            fixture
+        }
+
+        fn final_path(&self) -> PathBuf {
+            self.root.join(MACHINE_SECRET_LEAF)
+        }
+    }
+
+    fn nonce(value: u8) -> [u8; 16] {
+        [value; 16]
+    }
+
+    fn run_read(
+        fixture: &SecretFixture,
+    ) -> Result<Option<crate::MachineSecret>, MachineStoreError> {
+        let parent = open_config_parent_path_nofollow(&fixture.parent)?;
+        read_machine_secret_at(&parent, OsStr::new(ROOT_NAME), &fixture.policy)
+    }
+
+    fn run_replace(
+        fixture: &SecretFixture,
+        token: &[u8],
+        nonces: &[[u8; 16]],
+        fault: ConfigWriteFault,
+    ) -> Result<FileIdentity, MachineStoreError> {
+        let parent = open_config_parent_path_nofollow(&fixture.parent)?;
+        let mut queue = VecDeque::from(nonces.to_vec());
+        let mut next = || {
+            queue
+                .pop_front()
+                .ok_or_else(|| integrity("test nonce source exhausted"))
+        };
+        replace_machine_secret_at(
+            &parent,
+            OsStr::new(ROOT_NAME),
+            token,
+            &fixture.policy,
+            &mut next,
+            fault,
+        )
+    }
+
+    fn run_clear(fixture: &SecretFixture) -> Result<bool, MachineStoreError> {
+        let parent = open_config_parent_path_nofollow(&fixture.parent)?;
+        clear_machine_secret_at(&parent, OsStr::new(ROOT_NAME), &fixture.policy)
+    }
+
+    fn temp_entries(fixture: &SecretFixture) -> Vec<OsString> {
+        fs::read_dir(&fixture.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with(".cluster-token.dpapi.") && name.ends_with(".tmp")
+            })
+            .collect()
+    }
+
+    fn create_junction(link: &Path, target: &Path) {
+        let output = std::process::Command::new("cmd")
+            .args([
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn machine_secret_dpapi_local_machine_round_trip_hides_plaintext() {
+        let encrypted = protect_machine_secret(TOKEN).unwrap();
+        assert!(!encrypted.windows(TOKEN.len()).any(|window| window == TOKEN));
+
+        let decrypted = unprotect_machine_secret(&encrypted).unwrap();
+        assert_eq!(decrypted.as_ref(), TOKEN);
+    }
+
+    #[test]
+    fn machine_secret_envelope_and_dpapi_corruption_fail_closed() {
+        let envelope = encode_machine_secret_envelope(TOKEN).unwrap();
+        assert_eq!(&envelope[..8], b"SBZTOKN\0");
+
+        let mut malformed = Vec::new();
+        let mut wrong_magic = envelope.to_vec();
+        wrong_magic[0] ^= 1;
+        malformed.push(wrong_magic);
+        let mut wrong_version = envelope.to_vec();
+        wrong_version[8..12].copy_from_slice(&2u32.to_le_bytes());
+        malformed.push(wrong_version);
+        let mut wrong_length = envelope.to_vec();
+        wrong_length[12..16].copy_from_slice(&((TOKEN.len() as u32) + 1).to_le_bytes());
+        malformed.push(wrong_length);
+        let mut wrong_digest = envelope.to_vec();
+        wrong_digest[16] ^= 1;
+        malformed.push(wrong_digest);
+        malformed.push(envelope[..envelope.len() - 1].to_vec());
+        for bytes in malformed {
+            assert_eq!(
+                decode_machine_secret_envelope(&bytes)
+                    .unwrap_err()
+                    .classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+        }
+
+        let encrypted = protect_machine_secret(TOKEN).unwrap();
+        let mut corrupt = encrypted.to_vec();
+        let midpoint = corrupt.len() / 2;
+        corrupt[midpoint] ^= 1;
+        for bytes in [corrupt, encrypted[..encrypted.len() - 1].to_vec()] {
+            assert_eq!(
+                unprotect_machine_secret(&bytes)
+                    .unwrap_err()
+                    .classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+        }
+    }
+
+    #[test]
+    fn machine_secret_rejects_empty_and_oversized_tokens() {
+        for token in [Vec::new(), vec![0x5a; MAX_MACHINE_SECRET_BYTES + 1]] {
+            assert_eq!(
+                protect_machine_secret(&token).unwrap_err().classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+        }
+    }
+
+    #[test]
+    fn machine_secret_absent_replace_existing_and_readback_are_exact() {
+        let fixture = SecretFixture::committed();
+        assert!(run_read(&fixture).unwrap().is_none());
+
+        let first_identity =
+            run_replace(&fixture, TOKEN, &[nonce(1)], ConfigWriteFault::None).unwrap();
+        assert_eq!(run_read(&fixture).unwrap().unwrap().as_ref(), TOKEN);
+        let blob = fs::read(fixture.final_path()).unwrap();
+        assert!(!blob.windows(TOKEN.len()).any(|window| window == TOKEN));
+
+        let replacement = b"replacement-opaque-token";
+        let second_identity =
+            run_replace(&fixture, replacement, &[nonce(2)], ConfigWriteFault::None).unwrap();
+        assert_ne!(first_identity, second_identity);
+        assert_eq!(run_read(&fixture).unwrap().unwrap().as_ref(), replacement);
+        assert!(temp_entries(&fixture).is_empty());
+    }
+
+    #[test]
+    fn machine_secret_lifecycle_and_root_mismatch_fail_closed() {
+        let provisioned = SecretFixture::provisioned();
+        for result in [
+            run_read(&provisioned).map(drop),
+            run_replace(&provisioned, TOKEN, &[nonce(3)], ConfigWriteFault::None).map(drop),
+            run_clear(&provisioned).map(drop),
+        ] {
+            assert_eq!(
+                result.unwrap_err().classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+        }
+
+        let fixture = SecretFixture::committed();
+        let parent = open_config_parent_path_nofollow(&fixture.parent).unwrap();
+        let mut wrong_policy = fixture.policy.clone();
+        wrong_policy.root = ROOT_SDDL.to_owned();
+        assert_eq!(
+            read_machine_secret_at(&parent, OsStr::new(ROOT_NAME), &wrong_policy)
+                .unwrap_err()
+                .classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+    }
+
+    #[test]
+    fn machine_secret_final_hardlink_reparse_and_wrong_security_are_rejected() {
+        let hardlink = SecretFixture::committed();
+        let sentinel = hardlink.parent.join("hardlink-sentinel");
+        fs::write(&sentinel, b"outside-hardlink").unwrap();
+        fs::hard_link(&sentinel, hardlink.final_path()).unwrap();
+        assert!(run_read(&hardlink).is_err());
+        assert!(run_replace(&hardlink, TOKEN, &[nonce(10)], ConfigWriteFault::None).is_err());
+        assert!(run_clear(&hardlink).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-hardlink");
+
+        let reparse = SecretFixture::committed();
+        let external = reparse.parent.join("junction-target");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel");
+        fs::write(&sentinel, b"outside-reparse").unwrap();
+        create_junction(&reparse.final_path(), &external);
+        assert!(run_read(&reparse).is_err());
+        assert!(run_replace(&reparse, TOKEN, &[nonce(11)], ConfigWriteFault::None).is_err());
+        assert!(run_clear(&reparse).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-reparse");
+
+        let wrong_security = SecretFixture::committed();
+        fs::write(wrong_security.final_path(), b"unprotected").unwrap();
+        let before = inspect_path_nofollow_for_test(&wrong_security.final_path()).unwrap();
+        assert!(run_read(&wrong_security).is_err());
+        assert!(run_replace(&wrong_security, TOKEN, &[nonce(12)], ConfigWriteFault::None).is_err());
+        assert!(run_clear(&wrong_security).is_err());
+        assert_eq!(
+            inspect_path_nofollow_for_test(&wrong_security.final_path()).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(wrong_security.final_path()).unwrap(),
+            b"unprotected"
+        );
+    }
+
+    #[test]
+    fn machine_secret_temp_collisions_retry_then_exhaust_without_following() {
+        let retry = SecretFixture::committed();
+        let sentinel = retry.parent.join("collision-sentinel");
+        fs::write(&sentinel, b"outside").unwrap();
+        let first = nonce(20);
+        fs::hard_link(&sentinel, retry.root.join(machine_secret_temp_name(first))).unwrap();
+        run_replace(&retry, TOKEN, &[first, nonce(21)], ConfigWriteFault::None).unwrap();
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+        assert_eq!(run_read(&retry).unwrap().unwrap().as_ref(), TOKEN);
+
+        let exhausted = SecretFixture::committed();
+        let sentinel = exhausted.parent.join("exhausted-sentinel");
+        fs::write(&sentinel, b"outside").unwrap();
+        let mut nonces = Vec::new();
+        for value in 30..(30 + TEMP_CREATE_ATTEMPTS as u8) {
+            let current = nonce(value);
+            fs::hard_link(
+                &sentinel,
+                exhausted.root.join(machine_secret_temp_name(current)),
+            )
+            .unwrap();
+            nonces.push(current);
+        }
+        assert_eq!(
+            run_replace(&exhausted, TOKEN, &nonces, ConfigWriteFault::None)
+                .unwrap_err()
+                .classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside");
+        assert!(!exhausted.final_path().exists());
+
+        let reparse = SecretFixture::committed();
+        let external = reparse.parent.join("temp-junction-target");
+        fs::create_dir(&external).unwrap();
+        let sentinel = external.join("sentinel");
+        fs::write(&sentinel, b"outside-reparse").unwrap();
+        let current = nonce(40);
+        create_junction(
+            &reparse.root.join(machine_secret_temp_name(current)),
+            &external,
+        );
+        assert!(run_replace(&reparse, TOKEN, &[current], ConfigWriteFault::None).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"outside-reparse");
+    }
+
+    #[test]
+    fn machine_secret_injected_failures_preserve_old_identity_bytes_and_remove_temp() {
+        for (index, fault) in [
+            ConfigWriteFault::PartialWrite,
+            ConfigWriteFault::AfterSync,
+            ConfigWriteFault::Rename,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let fixture = SecretFixture::committed();
+            run_replace(&fixture, b"old-token", &[nonce(50)], ConfigWriteFault::None).unwrap();
+            let before_bytes = fs::read(fixture.final_path()).unwrap();
+            let before_identity = inspect_path_nofollow_for_test(&fixture.final_path())
+                .unwrap()
+                .identity;
+
+            assert_eq!(
+                run_replace(&fixture, b"new-token", &[nonce(51 + index as u8)], fault,)
+                    .unwrap_err()
+                    .classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+            assert_eq!(fs::read(fixture.final_path()).unwrap(), before_bytes);
+            assert_eq!(
+                inspect_path_nofollow_for_test(&fixture.final_path())
+                    .unwrap()
+                    .identity,
+                before_identity
+            );
+            assert!(temp_entries(&fixture).is_empty());
+        }
+    }
+
+    #[test]
+    fn machine_secret_clear_has_false_true_semantics_and_deletes_held_identity() {
+        let fixture = SecretFixture::committed();
+        assert!(!run_clear(&fixture).unwrap());
+        let identity = run_replace(&fixture, TOKEN, &[nonce(60)], ConfigWriteFault::None).unwrap();
+        assert_eq!(
+            inspect_path_nofollow_for_test(&fixture.final_path())
+                .unwrap()
+                .identity,
+            identity
+        );
+        assert!(run_clear(&fixture).unwrap());
+        assert!(!fixture.final_path().exists());
+        assert!(!run_clear(&fixture).unwrap());
     }
 }

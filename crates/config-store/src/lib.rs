@@ -3,6 +3,8 @@
 use std::fmt;
 use std::io;
 
+use zeroize::Zeroizing;
+
 #[cfg(windows)]
 mod windows;
 
@@ -113,6 +115,42 @@ pub fn seed_machine_config(
     platform::seed_config(target, contents)
 }
 
+/// Plaintext machine cluster token whose owned bytes are zeroized on drop.
+pub struct MachineSecret(Zeroizing<Vec<u8>>);
+
+impl MachineSecret {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+}
+
+impl AsRef<[u8]> for MachineSecret {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
+impl fmt::Debug for MachineSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MachineSecret([REDACTED])")
+    }
+}
+
+/// Reads the fixed `%ProgramData%\Sembazuru\cluster-token.dpapi` secret.
+pub fn read_machine_cluster_token() -> Result<Option<MachineSecret>, MachineStoreError> {
+    platform::read_machine_secret()
+}
+
+/// Atomically replaces the fixed machine cluster token.
+pub fn replace_machine_cluster_token(token: &[u8]) -> Result<(), MachineStoreError> {
+    platform::replace_machine_secret(token)
+}
+
+/// Clears the fixed machine cluster token by its validated held identity.
+pub fn clear_machine_cluster_token() -> Result<bool, MachineStoreError> {
+    platform::clear_machine_secret()
+}
+
 #[cfg(test)]
 mod machine_config_api_tests {
     use super::*;
@@ -168,9 +206,75 @@ mod machine_config_api_tests {
     }
 }
 
+#[cfg(test)]
+mod machine_secret_api_tests {
+    use super::*;
+
+    trait AmbiguousIfImpl<A> {
+        fn probe() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+    impl<T: Clone> AmbiguousIfImpl<u8> for T {}
+
+    #[test]
+    fn machine_secret_public_api_is_fixed_identity_and_secret_is_not_cloneable() {
+        let _: fn() -> Result<Option<MachineSecret>, MachineStoreError> =
+            read_machine_cluster_token;
+        let _: fn(&[u8]) -> Result<(), MachineStoreError> = replace_machine_cluster_token;
+        let _: fn() -> Result<bool, MachineStoreError> = clear_machine_cluster_token;
+        let _ = <MachineSecret as AmbiguousIfImpl<_>>::probe;
+
+        let source = include_str!("lib.rs");
+        for name in [
+            "read_machine_cluster_token",
+            "replace_machine_cluster_token",
+            "clear_machine_cluster_token",
+        ] {
+            let start = source
+                .find(&format!("pub fn {name}"))
+                .expect("public machine-secret declaration");
+            let declaration = source[start..]
+                .split_once(" {")
+                .expect("complete public machine-secret declaration")
+                .0;
+            for forbidden in ["Path", "Policy", "Scope", "Descriptor", "Sddl", "mode"] {
+                assert!(!declaration.contains(forbidden), "{declaration}");
+            }
+        }
+    }
+
+    #[test]
+    fn machine_secret_debug_is_redacted_and_plaintext_is_borrow_only() {
+        let secret = MachineSecret::new(b"machine-secret-debug-sentinel".to_vec());
+        assert_eq!(secret.as_ref(), b"machine-secret-debug-sentinel");
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains("machine-secret-debug-sentinel"), "{debug}");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn machine_secret_is_unsupported_without_side_effects_off_windows() {
+        assert_eq!(
+            read_machine_cluster_token().unwrap_err().classification(),
+            MachineStoreErrorClass::Unsupported
+        );
+        assert_eq!(
+            replace_machine_cluster_token(b"token")
+                .unwrap_err()
+                .classification(),
+            MachineStoreErrorClass::Unsupported
+        );
+        assert_eq!(
+            clear_machine_cluster_token().unwrap_err().classification(),
+            MachineStoreErrorClass::Unsupported
+        );
+    }
+}
+
 #[cfg(windows)]
 mod platform {
-    use super::{MachineConfigTarget, MachineStoreError, windows};
+    use super::{MachineConfigTarget, MachineSecret, MachineStoreError, windows};
 
     pub(super) fn provision() -> Result<(), MachineStoreError> {
         windows::provision_canonical()
@@ -201,13 +305,25 @@ mod platform {
     ) -> Result<bool, MachineStoreError> {
         windows::seed_config_canonical(target, contents)
     }
+
+    pub(super) fn read_machine_secret() -> Result<Option<MachineSecret>, MachineStoreError> {
+        windows::read_machine_secret_canonical()
+    }
+
+    pub(super) fn replace_machine_secret(token: &[u8]) -> Result<(), MachineStoreError> {
+        windows::replace_machine_secret_canonical(token)
+    }
+
+    pub(super) fn clear_machine_secret() -> Result<bool, MachineStoreError> {
+        windows::clear_machine_secret_canonical()
+    }
 }
 
 #[cfg(not(windows))]
 mod platform {
-    use super::{MachineConfigTarget, MachineStoreError, MachineStoreErrorClass};
+    use super::{MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass};
 
-    fn unsupported() -> Result<(), MachineStoreError> {
+    fn unsupported<T>() -> Result<T, MachineStoreError> {
         Err(MachineStoreError::new(
             MachineStoreErrorClass::Unsupported,
             "machine configuration store lifecycle requires Windows",
@@ -241,10 +357,19 @@ mod platform {
         _target: MachineConfigTarget,
         _contents: &[u8],
     ) -> Result<bool, MachineStoreError> {
-        Err(MachineStoreError::new(
-            MachineStoreErrorClass::Unsupported,
-            "machine configuration replacement requires Windows",
-        ))
+        unsupported()
+    }
+
+    pub(super) fn read_machine_secret() -> Result<Option<MachineSecret>, MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn replace_machine_secret(_token: &[u8]) -> Result<(), MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn clear_machine_secret() -> Result<bool, MachineStoreError> {
+        unsupported()
     }
 }
 
