@@ -1,21 +1,27 @@
 use std::ffi::c_void;
 use std::io;
 use std::mem::{size_of, size_of_val};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Security::{
     AllocateAndInitializeSid, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
     FreeSid, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
-    TokenIsRestricted, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinMediumLabelSid,
-    WinRestrictedCodeSid, WinWorldSid,
+    SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TOKEN_USER, TokenIntegrityLevel, TokenIsRestricted, TokenUser, WinAuthenticatedUserSid,
+    WinBuiltinUsersSid, WinMediumLabelSid, WinRestrictedCodeSid, WinWorldSid,
 };
+use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
@@ -78,6 +84,7 @@ impl Drop for ActionSid {
 pub(crate) struct ActionToken {
     token: OwnedHandle,
     action_sid: ActionSid,
+    broker_user: Vec<usize>,
 }
 
 #[cfg_attr(
@@ -95,6 +102,7 @@ impl ActionToken {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         let action_sid = ActionSid::random()?;
+        let broker_user = token_info(source, TokenUser)?;
         let mut sid_storage = Vec::new();
         for kind in [
             WinWorldSid,
@@ -134,12 +142,105 @@ impl ActionToken {
         // SAFETY: CreateRestrictedToken returned a unique live handle.
         let token = unsafe { OwnedHandle::from_raw_handle(restricted as RawHandle) };
         lower_to_medium_if_needed(token.as_raw_handle() as HANDLE)?;
-        Ok(Self { token, action_sid })
+        Ok(Self {
+            token,
+            action_sid,
+            broker_user,
+        })
     }
 
     pub(crate) fn handle(&self) -> HANDLE {
         self.token.as_raw_handle() as HANDLE
     }
+
+    fn broker_sid(&self) -> *mut c_void {
+        // SAFETY: broker_user owns a complete, aligned TOKEN_USER for self's lifetime.
+        unsafe { (*(self.broker_user.as_ptr().cast::<TOKEN_USER>())).User.Sid }
+    }
+}
+
+struct LocalAllocation(*mut c_void);
+
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        // SAFETY: the pointer is the outstanding LocalAlloc result.
+        unsafe { LocalFree(self.0) };
+    }
+}
+
+fn sid_string(sid: *mut c_void) -> io::Result<String> {
+    let mut value = null_mut();
+    // SAFETY: sid is live and value receives a LocalAlloc NUL-terminated string.
+    if unsafe { ConvertSidToStringSidW(sid, &mut value) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _allocation = LocalAllocation(value.cast());
+    let mut length = 0;
+    // SAFETY: allocation remains live and points at a NUL-terminated UTF-16 string.
+    while unsafe { *value.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: the preceding scan established the initialized string length.
+    Ok(unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(value, length)) })
+}
+
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+pub(crate) struct PrivateScratch(PathBuf);
+
+#[allow(dead_code, reason = "wired by sandbox integration phase")]
+impl PrivateScratch {
+    pub(crate) fn create(root: &Path, leaf: &str, token: &ActionToken) -> io::Result<Self> {
+        let components: Vec<_> = Path::new(leaf).components().collect();
+        if leaf.contains([':', '\0']) || !matches!(components.as_slice(), [Component::Normal(_)]) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let path = root.join(leaf);
+        let sddl = format!(
+            "O:{}D:P(A;OICI;FA;;;{})(A;OICI;GRGWGXSD;;;{})(A;OICI;RC;;;OW)",
+            sid_string(token.broker_sid())?,
+            sid_string(token.broker_sid())?,
+            sid_string(token.action_sid.0)?
+        );
+        create_secured_directory(&path, &sddl)?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    pub(crate) fn into_path(self) -> PathBuf {
+        self.0
+    }
+}
+
+fn create_secured_directory(path: &Path, sddl: &str) -> io::Result<()> {
+    let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = null_mut();
+    // SAFETY: the SDDL is NUL-terminated and descriptor is a valid out pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: the path and protected descriptor are live for this atomic create call.
+    if unsafe { CreateDirectoryW(wide_path.as_ptr(), &attributes) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn current_token(access: u32) -> io::Result<OwnedHandle> {
@@ -240,16 +341,22 @@ mod tests {
     use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LUID, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        EqualSid, ImpersonateLoggedOnUser, LookupPrivilegeValueW, RevertToSelf,
-        SE_CHANGE_NOTIFY_NAME, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_GROUPS,
+        ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetSecurityDescriptorControl, ImpersonateLoggedOnUser, LookupPrivilegeValueW,
+        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, RevertToSelf, SE_CHANGE_NOTIFY_NAME,
+        SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_GROUPS,
         TOKEN_PRIVILEGES, TOKEN_USER, TokenGroups, TokenPrivileges, TokenRestrictedSids, TokenUser,
+        WinCreatorOwnerRightsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        CREATE_ALWAYS, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
+    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 
     use super::*;
 
@@ -312,6 +419,15 @@ mod tests {
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(false),
                 Err(error) => Err(error),
             }
+        }
+
+        fn impersonated<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+            // SAFETY: handle is live and RevertGuard restores the prior thread token.
+            if unsafe { ImpersonateLoggedOnUser(self.handle()) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let _guard = RevertGuard;
+            operation()
         }
     }
 
@@ -404,6 +520,84 @@ mod tests {
         Ok(path)
     }
 
+    fn private_scratch_root() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sembazuru-private-scratch-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        create_secured_directory(&path, "D:P(A;OICI;FA;;;WD)").unwrap();
+        path
+    }
+
+    type ScratchAcl = (String, u16, Vec<(String, u8, u32)>);
+    fn scratch_acl(path: &Path) -> io::Result<ScratchAcl> {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
+        // SAFETY: path is NUL-terminated and all requested outputs are valid.
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let _descriptor = LocalAllocation(descriptor);
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: descriptor and its DACL remain live through _descriptor.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut aces = Vec::new();
+        // SAFETY: descriptor owns a non-null DACL with AceCount live entries.
+        for index in 0..unsafe { (*dacl).AceCount } as u32 {
+            let mut raw = null_mut();
+            // SAFETY: index is within AceCount and raw receives an ACE owned by descriptor.
+            if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let ace = unsafe { &*(raw.cast::<ACCESS_ALLOWED_ACE>()) };
+            assert_eq!(ace.Header.AceType, ACCESS_ALLOWED_ACE_TYPE as u8);
+            aces.push((
+                sid_string((&ace.SidStart as *const u32).cast_mut().cast())?,
+                ace.Header.AceFlags,
+                ace.Mask,
+            ));
+        }
+        Ok((sid_string(owner)?, control, aces))
+    }
+
+    fn can_open_directory(path: &Path, access: u32) -> bool {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: path is NUL-terminated and any returned handle is closed below.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                access,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            false
+        } else {
+            // SAFETY: CreateFileW returned a unique live handle.
+            drop(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) });
+            true
+        }
+    }
+
     #[test]
     fn action_token_identity_and_limits() {
         let a = ActionToken::create().unwrap();
@@ -433,5 +627,110 @@ mod tests {
     fn already_restricted_broker_token_is_rejected() {
         let restricted = ActionToken::create().unwrap();
         assert!(ActionToken::create_from_token(restricted.handle()).is_err());
+    }
+
+    #[test]
+    fn private_scratch_atomic_acl_and_fail_closed_creation() {
+        let token = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "action", &token).unwrap();
+        assert_eq!(scratch.path(), root.join("action"));
+        std::fs::write(scratch.path().join("sentinel"), b"keep").unwrap();
+        assert!(PrivateScratch::create(&root, "action", &token).is_err());
+        assert!(PrivateScratch::create(&root.join("missing"), "action", &token).is_err());
+        assert!(!root.join("missing").exists());
+        assert_eq!(
+            std::fs::read(scratch.path().join("sentinel")).unwrap(),
+            b"keep"
+        );
+        for leaf in ["", ".", "..", "a/b", "a\\b", "C:", "a:b", "a\0b"] {
+            assert!(
+                PrivateScratch::create(&root, leaf, &token).is_err(),
+                "{leaf:?}"
+            );
+        }
+        let (owner, control, aces) = scratch_acl(scratch.path()).unwrap();
+        assert_eq!(owner, sid_string(token.broker_sid()).unwrap());
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        let inherit = (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8;
+        let expected = vec![
+            (
+                sid_string(token.broker_sid()).unwrap(),
+                inherit,
+                FILE_ALL_ACCESS,
+            ),
+            (
+                sid_string(token.action_sid.0).unwrap(),
+                inherit,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE,
+            ),
+            (
+                sid_string(
+                    well_known_sid(WinCreatorOwnerRightsSid)
+                        .unwrap()
+                        .as_mut_ptr()
+                        .cast(),
+                )
+                .unwrap(),
+                inherit,
+                READ_CONTROL,
+            ),
+        ];
+        assert_eq!(aces, expected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_scratch_matching_action_can_mutate_without_acl_control() {
+        let token = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "action", &token).unwrap();
+        token
+            .impersonated(|| {
+                let nested = scratch.path().join("nested");
+                std::fs::create_dir(&nested)?;
+                let file = nested.join("file");
+                std::fs::write(&file, b"value")?;
+                assert_eq!(std::fs::read(&file)?, b"value");
+                let renamed = nested.join("renamed");
+                std::fs::rename(&file, &renamed)?;
+                std::fs::remove_file(renamed)?;
+                std::fs::remove_dir(nested)?;
+                assert!(!can_open_directory(scratch.path(), WRITE_DAC));
+                assert!(!can_open_directory(scratch.path(), WRITE_OWNER));
+                Ok(())
+            })
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn private_scratch_other_action_cannot_discover_or_open() {
+        let a = ActionToken::create().unwrap();
+        let b = ActionToken::create().unwrap();
+        let root = private_scratch_root();
+        assert!(
+            b.impersonated(|| Ok(std::fs::read_dir(&root).is_ok()))
+                .unwrap()
+        );
+        let scratch = PrivateScratch::create(&root, "action-a", &a).unwrap();
+        std::fs::write(scratch.path().join("known"), b"secret").unwrap();
+        b.impersonated(|| {
+            assert_eq!(
+                std::fs::read_dir(scratch.path()).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                File::open(scratch.path().join("known")).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                File::create(scratch.path().join("new")).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            Ok(())
+        })
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
