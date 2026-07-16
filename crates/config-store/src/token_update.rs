@@ -3,10 +3,14 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use sha2::{Digest, Sha256};
+use toml_edit::Document;
 use zeroize::Zeroizing;
 
 use super::*;
-use crate::{MachineTokenUpdate, MachineTokenUpdatePreparation, MachineTokenUpdateValue};
+use crate::{
+    MAX_MACHINE_CLUSTER_TOKEN_BYTES, MachineTokenMaintenanceResult, MachineTokenUpdate,
+    MachineTokenUpdatePreparation, MachineTokenUpdateValue,
+};
 
 pub(super) const JOURNAL_LEAF: &str = ".cluster-token-update-v1";
 const JOURNAL_MAGIC: &[u8; 8] = b"SBZTXN\0\0";
@@ -337,6 +341,217 @@ pub(super) enum ApplyFault {
     JournalAbsenceProof,
 }
 
+pub(super) enum MaintenanceOperation<'a> {
+    Migrate,
+    Rotate(&'a str),
+    Clear,
+}
+
+pub(super) enum MaintenanceFault {
+    None,
+    #[cfg(test)]
+    ReplaceAfterSnapshot(UpdateTarget, Vec<u8>),
+    #[cfg(test)]
+    Apply(ApplyFault),
+}
+
+pub(super) fn maintain_on_held_root(
+    root: &File,
+    root_identity: FileIdentity,
+    policy: &SecurityPolicy,
+    operation: MaintenanceOperation<'_>,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: MaintenanceFault,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    let store = UpdateStore::from_held_root(root, root_identity, policy)?;
+    let mut changed = false;
+    // A pending journal is immutable prior intent, so complete its forward
+    // recovery before a new snapshot can define another maintenance plan.
+    if read_journal(&store, false)?.is_some() {
+        apply_update_on_held_root(root, root_identity, policy, next_nonce, ApplyFault::None)?;
+        require_journal_absent(&store)?;
+        changed = true;
+    }
+
+    store.revalidate()?;
+    let snapshots = UpdateTarget::ALL
+        .map(|target| store.snapshot(target))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let (replacement, apply_fault): (Option<(UpdateTarget, Vec<u8>)>, ApplyFault) = match fault {
+        MaintenanceFault::None => (None, ApplyFault::None),
+        #[cfg(test)]
+        MaintenanceFault::ReplaceAfterSnapshot(target, bytes) => {
+            (Some((target, bytes)), ApplyFault::None)
+        }
+        #[cfg(test)]
+        MaintenanceFault::Apply(fault) => (None, fault),
+    };
+    #[cfg(test)]
+    if let Some((target, bytes)) = replacement {
+        write_test_race(&store, target, &bytes, next_nonce)?;
+    }
+    #[cfg(not(test))]
+    let _ = replacement;
+
+    let records = plan_maintenance(operation, &snapshots)?;
+    // Records retain the captured expected states so publication checks reject
+    // a snapshot race instead of adopting the raced state as a new baseline.
+    match prepare_records_on_store(&store, records, next_nonce, PrepareFault::None)? {
+        MachineTokenUpdatePreparation::NoChange => {
+            require_journal_absent(&store)?;
+            Ok(if changed {
+                MachineTokenMaintenanceResult::Changed
+            } else {
+                MachineTokenMaintenanceResult::Unchanged
+            })
+        }
+        MachineTokenUpdatePreparation::JournalReady => {
+            apply_update_on_held_root(root, root_identity, policy, next_nonce, apply_fault)?;
+            require_journal_absent(&store)?;
+            Ok(MachineTokenMaintenanceResult::Changed)
+        }
+    }
+}
+
+struct SanitizedConfig {
+    candidate: Option<Zeroizing<Vec<u8>>>,
+    replacement: Option<Zeroizing<Vec<u8>>>,
+}
+
+fn plan_maintenance(
+    operation: MaintenanceOperation<'_>,
+    snapshots: &[TargetSnapshot],
+) -> Result<Vec<JournalRecord>, MachineStoreError> {
+    let secret = secret_candidate(&snapshots[0])?;
+    let daemon = sanitize_config(&snapshots[1])?;
+    let worker = sanitize_config(&snapshots[2])?;
+    let secret_record = match operation {
+        MaintenanceOperation::Migrate => {
+            let mut selected: Option<&[u8]> = None;
+            for candidate in [
+                secret.as_deref(),
+                daemon.candidate.as_deref(),
+                worker.candidate.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if selected.is_some_and(|current| current != candidate) {
+                    return Err(integrity("machine token maintenance candidates conflict"));
+                }
+                selected = Some(candidate);
+            }
+            selected.map_or_else(
+                || {
+                    Ok(JournalRecord::preserve(
+                        UpdateTarget::Secret,
+                        snapshots[0].state,
+                    ))
+                },
+                |token| resolve_replacement(UpdateTarget::Secret, &snapshots[0], token),
+            )?
+        }
+        MaintenanceOperation::Rotate(token) => {
+            if token.is_empty() || token.len() > MAX_MACHINE_CLUSTER_TOKEN_BYTES {
+                return Err(MachineStoreError::new(
+                    MachineStoreErrorClass::InvalidInput,
+                    "machine token maintenance input is invalid",
+                ));
+            }
+            resolve_replacement(UpdateTarget::Secret, &snapshots[0], token.as_bytes())?
+        }
+        MaintenanceOperation::Clear => match snapshots[0].state {
+            ExpectedState::Absent => {
+                JournalRecord::preserve(UpdateTarget::Secret, snapshots[0].state)
+            }
+            ExpectedState::Present { .. } => {
+                JournalRecord::remove(UpdateTarget::Secret, snapshots[0].state)
+            }
+        },
+    };
+    Ok(vec![
+        secret_record,
+        config_record(UpdateTarget::Daemon, &snapshots[1], daemon)?,
+        config_record(UpdateTarget::Worker, &snapshots[2], worker)?,
+    ])
+}
+
+fn secret_candidate(
+    snapshot: &TargetSnapshot,
+) -> Result<Option<Zeroizing<Vec<u8>>>, MachineStoreError> {
+    if snapshot.state == ExpectedState::Absent {
+        return Ok(None);
+    }
+    let secret = unprotect_machine_secret(&snapshot.bytes)?;
+    let bytes = secret.as_ref();
+    if bytes.is_empty()
+        || bytes.len() > MAX_MACHINE_CLUSTER_TOKEN_BYTES
+        || std::str::from_utf8(bytes).is_err()
+    {
+        return Err(integrity("stored machine token is invalid"));
+    }
+    Ok(Some(Zeroizing::new(bytes.to_vec())))
+}
+
+fn sanitize_config(snapshot: &TargetSnapshot) -> Result<SanitizedConfig, MachineStoreError> {
+    if snapshot.state == ExpectedState::Absent {
+        return Ok(SanitizedConfig {
+            candidate: None,
+            replacement: None,
+        });
+    }
+    let text = std::str::from_utf8(&snapshot.bytes)
+        .map_err(|_| integrity("machine token maintenance configuration is invalid"))?;
+    let mut document = text
+        .parse::<Document>()
+        .map_err(|_| integrity("machine token maintenance configuration is invalid"))?;
+    let Some(item) = document.as_table().get("cluster_token") else {
+        return Ok(SanitizedConfig {
+            candidate: None,
+            replacement: None,
+        });
+    };
+    let value = item
+        .as_str()
+        .ok_or_else(|| integrity("machine token maintenance configuration token is invalid"))?;
+    if value.len() > MAX_MACHINE_CLUSTER_TOKEN_BYTES {
+        return Err(integrity(
+            "machine token maintenance configuration token is invalid",
+        ));
+    }
+    let candidate = (!value.is_empty()).then(|| Zeroizing::new(value.as_bytes().to_vec()));
+    // Item removal preserves unknown settings and their comments/decor, which
+    // schema-based regeneration could silently discard.
+    document.as_table_mut().remove("cluster_token");
+    Ok(SanitizedConfig {
+        candidate,
+        replacement: Some(Zeroizing::new(document.to_string().into_bytes())),
+    })
+}
+
+fn config_record(
+    target: UpdateTarget,
+    snapshot: &TargetSnapshot,
+    config: SanitizedConfig,
+) -> Result<JournalRecord, MachineStoreError> {
+    match config.replacement {
+        Some(bytes) => resolve_replacement(target, snapshot, &bytes),
+        None => Ok(JournalRecord::preserve(target, snapshot.state)),
+    }
+}
+
+fn require_journal_absent(store: &UpdateStore<'_>) -> Result<(), MachineStoreError> {
+    store.revalidate()?;
+    if read_journal(store, false)?.is_some() {
+        Err(integrity(
+            "machine token maintenance journal remains pending",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 pub(super) fn prepare_update_at(
     parent: &File,
@@ -394,6 +609,29 @@ pub(super) fn prepare_update_on_held_root(
         };
         records.push(record);
     }
+    prepare_records_on_store(&store, records, next_nonce, fault)
+}
+
+fn prepare_records_on_store(
+    store: &UpdateStore<'_>,
+    records: Vec<JournalRecord>,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: PrepareFault,
+) -> Result<MachineTokenUpdatePreparation, MachineStoreError> {
+    store.revalidate()?;
+    if read_journal(store, false)?.is_some() {
+        return Err(integrity(
+            "a machine token update journal is already pending",
+        ));
+    }
+    if records.len() != JOURNAL_RECORD_COUNT
+        || UpdateTarget::ALL
+            .into_iter()
+            .zip(&records)
+            .any(|(target, record)| target != record.target)
+    {
+        return Err(integrity("machine token update record set is invalid"));
+    }
     if records
         .iter()
         .all(|record| record.directive == UpdateDirective::Preserve)
@@ -415,8 +653,8 @@ pub(super) fn prepare_update_on_held_root(
         PrepareFault::JournalWrite(fault) => fault,
         _ => ConfigWriteFault::None,
     };
-    let journal_handle = publish_journal(&store, records, next_nonce, write_fault)?;
-    journal_handle.revalidate(&store)?;
+    let journal_handle = publish_journal(store, records, next_nonce, write_fault)?;
+    journal_handle.revalidate(store)?;
     for (target, record) in UpdateTarget::ALL
         .into_iter()
         .zip(&journal_handle.journal.records)
@@ -1329,6 +1567,10 @@ mod tests {
     const TOKEN: &[u8] = b"journal-plaintext-token-sentinel-71829";
     const NEW_DAEMON: &[u8] = b"[agent]\nlisten = 'journal-daemon-new'\n";
     const NEW_WORKER: &[u8] = b"[worker]\nendpoint = 'journal-worker-new'\n";
+    const MAINTENANCE_TOKEN: &[u8] = b"maintenance-shared-token";
+    const DAEMON_LEGACY: &[u8] = b"# keep-daemon-heading\nname = 'daemon' # keep-daemon-comment\ncluster_token = 'maintenance-shared-token'\n[network]\nport = 7319 # keep-daemon-port\n";
+    const WORKER_LEGACY: &[u8] =
+        b"name = 'worker' # keep-worker-comment\ncluster_token = 'maintenance-shared-token'\n";
 
     struct Fixture {
         _temp: TempDir,
@@ -1573,6 +1815,34 @@ mod tests {
         encoded
     }
 
+    fn maintenance(
+        fixture: &Fixture,
+        operation: MaintenanceOperation<'_>,
+        fault: MaintenanceFault,
+    ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+        let mut guard = fixture.update_guard()?;
+        let mut next = nonce_source(0xc0);
+        maintain_update_guard_with_fault_for_test(&mut guard, operation, &mut next, fault)
+    }
+
+    fn plaintext_secret(fixture: &Fixture) -> Option<Vec<u8>> {
+        fixture.bytes(UpdateTarget::Secret).map(|protected| {
+            unprotect_machine_secret(&protected)
+                .unwrap()
+                .as_ref()
+                .to_vec()
+        })
+    }
+
+    fn assert_legacy_stripped(bytes: &[u8], retained: &[u8]) {
+        assert!(
+            !bytes
+                .windows(b"cluster_token".len())
+                .any(|part| part == b"cluster_token")
+        );
+        assert!(bytes.windows(retained.len()).any(|part| part == retained));
+    }
+
     fn assert_intended(fixture: &Fixture) {
         assert_eq!(
             unprotect_machine_secret(&fixture.bytes(UpdateTarget::Secret).unwrap())
@@ -1798,6 +2068,380 @@ mod tests {
             assert_eq!(fixture.bytes(UpdateTarget::Worker).unwrap(), PRESERVED);
             assert!(!fixture.journal_path().exists());
         }
+    }
+
+    #[test]
+    fn machine_token_maintenance_busy_when_service_runtime_held() {
+        let fixture = Fixture::committed();
+        let service = fixture.service_guard().unwrap();
+
+        assert_eq!(
+            fixture.update_guard().unwrap_err().classification(),
+            MachineStoreErrorClass::Busy
+        );
+
+        drop(service);
+        fixture.update_guard().unwrap();
+    }
+
+    #[test]
+    fn machine_token_maintenance_migrate_equal_legacy_values_to_dpapi_and_strip_both() {
+        let fixture = Fixture::committed();
+        fixture.replace(UpdateTarget::Daemon, DAEMON_LEGACY);
+        fixture.replace(UpdateTarget::Worker, WORKER_LEGACY);
+        let mut guard = fixture.update_guard().unwrap();
+
+        assert_eq!(
+            crate::migrate_machine_cluster_token_storage(&mut guard).unwrap(),
+            MachineTokenMaintenanceResult::Changed
+        );
+        assert_eq!(plaintext_secret(&fixture).unwrap(), MAINTENANCE_TOKEN);
+        let daemon = fixture.bytes(UpdateTarget::Daemon).unwrap();
+        assert_legacy_stripped(&daemon, b"keep-daemon-comment");
+        for retained in [
+            b"keep-daemon-heading".as_slice(),
+            b"[network]".as_slice(),
+            b"keep-daemon-port".as_slice(),
+        ] {
+            assert!(daemon.windows(retained.len()).any(|part| part == retained));
+        }
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Worker).unwrap(),
+            b"keep-worker-comment",
+        );
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_migrate_mismatched_legacy_values_fails_without_journal() {
+        let fixture = Fixture::committed();
+        let daemon = b"name = 'daemon'\ncluster_token = 'candidate-a'\n";
+        let worker = b"name = 'worker'\ncluster_token = 'candidate-b'\n";
+        fixture.replace(UpdateTarget::Daemon, daemon);
+        fixture.replace(UpdateTarget::Worker, worker);
+
+        let error = maintenance(
+            &fixture,
+            MaintenanceOperation::Migrate,
+            MaintenanceFault::None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert_eq!(fixture.bytes(UpdateTarget::Daemon).unwrap(), daemon);
+        assert_eq!(fixture.bytes(UpdateTarget::Worker).unwrap(), worker);
+        assert!(fixture.bytes(UpdateTarget::Secret).is_none());
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_migrate_existing_equal_dpapi_strips_only() {
+        let fixture = Fixture::committed();
+        fixture.replace(
+            UpdateTarget::Secret,
+            &protect_machine_secret(MAINTENANCE_TOKEN).unwrap(),
+        );
+        fixture.replace(UpdateTarget::Daemon, DAEMON_LEGACY);
+        let secret_identity = inspect_path_nofollow_for_test(&fixture.path(UpdateTarget::Secret))
+            .unwrap()
+            .identity;
+
+        assert_eq!(
+            maintenance(
+                &fixture,
+                MaintenanceOperation::Migrate,
+                MaintenanceFault::None,
+            )
+            .unwrap(),
+            MachineTokenMaintenanceResult::Changed
+        );
+        assert_eq!(plaintext_secret(&fixture).unwrap(), MAINTENANCE_TOKEN);
+        assert_eq!(
+            inspect_path_nofollow_for_test(&fixture.path(UpdateTarget::Secret))
+                .unwrap()
+                .identity,
+            secret_identity
+        );
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Daemon).unwrap(),
+            b"keep-daemon-comment",
+        );
+        assert!(fixture.bytes(UpdateTarget::Worker).is_none());
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_migrate_existing_conflicting_dpapi_fails_closed() {
+        let fixture = Fixture::committed();
+        let protected = protect_machine_secret(b"dpapi-candidate").unwrap();
+        fixture.replace(UpdateTarget::Secret, &protected);
+        fixture.replace(UpdateTarget::Daemon, DAEMON_LEGACY);
+
+        let error = maintenance(
+            &fixture,
+            MaintenanceOperation::Migrate,
+            MaintenanceFault::None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert_eq!(
+            fixture.bytes(UpdateTarget::Secret).unwrap(),
+            protected.as_slice()
+        );
+        assert_eq!(fixture.bytes(UpdateTarget::Daemon).unwrap(), DAEMON_LEGACY);
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_migrate_resumes_pending_before_replanning() {
+        let fixture = Fixture::committed();
+        let mut guard = fixture.update_guard().unwrap();
+        assert_eq!(
+            crate::prepare_machine_cluster_token_update(&mut guard, full_update()).unwrap(),
+            MachineTokenUpdatePreparation::JournalReady
+        );
+
+        assert_eq!(
+            crate::migrate_machine_cluster_token_storage(&mut guard).unwrap(),
+            MachineTokenMaintenanceResult::Changed
+        );
+        assert!(!crate::machine_cluster_token_update_pending(&mut guard).unwrap());
+        assert_intended(&fixture);
+    }
+
+    #[test]
+    fn machine_token_maintenance_snapshot_replacement_fails_before_journal() {
+        let fixture = Fixture::committed();
+        fixture.replace(UpdateTarget::Daemon, DAEMON_LEGACY);
+        let replacement = b"name = 'raced'\ncluster_token = 'replacement-candidate'\n";
+
+        let error = maintenance(
+            &fixture,
+            MaintenanceOperation::Migrate,
+            MaintenanceFault::ReplaceAfterSnapshot(UpdateTarget::Daemon, replacement.to_vec()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert_eq!(fixture.bytes(UpdateTarget::Daemon).unwrap(), replacement);
+        assert!(fixture.bytes(UpdateTarget::Secret).is_none());
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_migrate_candidate_table() {
+        for (daemon, worker, expected, changed) in [
+            (Some(DAEMON_LEGACY), None, Some(MAINTENANCE_TOKEN), true),
+            (None, Some(WORKER_LEGACY), Some(MAINTENANCE_TOKEN), true),
+            (None, None, None, false),
+            (
+                Some(b"name = 'daemon'\ncluster_token = ''\n".as_slice()),
+                None,
+                None,
+                true,
+            ),
+        ] {
+            let fixture = Fixture::committed();
+            if let Some(bytes) = daemon {
+                fixture.replace(UpdateTarget::Daemon, bytes);
+            }
+            if let Some(bytes) = worker {
+                fixture.replace(UpdateTarget::Worker, bytes);
+            }
+
+            assert_eq!(
+                maintenance(
+                    &fixture,
+                    MaintenanceOperation::Migrate,
+                    MaintenanceFault::None,
+                )
+                .unwrap(),
+                if changed {
+                    MachineTokenMaintenanceResult::Changed
+                } else {
+                    MachineTokenMaintenanceResult::Unchanged
+                }
+            );
+            assert_eq!(plaintext_secret(&fixture).as_deref(), expected);
+            assert!(!fixture.journal_path().exists());
+        }
+    }
+
+    #[test]
+    fn machine_token_maintenance_rotate_replaces_dpapi_and_strips_legacy() {
+        let fixture = Fixture::committed();
+        fixture.replace(
+            UpdateTarget::Secret,
+            &protect_machine_secret(b"old-dpapi").unwrap(),
+        );
+        fixture.replace(UpdateTarget::Daemon, DAEMON_LEGACY);
+        fixture.replace(UpdateTarget::Worker, WORKER_LEGACY);
+
+        assert_eq!(
+            maintenance(
+                &fixture,
+                MaintenanceOperation::Rotate("rotated-maintenance-token"),
+                MaintenanceFault::None,
+            )
+            .unwrap(),
+            MachineTokenMaintenanceResult::Changed
+        );
+        assert_eq!(
+            plaintext_secret(&fixture).unwrap(),
+            b"rotated-maintenance-token"
+        );
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Daemon).unwrap(),
+            b"keep-daemon-comment",
+        );
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Worker).unwrap(),
+            b"keep-worker-comment",
+        );
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_clear_removes_dpapi_and_strips_legacy() {
+        let fixture = Fixture::committed();
+        fixture.replace(
+            UpdateTarget::Secret,
+            &protect_machine_secret(MAINTENANCE_TOKEN).unwrap(),
+        );
+        fixture.replace(UpdateTarget::Daemon, DAEMON_LEGACY);
+        fixture.replace(UpdateTarget::Worker, WORKER_LEGACY);
+
+        assert_eq!(
+            maintenance(
+                &fixture,
+                MaintenanceOperation::Clear,
+                MaintenanceFault::None,
+            )
+            .unwrap(),
+            MachineTokenMaintenanceResult::Changed
+        );
+        assert!(fixture.bytes(UpdateTarget::Secret).is_none());
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Daemon).unwrap(),
+            b"keep-daemon-comment",
+        );
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Worker).unwrap(),
+            b"keep-worker-comment",
+        );
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_invalid_utf8_toml_and_token_types_do_not_mutate() {
+        for invalid in [
+            vec![0xff, 0xfe],
+            b"cluster_token = [\n".to_vec(),
+            b"cluster_token = 42\n".to_vec(),
+        ] {
+            let fixture = Fixture::committed();
+            fixture.replace(UpdateTarget::Daemon, &invalid);
+            let error = maintenance(
+                &fixture,
+                MaintenanceOperation::Migrate,
+                MaintenanceFault::None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+            assert_eq!(fixture.bytes(UpdateTarget::Daemon).unwrap(), invalid);
+            assert!(fixture.bytes(UpdateTarget::Secret).is_none());
+            assert!(!fixture.journal_path().exists());
+        }
+
+        let fixture = Fixture::committed();
+        let protected = protect_machine_secret(&[0xff]).unwrap();
+        fixture.replace(UpdateTarget::Secret, &protected);
+        let error = maintenance(
+            &fixture,
+            MaintenanceOperation::Migrate,
+            MaintenanceFault::None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.classification(),
+            MachineStoreErrorClass::IntegrityViolation
+        );
+        assert_eq!(
+            fixture.bytes(UpdateTarget::Secret).unwrap(),
+            protected.as_slice()
+        );
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_maintenance_rotate_rejects_invalid_input_without_journal() {
+        for invalid in [String::new(), "x".repeat(MAX_MACHINE_SECRET_BYTES + 1)] {
+            let fixture = Fixture::committed();
+            let error = maintenance(
+                &fixture,
+                MaintenanceOperation::Rotate(&invalid),
+                MaintenanceFault::None,
+            )
+            .unwrap_err();
+            assert_eq!(error.classification(), MachineStoreErrorClass::InvalidInput);
+            assert!(!fixture.journal_path().exists());
+        }
+    }
+
+    #[test]
+    fn machine_token_maintenance_mixed_remove_replace_resumes_after_fault() {
+        let fixture = Fixture::committed();
+        fixture.replace(
+            UpdateTarget::Secret,
+            &protect_machine_secret(MAINTENANCE_TOKEN).unwrap(),
+        );
+        fixture.replace(UpdateTarget::Daemon, DAEMON_LEGACY);
+        fixture.replace(UpdateTarget::Worker, WORKER_LEGACY);
+        let mut guard = fixture.update_guard().unwrap();
+        let mut next = nonce_source(0xd0);
+
+        assert!(
+            maintain_update_guard_with_fault_for_test(
+                &mut guard,
+                MaintenanceOperation::Clear,
+                &mut next,
+                MaintenanceFault::Apply(ApplyFault::AfterTargetDelete(UpdateTarget::Secret)),
+            )
+            .is_err()
+        );
+        assert!(fixture.bytes(UpdateTarget::Secret).is_none());
+        assert!(crate::machine_cluster_token_update_pending(&mut guard).unwrap());
+
+        assert_eq!(
+            maintain_update_guard_with_fault_for_test(
+                &mut guard,
+                MaintenanceOperation::Clear,
+                &mut next,
+                MaintenanceFault::None,
+            )
+            .unwrap(),
+            MachineTokenMaintenanceResult::Changed
+        );
+        assert!(!crate::machine_cluster_token_update_pending(&mut guard).unwrap());
+        assert!(fixture.bytes(UpdateTarget::Secret).is_none());
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Daemon).unwrap(),
+            b"keep-daemon-comment",
+        );
+        assert_legacy_stripped(
+            &fixture.bytes(UpdateTarget::Worker).unwrap(),
+            b"keep-worker-comment",
+        );
     }
 
     #[test]

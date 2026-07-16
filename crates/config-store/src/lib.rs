@@ -5,6 +5,9 @@ use std::io;
 
 use zeroize::Zeroizing;
 
+/// Maximum UTF-8 byte length accepted for a fixed machine cluster token.
+pub const MAX_MACHINE_CLUSTER_TOKEN_BYTES: usize = 64 * 1024;
+
 #[cfg(windows)]
 mod windows;
 
@@ -17,6 +20,10 @@ pub enum MachineStoreErrorClass {
     NamespaceAlreadyExists,
     /// Persisted identity, type, security, or lifecycle state was not exact.
     IntegrityViolation,
+    /// The exclusive machine token-update lease is held by another process.
+    Busy,
+    /// A caller-supplied maintenance value is outside the fixed input contract.
+    InvalidInput,
     /// An operating-system operation failed without proving an integrity fault.
     Io,
 }
@@ -229,6 +236,37 @@ pub fn apply_or_resume_machine_cluster_token_update(
     guard: &mut MachineTokenUpdateGuard,
 ) -> Result<(), MachineStoreError> {
     platform::apply_token_update(&mut guard.inner)
+}
+
+/// Outcome of one fixed machine cluster-token maintenance operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineTokenMaintenanceResult {
+    /// The canonical store already had the requested state.
+    Unchanged,
+    /// The canonical store was changed and no update journal remains.
+    Changed,
+}
+
+/// Migrates matching legacy configuration tokens into the fixed DPAPI secret.
+pub fn migrate_machine_cluster_token_storage(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    platform::migrate_token_storage(&mut guard.inner)
+}
+
+/// Replaces the fixed DPAPI token and removes both legacy configuration keys.
+pub fn rotate_machine_cluster_token_storage(
+    guard: &mut MachineTokenUpdateGuard,
+    token: &str,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    platform::rotate_token_storage(&mut guard.inner, token)
+}
+
+/// Removes the fixed DPAPI token and both legacy configuration keys.
+pub fn clear_machine_cluster_token_storage(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    platform::clear_token_storage(&mut guard.inner)
 }
 
 #[cfg(test)]
@@ -478,8 +516,8 @@ mod machine_token_update_api_tests {
 #[cfg(windows)]
 mod platform {
     use super::{
-        MachineConfigTarget, MachineSecret, MachineStoreError, MachineTokenUpdate,
-        MachineTokenUpdatePreparation, windows,
+        MachineConfigTarget, MachineSecret, MachineStoreError, MachineTokenMaintenanceResult,
+        MachineTokenUpdate, MachineTokenUpdatePreparation, windows,
     };
 
     pub(super) type MachineServiceRuntimeGuard = windows::MachineServiceRuntimeGuard;
@@ -553,13 +591,32 @@ mod platform {
     ) -> Result<(), MachineStoreError> {
         windows::apply_machine_token_update(guard)
     }
+
+    pub(super) fn migrate_token_storage(
+        guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+        windows::migrate_machine_token_storage(guard)
+    }
+
+    pub(super) fn rotate_token_storage(
+        guard: &mut MachineTokenUpdateGuard,
+        token: &str,
+    ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+        windows::rotate_machine_token_storage(guard, token)
+    }
+
+    pub(super) fn clear_token_storage(
+        guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+        windows::clear_machine_token_storage(guard)
+    }
 }
 
 #[cfg(not(windows))]
 mod platform {
     use super::{
         MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass,
-        MachineTokenUpdate, MachineTokenUpdatePreparation,
+        MachineTokenMaintenanceResult, MachineTokenUpdate, MachineTokenUpdatePreparation,
     };
 
     pub(super) struct MachineServiceRuntimeGuard;
@@ -638,6 +695,25 @@ mod platform {
     pub(super) fn apply_token_update(
         _guard: &mut MachineTokenUpdateGuard,
     ) -> Result<(), MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn migrate_token_storage(
+        _guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn rotate_token_storage(
+        _guard: &mut MachineTokenUpdateGuard,
+        _token: &str,
+    ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+        unsupported()
+    }
+
+    pub(super) fn clear_token_storage(
+        _guard: &mut MachineTokenUpdateGuard,
+    ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
         unsupported()
     }
 }

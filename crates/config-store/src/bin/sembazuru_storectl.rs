@@ -38,6 +38,8 @@ impl CliError {
             Self::Lifecycle(MachineStoreErrorClass::IntegrityViolation) => {
                 "lifecycle-integrity-violation"
             }
+            Self::Lifecycle(MachineStoreErrorClass::Busy) => "lifecycle-busy",
+            Self::Lifecycle(MachineStoreErrorClass::InvalidInput) => "lifecycle-invalid-input",
             Self::Lifecycle(MachineStoreErrorClass::Io) => "lifecycle-io-failed",
         }
     }

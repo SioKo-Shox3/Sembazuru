@@ -16,8 +16,8 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, HANDLE, LocalFree, RtlNtStatusToDosError, STATUS_OBJECT_NAME_COLLISION,
-    STATUS_OBJECT_NAME_EXISTS, UNICODE_STRING,
+    ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, HANDLE, LocalFree, RtlNtStatusToDosError,
+    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_EXISTS, UNICODE_STRING,
 };
 #[cfg(test)]
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -56,7 +56,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     MachineConfigTarget, MachineSecret, MachineStoreError, MachineStoreErrorClass,
-    MachineTokenUpdate, MachineTokenUpdatePreparation,
+    MachineTokenMaintenanceResult, MachineTokenUpdate, MachineTokenUpdatePreparation,
 };
 
 #[path = "token_update.rs"]
@@ -81,7 +81,7 @@ const MACHINE_SECRET_VERSION: u32 = 1;
 const MACHINE_SECRET_DIGEST_BYTES: usize = 32;
 const MACHINE_SECRET_HEADER_BYTES: usize =
     MACHINE_SECRET_MAGIC.len() + 4 + 4 + MACHINE_SECRET_DIGEST_BYTES;
-const MAX_MACHINE_SECRET_BYTES: usize = 64 * 1024;
+const MAX_MACHINE_SECRET_BYTES: usize = crate::MAX_MACHINE_CLUSTER_TOKEN_BYTES;
 const MAX_MACHINE_SECRET_BLOB_BYTES: usize = 128 * 1024;
 
 #[derive(Clone)]
@@ -367,6 +367,49 @@ pub(super) fn apply_machine_token_update(
         &guard.policy,
         &mut nonce,
         token_update::ApplyFault::None,
+    )
+}
+
+pub(super) fn migrate_machine_token_storage(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    let mut nonce = random_nonce;
+    token_update::maintain_on_held_root(
+        &guard.root,
+        guard.root_identity,
+        &guard.policy,
+        token_update::MaintenanceOperation::Migrate,
+        &mut nonce,
+        token_update::MaintenanceFault::None,
+    )
+}
+
+pub(super) fn rotate_machine_token_storage(
+    guard: &mut MachineTokenUpdateGuard,
+    token: &str,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    let mut nonce = random_nonce;
+    token_update::maintain_on_held_root(
+        &guard.root,
+        guard.root_identity,
+        &guard.policy,
+        token_update::MaintenanceOperation::Rotate(token),
+        &mut nonce,
+        token_update::MaintenanceFault::None,
+    )
+}
+
+pub(super) fn clear_machine_token_storage(
+    guard: &mut MachineTokenUpdateGuard,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    let mut nonce = random_nonce;
+    token_update::maintain_on_held_root(
+        &guard.root,
+        guard.root_identity,
+        &guard.policy,
+        token_update::MaintenanceOperation::Clear,
+        &mut nonce,
+        token_update::MaintenanceFault::None,
     )
 }
 
@@ -693,6 +736,13 @@ fn is_not_found(error: &MachineStoreError) -> bool {
         .is_some_and(|source| source.kind() == io::ErrorKind::NotFound)
 }
 
+fn is_sharing_violation(error: &MachineStoreError) -> bool {
+    error
+        .source
+        .as_ref()
+        .is_some_and(|source| source.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32))
+}
+
 fn open_relative_optional(
     parent: &File,
     name: &OsStr,
@@ -868,8 +918,19 @@ fn acquire_committed_root_lease(
     policy: &SecurityPolicy,
     share_mode: u32,
 ) -> Result<(File, FileIdentity), MachineStoreError> {
-    let root = open_config_relative_with_share(parent, root_name, true, share_mode)
-        .map_err(|_| integrity("committed machine-store root lease is unavailable or unsafe"))?;
+    let root =
+        open_config_relative_with_share(parent, root_name, true, share_mode).map_err(|error| {
+            // Only exclusive-lease contention is retryable; treating any other
+            // unsafe or unavailable root as Busy would conceal integrity faults.
+            if share_mode == 0 && is_sharing_violation(&error) {
+                MachineStoreError::new(
+                    MachineStoreErrorClass::Busy,
+                    "machine token update lease is busy",
+                )
+            } else {
+                integrity("committed machine-store root lease is unavailable or unsafe")
+            }
+        })?;
     let identity = validate_committed_root_handle(&root, policy)?;
     Ok((root, identity))
 }
@@ -2278,6 +2339,23 @@ fn apply_update_guard_with_fault_for_test(
         &guard.inner.root,
         guard.inner.root_identity,
         &guard.inner.policy,
+        next_nonce,
+        fault,
+    )
+}
+
+#[cfg(test)]
+fn maintain_update_guard_with_fault_for_test(
+    guard: &mut crate::MachineTokenUpdateGuard,
+    operation: token_update::MaintenanceOperation<'_>,
+    next_nonce: &mut dyn FnMut() -> Result<[u8; 16], MachineStoreError>,
+    fault: token_update::MaintenanceFault,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    token_update::maintain_on_held_root(
+        &guard.inner.root,
+        guard.inner.root_identity,
+        &guard.inner.policy,
+        operation,
         next_nonce,
         fault,
     )
