@@ -116,15 +116,34 @@ impl ExpectedState {
 
 struct JournalRecord {
     target: UpdateTarget,
+    directive: UpdateDirective,
     expected: ExpectedState,
     payload: Option<Zeroizing<Vec<u8>>>,
     intended_digest: Option<[u8; 32]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpdateDirective {
+    Preserve,
+    Replace,
+    Remove,
+}
+
+impl UpdateDirective {
+    fn id(self) -> u8 {
+        match self {
+            Self::Preserve => 0,
+            Self::Replace => 1,
+            Self::Remove => 2,
+        }
+    }
 }
 
 impl JournalRecord {
     fn preserve(target: UpdateTarget, expected: ExpectedState) -> Self {
         Self {
             target,
+            directive: UpdateDirective::Preserve,
             expected,
             payload: None,
             intended_digest: None,
@@ -135,14 +154,28 @@ impl JournalRecord {
         let digest = hash_bytes(&payload);
         Self {
             target,
+            directive: UpdateDirective::Replace,
             expected,
             payload: Some(Zeroizing::new(payload)),
             intended_digest: Some(digest),
         }
     }
 
-    fn is_replace(&self) -> bool {
-        self.payload.is_some()
+    fn remove(target: UpdateTarget, expected: ExpectedState) -> Self {
+        Self {
+            target,
+            directive: UpdateDirective::Remove,
+            expected,
+            payload: None,
+            intended_digest: None,
+        }
+    }
+
+    fn required_state(&self) -> TargetState {
+        match self.directive {
+            UpdateDirective::Preserve => TargetState::Old,
+            UpdateDirective::Replace | UpdateDirective::Remove => TargetState::Intended,
+        }
     }
 }
 
@@ -208,10 +241,20 @@ impl<'a> UpdateStore<'a> {
                 bytes: Zeroizing::new(Vec::new()),
             });
         };
-        let identity = verify_config_file(&file, &self.config_descriptor)?;
+        self.snapshot_held(target, &mut file)
+    }
+
+    fn snapshot_held(
+        &self,
+        target: UpdateTarget,
+        file: &mut File,
+    ) -> Result<TargetSnapshot, MachineStoreError> {
+        let identity = verify_config_file(file, &self.config_descriptor)?;
         let bound = target.payload_bound();
         let mut bytes = Zeroizing::new(Vec::new());
-        Read::by_ref(&mut file)
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| map_io("rewind machine token update target", error))?;
+        Read::by_ref(file)
             .take((bound + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|error| map_io("read machine token update target", error))?;
@@ -279,6 +322,10 @@ pub(super) enum ApplyFault {
     #[cfg(test)]
     AfterTarget(UpdateTarget),
     #[cfg(test)]
+    AfterTargetDelete(UpdateTarget),
+    #[cfg(test)]
+    TargetAbsenceProof(UpdateTarget),
+    #[cfg(test)]
     TargetWrite(UpdateTarget, ConfigWriteFault),
     #[cfg(test)]
     ReplaceBeforeTarget(UpdateTarget, Vec<u8>),
@@ -340,10 +387,17 @@ pub(super) fn prepare_update_on_held_root(
             MachineTokenUpdateValue::Replace(contents) => {
                 resolve_replacement(target, snapshot, contents)?
             }
+            MachineTokenUpdateValue::Remove => match snapshot.state {
+                ExpectedState::Absent => JournalRecord::preserve(target, snapshot.state),
+                ExpectedState::Present { .. } => JournalRecord::remove(target, snapshot.state),
+            },
         };
         records.push(record);
     }
-    if records.iter().all(|record| !record.is_replace()) {
+    if records
+        .iter()
+        .all(|record| record.directive == UpdateDirective::Preserve)
+    {
         store.revalidate()?;
         for (target, record) in UpdateTarget::ALL.into_iter().zip(&records) {
             verify_expected(&store.snapshot(target)?, record.expected)?;
@@ -465,10 +519,11 @@ pub(super) fn apply_update_on_held_root(
             write_test_race(&store, target, bytes, next_nonce)?;
         }
         let current = store.snapshot(target)?;
-        match classify_snapshot(&current, record) {
-            TargetState::Old if !record.is_replace() => {}
-            TargetState::Intended if record.is_replace() => {}
-            TargetState::Old => {
+        match (record.directive, classify_snapshot(&current, record)) {
+            (UpdateDirective::Preserve, TargetState::Old)
+            | (UpdateDirective::Replace, TargetState::Intended)
+            | (UpdateDirective::Remove, TargetState::Intended) => {}
+            (UpdateDirective::Replace, TargetState::Old) => {
                 let write_fault = match &fault {
                     #[cfg(test)]
                     ApplyFault::TargetWrite(fault_target, fault) if *fault_target == target => {
@@ -494,18 +549,16 @@ pub(super) fn apply_update_on_held_root(
                     ));
                 }
             }
-            TargetState::Neither | TargetState::Intended => {
+            (UpdateDirective::Remove, TargetState::Old) => {
+                remove_expected_target(&store, target, record, &fault)?;
+            }
+            _ => {
                 return Err(integrity(
                     "machine token update immediate revalidation rejected target",
                 ));
             }
         }
-        let required = if record.is_replace() {
-            TargetState::Intended
-        } else {
-            TargetState::Old
-        };
-        if classify_snapshot(&store.snapshot(target)?, record) != required {
+        if classify_snapshot(&store.snapshot(target)?, record) != record.required_state() {
             return Err(integrity(
                 "machine token update target changed after immediate verification",
             ));
@@ -522,12 +575,7 @@ pub(super) fn apply_update_on_held_root(
     journal.revalidate(&store)?;
     for (target, record) in UpdateTarget::ALL.into_iter().zip(&journal.journal.records) {
         let final_state = classify_snapshot(&store.snapshot(target)?, record);
-        let valid = if record.is_replace() {
-            final_state == TargetState::Intended
-        } else {
-            final_state == TargetState::Old
-        };
-        if !valid {
+        if final_state != record.required_state() {
             return Err(integrity(
                 "machine token update final state verification failed",
             ));
@@ -558,6 +606,80 @@ pub(super) fn apply_update_on_held_root(
         )),
         Ok(_) => Err(integrity(
             "machine token update journal was replaced during deletion",
+        )),
+    }
+}
+
+fn remove_expected_target(
+    store: &UpdateStore<'_>,
+    target: UpdateTarget,
+    record: &JournalRecord,
+    fault: &ApplyFault,
+) -> Result<(), MachineStoreError> {
+    if record.directive != UpdateDirective::Remove {
+        return Err(integrity(
+            "machine token update removal directive is inconsistent",
+        ));
+    }
+    let expected_identity = match record.expected {
+        ExpectedState::Present { identity, .. } => identity,
+        ExpectedState::Absent => {
+            return Err(integrity(
+                "machine token update removal expected state is absent",
+            ));
+        }
+    };
+
+    store.revalidate()?;
+    // The held root and update lease pin the root, not a child's identity or
+    // contents, so revalidate the DELETE-capable no-follow handle itself.
+    let Some(mut file) = open_fixed_file_optional(store.root, OsStr::new(target.leaf()), true)?
+    else {
+        return Err(integrity(
+            "machine token update removal target disappeared before deletion",
+        ));
+    };
+    if store.snapshot_held(target, &mut file)?.state != record.expected {
+        return Err(integrity(
+            "machine token update removal target is not the expected identity and digest",
+        ));
+    }
+    store.revalidate()?;
+    if verify_config_file(&file, &store.config_descriptor)? != expected_identity {
+        return Err(integrity(
+            "machine token update removal target identity changed before deletion",
+        ));
+    }
+
+    delete_held_handle(&file)?;
+    drop(file);
+    #[cfg(test)]
+    if matches!(fault, ApplyFault::AfterTargetDelete(fault_target) if *fault_target == target) {
+        return Err(integrity(
+            "injected failure after machine token update target deletion",
+        ));
+    }
+    #[cfg(test)]
+    if matches!(fault, ApplyFault::TargetAbsenceProof(fault_target) if *fault_target == target) {
+        return Err(integrity(
+            "injected failure proving machine token update target absence",
+        ));
+    }
+    #[cfg(not(test))]
+    let _ = fault;
+
+    // Successful disposition does not prove namespace absence, so drop the
+    // handle first and verify the fixed leaf again through the held root.
+    match open_relative_any(store.root, OsStr::new(target.leaf())) {
+        Err(error) if is_not_found(&error) => Ok(()),
+        Err(_) => Err(integrity(
+            "machine token update target absence cannot be proven after removal",
+        )),
+        Ok(entry) if inspect_handle(&entry)?.identity == expected_identity => Err(integrity(
+            "machine token update target remained after identity-bound removal",
+        )),
+        Ok(_) => Err(integrity(
+            "machine token update target was replaced during removal",
         )),
     }
 }
@@ -623,10 +745,13 @@ fn classify_snapshot(snapshot: &TargetSnapshot, record: &JournalRecord) -> Targe
     if snapshot.state == record.expected {
         return TargetState::Old;
     }
-    match (snapshot.state, record.intended_digest) {
-        (ExpectedState::Present { digest, .. }, Some(intended)) if digest == intended => {
+    match (record.directive, snapshot.state, record.intended_digest) {
+        (UpdateDirective::Replace, ExpectedState::Present { digest, .. }, Some(intended))
+            if digest == intended =>
+        {
             TargetState::Intended
         }
+        (UpdateDirective::Remove, ExpectedState::Absent, None) => TargetState::Intended,
         _ => TargetState::Neither,
     }
 }
@@ -835,7 +960,7 @@ fn encode_journal(journal: &Journal) -> Result<Zeroizing<Vec<u8>>, MachineStoreE
         }
         let at = JOURNAL_FIRST_RECORD_OFFSET + index * JOURNAL_RECORD_BYTES;
         encoded[at + RECORD_TARGET_OFFSET] = record.target.id();
-        encoded[at + RECORD_DIRECTIVE_OFFSET] = u8::from(record.is_replace());
+        encoded[at + RECORD_DIRECTIVE_OFFSET] = record.directive.id();
         match record.expected {
             ExpectedState::Absent => {}
             ExpectedState::Present { identity, digest } => {
@@ -848,29 +973,53 @@ fn encode_journal(journal: &Journal) -> Result<Zeroizing<Vec<u8>>, MachineStoreE
                     .copy_from_slice(&digest);
             }
         }
-        if let (Some(payload), Some(digest)) = (&record.payload, record.intended_digest) {
-            if (record.target == UpdateTarget::Secret && payload.is_empty())
-                || payload.len() > record.target.payload_bound()
-            {
-                return Err(integrity(
-                    "machine token update journal payload length is invalid",
-                ));
+        match record.directive {
+            UpdateDirective::Preserve => {
+                if record.payload.is_some() || record.intended_digest.is_some() {
+                    return Err(integrity(
+                        "machine token update preserve record carries replacement data",
+                    ));
+                }
             }
-            let end = payload_offset
-                .checked_add(payload.len())
-                .ok_or_else(|| integrity("machine token update journal payload overflow"))?;
-            encoded[at + RECORD_INTENDED_DIGEST_OFFSET..at + RECORD_INTENDED_DIGEST_OFFSET + 32]
-                .copy_from_slice(&digest);
-            encoded[at + RECORD_PAYLOAD_OFFSET_OFFSET..at + RECORD_PAYLOAD_OFFSET_OFFSET + 4]
-                .copy_from_slice(&(payload_offset as u32).to_le_bytes());
-            encoded[at + RECORD_PAYLOAD_LENGTH_OFFSET..at + RECORD_PAYLOAD_LENGTH_OFFSET + 4]
-                .copy_from_slice(&(payload.len() as u32).to_le_bytes());
-            encoded[payload_offset..end].copy_from_slice(payload);
-            payload_offset = end;
-        } else if record.payload.is_some() || record.intended_digest.is_some() {
-            return Err(integrity(
-                "machine token update journal replacement fields disagree",
-            ));
+            UpdateDirective::Remove => {
+                if record.expected == ExpectedState::Absent {
+                    return Err(integrity(
+                        "machine token update removal record expects an absent target",
+                    ));
+                }
+                if record.payload.is_some() || record.intended_digest.is_some() {
+                    return Err(integrity(
+                        "machine token update removal record carries replacement data",
+                    ));
+                }
+            }
+            UpdateDirective::Replace => {
+                let (Some(payload), Some(digest)) = (&record.payload, record.intended_digest)
+                else {
+                    return Err(integrity(
+                        "machine token update replacement fields disagree",
+                    ));
+                };
+                if (record.target == UpdateTarget::Secret && payload.is_empty())
+                    || payload.len() > record.target.payload_bound()
+                {
+                    return Err(integrity(
+                        "machine token update journal payload length is invalid",
+                    ));
+                }
+                let end = payload_offset
+                    .checked_add(payload.len())
+                    .ok_or_else(|| integrity("machine token update journal payload overflow"))?;
+                encoded
+                    [at + RECORD_INTENDED_DIGEST_OFFSET..at + RECORD_INTENDED_DIGEST_OFFSET + 32]
+                    .copy_from_slice(&digest);
+                encoded[at + RECORD_PAYLOAD_OFFSET_OFFSET..at + RECORD_PAYLOAD_OFFSET_OFFSET + 4]
+                    .copy_from_slice(&(payload_offset as u32).to_le_bytes());
+                encoded[at + RECORD_PAYLOAD_LENGTH_OFFSET..at + RECORD_PAYLOAD_LENGTH_OFFSET + 4]
+                    .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+                encoded[payload_offset..end].copy_from_slice(payload);
+                payload_offset = end;
+            }
         }
     }
     refresh_journal_checksum(&mut encoded);
@@ -1025,10 +1174,30 @@ fn decode_journal(encoded: &[u8]) -> Result<Journal, MachineStoreError> {
                 payload_cursor = end;
                 JournalRecord {
                     target,
+                    directive: UpdateDirective::Replace,
                     expected,
                     payload: Some(Zeroizing::new(payload.to_vec())),
                     intended_digest: Some(intended_digest),
                 }
+            }
+            2 => {
+                if expected == ExpectedState::Absent {
+                    return Err(integrity(
+                        "machine token update removal record expects an absent target",
+                    ));
+                }
+                if payload_offset != 0
+                    || payload_len != 0
+                    || encoded[at + RECORD_INTENDED_DIGEST_OFFSET
+                        ..at + RECORD_INTENDED_DIGEST_OFFSET + 32]
+                        .iter()
+                        .any(|byte| *byte != 0)
+                {
+                    return Err(integrity(
+                        "machine token update removal record carries replacement data",
+                    ));
+                }
+                JournalRecord::remove(target, expected)
             }
             _ => {
                 return Err(integrity(
@@ -1355,6 +1524,55 @@ mod tests {
         }
     }
 
+    fn remove_update(target: UpdateTarget) -> MachineTokenUpdate<'static> {
+        MachineTokenUpdate {
+            cluster_token: if target == UpdateTarget::Secret {
+                MachineTokenUpdateValue::Remove
+            } else {
+                MachineTokenUpdateValue::Preserve
+            },
+            daemon_config: if target == UpdateTarget::Daemon {
+                MachineTokenUpdateValue::Remove
+            } else {
+                MachineTokenUpdateValue::Preserve
+            },
+            worker_config: if target == UpdateTarget::Worker {
+                MachineTokenUpdateValue::Remove
+            } else {
+                MachineTokenUpdateValue::Preserve
+            },
+        }
+    }
+
+    fn remove_codec_bytes() -> Vec<u8> {
+        let records = vec![
+            JournalRecord::preserve(
+                UpdateTarget::Secret,
+                ExpectedState::Present {
+                    identity: FileIdentity {
+                        volume: 7,
+                        file_id: [7; 16],
+                    },
+                    digest: [0x31; 32],
+                },
+            ),
+            JournalRecord::preserve(UpdateTarget::Daemon, ExpectedState::Absent),
+            JournalRecord::preserve(UpdateTarget::Worker, ExpectedState::Absent),
+        ];
+        let mut encoded = encode_journal(&Journal {
+            identity: FileIdentity {
+                volume: 9,
+                file_id: [9; 16],
+            },
+            records,
+        })
+        .unwrap()
+        .to_vec();
+        encoded[JOURNAL_FIRST_RECORD_OFFSET + RECORD_DIRECTIVE_OFFSET] = 2;
+        refresh_journal_checksum_for_test(&mut encoded);
+        encoded
+    }
+
     fn assert_intended(fixture: &Fixture) {
         assert_eq!(
             unprotect_machine_secret(&fixture.bytes(UpdateTarget::Secret).unwrap())
@@ -1429,6 +1647,156 @@ mod tests {
                 decode_journal(&bytes).unwrap_err().classification(),
                 MachineStoreErrorClass::IntegrityViolation
             );
+        }
+    }
+
+    #[test]
+    fn machine_token_update_remove_secret_is_resumable_after_delete() {
+        let fixture = Fixture::committed();
+        let protected = protect_machine_secret(TOKEN).unwrap();
+        fixture.replace(UpdateTarget::Secret, &protected);
+        assert_eq!(
+            fixture
+                .prepare(remove_update(UpdateTarget::Secret), PrepareFault::None,)
+                .unwrap(),
+            MachineTokenUpdatePreparation::JournalReady
+        );
+
+        let journal = fs::read(fixture.journal_path()).unwrap();
+        assert!(!journal.windows(TOKEN.len()).any(|bytes| bytes == TOKEN));
+        assert!(
+            !journal
+                .windows(protected.len())
+                .any(|bytes| bytes == protected.as_slice())
+        );
+        assert!(
+            fixture
+                .apply(ApplyFault::AfterTargetDelete(UpdateTarget::Secret))
+                .is_err()
+        );
+        assert!(!fixture.path(UpdateTarget::Secret).exists());
+        assert!(fixture.journal_path().exists());
+
+        fixture.apply(ApplyFault::None).unwrap();
+        assert!(!fixture.path(UpdateTarget::Secret).exists());
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_update_remove_absent_normalizes_to_preserve() {
+        let fixture = Fixture::committed();
+        assert_eq!(
+            fixture
+                .prepare(remove_update(UpdateTarget::Secret), PrepareFault::None,)
+                .unwrap(),
+            MachineTokenUpdatePreparation::NoChange
+        );
+        assert!(!fixture.path(UpdateTarget::Secret).exists());
+        assert!(!fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_update_remove_replaced_identity_fails_closed() {
+        const OLD: &[u8] = b"remove-old-identity-sentinel";
+        const REPLACEMENT: &[u8] = b"remove-raced-identity-sentinel";
+
+        let fixture = Fixture::committed();
+        fixture.replace(UpdateTarget::Daemon, OLD);
+        let old_identity = inspect_path_nofollow_for_test(&fixture.path(UpdateTarget::Daemon))
+            .unwrap()
+            .identity;
+        fixture
+            .prepare(remove_update(UpdateTarget::Daemon), PrepareFault::None)
+            .unwrap();
+
+        assert!(
+            fixture
+                .apply(ApplyFault::ReplaceBeforeTarget(
+                    UpdateTarget::Daemon,
+                    REPLACEMENT.to_vec(),
+                ))
+                .is_err()
+        );
+        let replacement_identity =
+            inspect_path_nofollow_for_test(&fixture.path(UpdateTarget::Daemon))
+                .unwrap()
+                .identity;
+        assert_ne!(old_identity, replacement_identity);
+        assert_eq!(fixture.bytes(UpdateTarget::Daemon).unwrap(), REPLACEMENT);
+        assert!(fixture.journal_path().exists());
+    }
+
+    #[test]
+    fn machine_token_update_remove_codec_rejects_payload_or_digest() {
+        let valid_remove = remove_codec_bytes();
+        decode_journal(&valid_remove).unwrap();
+
+        let record = JOURNAL_FIRST_RECORD_OFFSET;
+        let mut malformed = Vec::new();
+
+        let mut absent = valid_remove.clone();
+        absent[record + RECORD_EXPECTED_OFFSET] = 0;
+        absent[record + RECORD_VOLUME_OFFSET..record + RECORD_INTENDED_DIGEST_OFFSET].fill(0);
+        refresh_journal_checksum_for_test(&mut absent);
+        malformed.push(absent);
+
+        let mut intended_digest = valid_remove.clone();
+        intended_digest[record + RECORD_INTENDED_DIGEST_OFFSET] = 1;
+        refresh_journal_checksum_for_test(&mut intended_digest);
+        malformed.push(intended_digest);
+
+        for field in [RECORD_PAYLOAD_OFFSET_OFFSET, RECORD_PAYLOAD_LENGTH_OFFSET] {
+            let mut bytes = valid_remove.clone();
+            bytes[record + field..record + field + 4].copy_from_slice(&1u32.to_le_bytes());
+            refresh_journal_checksum_for_test(&mut bytes);
+            malformed.push(bytes);
+        }
+
+        let mut payload = valid_remove;
+        payload.push(0x5a);
+        let total = payload.len() as u32;
+        payload[JOURNAL_TOTAL_LENGTH_OFFSET..JOURNAL_TOTAL_LENGTH_OFFSET + 4]
+            .copy_from_slice(&total.to_le_bytes());
+        payload[record + RECORD_PAYLOAD_OFFSET_OFFSET..record + RECORD_PAYLOAD_OFFSET_OFFSET + 4]
+            .copy_from_slice(&(JOURNAL_PAYLOAD_OFFSET as u32).to_le_bytes());
+        payload[record + RECORD_PAYLOAD_LENGTH_OFFSET..record + RECORD_PAYLOAD_LENGTH_OFFSET + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+        refresh_journal_checksum_for_test(&mut payload);
+        malformed.push(payload);
+
+        for bytes in malformed {
+            assert_eq!(
+                decode_journal(&bytes).unwrap_err().classification(),
+                MachineStoreErrorClass::IntegrityViolation
+            );
+        }
+    }
+
+    #[test]
+    fn machine_token_update_remove_fault_keeps_journal_until_absence_proven() {
+        const OLD: &[u8] = b"remove-fault-old-sentinel";
+        const PRESERVED: &[u8] = b"remove-fault-preserved-sentinel";
+
+        for fault in [
+            ApplyFault::AfterTargetDelete(UpdateTarget::Daemon),
+            ApplyFault::TargetAbsenceProof(UpdateTarget::Daemon),
+        ] {
+            let fixture = Fixture::committed();
+            fixture.replace(UpdateTarget::Daemon, OLD);
+            fixture.replace(UpdateTarget::Worker, PRESERVED);
+            fixture
+                .prepare(remove_update(UpdateTarget::Daemon), PrepareFault::None)
+                .unwrap();
+
+            assert!(fixture.apply(fault).is_err());
+            assert!(!fixture.path(UpdateTarget::Daemon).exists());
+            assert_eq!(fixture.bytes(UpdateTarget::Worker).unwrap(), PRESERVED);
+            assert!(fixture.journal_path().exists());
+
+            fixture.apply(ApplyFault::None).unwrap();
+            assert!(!fixture.path(UpdateTarget::Daemon).exists());
+            assert_eq!(fixture.bytes(UpdateTarget::Worker).unwrap(), PRESERVED);
+            assert!(!fixture.journal_path().exists());
         }
     }
 

@@ -157,6 +157,8 @@ pub enum MachineTokenUpdateValue<'a> {
     Preserve,
     /// Atomically publish the supplied bytes for the fixed target.
     Replace(&'a [u8]),
+    /// Remove the fixed target when present.
+    Remove,
 }
 
 /// The complete fixed machine cluster-token transaction.
