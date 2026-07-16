@@ -101,6 +101,8 @@ $workerExe = Join-Path $repo 'target\debug\sembazuru-worker.exe'
 $WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
 if (Test-Path $WorkRoot) { Remove-Item -Recurse -Force $WorkRoot }
 New-Item -ItemType Directory -Force $WorkRoot | Out-Null
+$daemonConfig = Join-Path $WorkRoot 'daemon-override.toml'
+$workerConfig = Join-Path $WorkRoot 'worker-override.toml'
 
 # A self-contained TU: only a project header, no system includes (so every read
 # is under the VFS root and the gate needs no SDK on the worker side).
@@ -110,6 +112,11 @@ Set-Content (Join-Path $proj 'shared.h') "#define SHARED_VALUE 42`n" -Encoding a
 # The #pragma message prints a marker during compilation; we assert it reaches the
 # launcher's console, proving remote stdout/stderr mirroring end to end (M6.1).
 $diag = 'SBZ-REMOTE-DIAG-MARKER'
+$remoteSuccessNote = 'sembazuru: remote'
+function Test-RemoteSuccessNote([string]$note) {
+    return (($note -split '\r?\n') -contains $remoteSuccessNote)
+}
+if (Test-RemoteSuccessNote $diag) { throw 'compiler diagnostic must not count as remote success' }
 Set-Content (Join-Path $proj 'a.cpp') "#include `"shared.h`"`n#pragma message(`"$diag`")`nint f(){ return SHARED_VALUE; }`n" -Encoding ascii
 
 $scratchRoot = Join-Path $WorkRoot 'wscratch'
@@ -166,24 +173,40 @@ $coord = '127.0.0.1:50090'; $fs = '127.0.0.1:50092'; $worker = '127.0.0.1:50061'
 $daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 
 function Start-Daemon {
-    $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
-    $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
-    if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
-    $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
-    Remove-Item Env:\SEMBAZURU_COORD, Env:\SEMBAZURU_INTAKE, Env:\SEMBAZURU_FILESERVER, `
-        Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
-        -ErrorAction SilentlyContinue
+    $hadConfig = Test-Path Env:\SEMBAZURU_CONFIG
+    $oldConfig = $env:SEMBAZURU_CONFIG
+    try {
+        $env:SEMBAZURU_CONFIG = $daemonConfig
+        $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
+        $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
+        if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
+        $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
+    } finally {
+        Remove-Item Env:\SEMBAZURU_COORD, Env:\SEMBAZURU_INTAKE, Env:\SEMBAZURU_FILESERVER, `
+            Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+            -ErrorAction SilentlyContinue
+        if ($hadConfig) { $env:SEMBAZURU_CONFIG = $oldConfig }
+        else { Remove-Item Env:\SEMBAZURU_CONFIG -ErrorAction SilentlyContinue }
+    }
     $p
 }
 function Start-Worker {
-    $env:SEMBAZURU_AGENT = "http://$coord"
-    $env:SEMBAZURU_LAUNCHER = $launcherExe; $env:SEMBAZURU_DLL = $dll
-    $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot; $env:SEMBAZURU_CAS_ROOT = $casRoot
-    if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
-    $p = Start-Process -FilePath $workerExe -ArgumentList @($worker) -PassThru -WindowStyle Hidden
-    Remove-Item Env:\SEMBAZURU_AGENT, Env:\SEMBAZURU_LAUNCHER, Env:\SEMBAZURU_DLL, `
-        Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
-        -ErrorAction SilentlyContinue
+    $hadConfig = Test-Path Env:\SEMBAZURU_WORKER_CONFIG
+    $oldConfig = $env:SEMBAZURU_WORKER_CONFIG
+    try {
+        $env:SEMBAZURU_WORKER_CONFIG = $workerConfig
+        $env:SEMBAZURU_AGENT = "http://$coord"
+        $env:SEMBAZURU_LAUNCHER = $launcherExe; $env:SEMBAZURU_DLL = $dll
+        $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot; $env:SEMBAZURU_CAS_ROOT = $casRoot
+        if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
+        $p = Start-Process -FilePath $workerExe -ArgumentList @($worker) -PassThru -WindowStyle Hidden
+    } finally {
+        Remove-Item Env:\SEMBAZURU_AGENT, Env:\SEMBAZURU_LAUNCHER, Env:\SEMBAZURU_DLL, `
+            Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+            -ErrorAction SilentlyContinue
+        if ($hadConfig) { $env:SEMBAZURU_WORKER_CONFIG = $oldConfig }
+        else { Remove-Item Env:\SEMBAZURU_WORKER_CONFIG -ErrorAction SilentlyContinue }
+    }
     $p
 }
 # Run the launcher as the compiler wrapper; returns @{ exit; note } (note=stderr).
@@ -205,14 +228,16 @@ try {
     # Wait for the worker to register; retry the build until it runs remotely
     # (before registration completes, dispatch would local-fallback).
     $r = $null
+    $remoteSucceeded = $false
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 400
         $r = Invoke-Launcher
-        if ($r.note -match 'remote') { break }
+        $remoteSucceeded = Test-RemoteSuccessNote $r.note
+        if ($remoteSucceeded) { break }
     }
     Write-Host "BUILD1 exit=$($r.exit) note=$($r.note.Trim())"
     if ($r.exit -ne 0) { $failures += "distributed build did not exit 0 (exit=$($r.exit))" }
-    if ($r.note -notmatch 'remote') { $failures += 'build 1 never ran remotely (worker did not come up?)' }
+    if (-not $remoteSucceeded) { $failures += 'build 1 never ran remotely (worker did not come up?)' }
     if (-not (Test-Path $aObj)) { $failures += 'distributed build produced no .obj' }
     # Remote stdout/stderr mirroring: the compiler's #pragma message must reach
     # the launcher's console (it ran on the worker, not here).
