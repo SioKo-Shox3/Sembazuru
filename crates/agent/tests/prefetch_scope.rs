@@ -349,3 +349,136 @@ fn production_prefetch_only_exposes_scope_content_inputs() {
         );
     }
 }
+
+#[test]
+fn non_deterministic_submission_bypasses_cache_and_prefetch() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dirs = runtime.block_on(async {
+        let root = TempDir::new("non-deterministic-root");
+        let cache_dir = TempDir::new("non-deterministic-cache");
+        let scratch = TempDir::new("non-deterministic-scratch");
+        let input = root.write("src/in.h", b"stable-input");
+
+        let cache = Arc::new(AgentCache::open(&cache_dir.path).unwrap());
+        let command = command(&root.path);
+        let weak = cache.weak_key(&command.argv, &[], &command.cwd);
+        let manifest = InputManifest {
+            inputs: vec![InputEntry {
+                logical: "src\\in.h".into(),
+                absolute: input.to_string_lossy().into_owned(),
+                kind: InputKind::Content,
+            }],
+            cmds: vec![],
+            cacheable: true,
+        };
+        cache
+            .record(&weak, &manifest, &root.path, &[], 0, &[], &[])
+            .unwrap();
+        assert!(
+            matches!(
+                cache.resolve(&weak, &root.path),
+                Ok(sembazuru_agent::action_cache::CacheLookup::Hit { .. })
+            ),
+            "test precondition: the matching cache entry resolves"
+        );
+
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (release_tx, release_rx) = oneshot::channel();
+        let (worker_endpoint, worker_task) = start_worker(request_tx, release_rx).await;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register(
+            "non-deterministic-worker".into(),
+            worker_endpoint,
+            Capabilities {
+                cpu_count: 1,
+                worker_version: env!("CARGO_PKG_VERSION").into(),
+                ..Default::default()
+            },
+        );
+
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        let fileserver_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fileserver_addr = fileserver_listener.local_addr().unwrap();
+        let fileserver_registry = Arc::clone(&registry);
+        let fileserver_task = tokio::spawn(async move {
+            serve_files_with_stats_token(
+                fileserver_listener,
+                Arc::new(ServerStats::default()),
+                None,
+                fileserver_registry,
+                false,
+            )
+            .await
+            .unwrap();
+        });
+
+        let intake = IntakeService::with_vfs(
+            Scheduler::new(table),
+            IntakeVfsContext {
+                agent_fileserver: fileserver_addr.to_string(),
+                cache: Some(Arc::clone(&cache)),
+                scratch_root: scratch.path.clone(),
+                registry,
+            },
+        );
+        let metrics = intake.metrics();
+        let intake_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let intake_addr = intake_listener.local_addr().unwrap();
+        let intake_task = tokio::spawn(async move {
+            serve_intake_service(intake_listener, intake).await.unwrap();
+        });
+
+        let submit = tokio::spawn(submit_to_loopback_fixture(
+            format!("http://{intake_addr}"),
+            command,
+            SubmitOptions {
+                input_root: root.path.to_string_lossy().into_owned(),
+                non_deterministic: true,
+                ..Default::default()
+            },
+        ));
+        let request = tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .expect("non-deterministic action reaches the worker instead of a cache hit")
+            .expect("request channel remains open");
+
+        assert!(
+            request.predicted_paths.is_empty(),
+            "non-deterministic actions must not inherit cached predictions"
+        );
+        assert_eq!(metrics.cache_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.cache_misses.load(Ordering::Relaxed), 0);
+
+        release_tx.send(()).unwrap();
+        let (exit_code, _) = submit.await.unwrap().unwrap();
+        assert_eq!(exit_code, 0);
+        assert!(
+            matches!(
+                cache.resolve(&weak, &root.path),
+                Ok(sembazuru_agent::action_cache::CacheLookup::Hit { .. })
+            ),
+            "the pre-existing cache entry remains usable"
+        );
+
+        for task in [intake_task, worker_task, fileserver_task] {
+            task.abort();
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("server task stops within timeout");
+            assert!(
+                result.unwrap_err().is_cancelled(),
+                "server task was not cancelled"
+            );
+        }
+
+        [root, cache_dir, scratch]
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+
+    for dir in dirs {
+        dir.cleanup();
+    }
+}

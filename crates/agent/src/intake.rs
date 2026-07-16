@@ -610,8 +610,8 @@ async fn run_submission(
 
     // The weak key keys resolve, predicted_paths, and record. Computed off the
     // async runtime: weak_key_and_tool hashes the toolchain binary from disk.
-    let (weak, agent_tool_identity) = match &ctx.cache {
-        Some(cache) => {
+    let (weak, agent_tool_identity) = match (&ctx.cache, non_deterministic) {
+        (Some(cache), false) => {
             let cache = cache.clone();
             let argv = command.argv.clone();
             let cwd = command.cwd.clone();
@@ -628,7 +628,7 @@ async fn run_submission(
                 Err(_) => (None, None),
             }
         }
-        None => (None, None),
+        _ => (None, None),
     };
 
     // Cache resolve: a hit republishes the outputs and skips the worker entirely.
