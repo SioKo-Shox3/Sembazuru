@@ -663,6 +663,84 @@ function Assert-ServicesRunning {
     }
 }
 
+function Stop-ServicesForOfflineTokenMaintenance {
+    foreach ($name in @('SembazuruWorker', 'SembazuruDaemon')) {
+        $service = Get-Service -Name $name -ErrorAction Stop
+        if ($service.Status -ne 'Stopped') {
+            Stop-Service -Name $name -ErrorAction Stop
+            $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+            $service.Refresh()
+        }
+        if ($service.Status -ne 'Stopped') {
+            throw "$name did not reach Stopped for offline token maintenance: $($service.Status)"
+        }
+        Write-Host "SERVICE STOPPED: $name for offline token maintenance"
+    }
+}
+
+function Initialize-TestOnlyClusterToken {
+    param([string]$StoreCtl)
+
+    Stop-ServicesForOfflineTokenMaintenance
+    $token = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
+    if ($token.Length -ne 64 -or $token -notmatch '\A[0-9a-f]{64}\z') {
+        throw 'test-only cluster token generation did not produce the required opaque shape'
+    }
+    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) (
+        "sembazuru-m9-rotate-token-$([Guid]::NewGuid().ToString('N')).err")
+    try {
+        $stdout = @(& { $token | & $StoreCtl rotate-token 2> $stderrPath })
+        $exitCode = $LASTEXITCODE
+        [string]$stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+            [string](Get-Content -LiteralPath $stderrPath -Raw -ErrorAction Stop)
+        } else { '' }
+        if ($exitCode -ne 0 -or $stdout.Count -ne 1 -or [string]$stdout[0] -cne 'token-rotated' -or
+            $stderr -cne '') {
+            throw "test-only cluster token setup failed: exit=$exitCode stdoutCount=$($stdout.Count) stderrLength=$($stderr.Length)"
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $stderrPath) {
+            Remove-Item -LiteralPath $stderrPath -Force -ErrorAction Stop
+        }
+    }
+
+    foreach ($name in @('SembazuruDaemon', 'SembazuruWorker')) {
+        Start-Service -Name $name -ErrorAction Stop
+    }
+    Assert-ServicesRunning
+    Wait-ForWorkerExecutionEndpoint
+    Write-Host 'TEST-ONLY CLUSTER TOKEN PASS: offline DPAPI token rotation completed without exposing token material.'
+}
+
+function Assert-ClusterTokenSecret {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "cluster token DPAPI blob is missing: $Path"
+    }
+    Assert-ExactAclRules -Path $Path -ExpectedProtected $true -ExpectedInherited $false `
+        -WorkerMask 0x1200a9 -DaemonMask 0x1200a9 -RequireContainerInheritance $false `
+        -ExpectedOwnerSid 'S-1-5-18' -ExpectedGroupSid 'S-1-5-18'
+    Write-Host 'CLUSTER TOKEN ACL PASS: cluster-token.dpapi is SYSTEM-owned with the protected machine-secret DACL.'
+}
+
+function Assert-OfflineTokenSetupSource {
+    param([string]$Path)
+
+    $source = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ($source -notmatch '\$token\s*\|\s*&\s*\$StoreCtl\s+rotate-token') {
+        throw 'offline token setup must provide the token only through rotate-token stdin'
+    }
+    $unsafeTokenLines = @($source -split "`r?`n" | Where-Object {
+        $_ -match '(?<!\\)\$token\b' -and $_ -match '(?:Write-(?:Host|Output|Warning|Error)|throw|ArgumentList|Set-Content|Add-Content|Out-File)'
+    })
+    if ($unsafeTokenLines.Count -ne 0) {
+        throw 'offline token setup source exposes token material through output, argv, or a plain-text file sink'
+    }
+    Write-Host 'STATIC TOKEN SETUP PASS: rotate-token uses stdin and the script has no token output, argv, or plain-text sink.'
+}
+
 function Get-ServiceStatusSummary {
     $summaries = foreach ($name in @('SembazuruDaemon', 'SembazuruWorker')) {
         try {
@@ -1140,6 +1218,7 @@ function Wait-ForUninstallCleanup {
 }
 
 Assert-StaticLifecycleSource -Path $Source
+Assert-OfflineTokenSetupSource -Path $PSCommandPath
 $staticChildScript = New-StandardUserProbeScript `
     -DataRoot 'C:\ProgramData\Sembazuru' `
     -ScratchRoot 'C:\ProgramData\Sembazuru\scratch' `
@@ -1168,6 +1247,7 @@ $casRoot = Join-Path $dataRoot 'cas'
 $provisionMarker = Join-Path $dataRoot '.provisioning-v1'
 $daemonConfig = Join-Path $dataRoot 'daemon.toml'
 $workerConfig = Join-Path $dataRoot 'worker.toml'
+$clusterToken = Join-Path $dataRoot 'cluster-token.dpapi'
 $installRoot = Join-Path $programFiles 'Sembazuru'
 $productKey = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Sembazuru'
 
@@ -1234,6 +1314,9 @@ try {
         Remove-Item -LiteralPath $probeDir -Recurse -Force
     }
     Write-Host 'CHILD ACL PASS: scratch/cas file+directory probes inherit worker Modify and no other SID.'
+
+    Initialize-TestOnlyClusterToken -StoreCtl $StoreCtl
+    Assert-ClusterTokenSecret -Path $clusterToken
 
     $gateSid = New-StandardGateUser -Name $gateUser -Password $gatePassword
     New-StandardProbeRoot -Path $callerProbeRoot -UserSid $gateSid
