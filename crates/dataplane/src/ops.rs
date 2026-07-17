@@ -63,6 +63,13 @@ const METADATA_ENTRY_BYTES: usize = 41;
 const METADATA_PRESENT: u8 = 0;
 const METADATA_FILESYSTEM_ERROR: u8 = 1;
 
+/// Returns whether a Win32 error is a stable metadata result that can cross
+/// the protocol boundary. Other errors are infrastructure failures and must
+/// cause local fallback instead of being cached as a filesystem answer.
+pub const fn is_metadata_filesystem_error(raw_error: u32) -> bool {
+    matches!(raw_error, 2 | 3 | 5 | 123 | 161 | 206 | 267)
+}
+
 impl MetadataRequest {
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         if self.paths.len() > MAX_METADATA_PATHS {
@@ -131,6 +138,9 @@ impl MetadataResponse {
                     access_time,
                     write_time,
                 } => {
+                    if *attributes == u32::MAX {
+                        return Err(Error::InvalidValue);
+                    }
                     w.u8(METADATA_PRESENT);
                     w.u32(*attributes);
                     w.u64(*size);
@@ -140,7 +150,7 @@ impl MetadataResponse {
                     w.u32(0);
                 }
                 MetadataEntry::FilesystemError { raw_error } => {
-                    if *raw_error == 0 {
+                    if !is_metadata_filesystem_error(*raw_error) {
                         return Err(Error::InvalidValue);
                     }
                     w.u8(METADATA_FILESYSTEM_ERROR);
@@ -183,20 +193,22 @@ impl MetadataResponse {
             let write_time = r.u64()?;
             let raw_error = r.u32()?;
             match tag {
-                METADATA_PRESENT if raw_error == 0 => entries.push(MetadataEntry::Present {
-                    attributes,
-                    size,
-                    creation_time,
-                    access_time,
-                    write_time,
-                }),
+                METADATA_PRESENT if attributes != u32::MAX && raw_error == 0 => {
+                    entries.push(MetadataEntry::Present {
+                        attributes,
+                        size,
+                        creation_time,
+                        access_time,
+                        write_time,
+                    });
+                }
                 METADATA_FILESYSTEM_ERROR
                     if attributes == 0
                         && size == 0
                         && creation_time == 0
                         && access_time == 0
                         && write_time == 0
-                        && raw_error != 0 =>
+                        && is_metadata_filesystem_error(raw_error) =>
                 {
                     entries.push(MetadataEntry::FilesystemError { raw_error });
                 }
@@ -917,6 +929,68 @@ mod tests {
             MetadataResponse::decode(&unknown_tag),
             Err(Error::InvalidValue)
         );
+    }
+
+    #[test]
+    fn metadata_v1_filesystem_error_allowlist_is_exact() {
+        for raw_error in [2, 3, 5, 123, 161, 206, 267] {
+            assert!(is_metadata_filesystem_error(raw_error));
+            let response = MetadataResponse {
+                entries: vec![MetadataEntry::FilesystemError { raw_error }],
+            };
+            let encoded = response.encode().unwrap();
+            assert_eq!(MetadataResponse::decode(&encoded).unwrap(), response);
+        }
+
+        for raw_error in [0, 4, 8, 21, 32] {
+            assert!(!is_metadata_filesystem_error(raw_error));
+            assert_eq!(
+                MetadataResponse {
+                    entries: vec![MetadataEntry::FilesystemError { raw_error }],
+                }
+                .encode(),
+                Err(Error::InvalidValue)
+            );
+
+            let mut encoded = MetadataResponse {
+                entries: vec![MetadataEntry::FilesystemError { raw_error: 2 }],
+            }
+            .encode()
+            .unwrap();
+            encoded[41..45].copy_from_slice(&raw_error.to_le_bytes());
+            assert_eq!(MetadataResponse::decode(&encoded), Err(Error::InvalidValue));
+        }
+    }
+
+    #[test]
+    fn metadata_v1_rejects_invalid_file_attributes_sentinel() {
+        assert_eq!(
+            MetadataResponse {
+                entries: vec![MetadataEntry::Present {
+                    attributes: u32::MAX,
+                    size: 1,
+                    creation_time: 2,
+                    access_time: 3,
+                    write_time: 4,
+                }],
+            }
+            .encode(),
+            Err(Error::InvalidValue)
+        );
+
+        let mut encoded = MetadataResponse {
+            entries: vec![MetadataEntry::Present {
+                attributes: 0x20,
+                size: 1,
+                creation_time: 2,
+                access_time: 3,
+                write_time: 4,
+            }],
+        }
+        .encode()
+        .unwrap();
+        encoded[5..9].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(MetadataResponse::decode(&encoded), Err(Error::InvalidValue));
     }
 
     #[test]

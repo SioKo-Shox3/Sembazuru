@@ -64,7 +64,7 @@ use sembazuru_dataplane::ops::{
     DirEntry, DirListRequest, DirListResponse, HasRequest, HasResponse, HelloRequest,
     HelloResponse, MAX_DIRLIST_ENTRIES, MetadataEntry, MetadataRequest, MetadataResponse,
     OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse, StatEntry, StatRequest,
-    StatResponse, WriteBackRequest, WriteBackResponse,
+    StatResponse, WriteBackRequest, WriteBackResponse, is_metadata_filesystem_error,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -1169,7 +1169,7 @@ fn metadata_error(error: io::Error) -> io::Result<MetadataEntry> {
     let raw_error = error
         .raw_os_error()
         .and_then(|code| u32::try_from(code).ok())
-        .filter(|code| *code != 0)
+        .filter(|code| is_metadata_filesystem_error(*code))
         .ok_or(error)?;
     Ok(MetadataEntry::FilesystemError { raw_error })
 }
@@ -2165,6 +2165,31 @@ mod tests {
             response.entries[1],
             MetadataEntry::FilesystemError { raw_error: 2 },
             "the filesystem error is carried without an OpenRead/CAS path"
+        );
+    }
+
+    #[test]
+    fn metadata_error_only_translates_portable_filesystem_errors() {
+        for raw_error in [2, 5] {
+            assert_eq!(
+                metadata_error(io::Error::from_raw_os_error(raw_error)).unwrap(),
+                MetadataEntry::FilesystemError {
+                    raw_error: raw_error as u32
+                }
+            );
+        }
+
+        for raw_error in [4, 8, 21, 32] {
+            assert!(metadata_error(io::Error::from_raw_os_error(raw_error)).is_err());
+        }
+        assert!(metadata_error(io::Error::other("infrastructure failure")).is_err());
+        assert_eq!(
+            contained_metadata_error(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "portable containment denial",
+            ))
+            .unwrap(),
+            MetadataEntry::FilesystemError { raw_error: 2 }
         );
     }
 

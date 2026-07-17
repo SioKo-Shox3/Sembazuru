@@ -679,6 +679,60 @@ enum class VfsMetadataExchange {
     Transport,
 };
 
+constexpr bool IsMetadataFilesystemError(DWORD error) {
+    switch (error) {
+        case 2:    // ERROR_FILE_NOT_FOUND
+        case 3:    // ERROR_PATH_NOT_FOUND
+        case 5:    // ERROR_ACCESS_DENIED
+        case 123:  // ERROR_INVALID_NAME
+        case 161:  // ERROR_BAD_PATHNAME
+        case 206:  // ERROR_FILENAME_EXCED_RANGE
+        case 267:  // ERROR_DIRECTORY
+            return true;
+        default:
+            return false;
+    }
+}
+
+constexpr VfsMetadataExchange ClassifyMetadataEntry(
+    BYTE tag, DWORD attributes, ULONGLONG size, ULONGLONG creation,
+    ULONGLONG access, ULONGLONG write, DWORD error) {
+    if (tag == 0 && attributes != INVALID_FILE_ATTRIBUTES &&
+        error == ERROR_SUCCESS) {
+        return VfsMetadataExchange::Present;
+    }
+    if (tag == 1 && attributes == 0 && size == 0 && creation == 0 &&
+        access == 0 && write == 0 && IsMetadataFilesystemError(error)) {
+        return VfsMetadataExchange::FilesystemError;
+    }
+    return VfsMetadataExchange::Transport;
+}
+
+static_assert(ClassifyMetadataEntry(0, FILE_ATTRIBUTE_NORMAL, 1, 2, 3, 4, 0) ==
+              VfsMetadataExchange::Present);
+static_assert(ClassifyMetadataEntry(0, INVALID_FILE_ATTRIBUTES, 1, 2, 3, 4,
+                                    0) == VfsMetadataExchange::Transport);
+static_assert(ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 2) ==
+                  VfsMetadataExchange::FilesystemError &&
+              ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 3) ==
+                  VfsMetadataExchange::FilesystemError &&
+              ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 5) ==
+                  VfsMetadataExchange::FilesystemError &&
+              ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 123) ==
+                  VfsMetadataExchange::FilesystemError &&
+              ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 161) ==
+                  VfsMetadataExchange::FilesystemError &&
+              ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 206) ==
+                  VfsMetadataExchange::FilesystemError &&
+              ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 267) ==
+                  VfsMetadataExchange::FilesystemError);
+static_assert(ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 21) ==
+                  VfsMetadataExchange::Transport &&
+              ClassifyMetadataEntry(1, 0, 0, 0, 0, 0, 32) ==
+                  VfsMetadataExchange::Transport);
+static_assert(ClassifyMetadataEntry(1, FILE_ATTRIBUTE_NORMAL, 0, 0, 0, 0, 2) ==
+              VfsMetadataExchange::Transport);
+
 DWORD ReadLe32(const BYTE* p) {
     return static_cast<DWORD>(p[0]) | (static_cast<DWORD>(p[1]) << 8) |
            (static_cast<DWORD>(p[2]) << 16) | (static_cast<DWORD>(p[3]) << 24);
@@ -737,20 +791,21 @@ VfsMetadataExchange VfsMetadataOnce(HANDLE pipe, const char* path,
         const ULONGLONG access = ReadLe64(entry + 21);
         const ULONGLONG write = ReadLe64(entry + 29);
         const DWORD error = ReadLe32(entry + 37);
-        if (tag == 0 && error == ERROR_SUCCESS) {
+        const VfsMetadataExchange classification = ClassifyMetadataEntry(
+            tag, attributes, size, creation, access, write, error);
+        if (classification == VfsMetadataExchange::Present) {
             out->attributes = attributes;
             out->size = size;
             FileTimeFromU64(creation, &out->creation);
             FileTimeFromU64(access, &out->access);
             FileTimeFromU64(write, &out->write);
-            return VfsMetadataExchange::Present;
+            return classification;
         }
-        if (tag == 1 && attributes == 0 && size == 0 && creation == 0 &&
-            access == 0 && write == 0 && error != ERROR_SUCCESS) {
+        if (classification == VfsMetadataExchange::FilesystemError) {
             out->error = error;
-            return VfsMetadataExchange::FilesystemError;
+            return classification;
         }
-        return VfsMetadataExchange::Transport;
+        return classification;
     }
     return IsCompleteLegacyResponse(response, responseLen)
                ? VfsMetadataExchange::Legacy
