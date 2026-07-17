@@ -81,36 +81,29 @@ Set-Content -LiteralPath $restrictionCanaryPath -Value $restrictionCanaryText -E
 $currentRunnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
 if ($null -eq $currentRunnerSid) { throw 'could not determine the current runner SID for restriction canary' }
 $canaryReadRights = [System.Security.AccessControl.FileSystemRights]::Read
+$expectedCanaryRights = $canaryReadRights -bor [System.Security.AccessControl.FileSystemRights]::Synchronize
+$canaryAcl = [System.Security.AccessControl.FileSecurity]::new()
+$canaryAcl.SetSecurityDescriptorSddlForm(
+    "D:P(A;;FR;;;$($currentRunnerSid.Value))", [System.Security.AccessControl.AccessControlSections]::Access)
 $fileSystemAclExtensions = 'System.IO.FileSystemAclExtensions' -as [type]
 if ($fileSystemAclExtensions) {
     $canaryInfo = [System.IO.FileInfo]::new($restrictionCanaryPath)
-    $canaryAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl($canaryInfo)
-} else {
-    $canaryAcl = [System.IO.File]::GetAccessControl($restrictionCanaryPath)
-}
-$canaryAcl.SetAccessRuleProtection($true, $false)
-foreach ($accessRule in @($canaryAcl.Access)) {
-    [void]$canaryAcl.RemoveAccessRuleAll($accessRule)
-}
-$canaryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
-    $currentRunnerSid, $canaryReadRights, [System.Security.AccessControl.AccessControlType]::Allow))
-if ($fileSystemAclExtensions) {
     [System.IO.FileSystemAclExtensions]::SetAccessControl($canaryInfo, $canaryAcl)
     $canaryAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl($canaryInfo)
 } else {
     [System.IO.File]::SetAccessControl($restrictionCanaryPath, $canaryAcl)
     $canaryAcl = [System.IO.File]::GetAccessControl($restrictionCanaryPath)
 }
-$canaryRules = @($canaryAcl.Access)
+$canaryRules = @($canaryAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
 if (-not $canaryAcl.AreAccessRulesProtected -or $canaryRules.Count -ne 1) {
     throw 'restriction canary DACL is not protected and limited to one explicit rule'
 }
-$canaryRuleSid = $canaryRules[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
-$expectedCanaryRights = $canaryReadRights -bor [System.Security.AccessControl.FileSystemRights]::Synchronize
-if ($canaryRuleSid.Value -ne $currentRunnerSid.Value -or
+$canaryRule = $canaryRules[0]
+if ($canaryRule.IsInherited -or
+    $canaryRule.IdentityReference.Value -ne $currentRunnerSid.Value -or
     $canaryRules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
     $canaryRules[0].FileSystemRights -ne $expectedCanaryRights) {
-    throw "restriction canary DACL unexpectedly grants access: $($canaryRules[0].IdentityReference) $($canaryRules[0].AccessControlType) $($canaryRules[0].FileSystemRights)"
+    throw "restriction canary DACL unexpectedly grants access: $($canaryRule.IdentityReference) $($canaryRule.AccessControlType) $($canaryRule.FileSystemRights) inherited=$($canaryRule.IsInherited)"
 }
 
 # Probe: verify process-visible cwd/path APIs still expose the logical cwd, then
@@ -137,6 +130,7 @@ if ($canaryRuleSid.Value -ne $currentRunnerSid.Value -or
 $probeSrc = @'
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <stdio.h>
 #include <string.h>
 #include <wchar.h>
 static int CheckRestrictionCanary() {
@@ -151,7 +145,10 @@ static int CheckRestrictionCanary() {
         CloseHandle(canary);
         return 9;
     }
-    return GetLastError() == ERROR_ACCESS_DENIED ? 0 : 12;
+    DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED) return 0;
+    fprintf(stderr, "restriction canary unexpected Win32 error=%lu\\n", error);
+    return 12;
 }
 static int WideArgToAcp(const wchar_t* src, char* dst, int cap) {
     int n = WideCharToMultiByte(CP_ACP, 0, src, -1, dst, cap, nullptr, nullptr);
