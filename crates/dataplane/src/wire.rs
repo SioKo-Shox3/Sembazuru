@@ -25,6 +25,8 @@ pub enum Error {
     UnknownOp(u8),
     /// Trailing bytes remained after a payload was fully decoded.
     TrailingBytes,
+    /// A fixed-width payload used a reserved or otherwise non-canonical value.
+    InvalidValue,
 }
 
 impl fmt::Display for Error {
@@ -35,6 +37,7 @@ impl fmt::Display for Error {
             Error::BadUtf8 => write!(f, "string field not valid UTF-8"),
             Error::UnknownOp(op) => write!(f, "unknown op byte {op}"),
             Error::TrailingBytes => write!(f, "trailing bytes after payload"),
+            Error::InvalidValue => write!(f, "non-canonical payload value"),
         }
     }
 }
@@ -58,6 +61,10 @@ pub enum OpCode {
     /// auth is on, the worker's first frame MUST be a Hello the agent accepts,
     /// or the agent closes the connection.
     Hello = 7,
+    /// Versioned metadata-only probe. Unlike `StatBatch`, this deliberately
+    /// carries the Win32 fields needed by the VFS attribute APIs and never
+    /// names, hashes, or transfers file content.
+    MetadataBatchV1 = 8,
 }
 
 impl OpCode {
@@ -70,6 +77,7 @@ impl OpCode {
             5 => Ok(OpCode::WriteBack),
             6 => Ok(OpCode::Has),
             7 => Ok(OpCode::Hello),
+            8 => Ok(OpCode::MetadataBatchV1),
             other => Err(Error::UnknownOp(other)),
         }
     }

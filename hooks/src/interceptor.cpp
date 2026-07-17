@@ -486,14 +486,18 @@ bool ReadExactPipe(HANDLE h, void* buf, DWORD len) {
 // client thread-local so successive compiler opens do not pay a new named-pipe
 // connection each time. Nested hook activity must never share that connection:
 // it uses a short-lived pipe instead, preventing two frames from interleaving.
+enum class VfsPipeDialect { Unknown, MetadataV1, Legacy };
+
 struct VfsThreadPipe {
     HANDLE handle = INVALID_HANDLE_VALUE;
+    VfsPipeDialect dialect = VfsPipeDialect::Unknown;
 
     void Reset() {
         if (handle != INVALID_HANDLE_VALUE) {
             CloseHandle(handle);
             handle = INVALID_HANDLE_VALUE;
         }
+        dialect = VfsPipeDialect::Unknown;
     }
 
     ~VfsThreadPipe() { Reset(); }
@@ -648,6 +652,174 @@ bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
         }
     }
     return false;
+}
+
+// MetadataBatchV1's local-pipe envelope. The NUL makes it impossible for a
+// legacy UTF-8 path frame to collide with this request. The 41-byte entry is
+// the fixed canonical codec in dataplane/ops.rs.
+const char kMetadataPipePrefix[] = "NUL-SBZ-v1\0";
+// The literal has an explicit discriminator NUL plus C++'s storage terminator;
+// send exactly the former, matching Rust's `b"NUL-SBZ-v1\\0"`.
+constexpr DWORD kMetadataPipePrefixBytes = sizeof(kMetadataPipePrefix) - 1;
+constexpr DWORD kMetadataEntryBytes = 41;
+
+struct VfsMetadata {
+    DWORD attributes = 0;
+    ULONGLONG size = 0;
+    FILETIME creation = {};
+    FILETIME access = {};
+    FILETIME write = {};
+    DWORD error = ERROR_GEN_FAILURE;
+};
+
+enum class VfsMetadataExchange {
+    Present,
+    FilesystemError,
+    Legacy,
+    Transport,
+};
+
+DWORD ReadLe32(const BYTE* p) {
+    return static_cast<DWORD>(p[0]) | (static_cast<DWORD>(p[1]) << 8) |
+           (static_cast<DWORD>(p[2]) << 16) | (static_cast<DWORD>(p[3]) << 24);
+}
+
+ULONGLONG ReadLe64(const BYTE* p) {
+    return static_cast<ULONGLONG>(ReadLe32(p)) |
+           (static_cast<ULONGLONG>(ReadLe32(p + 4)) << 32);
+}
+
+void FileTimeFromU64(ULONGLONG value, FILETIME* out) {
+    out->dwLowDateTime = static_cast<DWORD>(value);
+    out->dwHighDateTime = static_cast<DWORD>(value >> 32);
+}
+
+// A complete legacy response is the former status-plus-UTF8-local-path frame.
+// It is the only reason MetadataBatchV1 may downgrade; malformed/truncated
+// frames are transport failures and must never trigger a hydrate fallback.
+bool IsCompleteLegacyResponse(const char* response, DWORD len) {
+    // The V1 discriminator is an impossible legacy path, so a conforming old
+    // worker returns only its exact one-byte not-found/error response. Refuse
+    // a status-0/path frame instead of trying to parse an attacker-controlled
+    // scratch path here; raw hydrate is re-issued only after this safe signal.
+    return len == 1 && (static_cast<BYTE>(response[0]) == 1 ||
+                        static_cast<BYTE>(response[0]) == 2);
+}
+
+VfsMetadataExchange VfsMetadataOnce(HANDLE pipe, const char* path,
+                                    DWORD pathLen, VfsMetadata* out) {
+    const DWORD requestLen = kMetadataPipePrefixBytes + pathLen;
+    if (!WriteAllPipe(pipe, &requestLen, 4) ||
+        !WriteAllPipe(pipe, kMetadataPipePrefix, kMetadataPipePrefixBytes) ||
+        !WriteAllPipe(pipe, path, pathLen)) {
+        return VfsMetadataExchange::Transport;
+    }
+    DWORD responseLen = 0;
+    if (!ReadExactPipe(pipe, &responseLen, 4)) {
+        return VfsMetadataExchange::Transport;
+    }
+    constexpr DWORD kMaxResponse = 8192;
+    if (responseLen == 0 || responseLen > kMaxResponse) {
+        return VfsMetadataExchange::Transport;
+    }
+    char response[kMaxResponse];
+    if (!ReadExactPipe(pipe, response, responseLen)) {
+        return VfsMetadataExchange::Transport;
+    }
+    if (responseLen == kMetadataPipePrefixBytes + kMetadataEntryBytes &&
+        memcmp(response, kMetadataPipePrefix, kMetadataPipePrefixBytes) == 0) {
+        const BYTE* entry = reinterpret_cast<const BYTE*>(response) +
+                            kMetadataPipePrefixBytes;
+        const BYTE tag = entry[0];
+        const DWORD attributes = ReadLe32(entry + 1);
+        const ULONGLONG size = ReadLe64(entry + 5);
+        const ULONGLONG creation = ReadLe64(entry + 13);
+        const ULONGLONG access = ReadLe64(entry + 21);
+        const ULONGLONG write = ReadLe64(entry + 29);
+        const DWORD error = ReadLe32(entry + 37);
+        if (tag == 0 && error == ERROR_SUCCESS) {
+            out->attributes = attributes;
+            out->size = size;
+            FileTimeFromU64(creation, &out->creation);
+            FileTimeFromU64(access, &out->access);
+            FileTimeFromU64(write, &out->write);
+            return VfsMetadataExchange::Present;
+        }
+        if (tag == 1 && attributes == 0 && size == 0 && creation == 0 &&
+            access == 0 && write == 0 && error != ERROR_SUCCESS) {
+            out->error = error;
+            return VfsMetadataExchange::FilesystemError;
+        }
+        return VfsMetadataExchange::Transport;
+    }
+    return IsCompleteLegacyResponse(response, responseLen)
+               ? VfsMetadataExchange::Legacy
+               : VfsMetadataExchange::Transport;
+}
+
+enum class VfsMetadataResult { Present, FilesystemError, Legacy, Infrastructure };
+
+VfsMetadataResult VfsProbeMetadata(const wchar_t* absPath, VfsMetadata* out) {
+    const int kBuf = 8192;
+    int u8len = WideCharToMultiByte(CP_UTF8, 0, absPath, -1, nullptr, 0,
+                                    nullptr, nullptr);
+    if (u8len <= 1 || u8len > kBuf) {
+        return VfsMetadataResult::Infrastructure;
+    }
+    char path[kBuf];
+    if (WideCharToMultiByte(CP_UTF8, 0, absPath, -1, path, u8len, nullptr,
+                            nullptr) == 0) {
+        return VfsMetadataResult::Infrastructure;
+    }
+    const DWORD pathLen = static_cast<DWORD>(u8len - 1);
+    VfsHydrateScope scope;
+    if (scope.outer && g_vfsThreadPipe.dialect == VfsPipeDialect::Legacy) {
+        return VfsMetadataResult::Legacy;
+    }
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        HANDLE pipe = INVALID_HANDLE_VALUE;
+        if (scope.outer) {
+            if (g_vfsThreadPipe.handle == INVALID_HANDLE_VALUE) {
+                g_vfsThreadPipe.handle = ConnectVfsPipe();
+            }
+            pipe = g_vfsThreadPipe.handle;
+        } else {
+            pipe = ConnectVfsPipe();
+        }
+        if (pipe == INVALID_HANDLE_VALUE) {
+            if (scope.outer) {
+                g_vfsThreadPipe.Reset();
+            }
+            continue;
+        }
+        VfsMetadataExchange exchange = VfsMetadataOnce(pipe, path, pathLen, out);
+        if (!scope.outer) {
+            CloseHandle(pipe);
+        }
+        switch (exchange) {
+            case VfsMetadataExchange::Present:
+                if (scope.outer) {
+                    g_vfsThreadPipe.dialect = VfsPipeDialect::MetadataV1;
+                }
+                return VfsMetadataResult::Present;
+            case VfsMetadataExchange::FilesystemError:
+                if (scope.outer) {
+                    g_vfsThreadPipe.dialect = VfsPipeDialect::MetadataV1;
+                }
+                return VfsMetadataResult::FilesystemError;
+            case VfsMetadataExchange::Legacy:
+                if (scope.outer) {
+                    g_vfsThreadPipe.dialect = VfsPipeDialect::Legacy;
+                }
+                return VfsMetadataResult::Legacy;
+            case VfsMetadataExchange::Transport:
+                if (scope.outer) {
+                    g_vfsThreadPipe.Reset();
+                }
+                break;
+        }
+    }
+    return VfsMetadataResult::Infrastructure;
 }
 
 // Drops a marker in the scratch root using the real CreateFileW and reports
@@ -915,6 +1087,67 @@ bool VfsMaterializeForProbe(const wchar_t* path, wchar_t* localOut,
     }
     *handled = true;
     return true;
+}
+
+enum class VfsProbeResult {
+    NotApplicable,
+    Present,
+    FilesystemError,
+    Legacy,
+    Infrastructure,
+};
+
+VfsProbeResult VfsMetadataForProbe(const wchar_t* path, VfsMetadata* metadata,
+                                   wchar_t* logicalOut, int logicalCap,
+                                   bool* handled) {
+    *handled = false;
+    if (logicalOut != nullptr && logicalCap > 0) {
+        logicalOut[0] = L'\0';
+    }
+    if (!g_vfsMode || path == nullptr) {
+        return VfsProbeResult::NotApplicable;
+    }
+    wchar_t abs[1024];
+    DWORD an = FullPathForVfsRootCheck(path, abs, 1024);
+    if (an == 0 || an >= ARRAYSIZE(abs)) {
+        // FullPath failed or exceeded our fixed resolver buffer. In VFS mode
+        // that leaves root membership unknowable (including relative long
+        // paths), so local probing would risk reading the worker filesystem.
+        // Fail the remote attempt rather than silently falling through.
+        VfsMarkUnvirtualized();
+        *handled = true;
+        SetLastError(ERROR_RETRY);
+        return VfsProbeResult::Infrastructure;
+    }
+    wchar_t lower[1024];
+    memcpy(lower, abs, (static_cast<size_t>(an) + 1) * sizeof(wchar_t));
+    int absLen = LowerAndTrim(lower, an);
+    if (PathUnderPrefix(lower, absLen, g_vfsScratch, g_vfsScratchLen)) {
+        return VfsProbeResult::NotApplicable;
+    }
+    if (!PathUnderPrefix(lower, absLen, g_vfsRoot, g_vfsRootLen)) {
+        return VfsProbeResult::NotApplicable;
+    }
+    if (logicalOut != nullptr && logicalCap > 0) {
+        _snwprintf_s(logicalOut, logicalCap, _TRUNCATE, L"%s", abs);
+    }
+    VfsMetadataResult result = VfsProbeMetadata(abs, metadata);
+    switch (result) {
+        case VfsMetadataResult::Present:
+            *handled = true;
+            return VfsProbeResult::Present;
+        case VfsMetadataResult::FilesystemError:
+            *handled = true;
+            return VfsProbeResult::FilesystemError;
+        case VfsMetadataResult::Legacy:
+            return VfsProbeResult::Legacy;
+        case VfsMetadataResult::Infrastructure:
+            VfsMarkUnvirtualized();
+            *handled = true;
+            SetLastError(ERROR_RETRY);
+            return VfsProbeResult::Infrastructure;
+    }
+    return VfsProbeResult::Infrastructure;
 }
 
 bool HasWildcard(const wchar_t* path) {
@@ -1421,12 +1654,26 @@ DWORD WINAPI HookedGetFullPathNameA(LPCSTR path, DWORD bufferLen, LPSTR buffer,
 }
 
 DWORD WINAPI HookedGetFileAttributesW(LPCWSTR path) {
+    DWORD callerLastError = GetLastError();
     wchar_t local[1024];
     wchar_t logical[1024];
     bool handled = false;
     const wchar_t* recordPath = path;
     DWORD attrs = INVALID_FILE_ATTRIBUTES;
-    if (VfsMaterializeForProbe(path, local, 1024, logical, 1024, &handled)) {
+    VfsMetadata metadata;
+    VfsProbeResult probe =
+        VfsMetadataForProbe(path, &metadata, logical, 1024, &handled);
+    if (probe == VfsProbeResult::Present) {
+        attrs = metadata.attributes;
+        recordPath = logical;
+        SetLastError(callerLastError);
+    } else if (probe == VfsProbeResult::FilesystemError) {
+        attrs = INVALID_FILE_ATTRIBUTES;
+        recordPath = logical;
+        SetLastError(metadata.error);
+    } else if (probe == VfsProbeResult::Legacy &&
+               VfsMaterializeForProbe(path, local, 1024, logical, 1024,
+                                      &handled)) {
         attrs = VfsInternalGetFileAttributesW(local);
         recordPath = logical;
     } else if (handled) {
@@ -1446,14 +1693,27 @@ DWORD WINAPI HookedGetFileAttributesW(LPCWSTR path) {
 }
 
 DWORD WINAPI HookedGetFileAttributesA(LPCSTR path) {
+    DWORD callerLastError = GetLastError();
     WideArg w(path);
     wchar_t local[1024];
     wchar_t logical[1024];
     bool handled = false;
     const wchar_t* recordPath = w.get();
     DWORD attrs = INVALID_FILE_ATTRIBUTES;
-    if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
-                               &handled)) {
+    VfsMetadata metadata;
+    VfsProbeResult probe =
+        VfsMetadataForProbe(w.get(), &metadata, logical, 1024, &handled);
+    if (probe == VfsProbeResult::Present) {
+        attrs = metadata.attributes;
+        recordPath = logical;
+        SetLastError(callerLastError);
+    } else if (probe == VfsProbeResult::FilesystemError) {
+        attrs = INVALID_FILE_ATTRIBUTES;
+        recordPath = logical;
+        SetLastError(metadata.error);
+    } else if (probe == VfsProbeResult::Legacy &&
+               VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
+                                      &handled)) {
         attrs = VfsInternalGetFileAttributesW(local);
         recordPath = logical;
     } else if (handled) {
@@ -1483,12 +1743,37 @@ ULONGLONG ExAttrsExtra(BOOL ok, GET_FILEEX_INFO_LEVELS level, LPVOID info) {
 BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR path,
                                        GET_FILEEX_INFO_LEVELS level,
                                        LPVOID info) {
+    if (level != GetFileExInfoStandard || info == nullptr) {
+        return TrueGetFileAttributesExW(path, level, info);
+    }
+    DWORD callerLastError = GetLastError();
     wchar_t local[1024];
     wchar_t logical[1024];
     bool handled = false;
     const wchar_t* recordPath = path;
     BOOL ok = FALSE;
-    if (VfsMaterializeForProbe(path, local, 1024, logical, 1024, &handled)) {
+    VfsMetadata metadata;
+    VfsProbeResult probe =
+        VfsMetadataForProbe(path, &metadata, logical, 1024, &handled);
+    if (probe == VfsProbeResult::Present) {
+        WIN32_FILE_ATTRIBUTE_DATA tmp = {};
+        tmp.dwFileAttributes = metadata.attributes;
+        tmp.nFileSizeHigh = static_cast<DWORD>(metadata.size >> 32);
+        tmp.nFileSizeLow = static_cast<DWORD>(metadata.size);
+        tmp.ftCreationTime = metadata.creation;
+        tmp.ftLastAccessTime = metadata.access;
+        tmp.ftLastWriteTime = metadata.write;
+        *static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(info) = tmp;
+        ok = TRUE;
+        recordPath = logical;
+        SetLastError(callerLastError);
+    } else if (probe == VfsProbeResult::FilesystemError) {
+        ok = FALSE;
+        recordPath = logical;
+        SetLastError(metadata.error);
+    } else if (probe == VfsProbeResult::Legacy &&
+               VfsMaterializeForProbe(path, local, 1024, logical, 1024,
+                                      &handled)) {
         ok = VfsInternalGetFileAttributesExW(local, level, info);
         recordPath = logical;
     } else if (handled) {
@@ -1509,14 +1794,41 @@ BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR path,
 BOOL WINAPI HookedGetFileAttributesExA(LPCSTR path,
                                        GET_FILEEX_INFO_LEVELS level,
                                        LPVOID info) {
+    DWORD callerLastError = GetLastError();
+    if (level != GetFileExInfoStandard || info == nullptr) {
+        return TrueGetFileAttributesExA(path, level, info);
+    }
     WideArg w(path);
+    if (w.get() == nullptr) {
+        return TrueGetFileAttributesExA(path, level, info);
+    }
     wchar_t local[1024];
     wchar_t logical[1024];
     bool handled = false;
     const wchar_t* recordPath = w.get();
     BOOL ok = FALSE;
-    if (VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
-                               &handled)) {
+    VfsMetadata metadata;
+    VfsProbeResult probe =
+        VfsMetadataForProbe(w.get(), &metadata, logical, 1024, &handled);
+    if (probe == VfsProbeResult::Present) {
+        WIN32_FILE_ATTRIBUTE_DATA tmp = {};
+        tmp.dwFileAttributes = metadata.attributes;
+        tmp.nFileSizeHigh = static_cast<DWORD>(metadata.size >> 32);
+        tmp.nFileSizeLow = static_cast<DWORD>(metadata.size);
+        tmp.ftCreationTime = metadata.creation;
+        tmp.ftLastAccessTime = metadata.access;
+        tmp.ftLastWriteTime = metadata.write;
+        *static_cast<WIN32_FILE_ATTRIBUTE_DATA*>(info) = tmp;
+        ok = TRUE;
+        recordPath = logical;
+        SetLastError(callerLastError);
+    } else if (probe == VfsProbeResult::FilesystemError) {
+        ok = FALSE;
+        recordPath = logical;
+        SetLastError(metadata.error);
+    } else if (probe == VfsProbeResult::Legacy &&
+               VfsMaterializeForProbe(w.get(), local, 1024, logical, 1024,
+                                      &handled)) {
         ok = VfsInternalGetFileAttributesExW(local, level, info);
         recordPath = logical;
     } else if (handled) {

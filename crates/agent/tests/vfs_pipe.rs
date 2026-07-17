@@ -126,6 +126,41 @@ async fn pipe_hydrate(full: &str, logical: &str) -> (u8, String) {
     (buf[0], String::from_utf8(buf[1..].to_vec()).unwrap())
 }
 
+async fn connect_pipe(full: &str) -> tokio::net::windows::named_pipe::NamedPipeClient {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match ClientOptions::new().open(full) {
+            Ok(client) => return client,
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("vfs pipe {full} never opened within 10s: {error}");
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+async fn pipe_metadata(
+    client: &mut tokio::net::windows::named_pipe::NamedPipeClient,
+    logical: &str,
+) -> Vec<u8> {
+    const PREFIX: &[u8] = b"NUL-SBZ-v1\0";
+    let mut request = PREFIX.to_vec();
+    request.extend_from_slice(logical.as_bytes());
+    client
+        .write_all(&(request.len() as u32).to_le_bytes())
+        .await
+        .unwrap();
+    client.write_all(&request).await.unwrap();
+    client.flush().await.unwrap();
+    let mut len = [0u8; 4];
+    client.read_exact(&mut len).await.unwrap();
+    let mut response = vec![0u8; u32::from_le_bytes(len) as usize];
+    client.read_exact(&mut response).await.unwrap();
+    response
+}
+
 #[tokio::test]
 async fn pipe_hydrates_file_into_scratch() {
     let dir = TempDir::new("hydrate");
@@ -176,6 +211,97 @@ async fn pipe_hydrates_file_into_scratch() {
     let missing = dir.join("nope.h").to_string_lossy().into_owned();
     let (status, _) = pipe_hydrate(&full, &missing).await;
     assert_eq!(status, 1, "missing file is reported not-found");
+}
+
+#[tokio::test]
+async fn metadata_probes_10000_transfer_no_content_or_scratch_bytes() {
+    const PREFIX: &[u8] = b"NUL-SBZ-v1\0";
+    let dir = TempDir::new("metadata-10000");
+    let logical = dir.join("proj/input.h");
+    std::fs::create_dir_all(logical.parent().unwrap()).unwrap();
+    std::fs::write(&logical, b"metadata-only").unwrap();
+    let logical = logical.to_string_lossy().into_owned();
+    let (addr, stats) = start_file_server_with_stats().await;
+    let scratch = dir.join("scratch");
+    let cas = dir.join("worker-cas");
+    let pipe_name = format!("sbz-vfs-metadata-{}", std::process::id());
+    let full = format!(r"\\.\pipe\{pipe_name}");
+    let pn = pipe_name.clone();
+    let sc = scratch.clone();
+    let ca = cas.clone();
+    tokio::spawn(async move {
+        let _ =
+            sembazuru_worker::vfs_pipe::serve_vfs(&pn, addr, sc, ca, Duration::ZERO, String::new())
+                .await;
+    });
+    let mut client = connect_pipe(&full).await;
+    for _ in 0..10_000 {
+        let response = pipe_metadata(&mut client, &logical).await;
+        assert_eq!(response.len(), PREFIX.len() + 41);
+        assert_eq!(&response[..PREFIX.len()], PREFIX);
+        assert_eq!(response[PREFIX.len()], 0, "present metadata tag");
+    }
+    assert_eq!(stats.read_ops.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(
+        stats.read_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        stats
+            .inline_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(
+        !scratch.exists() || std::fs::read_dir(&scratch).unwrap().next().is_none(),
+        "metadata probes must not materialize action scratch"
+    );
+    // BlobStore creates lifecycle bookkeeping at open, so directory emptiness
+    // is not a CAS oracle. Re-open the live store and prove both the fixture
+    // blob is absent and no blob bytes exist at all (the latter catches a
+    // different or zero-byte blob).
+    let worker_store = sembazuru_cas::BlobStore::open(&cas)
+        .expect("a second handle may inspect the live persistent worker CAS");
+    let fixture_digest = sembazuru_cas::Digest::of(b"metadata-only");
+    assert!(!worker_store.has(&fixture_digest));
+    assert_eq!(worker_store.total_size().unwrap(), 0);
+
+    // The next raw open is the first legal point at which bytes may move. It
+    // must hydrate once, populate both worker CAS and action scratch, then the
+    // same open must be a zero-content delta through the in-session cache.
+    drop(client);
+    let (status, first_local) = pipe_hydrate(&full, &logical).await;
+    assert_eq!(status, 0);
+    assert_eq!(std::fs::read(&first_local).unwrap(), b"metadata-only");
+    assert!(stats.content_bytes() > 0);
+    assert!(worker_store.has(&fixture_digest));
+    let first_cas_size = worker_store.total_size().unwrap();
+    assert!(first_cas_size > 0);
+    assert!(std::fs::read_dir(&scratch).unwrap().next().is_some());
+    let first_read_ops = stats.read_ops.load(std::sync::atomic::Ordering::Relaxed);
+    let first_read_bytes = stats.read_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let first_inline_bytes = stats
+        .inline_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    let (status, second_local) = pipe_hydrate(&full, &logical).await;
+    assert_eq!(status, 0);
+    assert_eq!(second_local, first_local);
+    assert_eq!(
+        stats.read_ops.load(std::sync::atomic::Ordering::Relaxed),
+        first_read_ops
+    );
+    assert_eq!(
+        stats.read_bytes.load(std::sync::atomic::Ordering::Relaxed),
+        first_read_bytes
+    );
+    assert_eq!(
+        stats
+            .inline_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        first_inline_bytes
+    );
+    assert_eq!(worker_store.total_size().unwrap(), first_cas_size);
 }
 
 #[tokio::test]

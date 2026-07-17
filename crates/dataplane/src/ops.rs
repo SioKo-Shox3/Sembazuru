@@ -9,11 +9,14 @@
 //! `Has` (M4) is the batch existence probe (§4.3); PrefetchHint (M5) is added
 //! when that milestone lands.
 
-use crate::wire::{Error, Reader, Writer};
+use crate::wire::{Error, HEADER_BYTES, MAX_FRAME_BODY, Reader, Writer};
 
 pub const MAX_STAT_PATHS: usize = 4096;
 pub const MAX_HAS_DIGESTS: usize = 4096;
 pub const MAX_DIRLIST_ENTRIES: usize = 4096;
+/// MetadataBatchV1 shares StatBatch's request cardinality limit. Keeping this
+/// separate makes the versioned codec's bound explicit at its call sites.
+pub const MAX_METADATA_PATHS: usize = 4096;
 
 /// Bounds an up-front `Vec::with_capacity` hint taken from an untrusted count,
 /// so a hostile length can't drive a huge allocation before the per-element
@@ -21,6 +24,188 @@ pub const MAX_DIRLIST_ENTRIES: usize = 4096;
 /// for it.
 fn cap_hint(n: usize) -> usize {
     n.min(MAX_STAT_PATHS)
+}
+
+// --- MetadataBatchV1 ----------------------------------------------------
+
+/// A metadata-only request for Win32 attribute APIs. This is intentionally a
+/// new operation rather than an extension of StatBatch: old peers retain the
+/// exact StatBatch framing and new peers can reject malformed fixed-width
+/// replies before they reach the DLL boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataRequest {
+    pub paths: Vec<String>,
+}
+
+/// Metadata for one path, in request order. `FilesystemError` preserves the
+/// raw Win32 error code (for example ERROR_FILE_NOT_FOUND) so the hook can
+/// preserve the native API contract without hydrating bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataEntry {
+    Present {
+        attributes: u32,
+        size: u64,
+        creation_time: u64,
+        access_time: u64,
+        write_time: u64,
+    },
+    FilesystemError {
+        raw_error: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataResponse {
+    pub entries: Vec<MetadataEntry>,
+}
+
+const METADATA_ENTRY_BYTES: usize = 41;
+const METADATA_PRESENT: u8 = 0;
+const METADATA_FILESYSTEM_ERROR: u8 = 1;
+
+impl MetadataRequest {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        if self.paths.len() > MAX_METADATA_PATHS {
+            return Err(Error::TooLarge);
+        }
+        let mut body = 4usize;
+        for path in &self.paths {
+            if path.len() > u32::MAX as usize {
+                return Err(Error::TooLarge);
+            }
+            body = body
+                .checked_add(4)
+                .and_then(|body| body.checked_add(path.len()))
+                .ok_or(Error::TooLarge)?;
+        }
+        if body.checked_add(HEADER_BYTES).ok_or(Error::TooLarge)? > MAX_FRAME_BODY {
+            return Err(Error::TooLarge);
+        }
+        let mut w = Writer::new();
+        w.u32(self.paths.len() as u32);
+        for path in &self.paths {
+            w.str(path);
+        }
+        Ok(w.into_bytes())
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let n = r.u32()? as usize;
+        if n > MAX_METADATA_PATHS {
+            return Err(Error::TooLarge);
+        }
+        let mut paths = Vec::with_capacity(cap_hint(n));
+        for _ in 0..n {
+            paths.push(r.str()?);
+        }
+        r.finish()?;
+        Ok(Self { paths })
+    }
+}
+
+impl MetadataResponse {
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        if self.entries.len() > MAX_METADATA_PATHS {
+            return Err(Error::TooLarge);
+        }
+        let body = 4usize
+            .checked_add(
+                self.entries
+                    .len()
+                    .checked_mul(METADATA_ENTRY_BYTES)
+                    .ok_or(Error::TooLarge)?,
+            )
+            .ok_or(Error::TooLarge)?;
+        if body.checked_add(HEADER_BYTES).ok_or(Error::TooLarge)? > MAX_FRAME_BODY {
+            return Err(Error::TooLarge);
+        }
+        let mut w = Writer::new();
+        w.u32(self.entries.len() as u32);
+        for entry in &self.entries {
+            match entry {
+                MetadataEntry::Present {
+                    attributes,
+                    size,
+                    creation_time,
+                    access_time,
+                    write_time,
+                } => {
+                    w.u8(METADATA_PRESENT);
+                    w.u32(*attributes);
+                    w.u64(*size);
+                    w.u64(*creation_time);
+                    w.u64(*access_time);
+                    w.u64(*write_time);
+                    w.u32(0);
+                }
+                MetadataEntry::FilesystemError { raw_error } => {
+                    if *raw_error == 0 {
+                        return Err(Error::InvalidValue);
+                    }
+                    w.u8(METADATA_FILESYSTEM_ERROR);
+                    w.u32(0);
+                    w.u64(0);
+                    w.u64(0);
+                    w.u64(0);
+                    w.u64(0);
+                    w.u32(*raw_error);
+                }
+            }
+        }
+        Ok(w.into_bytes())
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader::new(buf);
+        let n = r.u32()? as usize;
+        if n > MAX_METADATA_PATHS {
+            return Err(Error::TooLarge);
+        }
+        let byte_len = n
+            .checked_mul(METADATA_ENTRY_BYTES)
+            .and_then(|body| body.checked_add(4))
+            .ok_or(Error::TooLarge)?;
+        if buf.len() != byte_len {
+            return Err(if buf.len() < byte_len {
+                Error::Truncated
+            } else {
+                Error::TrailingBytes
+            });
+        }
+        let mut entries = Vec::with_capacity(cap_hint(n));
+        for _ in 0..n {
+            let tag = r.u8()?;
+            let attributes = r.u32()?;
+            let size = r.u64()?;
+            let creation_time = r.u64()?;
+            let access_time = r.u64()?;
+            let write_time = r.u64()?;
+            let raw_error = r.u32()?;
+            match tag {
+                METADATA_PRESENT if raw_error == 0 => entries.push(MetadataEntry::Present {
+                    attributes,
+                    size,
+                    creation_time,
+                    access_time,
+                    write_time,
+                }),
+                METADATA_FILESYSTEM_ERROR
+                    if attributes == 0
+                        && size == 0
+                        && creation_time == 0
+                        && access_time == 0
+                        && write_time == 0
+                        && raw_error != 0 =>
+                {
+                    entries.push(MetadataEntry::FilesystemError { raw_error });
+                }
+                _ => return Err(Error::InvalidValue),
+            }
+        }
+        r.finish()?;
+        Ok(Self { entries })
+    }
 }
 
 // --- StatBatch -----------------------------------------------------------
@@ -652,6 +837,86 @@ mod tests {
         bytes.extend_from_slice(&((MAX_STAT_PATHS + 1) as u32).to_le_bytes());
 
         assert_eq!(StatRequest::decode(&bytes), Err(Error::TooLarge));
+    }
+
+    #[test]
+    fn metadata_v1_is_canonical_fixed_width_and_round_trips() {
+        let request = MetadataRequest {
+            paths: vec!["C:\\src\\one.h".to_owned(), "C:\\src\\missing.h".to_owned()],
+        };
+        assert_eq!(
+            MetadataRequest::decode(&request.encode().unwrap()).unwrap(),
+            request
+        );
+
+        let response = MetadataResponse {
+            entries: vec![
+                MetadataEntry::Present {
+                    attributes: 0x20,
+                    size: 0x1_0000_0005,
+                    creation_time: 1,
+                    access_time: 2,
+                    write_time: 3,
+                },
+                MetadataEntry::FilesystemError { raw_error: 2 },
+            ],
+        };
+        let encoded = response.encode().unwrap();
+        assert_eq!(encoded.len(), 4 + 2 * METADATA_ENTRY_BYTES);
+        assert_eq!(MetadataResponse::decode(&encoded).unwrap(), response);
+    }
+
+    #[test]
+    fn metadata_v1_rejects_bad_cardinality_and_noncanonical_entries() {
+        let mut too_many = Vec::new();
+        too_many.extend_from_slice(&((MAX_METADATA_PATHS + 1) as u32).to_le_bytes());
+        assert_eq!(MetadataRequest::decode(&too_many), Err(Error::TooLarge));
+        assert_eq!(MetadataResponse::decode(&too_many), Err(Error::TooLarge));
+
+        let mut noncanonical = MetadataResponse {
+            entries: vec![MetadataEntry::Present {
+                attributes: 1,
+                size: 2,
+                creation_time: 3,
+                access_time: 4,
+                write_time: 5,
+            }],
+        }
+        .encode()
+        .unwrap();
+        *noncanonical.last_mut().unwrap() = 1;
+        assert!(MetadataResponse::decode(&noncanonical).is_err());
+        assert!(MetadataResponse::decode(&noncanonical[..noncanonical.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn metadata_v1_production_encoders_enforce_bounds_and_canonical_error() {
+        let too_many = MetadataRequest {
+            paths: vec![String::new(); MAX_METADATA_PATHS + 1],
+        };
+        assert_eq!(too_many.encode(), Err(Error::TooLarge));
+        let too_many_response = MetadataResponse {
+            entries: vec![MetadataEntry::FilesystemError { raw_error: 2 }; MAX_METADATA_PATHS + 1],
+        };
+        assert_eq!(too_many_response.encode(), Err(Error::TooLarge));
+        assert_eq!(
+            MetadataResponse {
+                entries: vec![MetadataEntry::FilesystemError { raw_error: 0 }],
+            }
+            .encode(),
+            Err(Error::InvalidValue)
+        );
+
+        let mut unknown_tag = MetadataResponse {
+            entries: vec![MetadataEntry::FilesystemError { raw_error: 2 }],
+        }
+        .encode()
+        .unwrap();
+        unknown_tag[4] = 0xff;
+        assert_eq!(
+            MetadataResponse::decode(&unknown_tag),
+            Err(Error::InvalidValue)
+        );
     }
 
     #[test]

@@ -85,6 +85,90 @@ static int WideArgToAcp(const wchar_t* src, char* dst, int cap) {
     int n = WideCharToMultiByte(CP_ACP, 0, src, -1, dst, cap, nullptr, nullptr);
     return n > 0 && n <= cap ? n : 0;
 }
+static ULONGLONG FileTimeValue(FILETIME value) {
+    return (static_cast<ULONGLONG>(value.dwHighDateTime) << 32) |
+           value.dwLowDateTime;
+}
+static bool SameMetadata(const WIN32_FILE_ATTRIBUTE_DATA& a,
+                         const WIN32_FILE_ATTRIBUTE_DATA& b) {
+    return a.dwFileAttributes == b.dwFileAttributes &&
+           a.nFileSizeHigh == b.nFileSizeHigh && a.nFileSizeLow == b.nFileSizeLow &&
+           FileTimeValue(a.ftCreationTime) == FileTimeValue(b.ftCreationTime) &&
+           FileTimeValue(a.ftLastAccessTime) == FileTimeValue(b.ftLastAccessTime) &&
+           FileTimeValue(a.ftLastWriteTime) == FileTimeValue(b.ftLastWriteTime);
+}
+static int CheckPresentMetadata(const wchar_t* logical, const wchar_t* backing,
+                                unsigned repeats, ULONGLONG* calls) {
+    char logicalA[1024];
+    char backingA[1024];
+    if (!WideArgToAcp(logical, logicalA, sizeof(logicalA)) ||
+        !WideArgToAcp(backing, backingA, sizeof(backingA))) return 2;
+    const DWORD sentinel = 0x51BADA55;
+    WIN32_FILE_ATTRIBUTE_DATA expected{};
+    SetLastError(sentinel);
+    DWORD expectedAttrs = GetFileAttributesW(backing);
+    if (expectedAttrs == INVALID_FILE_ATTRIBUTES || GetLastError() != sentinel ||
+        !GetFileAttributesExW(backing, GetFileExInfoStandard, &expected)) return 13;
+    for (unsigned i = 0; i < repeats; ++i) {
+        SetLastError(sentinel);
+        DWORD attrsW = GetFileAttributesW(logical);
+        if (attrsW != expectedAttrs || GetLastError() != sentinel) return 14;
+        ++*calls;
+        SetLastError(sentinel);
+        DWORD attrsA = GetFileAttributesA(logicalA);
+        if (attrsA != expectedAttrs || GetLastError() != sentinel) return 15;
+        ++*calls;
+        WIN32_FILE_ATTRIBUTE_DATA dataW{};
+        SetLastError(sentinel);
+        if (!GetFileAttributesExW(logical, GetFileExInfoStandard, &dataW) ||
+            !SameMetadata(dataW, expected) || GetLastError() != sentinel) return 16;
+        ++*calls;
+        WIN32_FILE_ATTRIBUTE_DATA dataA{};
+        SetLastError(sentinel);
+        if (!GetFileAttributesExA(logicalA, GetFileExInfoStandard, &dataA) ||
+            !SameMetadata(dataA, expected) || GetLastError() != sentinel) return 17;
+        ++*calls;
+    }
+    return 0;
+}
+static int CheckAbsentMetadata(const wchar_t* logical, const wchar_t* backing) {
+    char logicalA[1024];
+    char backingA[1024];
+    if (!WideArgToAcp(logical, logicalA, sizeof(logicalA)) ||
+        !WideArgToAcp(backing, backingA, sizeof(backingA))) return 2;
+    DWORD expectedW = GetFileAttributesW(backing);
+    DWORD expectedWError = GetLastError();
+    DWORD expectedA = GetFileAttributesA(backingA);
+    DWORD expectedAError = GetLastError();
+    if (expectedW != INVALID_FILE_ATTRIBUTES || expectedA != INVALID_FILE_ATTRIBUTES)
+        return 19;
+    BYTE expectedExW[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
+    memset(expectedExW, 0xA5, sizeof(expectedExW));
+    BOOL expectedExWOk = GetFileAttributesExW(backing, GetFileExInfoStandard, expectedExW);
+    DWORD expectedExWError = GetLastError();
+    BYTE expectedExA[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
+    memset(expectedExA, 0xA5, sizeof(expectedExA));
+    BOOL expectedExAOk = GetFileAttributesExA(backingA, GetFileExInfoStandard, expectedExA);
+    DWORD expectedExAError = GetLastError();
+    BYTE actualExW[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
+    memset(actualExW, 0xA5, sizeof(actualExW));
+    DWORD actualW = GetFileAttributesW(logical);
+    DWORD actualWError = GetLastError();
+    BYTE actualExA[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
+    memset(actualExA, 0xA5, sizeof(actualExA));
+    DWORD actualA = GetFileAttributesA(logicalA);
+    DWORD actualAError = GetLastError();
+    BOOL actualExWOk = GetFileAttributesExW(logical, GetFileExInfoStandard, actualExW);
+    DWORD actualExWError = GetLastError();
+    BOOL actualExAOk = GetFileAttributesExA(logicalA, GetFileExInfoStandard, actualExA);
+    DWORD actualExAError = GetLastError();
+    return actualW == expectedW && actualWError == expectedWError &&
+           actualA == expectedA && actualAError == expectedAError &&
+           actualExWOk == expectedExWOk && actualExWError == expectedExWError &&
+           actualExAOk == expectedExAOk && actualExAError == expectedExAError &&
+           memcmp(actualExW, expectedExW, sizeof(actualExW)) == 0 &&
+           memcmp(actualExA, expectedExA, sizeof(actualExA)) == 0 ? 0 : 20;
+}
 static int SpawnReadChild(const wchar_t* path, const wchar_t* expected,
                           BOOL ansi) {
     wchar_t exe[1024];
@@ -218,6 +302,19 @@ int wmain(int argc, wchar_t** argv) {
         if (r != elen) return 3;
         return memcmp(buf, exp, elen) == 0 ? 0 : 3;
     }
+    if (argc >= 8 && wcscmp(argv[1], L"--metadata-api") == 0) {
+        ULONGLONG started = GetTickCount64();
+        ULONGLONG calls = 0;
+        int result = CheckPresentMetadata(argv[2], argv[3], 2500, &calls);
+        if (result != 0) return result;
+        result = CheckAbsentMetadata(argv[4], argv[5]);
+        if (result != 0) return result;
+        result = CheckPresentMetadata(argv[6], argv[7], 1, &calls);
+        if (result != 0) return result;
+        wprintf(L"METADATA_NATIVE PASS calls=%llu wall_ms=%llu present=W/A/ExW/ExA absent=PASS sparse_4GiB=PASS\n",
+                calls, GetTickCount64() - started);
+        return 0;
+    }
     if (argc < 5) return 2;
     wchar_t cwd[1024];
     DWORD cn = GetCurrentDirectoryW(1024, cwd);
@@ -262,6 +359,8 @@ $verbatimTraceDir = Join-Path $WorkRoot 'trace-verbatim'
 $smuggledTraceDir = Join-Path $WorkRoot 'smuggled-trace'
 $fakeVfsCwd = Join-Path $WorkRoot 'fake-vfs-cwd'
 $rel = 'Src\Input.txt'
+$metadataAbsentRel = 'Src\metadata-absent.h'
+$metadataSparseRel = 'Src\metadata-sparse.bin'
 $correct = 'hello-from-the-agent-vfs'
 $stale = 'STALE-LOCAL-MUST-NOT-BE-READ'
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $logicalRoot $rel)) | Out-Null
@@ -271,6 +370,17 @@ foreach ($d in @($scratchRoot, $casRoot, $traceDir, $miscTraceDir, $verbatimTrac
 }
 Set-Content (Join-Path $logicalRoot $rel) $stale -Encoding ascii -NoNewline
 Set-Content (Join-Path $backingRoot $rel) $correct -Encoding ascii -NoNewline
+# The metadata gate must exercise the FILETIME high/low size composition without
+# writing 4 GiB of data. Mark the backing file sparse first, then SetLength.
+$logicalSparse = Join-Path $logicalRoot $metadataSparseRel
+$backingSparse = Join-Path $backingRoot $metadataSparseRel
+Set-Content $logicalSparse 'stale-small' -Encoding ascii -NoNewline
+New-Item -ItemType File -Force $backingSparse | Out-Null
+$sparseOutput = & fsutil sparse setflag $backingSparse 2>&1 | Out-String
+if ($LASTEXITCODE -ne 0) { throw "failed to mark sparse metadata fixture: $sparseOutput" }
+$sparseStream = [System.IO.File]::Open($backingSparse, [System.IO.FileMode]::Open,
+    [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+try { $sparseStream.SetLength([Int64]4294967301) } finally { $sparseStream.Dispose() }
 
 $fsAddr = '127.0.0.1:50082'
 $workerPort = 50083
@@ -300,6 +410,7 @@ $chdirAExit = 99
 $emptyTraceExit = 99
 $emptyTraceChildWExit = 99
 $emptyTraceChildAExit = 99
+$metadataExit = 99
 $oldSmuggledVfsCwd = $env:SEMBAZURU_VFS_CWD
 $oldSmuggledTraceDir = $env:SEMBAZURU_TRACE_DIR
 try {
@@ -328,6 +439,12 @@ try {
     try {
         $expectedInputPath = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot $rel))
         $verbatimInputPath = '\\?\' + $expectedInputPath
+        $metadataLogicalPath = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot $rel))
+        $metadataBackingPath = [System.IO.Path]::GetFullPath((Join-Path $backingRoot $rel))
+        $metadataLogicalAbsent = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot $metadataAbsentRel))
+        $metadataBackingAbsent = [System.IO.Path]::GetFullPath((Join-Path $backingRoot $metadataAbsentRel))
+        $metadataLogicalSparse = [System.IO.Path]::GetFullPath($logicalSparse)
+        $metadataBackingSparse = [System.IO.Path]::GetFullPath($backingSparse)
         $oldNativeEap = $null
         $hasNativeEap = Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
         if ($hasNativeEap) {
@@ -338,6 +455,13 @@ try {
             $logicalSrc = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot 'Src'))
             $env:SEMBAZURU_VFS_CWD = $fakeVfsCwd
             $env:SEMBAZURU_TRACE_DIR = $smuggledTraceDir
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
+                $probe --metadata-api $metadataLogicalPath $metadataBackingPath `
+                $metadataLogicalAbsent $metadataBackingAbsent `
+                $metadataLogicalSparse $metadataBackingSparse 2>&1 |
+                Out-String | Write-Host
+            $metadataExit = $LASTEXITCODE
+
             & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $traceDir -- `
                 $probe $rel $correct $logicalRoot $expectedInputPath 2>&1 |
                 Out-String | Write-Host
@@ -455,6 +579,9 @@ switch ($exit) {
 }
 if ($verbatimExit -ne 0) {
     $failures += "VFS Execute with verbatim DOS input failed (exit=$verbatimExit); expected agent-served bytes through the VFS"
+}
+if ($metadataExit -ne 0) {
+    $failures += "GetFileAttributesW/A and GetFileAttributesExW/A metadata fast path failed (exit=$metadataExit); expected remote attributes, 64-bit size, FILETIMEs, and preserved LastError"
 }
 if ($verbatimFindExit -ne 0) {
     $failures += "FindFirstFileW exact verbatim DOS input failed (exit=$verbatimFindExit); the verbatim prefix must not be treated as a wildcard"

@@ -44,10 +44,16 @@ use tokio::sync::{Mutex, Notify, OnceCell};
 
 use crate::fileclient::FileClient;
 use crate::sandbox::ActionPipeSecurity;
+use sembazuru_dataplane::ops::MetadataEntry;
 
 const STATUS_OK: u8 = 0;
 const STATUS_NOT_FOUND: u8 = 1;
 const STATUS_ERROR: u8 = 2;
+/// A NUL-terminated discriminator cannot collide with legacy UTF-8 path
+/// frames: Windows paths cannot contain NUL. The worker keeps legacy hydrate
+/// framing byte-for-byte unchanged for old injected DLLs.
+const METADATA_PIPE_PREFIX: &[u8] = b"NUL-SBZ-v1\0";
+const METADATA_ENTRY_BYTES: usize = 41;
 const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 const PREFETCH_CONCURRENCY: usize = 32;
 static HYDRATE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
@@ -940,16 +946,41 @@ async fn handle_client(
 ) -> io::Result<()> {
     let _connection_guard = VfsHarnessConnectionGuard(harness.clone());
     loop {
-        let path = match read_msg(&mut pipe).await {
-            Ok(Some(bytes)) => match String::from_utf8(bytes) {
-                Ok(p) => p,
-                Err(_) => {
-                    write_response(&mut pipe, STATUS_ERROR, "").await?;
-                    continue;
-                }
-            },
+        let request = match read_msg(&mut pipe).await {
+            Ok(Some(bytes)) => bytes,
             Ok(None) => return Ok(()), // client closed
             Err(e) => return Err(e),
+        };
+        if let Some(path_bytes) = request.strip_prefix(METADATA_PIPE_PREFIX) {
+            let path = match std::str::from_utf8(path_bytes) {
+                Ok(path) if !path.is_empty() => path,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bad metadata pipe request",
+                    ));
+                }
+            };
+            if let Some(harness) = &harness {
+                harness.record_request();
+            }
+            let entry = match metadata_probe(path, &state).await {
+                Ok(entry) => entry,
+                // No synthetic error entry here: a caller must distinguish an
+                // agent/fileserver failure from a real filesystem result, so
+                // close this connection and let the DLL use its bounded retry.
+                Err(error) => return Err(error),
+            };
+            write_metadata_response(&mut pipe, &entry).await?;
+            continue;
+        }
+
+        let path = match String::from_utf8(request) {
+            Ok(p) => p,
+            Err(_) => {
+                write_response(&mut pipe, STATUS_ERROR, "").await?;
+                continue;
+            }
         };
 
         if let Some(harness) = &harness {
@@ -970,6 +1001,21 @@ async fn handle_client(
         {
             return Ok(());
         }
+    }
+}
+
+/// One metadata-only operation. Keeping this out of `hydrate` is a hard
+/// boundary: no logical-path hydrate map, worker CAS, scratch path, or content
+/// operation can be reached from attributes/time probes.
+async fn metadata_probe(path: &str, state: &VfsState) -> io::Result<MetadataEntry> {
+    let client = state.client().await?;
+    let response = client.metadata_batch(&[path.to_owned()]).await?;
+    match response.entries.as_slice() {
+        [entry] => Ok(entry.clone()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata response cardinality mismatch",
+        )),
     }
 }
 
@@ -1125,6 +1171,25 @@ async fn write_response(pipe: &mut NamedPipeServer, status: u8, local: &str) -> 
     let mut payload = Vec::with_capacity(1 + local.len());
     payload.push(status);
     payload.extend_from_slice(local.as_bytes());
+    pipe.write_all(&(payload.len() as u32).to_le_bytes())
+        .await?;
+    pipe.write_all(&payload).await?;
+    pipe.flush().await
+}
+
+async fn write_metadata_response(
+    pipe: &mut NamedPipeServer,
+    entry: &MetadataEntry,
+) -> io::Result<()> {
+    let encoded = sembazuru_dataplane::ops::MetadataResponse {
+        entries: vec![entry.clone()],
+    }
+    .encode()
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    debug_assert_eq!(encoded.len(), 4 + METADATA_ENTRY_BYTES);
+    let mut payload = Vec::with_capacity(METADATA_PIPE_PREFIX.len() + METADATA_ENTRY_BYTES);
+    payload.extend_from_slice(METADATA_PIPE_PREFIX);
+    payload.extend_from_slice(&encoded[4..]);
     pipe.write_all(&(payload.len() as u32).to_le_bytes())
         .await?;
     pipe.write_all(&payload).await?;

@@ -62,11 +62,17 @@ use sembazuru_cas::{BlobStore, Digest, DigestHasher};
 use sembazuru_dataplane::async_io::{read_frame, read_frame_with_body_guard, write_frame};
 use sembazuru_dataplane::ops::{
     DirEntry, DirListRequest, DirListResponse, HasRequest, HasResponse, HelloRequest,
-    HelloResponse, MAX_DIRLIST_ENTRIES, OpenReadRequest, OpenReadResponse, ReadRequest,
-    ReadResponse, StatEntry, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
+    HelloResponse, MAX_DIRLIST_ENTRIES, MetadataEntry, MetadataRequest, MetadataResponse,
+    OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse, StatEntry, StatRequest,
+    StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+#[cfg(windows)]
+use cap_std::fs::MetadataExt as CapMetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as StdMetadataExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
@@ -762,6 +768,21 @@ async fn dispatch(
             Ok(req) => stat_batch(req, map, cap).await.encode(),
             Err(_) => StatResponse { entries: vec![] }.encode(),
         },
+        OpCode::MetadataBatchV1 => match MetadataRequest::decode(payload) {
+            Ok(req) => match metadata_batch_v1(req, map, cap).await {
+                Ok(response) => response
+                    .encode()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+                // The worker treats a cardinality mismatch as infrastructure,
+                // rather than receiving a fabricated filesystem error.
+                Err(_) => MetadataResponse { entries: vec![] }
+                    .encode()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            },
+            Err(_) => MetadataResponse { entries: vec![] }
+                .encode()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+        },
         OpCode::OpenRead => match OpenReadRequest::decode(payload) {
             Ok(req) => open_read(req, cap, store, map, stats).await.encode(),
             Err(_) => not_found_open().encode(),
@@ -806,6 +827,9 @@ async fn dispatch(
 fn closed_response(op: OpCode) -> Vec<u8> {
     match op {
         OpCode::StatBatch => StatResponse { entries: vec![] }.encode(),
+        OpCode::MetadataBatchV1 => MetadataResponse { entries: vec![] }
+            .encode()
+            .expect("empty MetadataBatchV1 response is canonical"),
         OpCode::OpenRead => not_found_open().encode(),
         OpCode::Read => ReadResponse { bytes: vec![] }.encode(),
         OpCode::DirList => DirListResponse {
@@ -1117,6 +1141,92 @@ async fn stat_batch(req: StatRequest, map: &PathMap, cap: &SessionCapability) ->
         entries.push(entry);
     }
     StatResponse { entries }
+}
+
+#[cfg(windows)]
+fn cap_metadata_entry(metadata: &cap_std::fs::Metadata) -> MetadataEntry {
+    MetadataEntry::Present {
+        attributes: CapMetadataExt::file_attributes(metadata),
+        size: metadata.len(),
+        creation_time: CapMetadataExt::creation_time(metadata),
+        access_time: CapMetadataExt::last_access_time(metadata),
+        write_time: CapMetadataExt::last_write_time(metadata),
+    }
+}
+
+#[cfg(windows)]
+fn std_metadata_entry(metadata: &std::fs::Metadata) -> MetadataEntry {
+    MetadataEntry::Present {
+        attributes: StdMetadataExt::file_attributes(metadata),
+        size: metadata.len(),
+        creation_time: StdMetadataExt::creation_time(metadata),
+        access_time: StdMetadataExt::last_access_time(metadata),
+        write_time: StdMetadataExt::last_write_time(metadata),
+    }
+}
+
+fn metadata_error(error: io::Error) -> io::Result<MetadataEntry> {
+    let raw_error = error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+        .filter(|code| *code != 0)
+        .ok_or(error)?;
+    Ok(MetadataEntry::FilesystemError { raw_error })
+}
+
+fn contained_metadata_error(error: io::Error) -> io::Result<MetadataEntry> {
+    if error.raw_os_error().is_none() && error.kind() == io::ErrorKind::PermissionDenied {
+        // cap-std reports a rejected intermediate reparse escape as a portable
+        // PermissionDenied without a Win32 code. It is an existence-hiding
+        // containment result, not an internal server failure.
+        return Ok(MetadataEntry::FilesystemError { raw_error: 2 });
+    }
+    metadata_error(error)
+}
+
+/// Windows metadata only; no digest, BlobStore, ServerStats, or content path
+/// is reachable from here. This is intentionally separate from StatBatch so a
+/// metadata probe cannot accidentally become a hydrate-on-probe regression.
+async fn metadata_batch_v1(
+    req: MetadataRequest,
+    map: &PathMap,
+    cap: &SessionCapability,
+) -> io::Result<MetadataResponse> {
+    enum MetadataTarget {
+        NotFound,
+        Contained(RootDir, String),
+        Ambient(PathBuf),
+    }
+
+    let mut targets = Vec::with_capacity(req.paths.len());
+    for path in &req.paths {
+        if !path_in_scope(path, cap.root()) || cap.requires_contained_root() {
+            targets.push(MetadataTarget::NotFound);
+            continue;
+        }
+        targets.push(match contained_root_access(cap, map, path) {
+            Some((root_dir, rel)) => MetadataTarget::Contained(root_dir, rel),
+            None => MetadataTarget::Ambient(map.resolve(path)),
+        });
+    }
+    let entries = tokio::task::spawn_blocking(move || {
+        targets
+            .into_iter()
+            .map(|target| match target {
+                MetadataTarget::NotFound => Ok(MetadataEntry::FilesystemError { raw_error: 2 }),
+                MetadataTarget::Contained(root_dir, rel) => root_dir
+                    .symlink_metadata(&rel)
+                    .map(|metadata| cap_metadata_entry(&metadata))
+                    .or_else(contained_metadata_error),
+                MetadataTarget::Ambient(path) => std::fs::symlink_metadata(path)
+                    .map(|metadata| std_metadata_entry(&metadata))
+                    .or_else(metadata_error),
+            })
+            .collect::<io::Result<Vec<_>>>()
+    })
+    .await
+    .map_err(blocking_join_to_io)??;
+    Ok(MetadataResponse { entries })
 }
 
 async fn open_read(
@@ -1937,6 +2047,20 @@ mod tests {
             "stat must not follow an intermediate junction outside the session root"
         );
 
+        let metadata = metadata_batch_v1(
+            MetadataRequest {
+                paths: vec![requested.clone()],
+            },
+            &PathMap::Identity,
+            &cap,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            metadata.entries.as_slice(),
+            [MetadataEntry::FilesystemError { .. }]
+        ));
+
         let open = open_read(
             OpenReadRequest {
                 path: requested,
@@ -1966,6 +2090,81 @@ mod tests {
         assert!(
             !listed.exists,
             "dir_list must not enumerate through an out-of-root junction"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn metadata_returns_final_junction_reparse_point_without_following_it() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+        let outside = ScratchDir::new("metadata-final-junction-outside");
+        std::fs::write(outside.path().join("secret.txt"), b"outside").unwrap();
+        let mut root = ScratchDir::new("metadata-final-junction-root");
+        create_junction(&mut root, "final-link", outside.path())
+            .expect("mklink /J should create an unprivileged junction on Windows");
+        let root_name = normalize_root(&root.path().to_string_lossy()).unwrap();
+        let registry = SessionRegistry::new().unwrap();
+        let cap = registry
+            .create(
+                "metadata-final-junction".into(),
+                Some(root_name.clone()),
+                Vec::new(),
+            )
+            .await;
+        let response = metadata_batch_v1(
+            MetadataRequest {
+                paths: vec![root_path_string(&root_name, "final-link")],
+            },
+            &PathMap::Identity,
+            &cap,
+        )
+        .await
+        .unwrap();
+        match response.entries.as_slice() {
+            [MetadataEntry::Present { attributes, .. }] => assert_ne!(
+                attributes & FILE_ATTRIBUTE_REPARSE_POINT,
+                0,
+                "the final junction itself must be represented, not followed"
+            ),
+            other => panic!("expected final-junction metadata, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn metadata_batch_returns_attributes_and_raw_missing_error_without_opening_content() {
+        let root = ScratchDir::new("metadata-only");
+        let input = root.path().join("input.h");
+        std::fs::write(&input, b"metadata must not hydrate").unwrap();
+        let missing = root.path().join("missing.h");
+        let normalized_root =
+            normalize_root(&root.path().to_string_lossy()).expect("absolute temp root");
+        let registry = SessionRegistry::new().unwrap();
+        let cap = registry
+            .create("metadata-only".into(), Some(normalized_root), Vec::new())
+            .await;
+        let response = metadata_batch_v1(
+            MetadataRequest {
+                paths: vec![
+                    input.to_string_lossy().into_owned(),
+                    missing.to_string_lossy().into_owned(),
+                ],
+            },
+            &PathMap::Identity,
+            &cap,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.entries.len(), 2);
+        match &response.entries[0] {
+            MetadataEntry::Present { size, .. } => assert_eq!(*size, 25),
+            other => panic!("expected metadata present, got {other:?}"),
+        }
+        assert_eq!(
+            response.entries[1],
+            MetadataEntry::FilesystemError { raw_error: 2 },
+            "the filesystem error is carried without an OpenRead/CAS path"
         );
     }
 

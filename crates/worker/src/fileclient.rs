@@ -26,8 +26,8 @@ use sembazuru_cas::Digest;
 use sembazuru_dataplane::async_io::{read_frame, write_frame};
 use sembazuru_dataplane::ops::{
     DirListRequest, DirListResponse, HasRequest, HasResponse, MAX_HAS_DIGESTS, MAX_STAT_PATHS,
-    OpenReadRequest, OpenReadResponse, ReadRequest, ReadResponse, StatRequest, StatResponse,
-    WriteBackRequest, WriteBackResponse,
+    MetadataRequest, MetadataResponse, OpenReadRequest, OpenReadResponse, ReadRequest,
+    ReadResponse, StatRequest, StatResponse, WriteBackRequest, WriteBackResponse,
 };
 use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -325,6 +325,35 @@ impl FileClient {
         Ok(StatResponse { entries })
     }
 
+    /// Metadata-only probe for the hook's Win32 attribute APIs. This operation
+    /// is deliberately kept separate from OpenRead: it must never cause a
+    /// digest lookup, CAS read, or content transfer.
+    pub async fn metadata_batch(&self, paths: &[String]) -> io::Result<MetadataResponse> {
+        if paths.is_empty() {
+            return Ok(MetadataResponse {
+                entries: Vec::new(),
+            });
+        }
+        let mut entries = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(sembazuru_dataplane::ops::MAX_METADATA_PATHS) {
+            let payload = MetadataRequest {
+                paths: chunk.to_vec(),
+            }
+            .encode()
+            .map_err(to_io)?;
+            let response = self.call(OpCode::MetadataBatchV1, &payload).await?;
+            let response = MetadataResponse::decode(&response).map_err(to_io)?;
+            if response.entries.len() != chunk.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "metadata response cardinality mismatch",
+                ));
+            }
+            entries.extend(response.entries);
+        }
+        Ok(MetadataResponse { entries })
+    }
+
     /// Resolves `path`, optionally inlining its first chunk. With
     /// `want_inline = false` this is a cheap *digest probe* (no content bytes).
     pub async fn open_read(&self, path: &str, want_inline: bool) -> io::Result<OpenReadResponse> {
@@ -512,7 +541,9 @@ fn to_io(e: sembazuru_dataplane::wire::Error) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sembazuru_dataplane::ops::{HelloResponse, StatEntry};
+    use sembazuru_dataplane::ops::{
+        HelloResponse, MetadataEntry, MetadataRequest, MetadataResponse, StatEntry,
+    };
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
 
@@ -862,6 +893,80 @@ mod tests {
         assert_eq!(response.entries.len(), paths.len());
         assert_eq!(*seen.lock().await, vec![MAX_STAT_PATHS, 1]);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_batch_chunks_10000_requests_without_content_ops() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = Arc::clone(&seen);
+        let server = tokio::spawn(async move {
+            let mut sock = accept_test_handshake(listener).await;
+            while let Ok((header, payload)) = read_frame(&mut sock).await {
+                assert_eq!(header.op, OpCode::MetadataBatchV1);
+                let request = MetadataRequest::decode(&payload).unwrap();
+                server_seen.lock().await.push(request.paths.len());
+                let response = MetadataResponse {
+                    entries: request
+                        .paths
+                        .into_iter()
+                        .map(|_| MetadataEntry::FilesystemError { raw_error: 2 })
+                        .collect(),
+                }
+                .encode()
+                .unwrap();
+                write_frame(
+                    &mut sock,
+                    FrameHeader {
+                        request_id: header.request_id,
+                        op: OpCode::MetadataBatchV1,
+                        is_response: true,
+                    },
+                    &response,
+                )
+                .await
+                .unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        let client = FileClient::connect(addr).await.unwrap();
+        let paths = (0..10_000)
+            .map(|i| format!("c:\\src\\probe-{i}.h"))
+            .collect::<Vec<_>>();
+        let response = client.metadata_batch(&paths).await.unwrap();
+        assert_eq!(response.entries.len(), 10_000);
+        assert_eq!(*seen.lock().await, vec![4096, 4096, 1808]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metadata_batch_rejects_malformed_cardinality() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut sock = accept_test_handshake(listener).await;
+            let (header, _payload) = read_frame(&mut sock).await.unwrap();
+            let malformed = MetadataResponse { entries: vec![] }.encode().unwrap();
+            write_frame(
+                &mut sock,
+                FrameHeader {
+                    request_id: header.request_id,
+                    op: OpCode::MetadataBatchV1,
+                    is_response: true,
+                },
+                &malformed,
+            )
+            .await
+            .unwrap();
+        });
+        let client = FileClient::connect(addr).await.unwrap();
+        let error = client
+            .metadata_batch(&["c:\\src\\one.h".to_owned()])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        server.await.unwrap();
     }
 
     #[tokio::test]
