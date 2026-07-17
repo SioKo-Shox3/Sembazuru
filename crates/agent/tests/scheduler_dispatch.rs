@@ -63,6 +63,10 @@ fn cmd(argv: &[&str]) -> Command {
     }
 }
 
+// Restricted worker startup can be slow under loaded CI. Tests that require a
+// Remote outcome need enough budget to avoid mistaking fixture latency for fallback.
+const GENEROUS_REMOTE_BUDGET: Duration = Duration::from_secs(30);
+
 async fn unavailable_endpoint() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -106,7 +110,7 @@ async fn remote_nonzero_exit_is_failed_not_completed() {
     let (worker, _) = start_worker().await;
     let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
         table_with(&[("w1", &worker, 1)]),
-        Duration::from_secs(1),
+        GENEROUS_REMOTE_BUDGET,
         None,
         tracker.clone(),
     );
@@ -133,14 +137,18 @@ async fn worker_stream_exposes_running_before_remote_completion() {
     let (worker, _) = start_worker().await;
     let scheduler = Scheduler::with_remote_budget_and_cluster_token_and_tracker(
         table_with(&[("w1", &worker, 1)]),
-        Duration::from_secs(5),
+        GENEROUS_REMOTE_BUDGET,
         None,
         tracker.clone(),
     );
     let run = tokio::spawn(async move {
         scheduler
             .dispatch(
-                cmd(&["cmd", "/c", "ping -n 3 127.0.0.1 >nul"]),
+                cmd(&[
+                    "cmd",
+                    "/c",
+                    "waitfor /t 2 SembazuruSchedulerRunningNeverSignal4c8f21a7 >nul 2>nul & exit /b 0",
+                ]),
                 "running".into(),
                 "session".into(),
                 ExecOptions::default(),
@@ -148,7 +156,7 @@ async fn worker_stream_exposes_running_before_remote_completion() {
             .await
     });
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if tracker
                 .snapshot()
@@ -162,7 +170,10 @@ async fn worker_stream_exposes_running_before_remote_completion() {
     })
     .await
     .expect("worker Running event was not observed before completion");
-    assert!(matches!(run.await.unwrap(), Execution::Remote(_)));
+    match run.await.unwrap() {
+        Execution::Remote(outcome) => assert_eq!(outcome.exit_code, Some(0)),
+        other => panic!("expected remote execution, got {other:?}"),
+    }
     assert_eq!(tracker.snapshot()[0].state, ActivityState::Completed);
 }
 
