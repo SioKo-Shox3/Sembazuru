@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use sembazuru_cas::Digest;
@@ -33,6 +33,7 @@ use sembazuru_dataplane::wire::{FrameHeader, OpCode};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio::sync::{Mutex, Semaphore, oneshot};
+use tokio_util::sync::CancellationToken;
 
 /// How much to request per Read after the inlined first chunk.
 const READ_CHUNK: u32 = 256 * 1024;
@@ -60,6 +61,7 @@ struct Mux {
     write: Mutex<OwnedWriteHalf>,
     pending: Mutex<PendingMap>,
     in_flight: Semaphore,
+    reader_cancel: CancellationToken,
     /// Set once the reader task exits (connection dead). Checked under the
     /// `pending` lock so a call cannot register a waiter that will never be woken
     /// — without it, a request issued after the reader stopped would hang forever.
@@ -76,11 +78,21 @@ impl Mux {
     /// Reads responses forever, waking the matching waiter. On a read error or
     /// EOF the connection is dead: drop all waiters (their `recv` errors, which
     /// callers surface as a broken-pipe `io::Error`).
-    async fn read_loop(self: Arc<Self>, mut rd: OwnedReadHalf) {
+    async fn read_loop(mux: Weak<Self>, reader_cancel: CancellationToken, mut rd: OwnedReadHalf) {
         // Until the connection errors/EOFs, route each response to its waiter.
         // A response with no waiter (duplicate / unsolicited) is dropped.
-        while let Ok((header, payload)) = read_frame(&mut rd).await {
-            let waiter = self.pending.lock().await.remove(&header.request_id);
+        loop {
+            let frame = tokio::select! {
+                _ = reader_cancel.cancelled() => break,
+                frame = read_frame(&mut rd) => frame,
+            };
+            let Ok((header, payload)) = frame else {
+                break;
+            };
+            let Some(mux) = mux.upgrade() else {
+                break;
+            };
+            let waiter = mux.pending.lock().await.remove(&header.request_id);
             if let Some(tx) = waiter {
                 let _ = tx.send((header, payload));
             }
@@ -89,8 +101,10 @@ impl Mux {
         // lock: any call that already registered is woken (with an error) here,
         // and any call that has not yet locked `pending` will see `closed` and
         // bail instead of registering a waiter nobody will ever wake.
-        self.closed.store(true, Ordering::SeqCst);
-        self.pending.lock().await.clear();
+        if let Some(mux) = mux.upgrade() {
+            mux.closed.store(true, Ordering::SeqCst);
+            mux.pending.lock().await.clear();
+        }
     }
 
     /// One request/response over the multiplexed connection. Registers a waiter
@@ -171,6 +185,12 @@ impl Mux {
             ));
         }
         Ok(resp)
+    }
+}
+
+impl Drop for Mux {
+    fn drop(&mut self) {
+        self.reader_cancel.cancel();
     }
 }
 
@@ -270,11 +290,16 @@ impl FileClient {
             write: Mutex::new(wr),
             pending: Mutex::new(HashMap::new()),
             in_flight: Semaphore::new(max_in_flight),
+            reader_cancel: CancellationToken::new(),
             closed: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             rtt,
         });
-        tokio::spawn(Arc::clone(&mux).read_loop(rd));
+        tokio::spawn(Mux::read_loop(
+            Arc::downgrade(&mux),
+            mux.reader_cancel.clone(),
+            rd,
+        ));
         Ok(FileClient { mux })
     }
 
@@ -607,6 +632,65 @@ mod tests {
             );
         });
         (addr, server)
+    }
+
+    #[tokio::test]
+    async fn dropping_last_client_releases_blocked_reader_and_pending_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client_stream, accepted) = tokio::join!(connect, accept);
+        let (mut server_stream, _) = accepted.unwrap();
+        let (rd, wr) = client_stream.unwrap().into_split();
+        let mux = Arc::new(Mux {
+            write: Mutex::new(wr),
+            pending: Mutex::new(HashMap::new()),
+            in_flight: Semaphore::new(MAX_IN_FLIGHT_REQUESTS),
+            reader_cancel: CancellationToken::new(),
+            closed: AtomicBool::new(false),
+            next_id: AtomicU64::new(1),
+            rtt: Duration::ZERO,
+        });
+        let reader = tokio::spawn(Mux::read_loop(
+            Arc::downgrade(&mux),
+            mux.reader_cancel.clone(),
+            rd,
+        ));
+        let client = FileClient { mux };
+        let weak_mux = Arc::downgrade(&client.mux);
+        let (request_seen_tx, request_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _request = read_frame(&mut server_stream).await.unwrap();
+            request_seen_tx.send(()).unwrap();
+            let eof = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut server_stream))
+                .await
+                .expect("dropping the last client must close the peer socket");
+            assert!(
+                eof.is_err(),
+                "peer must observe EOF after the last client drops"
+            );
+        });
+
+        let mut call = Box::pin(client.open_read(r"c:\blocked\forever.h", false));
+        tokio::select! {
+            result = &mut call => panic!("unanswered request completed unexpectedly: {result:?}"),
+            seen = request_seen_rx => seen.unwrap(),
+        }
+        assert_eq!(client.mux.pending.lock().await.len(), 1);
+
+        drop(call);
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(2), reader)
+            .await
+            .expect("reader task must stop when the last client drops")
+            .unwrap();
+        assert!(
+            weak_mux.upgrade().is_none(),
+            "reader task must not keep Mux and its pending map alive"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
