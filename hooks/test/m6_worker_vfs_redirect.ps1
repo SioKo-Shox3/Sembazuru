@@ -29,6 +29,19 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+function Remove-RestrictionCanary {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    # The fixture deliberately omits DELETE. Its owner (the runner) restores
+    # cleanup rights only after every restricted action has finished.
+    $ownerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $grant = "*$($ownerSid):(F)"
+    & icacls.exe $Path '/grant:r' $grant '/c' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "could not restore cleanup rights for restriction canary: $Path" }
+    Remove-Item -LiteralPath $Path -Force
+}
+
 $launcher = Join-Path $BuildDir 'launcher.exe'
 $dll = Join-Path $BuildDir 'sbz_interceptor64.dll'
 foreach ($f in @($launcher, $dll)) {
@@ -52,8 +65,53 @@ $execVfs = Join-Path $repo 'target\debug\examples\exec_vfs.exe'
 $fsHost = Join-Path $repo 'target\debug\examples\fileserver_host.exe'
 
 $WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
+$previousRestrictionCanary = Join-Path $WorkRoot 'restricted-token-canary.txt'
+Remove-RestrictionCanary $previousRestrictionCanary
 if (Test-Path $WorkRoot) { Remove-Item -Recurse -Force $WorkRoot }
 New-Item -ItemType Directory -Force $WorkRoot | Out-Null
+
+# A restricted token must satisfy both the normal-user SID and restricting-SID
+# access checks. This protected DACL admits only the normal CI runner SID, so a
+# direct read is a deliberate negative control while the action's restricted
+# token must receive ERROR_ACCESS_DENIED. Keep it outside logicalRoot: the VFS
+# hook must delegate this access to the real filesystem.
+$restrictionCanaryPath = Join-Path $WorkRoot 'restricted-token-canary.txt'
+$restrictionCanaryText = 'normal-runner-only restriction canary'
+Set-Content -LiteralPath $restrictionCanaryPath -Value $restrictionCanaryText -Encoding ascii -NoNewline
+$currentRunnerSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+if ($null -eq $currentRunnerSid) { throw 'could not determine the current runner SID for restriction canary' }
+$canaryReadRights = [System.Security.AccessControl.FileSystemRights]::Read
+$fileSystemAclExtensions = 'System.IO.FileSystemAclExtensions' -as [type]
+if ($fileSystemAclExtensions) {
+    $canaryInfo = [System.IO.FileInfo]::new($restrictionCanaryPath)
+    $canaryAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl($canaryInfo)
+} else {
+    $canaryAcl = [System.IO.File]::GetAccessControl($restrictionCanaryPath)
+}
+$canaryAcl.SetAccessRuleProtection($true, $false)
+foreach ($accessRule in @($canaryAcl.Access)) {
+    [void]$canaryAcl.RemoveAccessRuleAll($accessRule)
+}
+$canaryAcl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+    $currentRunnerSid, $canaryReadRights, [System.Security.AccessControl.AccessControlType]::Allow))
+if ($fileSystemAclExtensions) {
+    [System.IO.FileSystemAclExtensions]::SetAccessControl($canaryInfo, $canaryAcl)
+    $canaryAcl = [System.IO.FileSystemAclExtensions]::GetAccessControl($canaryInfo)
+} else {
+    [System.IO.File]::SetAccessControl($restrictionCanaryPath, $canaryAcl)
+    $canaryAcl = [System.IO.File]::GetAccessControl($restrictionCanaryPath)
+}
+$canaryRules = @($canaryAcl.Access)
+if (-not $canaryAcl.AreAccessRulesProtected -or $canaryRules.Count -ne 1) {
+    throw 'restriction canary DACL is not protected and limited to one explicit rule'
+}
+$canaryRuleSid = $canaryRules[0].IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+$expectedCanaryRights = $canaryReadRights -bor [System.Security.AccessControl.FileSystemRights]::Synchronize
+if ($canaryRuleSid.Value -ne $currentRunnerSid.Value -or
+    $canaryRules[0].AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+    $canaryRules[0].FileSystemRights -ne $expectedCanaryRights) {
+    throw "restriction canary DACL unexpectedly grants access: $($canaryRules[0].IdentityReference) $($canaryRules[0].AccessControlType) $($canaryRules[0].FileSystemRights)"
+}
 
 # Probe: verify process-visible cwd/path APIs still expose the logical cwd, then
 # make argv[1] absolute with GetFullPathNameW (common in runtimes/tools), probe
@@ -72,15 +130,29 @@ New-Item -ItemType Directory -Force $WorkRoot | Out-Null
 #   6 = GetFileAttributesW failed before CreateFileW hydrated the file
 #   7 = wildcard enumeration unexpectedly reached the real filesystem
 #   8 = SetCurrentDirectoryW failed
-#   9 = process token was not restricted (or could not be queried)
+#   9 = restriction canary was readable (restricted-token regression)
 #  10 = process was not assigned to a Job (or membership could not be queried)
+#  12 = restriction canary fixture or its access check failed
 # Static CRT (/MT) so it needs no runtime DLL beyond the cleared+rebuilt env.
 $probeSrc = @'
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string.h>
 #include <wchar.h>
-#pragma comment(lib, "advapi32.lib")
+static int CheckRestrictionCanary() {
+    wchar_t path[32768];
+    DWORD length = GetEnvironmentVariableW(
+        L"SBZ_M6_RESTRICTION_CANARY", path, static_cast<DWORD>(sizeof(path) / sizeof(path[0])));
+    if (length == 0 || length >= sizeof(path) / sizeof(path[0])) return 12;
+    HANDLE canary = CreateFileW(path, GENERIC_READ,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (canary != INVALID_HANDLE_VALUE) {
+        CloseHandle(canary);
+        return 9;
+    }
+    return GetLastError() == ERROR_ACCESS_DENIED ? 0 : 12;
+}
 static int WideArgToAcp(const wchar_t* src, char* dst, int cap) {
     int n = WideCharToMultiByte(CP_ACP, 0, src, -1, dst, cap, nullptr, nullptr);
     return n > 0 && n <= cap ? n : 0;
@@ -205,11 +277,8 @@ static int SpawnReadChild(const wchar_t* path, const wchar_t* expected,
     return static_cast<int>(exitCode);
 }
 int wmain(int argc, wchar_t** argv) {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 12;
-    BOOL restricted = IsTokenRestricted(token);
-    CloseHandle(token);
-    if (!restricted) return 9;
+    int canary = CheckRestrictionCanary();
+    if (canary != 0) return canary;
     BOOL inJob = FALSE;
     if (!IsProcessInJob(GetCurrentProcess(), nullptr, &inJob) || !inJob) return 10;
     if (argc >= 4 && wcscmp(argv[1], L"--spawn-child-w") == 0) {
@@ -413,11 +482,14 @@ $emptyTraceChildAExit = 99
 $metadataExit = 99
 $oldSmuggledVfsCwd = $env:SEMBAZURU_VFS_CWD
 $oldSmuggledTraceDir = $env:SEMBAZURU_TRACE_DIR
+$hadRestrictionCanary = Test-Path Env:\SBZ_M6_RESTRICTION_CANARY
+$oldRestrictionCanary = $env:SBZ_M6_RESTRICTION_CANARY
 try {
     $env:SEMBAZURU_LAUNCHER = $launcher
     $env:SEMBAZURU_DLL = $dll
     $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot
     $env:SEMBAZURU_CAS_ROOT = $casRoot
+    $env:SBZ_M6_RESTRICTION_CANARY = $restrictionCanaryPath
     # An explicit absent path selects the development/test override identity. The
     # worker then loads defaults plus the env overrides above without acquiring the
     # canonical machine service-runtime guard used by production installations.
@@ -452,6 +524,21 @@ try {
             $PSNativeCommandUseErrorActionPreference = $false
         }
         try {
+            # Negative control: the unmodified runner token must read the canary,
+            # and the same native probe must therefore report exit 9 before an
+            # action starts. The action uses a restricted token and must instead
+            # receive ERROR_ACCESS_DENIED, then continue through its VFS checks.
+            $normalCanaryText = [System.IO.File]::ReadAllText($restrictionCanaryPath)
+            if ($normalCanaryText -ne $restrictionCanaryText) {
+                throw 'normal runner could not read the restriction canary content'
+            }
+            & $probe 2>&1 | Out-String | Write-Host
+            $normalCanaryProbeExit = $LASTEXITCODE
+            if ($normalCanaryProbeExit -ne 9) {
+                throw "restriction canary negative control failed: normal native probe exit=$normalCanaryProbeExit, expected 9"
+            }
+            Write-Host 'RESTRICTION_CANARY NEGATIVE_CONTROL PASS normal_probe_exit=9'
+
             $logicalSrc = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot 'Src'))
             $env:SEMBAZURU_VFS_CWD = $fakeVfsCwd
             $env:SEMBAZURU_TRACE_DIR = $smuggledTraceDir
@@ -555,9 +642,15 @@ try {
     } else {
         $env:SEMBAZURU_TRACE_DIR = $oldSmuggledTraceDir
     }
+    if ($hadRestrictionCanary) {
+        $env:SBZ_M6_RESTRICTION_CANARY = $oldRestrictionCanary
+    } else {
+        Remove-Item Env:\SBZ_M6_RESTRICTION_CANARY -ErrorAction SilentlyContinue
+    }
     foreach ($p in @($workerProc, $fsProc)) {
         if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
     }
+    Remove-RestrictionCanary $restrictionCanaryPath
 }
 
 # The action's exit code IS the provenance proof (the probe compared the bytes it
@@ -572,9 +665,9 @@ switch ($exit) {
     4 { $failures += 'GetCurrentDirectoryW returned the scratch cwd instead of the logical submitted cwd (exit 4)' }
     5 { $failures += 'GetFullPathNameW resolved the relative input outside the logical submitted cwd (exit 5)' }
     6 { $failures += 'GetFileAttributesW failed before CreateFileW hydrated the VFS input (exit 6)' }
-    9 { $failures += 'the target entered without a restricted token (exit 9)' }
+    9 { $failures += 'the restricted action could read the runner-only restriction canary (exit 9)' }
     10 { $failures += 'the target entered outside the worker Job object (exit 10)' }
-    12 { $failures += 'the target token could not be opened for restriction verification (exit 12)' }
+    12 { $failures += 'the restriction canary could not be checked (exit 12): fixture ACL or real filesystem access failed' }
     default { $failures += "the VFS-mode Execute failed (exit=$exit)" }
 }
 if ($verbatimExit -ne 0) {
