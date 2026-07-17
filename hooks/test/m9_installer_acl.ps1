@@ -681,32 +681,146 @@ function Stop-ServicesForOfflineTokenMaintenance {
 function Initialize-TestOnlyClusterToken {
     param([string]$StoreCtl)
 
-    Stop-ServicesForOfflineTokenMaintenance
-    $token = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
-    if ($token.Length -ne 64 -or $token -notmatch '\A[0-9a-f]{64}\z') {
-        throw 'test-only cluster token generation did not produce the required opaque shape'
-    }
-    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) (
-        "sembazuru-m9-rotate-token-$([Guid]::NewGuid().ToString('N')).err")
+    $offlineMaintenanceStarted = $false
+    $childReaped = $true
+    $rotationFailure = $null
+    $restartFailures = [Collections.Generic.List[string]]::new()
     try {
-        $stdout = @(& { $token | & $StoreCtl rotate-token 2> $stderrPath })
-        $exitCode = $LASTEXITCODE
-        [string]$stderr = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
-            [string](Get-Content -LiteralPath $stderrPath -Raw -ErrorAction Stop)
-        } else { '' }
-        if ($exitCode -ne 0 -or $stdout.Count -ne 1 -or [string]$stdout[0] -cne 'token-rotated' -or
-            $stderr -cne '') {
-            throw "test-only cluster token setup failed: exit=$exitCode stdoutCount=$($stdout.Count) stderrLength=$($stderr.Length)"
+        $offlineMaintenanceStarted = $true
+        Stop-ServicesForOfflineTokenMaintenance
+        $token = [Guid]::NewGuid().ToString('N') + [Guid]::NewGuid().ToString('N')
+        if ($token.Length -ne 64 -or $token -notmatch '\A[0-9a-f]{64}\z') {
+            throw 'test-only cluster token generation did not produce the required opaque shape'
+        }
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $process = $null
+        $processStarted = $false
+        $stdin = $null
+        $stdoutReader = $null
+        $stderrReader = $null
+        $processFailure = $null
+        $processCleanupFailures = [Collections.Generic.List[string]]::new()
+        try {
+            $startInfo.FileName = $StoreCtl
+            [void]$startInfo.ArgumentList.Add('rotate-token')
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardInput = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $startInfo.CreateNoWindow = $true
+
+            $process = [System.Diagnostics.Process]::new()
+            $process.StartInfo = $startInfo
+            $processStarted = $process.Start()
+            if (-not $processStarted) {
+                throw 'test-only cluster token setup could not start rotate-token'
+            }
+            $childReaped = $false
+            $stdin = $process.StandardInput
+            $stdoutReader = $process.StandardOutput
+            $stderrReader = $process.StandardError
+            $stdoutTask = $stdoutReader.ReadToEndAsync()
+            $stderrTask = $stderrReader.ReadToEndAsync()
+            try {
+                $stdin.WriteLine($token)
+            }
+            finally {
+                $stdin.Close()
+            }
+            $timedOut = -not $process.WaitForExit(30000)
+            $childReaped = -not $timedOut
+            if ($timedOut) {
+                $process.Kill($true)
+                $childReaped = $process.WaitForExit(5000)
+                if (-not $childReaped) {
+                    throw 'test-only cluster token setup timed out and child was not reaped within 5 seconds'
+                }
+            }
+            [string]$stdout = $stdoutTask.GetAwaiter().GetResult()
+            [string]$stderr = $stderrTask.GetAwaiter().GetResult()
+            $exitCode = $process.ExitCode
+            if ($timedOut) {
+                throw 'test-only cluster token setup timed out after 30 seconds'
+            }
+            if ($exitCode -ne 0 -or $stdout -cnotmatch '\Atoken-rotated(?:\r?\n)?\z' -or
+                $stderr -cne '') {
+                $stderrClass = if ([string]::IsNullOrEmpty($stderr)) {
+                    'empty'
+                } elseif ($stderr -match '\Asembazuru-storectl: token-io-failed(?:\r?\n)?\z') {
+                    'token-io-failed'
+                } else {
+                    'unexpected'
+                }
+                throw "test-only cluster token setup failed: exit=$exitCode stdoutLength=$($stdout.Length) stderrClass=$stderrClass stderrLength=$($stderr.Length)"
+            }
+        }
+        catch {
+            $processFailure = $_
+        }
+        finally {
+            if ($processStarted -and -not $childReaped) {
+                $hasExited = $false
+                try { $hasExited = $process.HasExited }
+                catch { $processCleanupFailures.Add("process-state:$($_.Exception.GetType().Name)") }
+                try {
+                    if (-not $hasExited) { $process.Kill($true) }
+                }
+                catch {
+                    $processCleanupFailures.Add("process-kill:$($_.Exception.GetType().Name)")
+                }
+                try { $childReaped = $process.WaitForExit(5000) }
+                catch { $processCleanupFailures.Add("process-reap:$($_.Exception.GetType().Name)") }
+                if (-not $childReaped) { $processCleanupFailures.Add('child-not-reaped') }
+            }
+            foreach ($stream in @($stdin, $stdoutReader, $stderrReader)) {
+                if ($null -eq $stream) { continue }
+                try { $stream.Dispose() }
+                catch { $processCleanupFailures.Add("stream:$($_.Exception.GetType().Name)") }
+            }
+            if ($null -ne $process) {
+                try { $process.Dispose() }
+                catch { $processCleanupFailures.Add("process-dispose:$($_.Exception.GetType().Name)") }
+            }
+        }
+
+        if ($null -ne $processFailure) {
+            if ($processCleanupFailures.Count -ne 0) {
+                throw [Exception]::new(
+                    "$($processFailure.Exception.Message); process cleanup failed: $($processCleanupFailures -join ',')",
+                    $processFailure.Exception)
+            }
+            throw $processFailure
+        }
+        if ($processCleanupFailures.Count -ne 0) {
+            throw "test-only cluster token process cleanup failed: $($processCleanupFailures -join ',')"
         }
     }
+    catch {
+        $rotationFailure = $_
+    }
     finally {
-        if (Test-Path -LiteralPath $stderrPath) {
-            Remove-Item -LiteralPath $stderrPath -Force -ErrorAction Stop
+        if ($offlineMaintenanceStarted) {
+            if (-not $childReaped) {
+                $restartFailures.Add('service-restart-skipped:child-not-reaped')
+            } else {
+                foreach ($name in @('SembazuruDaemon', 'SembazuruWorker')) {
+                    try { Start-Service -Name $name -ErrorAction Stop }
+                    catch { $restartFailures.Add("${name}:$($_.Exception.GetType().Name)") }
+                }
+            }
         }
     }
 
-    foreach ($name in @('SembazuruDaemon', 'SembazuruWorker')) {
-        Start-Service -Name $name -ErrorAction Stop
+    if ($null -ne $rotationFailure) {
+        if ($restartFailures.Count -ne 0) {
+            throw [Exception]::new(
+                "$($rotationFailure.Exception.Message); service restart failed: $($restartFailures -join ',')",
+                $rotationFailure.Exception)
+        }
+        throw $rotationFailure
+    }
+    if ($restartFailures.Count -ne 0) {
+        throw "test-only cluster token service restart failed: $($restartFailures -join ',')"
     }
     Assert-ServicesRunning
     Wait-ForWorkerExecutionEndpoint
@@ -729,16 +843,25 @@ function Assert-OfflineTokenSetupSource {
     param([string]$Path)
 
     $source = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-    if ($source -notmatch '\$token\s*\|\s*&\s*\$StoreCtl\s+rotate-token') {
+    if ($source -match '\$token\s*\|\s*&\s*\$StoreCtl\s+rotate-token' -or
+        $source -notmatch '\[System\.Diagnostics\.ProcessStartInfo\]::new\(\)' -or
+        $source -notmatch '\$startInfo\.ArgumentList\.Add\(''rotate-token''\)' -or
+        $source -notmatch '\$startInfo\.UseShellExecute\s*=\s*\$false' -or
+        $source -notmatch '\$startInfo\.RedirectStandardInput\s*=\s*\$true' -or
+        $source -notmatch '\$startInfo\.RedirectStandardOutput\s*=\s*\$true' -or
+        $source -notmatch '\$startInfo\.RedirectStandardError\s*=\s*\$true' -or
+        $source -notmatch '\$startInfo\.CreateNoWindow\s*=\s*\$true' -or
+        $source -notmatch '\$stdin\.WriteLine\(\$token\)' -or
+        $source -notmatch '\$stdin\.Close\(\)') {
         throw 'offline token setup must provide the token only through rotate-token stdin'
     }
     $unsafeTokenLines = @($source -split "`r?`n" | Where-Object {
-        $_ -match '(?<!\\)\$token\b' -and $_ -match '(?:Write-(?:Host|Output|Warning|Error)|throw|ArgumentList|Set-Content|Add-Content|Out-File)'
+        $_ -match '(?<!\\)\$token\b' -and $_ -match '(?:Write-(?:Host|Output|Warning|Error)|throw|Arguments?|Set-Content|Add-Content|Out-File|\$env:|Set-Item\s+(?:-Path\s+)?Env:|SetEnvironmentVariable)'
     })
     if ($unsafeTokenLines.Count -ne 0) {
         throw 'offline token setup source exposes token material through output, argv, or a plain-text file sink'
     }
-    Write-Host 'STATIC TOKEN SETUP PASS: rotate-token uses stdin and the script has no token output, argv, or plain-text sink.'
+    Write-Host 'STATIC TOKEN SETUP PASS: rotate-token uses redirected stdin and has no token output, argv, or plain-text sink.'
 }
 
 function Get-ServiceStatusSummary {
