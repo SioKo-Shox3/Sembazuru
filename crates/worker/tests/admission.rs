@@ -13,9 +13,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use sembazuru_agent::{ActionOutcome, ExecuteError};
-use sembazuru_proto::v0::Command;
+use sembazuru_proto::v0::execute_event::Event;
+use sembazuru_proto::v0::execution_server::Execution as _;
+use sembazuru_proto::v0::{ActionState, Command, ExecuteRequest};
 use sembazuru_worker::WorkerService;
 use tokio::task::JoinSet;
+use tokio_stream::StreamExt;
+use tonic::Request;
 
 type RpcOutcome = Result<ActionOutcome, ExecuteError>;
 
@@ -64,6 +68,114 @@ fn drain_finished(
             Err(error) => panic!("admission RPC task failed to join: {error}"),
         }
     }
+}
+
+fn execute_request(action_id: &str) -> ExecuteRequest {
+    ExecuteRequest {
+        action_id: action_id.to_string(),
+        command: Some(blocking_cmd()),
+        session_id: "sess".into(),
+        predicted_inputs: None,
+        predicted_paths: Vec::new(),
+        vfs: None,
+        action_capability: Vec::new(),
+    }
+}
+
+async fn expect_state(
+    stream: &mut <WorkerService as sembazuru_proto::v0::execution_server::Execution>::ExecuteStream,
+    expected: ActionState,
+) {
+    let event = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("worker did not emit the expected state")
+        .expect("worker closed the execution stream early")
+        .expect("worker returned a stream error");
+    let Some(Event::State(state)) = event.event else {
+        panic!("expected a state event, got {event:?}");
+    };
+    assert_eq!(state.state, expected as i32);
+}
+
+#[tokio::test]
+async fn dropping_a_queued_stream_cancels_before_admission() {
+    let scratch_root = std::env::temp_dir().join(format!(
+        "sbz-admission-queued-cancel-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch_root);
+    std::fs::create_dir(&scratch_root).unwrap();
+
+    let service = WorkerService::with_capacity(1).with_scratch_root(scratch_root.clone());
+    let running = service.running_handle();
+    let served = service.served_handle();
+
+    let mut first = service
+        .execute(Request::new(execute_request("first")))
+        .await
+        .unwrap()
+        .into_inner();
+    expect_state(&mut first, ActionState::Queued).await;
+
+    let first_ready = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(path) = ready_scratch_dirs(&scratch_root).into_iter().next() {
+                break path;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first action never acquired the sole permit");
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+    assert_eq!(running.load(Ordering::SeqCst), 1);
+
+    let mut second = service
+        .execute(Request::new(execute_request("second")))
+        .await
+        .unwrap()
+        .into_inner();
+    expect_state(&mut second, ActionState::Queued).await;
+    drop(second);
+
+    std::fs::write(first_ready.join("release"), b"release").unwrap();
+    while first.next().await.is_some() {}
+
+    let cleanup_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "the cancelled queued action reached admission"
+        );
+        if running.load(Ordering::SeqCst) == 0
+            && std::fs::read_dir(&scratch_root).unwrap().next().is_none()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < cleanup_deadline,
+            "cancelled queued action reached running or left private scratch: running={}, scratch={:?}",
+            running.load(Ordering::SeqCst),
+            ready_scratch_dirs(&scratch_root)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(served.load(Ordering::SeqCst), 1);
+    assert_eq!(running.load(Ordering::SeqCst), 0);
+    assert!(std::fs::read_dir(&scratch_root).unwrap().next().is_none());
+
+    // Keep the runtime alive after the permit is released so the queued task
+    // must observe cancellation rather than merely remaining unscheduled.
+    let stable_until = tokio::time::Instant::now() + Duration::from_millis(250);
+    while tokio::time::Instant::now() < stable_until {
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+        assert!(std::fs::read_dir(&scratch_root).unwrap().next().is_none());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::remove_dir(scratch_root).unwrap();
 }
 
 #[tokio::test]

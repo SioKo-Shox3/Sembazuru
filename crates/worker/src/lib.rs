@@ -776,20 +776,32 @@ async fn run_action(
     // stays bounded; released on drop when the action leaves the worker.
     _accept: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let _ = tx.send(state_event(ActionState::Queued, "")).await;
+    if tx.send(state_event(ActionState::Queued, "")).await.is_err() {
+        return;
+    }
 
-    // Admission control: wait for a free slot. The owned permit is held for the
-    // whole run and released on drop (normal end, early return, or panic).
-    let _permit = match limit.acquire_owned().await {
-        Ok(p) => p,
-        // Only happens if the semaphore is closed (worker shutting down).
-        Err(_) => {
-            let _ = tx
-                .send(state_event(ActionState::Failed, "worker shutting down"))
-                .await;
-            return;
+    // Admission control: a client that drops its response stream while queued
+    // has cancelled the request. Prefer cancellation when it races a newly-free
+    // permit, then recheck after acquisition before any accounting or setup.
+    let _permit = tokio::select! {
+        biased;
+        _ = tx.closed() => return,
+        permit = limit.acquire_owned() => {
+            match permit {
+                Ok(p) => p,
+                // Only happens if the semaphore is closed (worker shutting down).
+                Err(_) => {
+                    let _ = tx
+                        .send(state_event(ActionState::Failed, "worker shutting down"))
+                        .await;
+                    return;
+                }
+            }
         }
     };
+    if tx.is_closed() {
+        return;
+    }
     // Now genuinely running: count it for capacity reporting until the guard
     // drops. Queued (un-admitted) actions are deliberately not counted.
     running.fetch_add(1, Ordering::SeqCst);
