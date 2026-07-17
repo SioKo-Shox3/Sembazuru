@@ -31,7 +31,7 @@ int Child(const wchar_t* sentinel, bool requireHook) {
 int Parent(bool ansi, bool requireHook, bool customEnvironment,
            const wchar_t* child, const wchar_t* sentinel) {
     wchar_t command[4096];
-    if (_snwprintf_s(command, _countof(command), _TRUNCATE,
+    if (_snwprintf_s(command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
                      L"\"%s\" %s \"%s\"", child,
                      requireHook ? L"--child-module" : L"--child", sentinel) <
         0) {
