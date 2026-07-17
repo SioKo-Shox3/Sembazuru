@@ -482,10 +482,123 @@ bool ReadExactPipe(HANDLE h, void* buf, DWORD len) {
     return true;
 }
 
+// A VFS hydrate is a synchronous request/response exchange. Keep its pipe
+// client thread-local so successive compiler opens do not pay a new named-pipe
+// connection each time. Nested hook activity must never share that connection:
+// it uses a short-lived pipe instead, preventing two frames from interleaving.
+struct VfsThreadPipe {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    void Reset() {
+        if (handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    ~VfsThreadPipe() { Reset(); }
+};
+
+thread_local VfsThreadPipe g_vfsThreadPipe;
+thread_local unsigned g_vfsHydrateDepth = 0;
+
+struct VfsHydrateScope {
+    bool outer = false;
+
+    VfsHydrateScope() : outer(g_vfsHydrateDepth++ == 0) {}
+    ~VfsHydrateScope() { --g_vfsHydrateDepth; }
+};
+
+HANDLE ConnectVfsPipe() {
+    // Ask only for pipe data I/O. GENERIC_WRITE expands to
+    // FILE_CREATE_PIPE_INSTANCE (0x4); that create-instance bit is intentionally
+    // not requested by a client, and the worker's action DACL withholds it.
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    for (;;) {
+        HANDLE pipe =
+            TrueCreateFileW(g_vfsPipe, FILE_READ_DATA | FILE_WRITE_DATA, 0,
+                            nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe != INVALID_HANDLE_VALUE) {
+            return pipe;
+        }
+        DWORD error = GetLastError();
+        if (error != ERROR_PIPE_BUSY) {
+            break;
+        }
+
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) {
+            break;
+        }
+        // WaitNamedPipe only observes availability; another racing client can
+        // take that instance first. Keep retrying BUSY within the original
+        // five-second connection budget rather than treating one wakeup as a
+        // reservation. A vanished pipe still fails immediately on the next
+        // CreateFileW with ERROR_FILE_NOT_FOUND.
+        ULONGLONG remaining = deadline - now;
+        DWORD waitMs = remaining > 0xFFFFFFFFu ? 0xFFFFFFFFu
+                                                : static_cast<DWORD>(remaining);
+        if (WaitNamedPipeW(g_vfsPipe, waitMs)) {
+            continue;
+        }
+        error = GetLastError();
+        if (error == ERROR_SEM_TIMEOUT && GetTickCount64() < deadline) {
+            continue;
+        }
+        break;
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+enum class VfsPipeExchange { Ok, Response, Transport };
+
+// Performs exactly one complete hydrate exchange. `Response` means the server
+// sent a valid non-success response; only a broken/partial transport response
+// is eligible for the caller's one fresh-connection retry.
+VfsPipeExchange VfsHydrateOnce(HANDLE pipe, const char* request,
+                                DWORD requestLen, wchar_t* localOut,
+                                int localCap) {
+    if (!WriteAllPipe(pipe, &requestLen, 4) ||
+        !WriteAllPipe(pipe, request, requestLen)) {
+        return VfsPipeExchange::Transport;
+    }
+    DWORD respLen = 0;
+    if (!ReadExactPipe(pipe, &respLen, 4)) {
+        return VfsPipeExchange::Transport;
+    }
+    constexpr int kBuf = 8192;
+    if (respLen < 1 || respLen > static_cast<DWORD>(kBuf)) {
+        return VfsPipeExchange::Transport;
+    }
+    char response[kBuf];
+    if (!ReadExactPipe(pipe, response, respLen)) {
+        return VfsPipeExchange::Transport;
+    }
+    if (static_cast<BYTE>(response[0]) != 0 || respLen <= 1) {
+        return VfsPipeExchange::Response;
+    }
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, response + 1,
+                                   static_cast<int>(respLen - 1), nullptr, 0);
+    if (wlen <= 0 || wlen >= localCap) {
+        return VfsPipeExchange::Response;
+    }
+    wchar_t converted[1024];
+    if (wlen >= 1024 ||
+        MultiByteToWideChar(CP_UTF8, 0, response + 1,
+                            static_cast<int>(respLen - 1), converted,
+                            wlen) <= 0) {
+        return VfsPipeExchange::Response;
+    }
+    converted[wlen] = L'\0';
+    memcpy(localOut, converted, (static_cast<size_t>(wlen) + 1) * sizeof(wchar_t));
+    return VfsPipeExchange::Ok;
+}
+
 // Asks the worker to hydrate `absPath`; on success writes the local scratch path
 // (wide) into `localOut` and returns true. On not-found/error returns false and
-// the caller falls back to a local open. One short-lived pipe connection per
-// call (a per-thread persistent connection is an M3.5 latency optimization).
+// the caller falls back to a local open. Each outer thread keeps one pipe; a
+// broken response drops that handle and retries this idempotent hydrate once on
+// a fresh connection. Re-entrant calls never borrow the cached handle.
 bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
     // Wide -> UTF-8 request. Paths are bounded (abs buffer is 1024 wide), so an
     // 8 KiB UTF-8 buffer is ample and keeps stack use modest in this hot path.
@@ -501,52 +614,40 @@ bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
         return false;
     }
     DWORD payloadLen = static_cast<DWORD>(u8len - 1);  // drop NUL
-
-    // Ask only for pipe data I/O. GENERIC_WRITE expands to
-    // FILE_CREATE_PIPE_INSTANCE (0x4); that create-instance bit is intentionally
-    // not requested by a client, and the worker's action DACL withholds it.
-    HANDLE pipe = TrueCreateFileW(g_vfsPipe, FILE_READ_DATA | FILE_WRITE_DATA, 0,
-                                  nullptr, OPEN_EXISTING, 0, nullptr);
-    if (pipe == INVALID_HANDLE_VALUE) {
-        if (GetLastError() == ERROR_PIPE_BUSY &&
-            WaitNamedPipeW(g_vfsPipe, 5000)) {
-            pipe = TrueCreateFileW(g_vfsPipe,
-                                   FILE_READ_DATA | FILE_WRITE_DATA, 0,
-                                   nullptr, OPEN_EXISTING, 0, nullptr);
+    VfsHydrateScope scope;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        HANDLE pipe = INVALID_HANDLE_VALUE;
+        if (scope.outer) {
+            if (g_vfsThreadPipe.handle == INVALID_HANDLE_VALUE) {
+                g_vfsThreadPipe.handle = ConnectVfsPipe();
+            }
+            pipe = g_vfsThreadPipe.handle;
+        } else {
+            pipe = ConnectVfsPipe();
         }
         if (pipe == INVALID_HANDLE_VALUE) {
+            if (scope.outer) {
+                g_vfsThreadPipe.Reset();
+            }
             return false;
         }
-    }
 
-    bool ok = false;
-    if (WriteAllPipe(pipe, &payloadLen, 4) &&
-        WriteAllPipe(pipe, u8, payloadLen)) {
-        DWORD respLen = 0;
-        if (ReadExactPipe(pipe, &respLen, 4) && respLen >= 1 &&
-            respLen <= static_cast<DWORD>(kBuf)) {
-            char resp[kBuf];
-            if (ReadExactPipe(pipe, resp, respLen)) {
-                BYTE status = static_cast<BYTE>(resp[0]);
-                if (status == 0 && respLen > 1) {
-                    int wlen = MultiByteToWideChar(CP_UTF8, 0, resp + 1,
-                                                   static_cast<int>(respLen - 1),
-                                                   nullptr, 0);
-                    if (wlen > 0 && wlen < localCap) {
-                        int w = MultiByteToWideChar(
-                            CP_UTF8, 0, resp + 1,
-                            static_cast<int>(respLen - 1), localOut, wlen);
-                        if (w > 0) {
-                            localOut[w] = L'\0';
-                            ok = true;
-                        }
-                    }
-                }
-            }
+        VfsPipeExchange result =
+            VfsHydrateOnce(pipe, u8, payloadLen, localOut, localCap);
+        if (!scope.outer) {
+            CloseHandle(pipe);
+        }
+        if (result == VfsPipeExchange::Ok) {
+            return true;
+        }
+        if (result == VfsPipeExchange::Response) {
+            return false;
+        }
+        if (scope.outer) {
+            g_vfsThreadPipe.Reset();
         }
     }
-    CloseHandle(pipe);
-    return ok;
+    return false;
 }
 
 // Drops a marker in the scratch root using the real CreateFileW and reports

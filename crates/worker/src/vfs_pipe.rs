@@ -52,6 +52,125 @@ const MAX_MSG: u32 = 64 * 1024; // a path message; generous bound
 const PREFETCH_CONCURRENCY: usize = 32;
 static HYDRATE_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+/// Development-harness-only pipe observation and transport-fault controls.
+/// Production action servers always pass `None`; the wire format, pipe DACL,
+/// and client access mask are unchanged. The standalone `vfs_host` example uses
+/// this to make connection reuse and bounded retry externally measurable.
+#[derive(Clone)]
+pub struct VfsHarnessOptions {
+    metrics_path: PathBuf,
+    metrics: Arc<VfsHarnessMetrics>,
+    publish_lock: Arc<StdMutex<()>>,
+    close_after_response: bool,
+}
+
+#[derive(Default)]
+struct VfsHarnessMetrics {
+    connections: AtomicUsize,
+    active_connections: AtomicUsize,
+    requests: AtomicUsize,
+    drop_responses: AtomicUsize,
+}
+
+impl VfsHarnessOptions {
+    pub fn new(metrics_path: PathBuf, drop_responses: usize, close_after_response: bool) -> Self {
+        let options = Self {
+            metrics_path,
+            metrics: Arc::new(VfsHarnessMetrics {
+                connections: AtomicUsize::new(0),
+                active_connections: AtomicUsize::new(0),
+                requests: AtomicUsize::new(0),
+                drop_responses: AtomicUsize::new(drop_responses),
+            }),
+            publish_lock: Arc::new(StdMutex::new(())),
+            close_after_response,
+        };
+        options.publish();
+        options
+    }
+
+    fn publish(&self) {
+        let _lock = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let text = format!(
+            "connections={}\nactive_connections={}\nrequests={}\n",
+            self.metrics.connections.load(AtomicOrdering::Relaxed),
+            self.metrics
+                .active_connections
+                .load(AtomicOrdering::Relaxed),
+            self.metrics.requests.load(AtomicOrdering::Relaxed),
+        );
+        let _ = std::fs::write(&self.metrics_path, text);
+    }
+
+    fn record_connection(&self) {
+        let connections = self
+            .metrics
+            .connections
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        self.metrics
+            .active_connections
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        if connections <= 32 || connections.is_multiple_of(100) {
+            self.publish();
+        }
+    }
+
+    fn record_request(&self) {
+        let requests = self.metrics.requests.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        if requests <= 2 || requests.is_multiple_of(100) {
+            self.publish();
+        }
+    }
+
+    fn record_connection_closed(&self) {
+        self.metrics
+            .active_connections
+            .fetch_sub(1, AtomicOrdering::Relaxed);
+        let connections = self.metrics.connections.load(AtomicOrdering::Relaxed);
+        // The forced-reconnect control can close 1000 connections. Publish the
+        // same low-frequency cadence as the counters so metrics I/O cannot be
+        // the thing that makes reconnects look expensive; its final 1000th
+        // close still publishes active_connections=0 for the cleanup assertion.
+        if connections <= 32 || connections.is_multiple_of(100) {
+            self.publish();
+        }
+    }
+
+    fn closes_after_response(&self) -> bool {
+        self.close_after_response
+    }
+
+    fn take_drop_response(&self) -> bool {
+        let mut remaining = self.metrics.drop_responses.load(AtomicOrdering::Relaxed);
+        while remaining != 0 {
+            match self.metrics.drop_responses.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => remaining = actual,
+            }
+        }
+        false
+    }
+}
+
+struct VfsHarnessConnectionGuard(Option<VfsHarnessOptions>);
+
+impl Drop for VfsHarnessConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(harness) = &self.0 {
+            harness.record_connection_closed();
+        }
+    }
+}
+
 struct ActionPipeFactory {
     full: String,
     security: ActionPipeSecurity,
@@ -502,6 +621,36 @@ pub async fn serve_vfs(
     .await
 }
 
+/// Development-harness variant of [`serve_vfs`]. This is intentionally opt-in
+/// from the example binary only; production action servers do not accept a
+/// fault flag or metrics path.
+pub async fn serve_vfs_harness(
+    pipe_name: &str,
+    agent_addr: SocketAddr,
+    scratch_root: PathBuf,
+    cas_root: PathBuf,
+    rtt: Duration,
+    vfs_root: String,
+    harness: VfsHarnessOptions,
+) -> io::Result<()> {
+    let (ready, _rx) = tokio::sync::oneshot::channel();
+    serve_vfs_with_prefetch_ready_tracked_factory(
+        PipeInstanceFactory::Legacy(format!(r"\\.\pipe\{pipe_name}")),
+        agent_addr,
+        scratch_root,
+        cas_root,
+        rtt,
+        Vec::new(),
+        ready,
+        vfs_root,
+        String::new(),
+        String::new(),
+        MaterializationTracker::default(),
+        Some(harness),
+    )
+    .await
+}
+
 /// Like [`serve_vfs`], but warms `predicted_paths` (a prior build's inputs, from
 /// `ExecuteRequest.predicted_paths`) into the session in the background as it
 /// starts serving — so the compiler's first opens hit an already-warm cache
@@ -572,6 +721,7 @@ pub async fn serve_vfs_with_prefetch_ready(
         session_id,
         auth_token,
         MaterializationTracker::default(),
+        None,
     )
     .await
 }
@@ -604,6 +754,7 @@ pub async fn start_action_vfs(
             session_id,
             auth_token,
             materializations,
+            None,
         )
         .await
     })
@@ -639,6 +790,7 @@ pub(crate) async fn start_secured_action_vfs(
             session_id,
             auth_token,
             materializations,
+            None,
         )
         .await
     })
@@ -681,6 +833,7 @@ async fn serve_vfs_with_prefetch_ready_tracked(
     session_id: String,
     auth_token: String,
     materializations: MaterializationTracker,
+    harness: Option<VfsHarnessOptions>,
 ) -> io::Result<()> {
     let full = format!(r"\\.\pipe\{pipe_name}");
     serve_vfs_with_prefetch_ready_tracked_factory(
@@ -695,6 +848,7 @@ async fn serve_vfs_with_prefetch_ready_tracked(
         session_id,
         auth_token,
         materializations,
+        harness,
     )
     .await
 }
@@ -712,6 +866,7 @@ async fn serve_vfs_with_prefetch_ready_tracked_factory(
     session_id: String,
     auth_token: String,
     materializations: MaterializationTracker,
+    harness: Option<VfsHarnessOptions>,
 ) -> io::Result<()> {
     let state = Arc::new(VfsState {
         scratch_root,
@@ -740,7 +895,11 @@ async fn serve_vfs_with_prefetch_ready_tracked_factory(
     let warm_state = Arc::clone(&state);
     let warm = warm_state.prefetch_warm(&predicted_paths);
     serve_pipe_with_owned_futures(factory, server, warm, move |connected| {
-        handle_client(connected, Arc::clone(&state))
+        let harness = harness.clone();
+        if let Some(harness) = &harness {
+            harness.record_connection();
+        }
+        handle_client(connected, Arc::clone(&state), harness)
     })
     .await
 }
@@ -759,7 +918,6 @@ where
     let mut warm_done = false;
     tokio::pin!(warm);
     let mut clients = FuturesUnordered::new();
-
     loop {
         tokio::select! {
             () = &mut warm, if !warm_done => warm_done = true,
@@ -775,7 +933,12 @@ where
     }
 }
 
-async fn handle_client(mut pipe: NamedPipeServer, state: Arc<VfsState>) -> io::Result<()> {
+async fn handle_client(
+    mut pipe: NamedPipeServer,
+    state: Arc<VfsState>,
+    harness: Option<VfsHarnessOptions>,
+) -> io::Result<()> {
+    let _connection_guard = VfsHarnessConnectionGuard(harness.clone());
     loop {
         let path = match read_msg(&mut pipe).await {
             Ok(Some(bytes)) => match String::from_utf8(bytes) {
@@ -789,8 +952,24 @@ async fn handle_client(mut pipe: NamedPipeServer, state: Arc<VfsState>) -> io::R
             Err(e) => return Err(e),
         };
 
+        if let Some(harness) = &harness {
+            harness.record_request();
+        }
+
         let (status, local) = hydrate(&path, &state, || hydrate_uncached(&path, &state)).await;
+        if harness
+            .as_ref()
+            .is_some_and(VfsHarnessOptions::take_drop_response)
+        {
+            return write_truncated_response(&mut pipe, status, &local).await;
+        }
         write_response(&mut pipe, status, &local).await?;
+        if harness
+            .as_ref()
+            .is_some_and(VfsHarnessOptions::closes_after_response)
+        {
+            return Ok(());
+        }
     }
 }
 
@@ -949,6 +1128,19 @@ async fn write_response(pipe: &mut NamedPipeServer, status: u8, local: &str) -> 
     pipe.write_all(&(payload.len() as u32).to_le_bytes())
         .await?;
     pipe.write_all(&payload).await?;
+    pipe.flush().await
+}
+
+/// Writes only a response length then closes the harness connection. This
+/// simulates a response cut in transit; the C++ client's exact-read sees a
+/// transport failure rather than a valid error response.
+async fn write_truncated_response(
+    pipe: &mut NamedPipeServer,
+    _status: u8,
+    local: &str,
+) -> io::Result<()> {
+    let len = 1usize.saturating_add(local.len()) as u32;
+    pipe.write_all(&len.to_le_bytes()).await?;
     pipe.flush().await
 }
 

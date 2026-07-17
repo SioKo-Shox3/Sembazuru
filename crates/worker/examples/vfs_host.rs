@@ -5,6 +5,8 @@
 //! requested reads into the scratch dir.
 //!
 //! Usage: vfs_host <pipe_name> <scratch_dir> [logical_root backing_root]
+//!                  [--metrics <path> --drop-responses <count>
+//!                   --close-after-response]
 //!
 //! With the optional logical/backing pair, the file server remaps reads under
 //! logical_root to backing_root, so the bytes the agent supplies differ from
@@ -33,8 +35,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(|p| p.join("sbz-worker-cas"))
                 .unwrap_or_else(|| PathBuf::from("sbz-worker-cas"))
         });
-    let remap = if args.len() >= 4 {
-        Some((args[2].clone(), PathBuf::from(&args[3])))
+    let mut positionals = Vec::new();
+    let mut metrics = None;
+    let mut drop_responses = 0usize;
+    let mut close_after_response = false;
+    let mut index = 2;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--metrics" if index + 1 < args.len() => {
+                metrics = Some(PathBuf::from(&args[index + 1]));
+                index += 2;
+            }
+            "--drop-responses" if index + 1 < args.len() => {
+                drop_responses = args[index + 1].parse()?;
+                index += 2;
+            }
+            "--close-after-response" => {
+                close_after_response = true;
+                index += 1;
+            }
+            value => {
+                positionals.push(value.to_owned());
+                index += 1;
+            }
+        }
+    }
+    if !positionals.is_empty() && positionals.len() != 2 {
+        return Err("logical_root and backing_root must be supplied together".into());
+    }
+    let remap = if positionals.len() == 2 {
+        Some((positionals[0].clone(), PathBuf::from(&positionals[1])))
     } else {
         None
     };
@@ -59,7 +89,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     eprintln!("vfs_host: file server on {addr}, pipe {pipe_name}, rtt {rtt:?}");
     // Dev harness: unscoped (production scoping is exercised by the daemon gate,
     // where the worker declares the action's vfs_root). Empty root = no scoping.
-    sembazuru_worker::vfs_pipe::serve_vfs(&pipe_name, addr, scratch, cas_root, rtt, String::new())
-        .await?;
+    match metrics {
+        Some(metrics_path) => {
+            let harness = sembazuru_worker::vfs_pipe::VfsHarnessOptions::new(
+                metrics_path,
+                drop_responses,
+                close_after_response,
+            );
+            sembazuru_worker::vfs_pipe::serve_vfs_harness(
+                &pipe_name,
+                addr,
+                scratch,
+                cas_root,
+                rtt,
+                String::new(),
+                harness,
+            )
+            .await?;
+        }
+        None => {
+            sembazuru_worker::vfs_pipe::serve_vfs(
+                &pipe_name,
+                addr,
+                scratch,
+                cas_root,
+                rtt,
+                String::new(),
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
