@@ -122,13 +122,10 @@ static int SpawnReadChild(const wchar_t* path, const wchar_t* expected,
 }
 int wmain(int argc, wchar_t** argv) {
     HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 9;
-    BOOL restricted = FALSE;
-    DWORD tokenInfoSize = 0;
-    BOOL tokenOk = GetTokenInformation(token, TokenIsRestricted, &restricted,
-                                       sizeof(restricted), &tokenInfoSize);
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 12;
+    BOOL restricted = IsTokenRestricted(token);
     CloseHandle(token);
-    if (!tokenOk || !restricted) return 9;
+    if (!restricted) return 9;
     BOOL inJob = FALSE;
     if (!IsProcessInJob(GetCurrentProcess(), nullptr, &inJob) || !inJob) return 10;
     if (argc >= 4 && wcscmp(argv[1], L"--spawn-child-w") == 0) {
@@ -453,6 +450,7 @@ switch ($exit) {
     6 { $failures += 'GetFileAttributesW failed before CreateFileW hydrated the VFS input (exit 6)' }
     9 { $failures += 'the target entered without a restricted token (exit 9)' }
     10 { $failures += 'the target entered outside the worker Job object (exit 10)' }
+    12 { $failures += 'the target token could not be opened for restriction verification (exit 12)' }
     default { $failures += "the VFS-mode Execute failed (exit=$exit)" }
 }
 if ($verbatimExit -ne 0) {

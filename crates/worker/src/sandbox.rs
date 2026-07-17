@@ -22,9 +22,9 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::Security::{
     AllocateAndInitializeSid, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
     FreeSid, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES,
-    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenIsRestricted,
+    IsTokenRestricted, SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY,
+    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
     TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinMediumLabelSid,
     WinRestrictedCodeSid, WinWorldSid,
 };
@@ -129,7 +129,7 @@ impl ActionToken {
     }
 
     fn create_from_token(source: HANDLE) -> io::Result<Self> {
-        if token_u32(source, TokenIsRestricted)? != 0 {
+        if is_token_restricted(source) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         let action_sid = ActionSid::random()?;
@@ -468,13 +468,23 @@ fn create_secured_directory(path: &Path, sddl: &str) -> io::Result<()> {
 }
 
 fn current_token(access: u32) -> io::Result<OwnedHandle> {
+    process_token(unsafe { GetCurrentProcess() }, access)
+}
+
+fn process_token(process: HANDLE, access: u32) -> io::Result<OwnedHandle> {
     let mut token = null_mut();
     // SAFETY: token is a valid out pointer; success returns a unique handle we immediately own.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut token) } == 0 {
+    if unsafe { OpenProcessToken(process, access, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: OpenProcessToken returned a unique live handle.
     Ok(unsafe { OwnedHandle::from_raw_handle(token as RawHandle) })
+}
+
+fn is_token_restricted(token: HANDLE) -> bool {
+    // SAFETY: callers supply a live queryable token. The documented predicate is
+    // SKU-independent; false is treated fail-closed for action child validation.
+    unsafe { IsTokenRestricted(token) != 0 }
 }
 
 fn token_info(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
@@ -492,14 +502,6 @@ fn token_info(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
         return Err(io::Error::last_os_error());
     }
     Ok(info)
-}
-
-fn token_u32(token: HANDLE, class: i32) -> io::Result<u32> {
-    let value = token_info(token, class)?
-        .first()
-        .copied()
-        .ok_or_else(|| io::Error::other("token information was truncated"))? as u32;
-    Ok(value)
 }
 
 fn well_known_sid(kind: i32) -> io::Result<Vec<u8>> {
@@ -774,6 +776,8 @@ fn stdio_pipe(child_reads: bool) -> io::Result<(OwnedHandle, OwnedHandle)> {
 #[derive(Clone, Copy, PartialEq)]
 enum SpawnFailure {
     AfterCreate,
+    ChildTokenOpen,
+    ChildTokenUnrestricted,
     BeforeResume,
 }
 
@@ -870,6 +874,28 @@ impl RestrictedProcess {
         #[cfg(test)]
         if failure == Some(SpawnFailure::AfterCreate) {
             return Err(io::Error::other("after_create: injected failure"));
+        }
+        #[cfg(test)]
+        if failure == Some(SpawnFailure::ChildTokenOpen) {
+            return Err(io::Error::other("child_token_open: injected failure"));
+        }
+        let child_token = process_token(
+            guardian.0.as_ref().unwrap().as_raw_handle() as HANDLE,
+            TOKEN_QUERY,
+        )?;
+        #[cfg(test)]
+        let child_restricted = if failure == Some(SpawnFailure::ChildTokenUnrestricted) {
+            false
+        } else {
+            is_token_restricted(child_token.as_raw_handle() as HANDLE)
+        };
+        #[cfg(not(test))]
+        let child_restricted = is_token_restricted(child_token.as_raw_handle() as HANDLE);
+        if !child_restricted {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "suspended child token is not restricted",
+            ));
         }
         job.assign_verified(guardian.0.as_ref().unwrap().as_raw_handle())?;
         #[cfg(test)]
@@ -1308,6 +1334,9 @@ mod tests {
     fn action_token_identity_and_limits() {
         let a = ActionToken::create().unwrap();
         let b = ActionToken::create().unwrap();
+        let broker = current_token(TOKEN_QUERY).unwrap();
+        assert!(!is_token_restricted(broker.as_raw_handle() as HANDLE));
+        assert!(is_token_restricted(a.handle()));
         assert!(!token_groups_contain(a.handle(), TokenGroups, a.action_sid.0).unwrap());
         assert!(token_groups_contain(a.handle(), TokenRestrictedSids, a.action_sid.0).unwrap());
         // SAFETY: both action SIDs are valid for the compared token lifetimes.
@@ -1823,9 +1852,14 @@ mod tests {
         let root = private_scratch_root();
         let scratch = PrivateScratch::create(&root, "failures", &token).unwrap();
         let cmd = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe");
-        for (index, failure) in [SpawnFailure::AfterCreate, SpawnFailure::BeforeResume]
-            .into_iter()
-            .enumerate()
+        for (index, failure) in [
+            SpawnFailure::AfterCreate,
+            SpawnFailure::ChildTokenOpen,
+            SpawnFailure::ChildTokenUnrestricted,
+            SpawnFailure::BeforeResume,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let marker = scratch.path().join(format!("marker-{index}"));
             let command = RestrictedCommand::new(&cmd, scratch.path())
