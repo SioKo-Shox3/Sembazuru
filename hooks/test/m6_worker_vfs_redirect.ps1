@@ -47,9 +47,11 @@ $dll = Join-Path $BuildDir 'sbz_interceptor64.dll'
 foreach ($f in @($launcher, $dll)) {
     if (-not (Test-Path $f)) { throw "missing build artifact: $f" }
 }
-if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
+$clCommand = Get-Command cl.exe -CommandType Application -ErrorAction SilentlyContinue
+if (-not $clCommand) {
     throw 'cl.exe not on PATH (run from a VS dev shell or after msvc-dev-cmd)'
 }
+$clExe = (Resolve-Path -LiteralPath $clCommand.Source).Path
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Push-Location $repo
@@ -273,6 +275,84 @@ static int SpawnReadChild(const wchar_t* path, const wchar_t* expected,
     CloseHandle(process.hProcess);
     return static_cast<int>(exitCode);
 }
+static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
+    wchar_t tmp[32768];
+    wchar_t temp[32768];
+    wchar_t scratch[32768];
+    wchar_t canonicalTmp[32768];
+    wchar_t canonicalRoot[32768];
+    DWORD tmpLength = GetEnvironmentVariableW(
+        L"TMP", tmp, static_cast<DWORD>(sizeof(tmp) / sizeof(tmp[0])));
+    DWORD tempLength = GetEnvironmentVariableW(
+        L"TEMP", temp, static_cast<DWORD>(sizeof(temp) / sizeof(temp[0])));
+    DWORD scratchLength = GetEnvironmentVariableW(
+        L"SEMBAZURU_VFS_SCRATCH", scratch,
+        static_cast<DWORD>(sizeof(scratch) / sizeof(scratch[0])));
+    if (tmpLength == 0 || tmpLength >= sizeof(tmp) / sizeof(tmp[0]) ||
+        tempLength == 0 || tempLength >= sizeof(temp) / sizeof(temp[0]) ||
+        scratchLength == 0 || scratchLength >= sizeof(scratch) / sizeof(scratch[0]) ||
+        wcscmp(tmp, temp) != 0 || wcscmp(tmp, scratch) != 0) return 21;
+    DWORD canonicalTmpLength = GetFullPathNameW(
+        tmp, static_cast<DWORD>(sizeof(canonicalTmp) / sizeof(canonicalTmp[0])),
+        canonicalTmp, nullptr);
+    DWORD canonicalRootLength = GetFullPathNameW(
+        expectedScratchRoot,
+        static_cast<DWORD>(sizeof(canonicalRoot) / sizeof(canonicalRoot[0])),
+        canonicalRoot, nullptr);
+    if (canonicalTmpLength == 0 ||
+        canonicalTmpLength >= sizeof(canonicalTmp) / sizeof(canonicalTmp[0]) ||
+        canonicalRootLength == 0 ||
+        canonicalRootLength >= sizeof(canonicalRoot) / sizeof(canonicalRoot[0])) return 21;
+    size_t rootLength = wcslen(canonicalRoot);
+    if (_wcsnicmp(canonicalTmp, canonicalRoot, rootLength) != 0 ||
+        canonicalTmp[rootLength] != L'\\') return 21;
+    const wchar_t* leaf = canonicalTmp + rootLength + 1;
+    if (_wcsnicmp(leaf, L"action-", 7) != 0 || leaf[7] == L'\0' ||
+        wcschr(leaf, L'\\') != nullptr)
+        return 21;
+    wchar_t object[32768];
+    int objectLength = _snwprintf_s(
+        object, sizeof(object) / sizeof(object[0]), _TRUNCATE, L"%s\\gl_tmp.obj", tmp);
+    if (objectLength < 0) return 22;
+    if (GetFileAttributesW(object) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(object))
+        return 23;
+    wchar_t command[32768];
+    int commandLength = _snwprintf_s(
+        command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
+        L"\"%s\" /nologo /c /GL \"Src\\gl_tmp.cpp\" /Fo\"%s\"", clExe, object);
+    if (commandLength < 0) return 22;
+    SetEnvironmentVariableW(L"CL", nullptr);
+    SetEnvironmentVariableW(L"_CL_", nullptr);
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(clExe, command, nullptr, nullptr, FALSE, 0, nullptr,
+                        nullptr, &startup, &process)) return 24;
+    DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+    if (wait != WAIT_OBJECT_0) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return 25;
+    }
+    DWORD exitCode = 25;
+    if (!GetExitCodeProcess(process.hProcess, &exitCode)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+        return 25;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    if (exitCode != 0) return 26;
+    LARGE_INTEGER objectSize{};
+    HANDLE objectHandle = CreateFileW(object, GENERIC_READ,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (objectHandle == INVALID_HANDLE_VALUE) return 27;
+    BOOL hasContent = GetFileSizeEx(objectHandle, &objectSize) && objectSize.QuadPart > 0;
+    CloseHandle(objectHandle);
+    if (!hasContent) return 28;
+    return DeleteFileW(object) ? 0 : 29;
+}
 int wmain(int argc, wchar_t** argv) {
     int canary = CheckRestrictionCanary();
     if (canary != 0) return canary;
@@ -283,6 +363,9 @@ int wmain(int argc, wchar_t** argv) {
     }
     if (argc >= 4 && wcscmp(argv[1], L"--spawn-child-a") == 0) {
         return SpawnReadChild(argv[2], argv[3], TRUE);
+    }
+    if (argc >= 4 && wcscmp(argv[1], L"--spawn-cl-gl") == 0) {
+        return SpawnClGl(argv[2], argv[3]);
     }
     if (argc >= 3 && wcscmp(argv[1], L"--chdir") == 0) {
         return SetCurrentDirectoryW(argv[2]) ? 0 : 8;
@@ -425,10 +508,13 @@ $verbatimTraceDir = Join-Path $WorkRoot 'trace-verbatim'
 $smuggledTraceDir = Join-Path $WorkRoot 'smuggled-trace'
 $fakeVfsCwd = Join-Path $WorkRoot 'fake-vfs-cwd'
 $rel = 'Src\Input.txt'
+$glRel = 'Src\gl_tmp.cpp'
 $metadataAbsentRel = 'Src\metadata-absent.h'
 $metadataSparseRel = 'Src\metadata-sparse.bin'
 $correct = 'hello-from-the-agent-vfs'
 $stale = 'STALE-LOCAL-MUST-NOT-BE-READ'
+$glStale = 'int gl_tmp( { return 0; }'
+$glCorrect = 'int gl_tmp() { return 42; }'
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $logicalRoot $rel)) | Out-Null
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $backingRoot $rel)) | Out-Null
 foreach ($d in @($scratchRoot, $casRoot, $traceDir, $miscTraceDir, $verbatimTraceDir, $smuggledTraceDir, $fakeVfsCwd)) {
@@ -436,6 +522,8 @@ foreach ($d in @($scratchRoot, $casRoot, $traceDir, $miscTraceDir, $verbatimTrac
 }
 Set-Content (Join-Path $logicalRoot $rel) $stale -Encoding ascii -NoNewline
 Set-Content (Join-Path $backingRoot $rel) $correct -Encoding ascii -NoNewline
+Set-Content (Join-Path $logicalRoot $glRel) $glStale -Encoding ascii -NoNewline
+Set-Content (Join-Path $backingRoot $glRel) $glCorrect -Encoding ascii -NoNewline
 # The metadata gate must exercise the FILETIME high/low size composition without
 # writing 4 GiB of data. Mark the backing file sparse first, then SetLength.
 $logicalSparse = Join-Path $logicalRoot $metadataSparseRel
@@ -477,6 +565,7 @@ $emptyTraceExit = 99
 $emptyTraceChildWExit = 99
 $emptyTraceChildAExit = 99
 $metadataExit = 99
+$glExit = 99
 $oldSmuggledVfsCwd = $env:SEMBAZURU_VFS_CWD
 $oldSmuggledTraceDir = $env:SEMBAZURU_TRACE_DIR
 $hadRestrictionCanary = Test-Path Env:\SBZ_M6_RESTRICTION_CANARY
@@ -572,6 +661,11 @@ try {
             $outputExit = $LASTEXITCODE
 
             & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
+                $probe --spawn-cl-gl $scratchRoot $clExe 2>&1 |
+                Out-String | Write-Host
+            $glExit = $LASTEXITCODE
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --wildcard-enum 'Src\*.txt' 2>&1 |
                 Out-String | Write-Host
             $wildcardExit = $LASTEXITCODE
@@ -645,7 +739,10 @@ try {
         Remove-Item Env:\SBZ_M6_RESTRICTION_CANARY -ErrorAction SilentlyContinue
     }
     foreach ($p in @($workerProc, $fsProc)) {
-        if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+        if ($p -and -not $p.HasExited) {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            if (-not $p.WaitForExit(5000)) { throw "process did not stop: $($p.Id)" }
+        }
     }
     Remove-RestrictionCanary $restrictionCanaryPath
 }
@@ -681,6 +778,19 @@ if ($verbatimFindExWExit -ne 0) {
 }
 if ($outputExit -eq 0) {
     $failures += 'a scratch-cwd action that wrote a relative output completed remotely; outputs would be stranded without WriteBack'
+}
+switch ($glExit) {
+    0 { }
+    21 { $failures += 'hosted cl.exe /GL saw mismatched TMP, TEMP, and SEMBAZURU_VFS_SCRATCH; private scratch was not staged consistently' }
+    22 { $failures += 'hosted cl.exe /GL could not construct its private-scratch object path' }
+    23 { $failures += 'hosted cl.exe /GL could not clear a pre-existing private-scratch object' }
+    24 { $failures += 'hosted cl.exe /GL could not be created through the staged launcher/interceptor path' }
+    25 { $failures += 'hosted cl.exe /GL did not finish before the probe timeout' }
+    26 { $failures += 'hosted cl.exe /GL failed; expected backing Src\\gl_tmp.cpp and writable private scratch (inspect compiler output above)' }
+    27 { $failures += 'hosted cl.exe /GL did not create %TMP%\\gl_tmp.obj' }
+    28 { $failures += 'hosted cl.exe /GL created an empty %TMP%\\gl_tmp.obj' }
+    29 { $failures += 'hosted cl.exe /GL could not delete %TMP%\\gl_tmp.obj' }
+    default { $failures += "hosted cl.exe /GL VFS probe failed (exit=$glExit)" }
 }
 if ($wildcardExit -ne -1) {
     $failures += "wildcard enumeration under the logical cwd completed remotely (exit=$wildcardExit); expected worker fallback exit=-1"
@@ -761,13 +871,14 @@ if ($verbatimScratchHits.Count -gt 0) {
     $failures += "verbatim trace recorded scratch paths as inputs; logical cwd/path preservation regressed: $($verbatimScratchHits -join '; ')"
 }
 
-# Belt-and-suspenders: the per-action scratch tree must NOT linger after the run
-# (M9.2 eviction). Its absence is expected; a lingering tree is a disk-leak
-# regression, not a redirect failure, so report it distinctly (still a failure).
-$leftover = Get-ChildItem -Recurse -File -Filter 'input.txt' $scratchRoot -ErrorAction SilentlyContinue |
-    Select-Object -First 1
-if ($leftover) {
-    $failures += "per-action scratch was not cleaned up after the run ($($leftover.FullName)): M9.2 eviction regressed"
+# The worker is stopped above. Its dedicated per-action scratch root must now be
+# empty: checking the full entry set catches a failed /GL object's temp files as
+# well as a surviving action leaf, rather than only the original input fixture.
+$leftovers = @(Get-ChildItem -Force $scratchRoot -ErrorAction SilentlyContinue |
+    Select-Object -First 5)
+if ($leftovers.Count -gt 0) {
+    $leftoverPaths = $leftovers | ForEach-Object { $_.FullName }
+    $failures += "per-action scratch was not cleaned up after worker shutdown: $($leftoverPaths -join '; ')"
 }
 
 if ($failures.Count -gt 0) {
