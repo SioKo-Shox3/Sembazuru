@@ -744,14 +744,13 @@ function Initialize-TestOnlyClusterToken {
             }
             if ($exitCode -ne 0 -or $stdout -cnotmatch '\Atoken-rotated(?:\r?\n)?\z' -or
                 $stderr -cne '') {
-                $stderrClass = if ([string]::IsNullOrEmpty($stderr)) {
-                    'empty'
-                } elseif ($stderr -match '\Asembazuru-storectl: token-io-failed(?:\r?\n)?\z') {
-                    'token-io-failed'
-                } else {
-                    'unexpected'
+                $diagnostic = [regex]::Match(
+                    $stderr,
+                    '\Asembazuru-storectl: backend operation=(?<operation>[A-Za-z0-9-]+); context=(?<context>[A-Za-z0-9 -]+); raw-os-error=(?<raw>none|-?[0-9]+)\r?\nsembazuru-storectl: token-io-failed\r?\n\z')
+                if (-not $diagnostic.Success -or $exitCode -ne 11 -or $stdout -cne '') {
+                    throw 'test-only cluster token setup backend diagnostic missing or malformed'
                 }
-                throw "test-only cluster token setup failed: exit=$exitCode stdoutLength=$($stdout.Length) stderrClass=$stderrClass stderrLength=$($stderr.Length)"
+                throw "test-only cluster token setup failed: backend-operation=$($diagnostic.Groups['operation'].Value) context=$($diagnostic.Groups['context'].Value) raw-os-error=$($diagnostic.Groups['raw'].Value)"
             }
         }
         catch {
@@ -860,6 +859,11 @@ function Assert-OfflineTokenSetupSource {
     })
     if ($unsafeTokenLines.Count -ne 0) {
         throw 'offline token setup source exposes token material through output, argv, or a plain-text file sink'
+    }
+    if ($source -notmatch [regex]::Escape('backend operation=') -or
+        $source -notmatch [regex]::Escape('raw-os-error=') -or
+        $source -notmatch [regex]::Escape('backend diagnostic missing or malformed')) {
+        throw 'offline token setup must strictly parse the fixed backend diagnostic without exposing stderr'
     }
     Write-Host 'STATIC TOKEN SETUP PASS: rotate-token uses redirected stdin and has no token output, argv, or plain-text sink.'
 }

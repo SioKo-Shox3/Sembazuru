@@ -42,6 +42,16 @@ impl MachineStoreError {
         self.class
     }
 
+    /// Returns the fixed operation context without formatting the underlying I/O error.
+    pub const fn context(&self) -> &'static str {
+        self.context
+    }
+
+    /// Returns only the source operating-system error number, when one was captured.
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.source.as_ref().and_then(io::Error::raw_os_error)
+    }
+
     fn new(class: MachineStoreErrorClass, context: &'static str) -> Self {
         Self {
             class,
@@ -1035,5 +1045,18 @@ mod tests {
             assert!(!declaration.contains("Path"), "{declaration}");
             assert!(!declaration.contains("Policy"), "{declaration}");
         }
+    }
+
+    #[test]
+    fn machine_store_error_diagnostic_accessors_are_static_and_raw_only() {
+        let error = MachineStoreError::with_io(
+            MachineStoreErrorClass::Io,
+            "atomic rename",
+            io::Error::from_raw_os_error(5),
+        );
+        let context: &'static str = error.context();
+
+        assert_eq!(context, "atomic rename");
+        assert_eq!(error.raw_os_error(), Some(5));
     }
 }

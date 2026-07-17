@@ -3,11 +3,12 @@ use std::fmt;
 use std::io::{self, IsTerminal, Read};
 
 use sembazuru_config_store::{
-    MAX_MACHINE_CLUSTER_TOKEN_BYTES, MachineStoreErrorClass, MachineTokenMaintenanceResult,
-    MachineTokenUpdateGuard, begin_machine_token_update, clear_machine_cluster_token_storage,
-    commit_machine_store_provision, migrate_machine_cluster_token_storage,
-    provision_fresh_machine_store, rollback_machine_store_provision,
-    rotate_machine_cluster_token_storage, uninstall_committed_machine_store,
+    MAX_MACHINE_CLUSTER_TOKEN_BYTES, MachineStoreError, MachineStoreErrorClass,
+    MachineTokenMaintenanceResult, MachineTokenUpdateGuard, begin_machine_token_update,
+    clear_machine_cluster_token_storage, commit_machine_store_provision,
+    migrate_machine_cluster_token_storage, provision_fresh_machine_store,
+    rollback_machine_store_provision, rotate_machine_cluster_token_storage,
+    uninstall_committed_machine_store,
 };
 use zeroize::Zeroizing;
 
@@ -23,6 +24,18 @@ enum Verb {
 }
 
 impl Verb {
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Provision => "provision",
+            Self::RollbackProvision => "rollback-provision",
+            Self::CommitProvision => "commit-provision",
+            Self::Uninstall => "uninstall",
+            Self::MigrateToken => "migrate-token",
+            Self::RotateToken => "rotate-token",
+            Self::ClearToken => "clear-token",
+        }
+    }
+
     const fn is_token_maintenance(self) -> bool {
         matches!(
             self,
@@ -173,6 +186,28 @@ trait StoreActions {
 type StoreResult<T> = Result<T, MachineStoreErrorClass>;
 type TokenResult = StoreResult<MachineTokenMaintenanceResult>;
 
+fn backend_diagnostic(
+    operation: &'static str,
+    context: &'static str,
+    raw_os_error: Option<i32>,
+) -> String {
+    let raw_os_error = raw_os_error.map_or_else(|| "none".to_owned(), |code| code.to_string());
+    format!(
+        "sembazuru-storectl: backend operation={operation}; context={context}; raw-os-error={raw_os_error}"
+    )
+}
+
+fn classify_backend_error(
+    operation: &'static str,
+    error: MachineStoreError,
+) -> MachineStoreErrorClass {
+    eprintln!(
+        "{}",
+        backend_diagnostic(operation, error.context(), error.raw_os_error())
+    );
+    error.classification()
+}
+
 struct MachineStoreLifecycle;
 
 impl StoreActions for MachineStoreLifecycle {
@@ -186,24 +221,27 @@ impl StoreActions for MachineStoreLifecycle {
             Verb::Uninstall => uninstall_committed_machine_store(),
             _ => unreachable!("token verb reached lifecycle dispatch"),
         }
-        .map_err(|error| error.classification())
+        .map_err(|error| classify_backend_error(verb.operation(), error))
     }
 
     fn begin_update(&mut self) -> StoreResult<Self::Update> {
-        begin_machine_token_update().map_err(|error| error.classification())
+        begin_machine_token_update()
+            .map_err(|error| classify_backend_error("begin-token-update", error))
     }
 
     fn migrate_token(&mut self, update: &mut Self::Update) -> TokenResult {
-        migrate_machine_cluster_token_storage(update).map_err(|error| error.classification())
+        migrate_machine_cluster_token_storage(update)
+            .map_err(|error| classify_backend_error("migrate-token", error))
     }
 
     fn rotate_token(&mut self, update: &mut Self::Update, secret: &SecretInput) -> TokenResult {
         rotate_machine_cluster_token_storage(update, secret.expose())
-            .map_err(|error| error.classification())
+            .map_err(|error| classify_backend_error("rotate-token", error))
     }
 
     fn clear_token(&mut self, update: &mut Self::Update) -> TokenResult {
-        clear_machine_cluster_token_storage(update).map_err(|error| error.classification())
+        clear_machine_cluster_token_storage(update)
+            .map_err(|error| classify_backend_error("clear-token", error))
     }
 }
 
@@ -768,5 +806,21 @@ mod tests {
             CliError::TokenMaintenance(MachineStoreErrorClass::Io).code(),
             "token-io-failed"
         );
+    }
+
+    #[test]
+    fn backend_diagnostic_is_structured_and_preserves_token_io_exit_contract() {
+        let diagnostic = backend_diagnostic("rotate-token", "atomic rename", Some(5));
+
+        assert_eq!(
+            diagnostic,
+            "sembazuru-storectl: backend operation=rotate-token; context=atomic rename; raw-os-error=5"
+        );
+        assert!(!diagnostic.contains("cli-secret-sentinel-91827"));
+        assert!(!diagnostic.contains("C:\\ProgramData\\Sembazuru"));
+
+        let error = CliError::TokenMaintenance(MachineStoreErrorClass::Io);
+        assert_eq!(error.code(), "token-io-failed");
+        assert_eq!(error.exit_code(), 11);
     }
 }
