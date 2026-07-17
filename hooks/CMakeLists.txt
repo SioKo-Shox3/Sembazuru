@@ -49,3 +49,10 @@ target_link_libraries(launcher PRIVATE detours)
 # Cross-bitness injection probe (M7.3). A tiny target the 32-bit build turns into
 # a 32-bit child for m7_inject32.ps1; no Detours dependency (it is the injectee).
 add_executable(probe test/probe.cpp)
+
+# Production-neutral child-injection failure probe. The integration script
+# injects a temporary x64 hook without its x86 sibling, then proves a real
+# cross-bitness injection failure cannot run an unhooked VFS child.
+add_executable(process_injection_failure_probe
+  test/process_injection_failure_probe.cpp
+)

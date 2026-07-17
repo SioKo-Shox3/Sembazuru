@@ -187,6 +187,10 @@ const MAX_CAPACITY: u32 = 256;
 /// unsupported VFS-root wildcard enumeration both use it.
 /// Must match `kUnvirtMarker` in `hooks/src/interceptor.cpp`.
 const UNVIRT_MARKER: &str = ".sbz-unvirtualized";
+/// Dedicated action exit for every VFS child-injection failure, regardless of
+/// whether the hook can create `UNVIRT_MARKER`. Must match the hook constant.
+const VFS_INJECTION_FAIL_CLOSED_EXIT_CODE: u32 = 0x0053_4249;
+const VFS_INJECTION_FAIL_CLOSED_DETAIL: &str = "VFS child injection failed: re-run locally";
 /// Marker the injected DLL drops when a scratch-cwd action mutates a logical-root
 /// path. Until output WriteBack is wired end-to-end, those outputs would be
 /// stranded in scratch, so the worker must force local fallback instead.
@@ -419,6 +423,10 @@ fn state_event(state: ActionState, detail: &str) -> Result<ExecuteEvent, Status>
 fn setup_err(category: &'static str, detail: impl std::fmt::Display) -> String {
     eprintln!("sembazuru-worker: {category}: {detail}");
     category.to_string()
+}
+
+fn vfs_injection_fail_closed_detail(code: u32) -> Option<&'static str> {
+    (code == VFS_INJECTION_FAIL_CLOSED_EXIT_CODE).then_some(VFS_INJECTION_FAIL_CLOSED_DETAIL)
 }
 
 fn cap_predicted_paths(mut predicted_paths: Vec<String>) -> Vec<String> {
@@ -893,42 +901,46 @@ async fn run_action(
 
     match finish {
         Finish::Exited(Ok(code)) => {
-            let publish = if let Some(trace) = trace {
-                tokio::task::spawn_blocking(move || {
-                    publish_trace_directory(&trace.stage, &trace.destination)
-                })
-                .await
-                .map_err(|_| io::Error::other("trace publisher failed"))
-                .and_then(|result| result)
+            if let Some(detail) = vfs_injection_fail_closed_detail(code) {
+                let _ = tx.send(state_event(ActionState::Failed, detail)).await;
             } else {
-                Ok(())
-            };
-            if let Err(error) = publish {
-                let detail = setup_err("trace publish failed", error);
-                let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
-            } else if unvirt_marker.as_ref().is_some_and(|marker| marker.exists()) {
-                let _ = tx
-                    .send(state_event(
-                        ActionState::Failed,
-                        "unsupported VFS access under vfs_root: re-run locally",
-                    ))
-                    .await;
-            } else if unsafe_output_marker
-                .as_ref()
-                .is_some_and(|marker| marker.exists())
-            {
-                let _ = tx
-                    .send(state_event(
-                        ActionState::Failed,
-                        "output under virtual cwd requires WriteBack: re-run locally",
-                    ))
-                    .await;
-            } else {
-                let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-                let _ = tx
-                    .send(exit_event(code as i32, wall, resolved_tool_digest))
-                    .await;
-                let _ = tx.send(state_event(ActionState::Completed, "")).await;
+                let publish = if let Some(trace) = trace {
+                    tokio::task::spawn_blocking(move || {
+                        publish_trace_directory(&trace.stage, &trace.destination)
+                    })
+                    .await
+                    .map_err(|_| io::Error::other("trace publisher failed"))
+                    .and_then(|result| result)
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = publish {
+                    let detail = setup_err("trace publish failed", error);
+                    let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
+                } else if unvirt_marker.as_ref().is_some_and(|marker| marker.exists()) {
+                    let _ = tx
+                        .send(state_event(
+                            ActionState::Failed,
+                            "unsupported VFS access under vfs_root: re-run locally",
+                        ))
+                        .await;
+                } else if unsafe_output_marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.exists())
+                {
+                    let _ = tx
+                        .send(state_event(
+                            ActionState::Failed,
+                            "output under virtual cwd requires WriteBack: re-run locally",
+                        ))
+                        .await;
+                } else {
+                    let wall = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    let _ = tx
+                        .send(exit_event(code as i32, wall, resolved_tool_digest))
+                        .await;
+                    let _ = tx.send(state_event(ActionState::Completed, "")).await;
+                }
             }
         }
         Finish::Exited(Err(error)) => {
@@ -1281,6 +1293,15 @@ pub async fn serve_on_listener_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vfs_injection_fail_closed_exit_maps_to_failed_detail() {
+        assert_eq!(
+            vfs_injection_fail_closed_detail(0x534249),
+            Some("VFS child injection failed: re-run locally")
+        );
+        assert_eq!(vfs_injection_fail_closed_detail(0), None);
+    }
 
     #[test]
     fn with_capacity_clamps_and_does_not_overflow() {

@@ -85,6 +85,41 @@ static int WideArgToAcp(const wchar_t* src, char* dst, int cap) {
     int n = WideCharToMultiByte(CP_ACP, 0, src, -1, dst, cap, nullptr, nullptr);
     return n > 0 && n <= cap ? n : 0;
 }
+static int SpawnReadChild(const wchar_t* path, const wchar_t* expected,
+                          BOOL ansi) {
+    wchar_t exe[1024];
+    DWORD exeLen = GetModuleFileNameW(nullptr, exe, 1024);
+    if (exeLen == 0 || exeLen >= 1024) return 11;
+    wchar_t command[4096];
+    int commandLen = _snwprintf_s(
+        command, 4096, _TRUNCATE, L"\"%s\" --open-exact \"%s\" \"%s\"",
+        exe, path, expected);
+    if (commandLen < 0) return 11;
+    PROCESS_INFORMATION process{};
+    BOOL created = FALSE;
+    if (ansi) {
+        char exeA[1024];
+        char commandA[4096];
+        if (!WideArgToAcp(exe, exeA, sizeof(exeA)) ||
+            !WideArgToAcp(command, commandA, sizeof(commandA))) return 11;
+        STARTUPINFOA startup{};
+        startup.cb = sizeof(startup);
+        created = CreateProcessA(exeA, commandA, nullptr, nullptr, FALSE, 0,
+                                 nullptr, nullptr, &startup, &process);
+    } else {
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        created = CreateProcessW(exe, command, nullptr, nullptr, FALSE, 0,
+                                 nullptr, nullptr, &startup, &process);
+    }
+    if (!created) return 11;
+    DWORD wait = WaitForSingleObject(process.hProcess, 30000);
+    DWORD exitCode = 11;
+    if (wait == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &exitCode);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return static_cast<int>(exitCode);
+}
 int wmain(int argc, wchar_t** argv) {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return 9;
@@ -96,6 +131,12 @@ int wmain(int argc, wchar_t** argv) {
     if (!tokenOk || !restricted) return 9;
     BOOL inJob = FALSE;
     if (!IsProcessInJob(GetCurrentProcess(), nullptr, &inJob) || !inJob) return 10;
+    if (argc >= 4 && wcscmp(argv[1], L"--spawn-child-w") == 0) {
+        return SpawnReadChild(argv[2], argv[3], FALSE);
+    }
+    if (argc >= 4 && wcscmp(argv[1], L"--spawn-child-a") == 0) {
+        return SpawnReadChild(argv[2], argv[3], TRUE);
+    }
     if (argc >= 3 && wcscmp(argv[1], L"--chdir") == 0) {
         return SetCurrentDirectoryW(argv[2]) ? 0 : 8;
     }
@@ -260,6 +301,8 @@ $wildcardExAExit = 99
 $chdirExit = 99
 $chdirAExit = 99
 $emptyTraceExit = 99
+$emptyTraceChildWExit = 99
+$emptyTraceChildAExit = 99
 $oldSmuggledVfsCwd = $env:SEMBAZURU_VFS_CWD
 $oldSmuggledTraceDir = $env:SEMBAZURU_TRACE_DIR
 try {
@@ -357,6 +400,16 @@ try {
                 $probe $rel $correct $logicalRoot $expectedInputPath 2>&1 |
                 Out-String | Write-Host
             $emptyTraceExit = $LASTEXITCODE
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot --empty-trace-dir -- `
+                $probe --spawn-child-w $expectedInputPath $correct 2>&1 |
+                Out-String | Write-Host
+            $emptyTraceChildWExit = $LASTEXITCODE
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot --empty-trace-dir -- `
+                $probe --spawn-child-a $expectedInputPath $correct 2>&1 |
+                Out-String | Write-Host
+            $emptyTraceChildAExit = $LASTEXITCODE
         } finally {
             if ($hasNativeEap) { $PSNativeCommandUseErrorActionPreference = $oldNativeEap }
         }
@@ -434,6 +487,12 @@ if ($chdirAExit -ne -1) {
 }
 if ($emptyTraceExit -ne 0) {
     $failures += "VFS Execute with empty worker trace_dir failed (exit=$emptyTraceExit); expected successful read with smuggled trace env removed"
+}
+if ($emptyTraceChildWExit -ne 0) {
+    $failures += "CreateProcessW child under empty worker trace_dir failed provenance (exit=$emptyTraceChildWExit); the child must inherit VFS injection and read agent bytes"
+}
+if ($emptyTraceChildAExit -ne 0) {
+    $failures += "CreateProcessA child under empty worker trace_dir failed provenance (exit=$emptyTraceChildAExit); the child must inherit VFS injection and read agent bytes"
 }
 $smuggledTrace = Get-ChildItem $smuggledTraceDir -Filter '*.sbzt' -ErrorAction SilentlyContinue |
     Select-Object -First 1

@@ -158,6 +158,9 @@ thread_local bool g_vfsInternalIoActive = false;
 // and re-run locally. Strict unsupplied reads and VFS-root wildcard enumeration
 // both use it. Must match `UNVIRT_MARKER` in `crates/worker/src/lib.rs`.
 const wchar_t* kUnvirtMarker = L".sbz-unvirtualized";
+// Dedicated worker-visible exit when VFS child injection failed and the
+// fallback marker itself could not be created. Must match worker/src/lib.rs.
+const DWORD kVfsInjectionFailClosedExitCode = 0x00534249;  // "SBI"
 // Marker dropped when a scratch-cwd action writes under the logical root. Until
 // the worker uploads outputs through WriteBack, such a run must fall back locally
 // rather than report remote success with outputs stranded in scratch.
@@ -546,33 +549,48 @@ bool VfsHydrate(const wchar_t* absPath, wchar_t* localOut, int localCap) {
     return ok;
 }
 
-// Drops a marker in the scratch root. Best-effort: uses the real CreateFileW; if
-// it cannot be written the worker simply won't fall back - never worse than the
-// pre-marker path.
-void VfsMarkScratchMarker(const wchar_t* markerName) {
+// Drops a marker in the scratch root using the real CreateFileW and reports
+// whether the worker can reliably observe it after this process exits.
+bool VfsMarkScratchMarker(const wchar_t* markerName) {
     if (g_vfsScratchLen == 0) {
-        return;  // no scratch root to drop the marker in
+        return false;  // no scratch root to drop the marker in
     }
     wchar_t marker[1100];
     if (_snwprintf_s(marker, 1100, _TRUNCATE, L"%s\\%s", g_vfsScratch,
                      markerName) < 0) {
-        return;
+        return false;
     }
     HANDLE h = TrueCreateFileW(marker, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h != INVALID_HANDLE_VALUE) {
-        CloseHandle(h);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
     }
+    CloseHandle(h);
+    return true;
 }
 
 // Drops the local-rerun marker (kUnvirtMarker) in the scratch root, once per
 // process, so the worker turns this action into a local re-run.
-void VfsMarkUnvirtualized() {
-    static LONG written = 0;
-    if (InterlockedExchange(&written, 1) != 0) {
-        return;  // already marked this action
+bool VfsMarkUnvirtualized() {
+    // 0 = unattempted, 1 = marker exists, -1 = marker creation failed.
+    static LONG result = 0;
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    if (result == 0) {
+        result = VfsMarkScratchMarker(kUnvirtMarker) ? 1 : -1;
     }
-    VfsMarkScratchMarker(kUnvirtMarker);
+    bool marked = result > 0;
+    ReleaseSRWLockExclusive(&lock);
+    return marked;
+}
+
+// A failed child injection must never degrade to a successful remote action.
+// The marker is best-effort diagnostics only: the action must terminate even
+// when its caller would otherwise ignore CreateProcess returning FALSE.
+void VfsHandleChildInjectionFailure() {
+    (void)VfsMarkUnvirtualized();
+    TerminateProcess(GetCurrentProcess(), kVfsInjectionFailClosedExitCode);
+    ExitProcess(kVfsInjectionFailClosedExitCode);
 }
 
 // Drops the unsafe-output marker once when a scratch-cwd action mutates a path
@@ -583,7 +601,7 @@ void VfsMarkUnsafeOutput() {
     if (InterlockedExchange(&written, 1) != 0) {
         return;
     }
-    VfsMarkScratchMarker(kUnsafeOutputMarker);
+    (void)VfsMarkScratchMarker(kUnsafeOutputMarker);
 }
 
 bool CanonicalScratchPath(const wchar_t* local, wchar_t* canonOut, int canonCap) {
@@ -1656,23 +1674,40 @@ BOOL WINAPI HookedCreateProcessW(LPCWSTR app, LPWSTR cmd,
                                  DWORD flags, LPVOID env, LPCWSTR dir,
                                  LPSTARTUPINFOW si,
                                  LPPROCESS_INFORMATION pi) {
+    // A custom block replaces the inherited environment. Until we can prove it
+    // preserves the authoritative VFS configuration, do not create any child.
+    if (g_vfsMode && env != nullptr) {
+        VfsHandleChildInjectionFailure();
+    }
     const char* dll = trace::DllPathA();
     BOOL ok;
     DWORD saved;
-    if (dll != nullptr && trace::Enabled()) {
+    if (dll != nullptr && (g_vfsMode || trace::Enabled())) {
         ok = DetourCreateProcessWithDllExW(app, cmd, pa, ta, inherit, flags,
                                            env, dir, si, pi, dll,
                                            TrueCreateProcessW);
         saved = GetLastError();
         if (!ok) {
             // Injection-capable spawn failed (Detours kills the child on
-            // injection failure). Observe-only must not break the build:
-            // retry untraced; the missing child trace surfaces as a reader
-            // warning.
-            ok = TrueCreateProcessW(app, cmd, pa, ta, inherit, flags, env,
-                                    dir, si, pi);
-            saved = GetLastError();
+            // injection failure). A VFS child cannot run uninstrumented: it
+            // would read stale local bytes and could report a false remote
+            // success. Mark the action for local fallback and preserve the
+            // failed CreateProcess result. Observe-only tracing keeps its
+            // compatibility retry; the missing trace surfaces as a warning.
+            if (g_vfsMode) {
+                VfsHandleChildInjectionFailure();
+            } else {
+                ok = TrueCreateProcessW(app, cmd, pa, ta, inherit, flags, env,
+                                        dir, si, pi);
+                saved = GetLastError();
+            }
         }
+    } else if (g_vfsMode) {
+        // A non-representable DLL path is as unsafe as an injection failure in
+        // VFS mode: never launch a child that cannot inherit virtualization.
+        VfsHandleChildInjectionFailure();
+        ok = FALSE;
+        saved = ERROR_MOD_NOT_FOUND;
     } else {
         ok = TrueCreateProcessW(app, cmd, pa, ta, inherit, flags, env, dir,
                                 si, pi);
@@ -1690,19 +1725,32 @@ BOOL WINAPI HookedCreateProcessA(LPCSTR app, LPSTR cmd,
                                  DWORD flags, LPVOID env, LPCSTR dir,
                                  LPSTARTUPINFOA si,
                                  LPPROCESS_INFORMATION pi) {
+    // A custom block replaces the inherited environment. Until we can prove it
+    // preserves the authoritative VFS configuration, do not create any child.
+    if (g_vfsMode && env != nullptr) {
+        VfsHandleChildInjectionFailure();
+    }
     const char* dll = trace::DllPathA();
     BOOL ok;
     DWORD saved;
-    if (dll != nullptr && trace::Enabled()) {
+    if (dll != nullptr && (g_vfsMode || trace::Enabled())) {
         ok = DetourCreateProcessWithDllExA(app, cmd, pa, ta, inherit, flags,
                                            env, dir, si, pi, dll,
                                            TrueCreateProcessA);
         saved = GetLastError();
         if (!ok) {
-            ok = TrueCreateProcessA(app, cmd, pa, ta, inherit, flags, env,
-                                    dir, si, pi);
-            saved = GetLastError();
+            if (g_vfsMode) {
+                VfsHandleChildInjectionFailure();
+            } else {
+                ok = TrueCreateProcessA(app, cmd, pa, ta, inherit, flags, env,
+                                        dir, si, pi);
+                saved = GetLastError();
+            }
         }
+    } else if (g_vfsMode) {
+        VfsHandleChildInjectionFailure();
+        ok = FALSE;
+        saved = ERROR_MOD_NOT_FOUND;
     } else {
         ok = TrueCreateProcessA(app, cmd, pa, ta, inherit, flags, env, dir,
                                 si, pi);
