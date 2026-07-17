@@ -81,6 +81,14 @@ jobs:
       # lookup finds it when a 64-bit injector spawns a 32-bit child.
       - run: cmake -S hooks -B hooks/build32 -A Win32
       - run: cmake --build hooks/build32 --config Release
+      - name: Trace writer batching (x64 CTest + injected functional probe)
+        run: |
+          ctest --test-dir hooks/build -C Release --output-on-failure
+          pwsh -NoProfile -File hooks/test/trace_write_batch.ps1 -CandidateDll hooks/build/Release/sbz_interceptor64.dll
+      - name: Trace writer batching (x86 CTest + injected functional probe)
+        run: |
+          ctest --test-dir hooks/build32 -C Release --output-on-failure
+          pwsh -NoProfile -File hooks/test/trace_write_batch.ps1 -CandidateDll hooks/build32/Release/sbz_interceptor32.dll
       - name: Stage 32-bit interceptor next to the 64-bit one
         run: Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
       - run: cargo build -p sembazuru-tracer --release

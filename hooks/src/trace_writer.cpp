@@ -109,22 +109,139 @@ void AppendStr(wchar_t* buf, int cap, int& pos, const wchar_t* s) {
     buf[pos] = L'\0';
 }
 
-bool WriteBytes(const void* p, DWORD n) {
-    DWORD written = 0;
-    return WriteFile(g_file, p, n, &written, nullptr) && written == n;
+constexpr size_t kStackRecordBytes = 1024;
+
+// A writer failure must be terminal: a later record cannot safely follow a
+// partial v0 record.  Tracing is observe-only, so disable it and leave the
+// intercepted process alone.
+void DisableLocked() {
+    if (g_file != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_file);
+        g_file = INVALID_HANDLE_VALUE;
+    }
+    g_initDone = true;
 }
 
-bool WriteStringField(const wchar_t* s, int lenChars) {
-    if (s == nullptr) {
-        lenChars = 0;
-    } else if (lenChars < 0) {
-        lenChars = lstrlenW(s);
+// Caller holds g_lock.  A normal complete buffer produces exactly one
+// synchronous WriteFile.  A short successful write is resumed from its suffix
+// under the same lock so records cannot interleave; a failed/zero write turns
+// tracing off permanently.
+bool WriteAllLocked(const BYTE* bytes, DWORD size) {
+    DWORD offset = 0;
+    while (offset < size) {
+        DWORD written = 0;
+        if (!WriteFile(g_file, bytes + offset, size - offset, &written,
+                       nullptr) || written == 0 || written > size - offset) {
+            DisableLocked();
+            return false;
+        }
+        offset += written;
     }
-    DWORD count = static_cast<DWORD>(lenChars);
-    if (!WriteBytes(&count, sizeof(count))) {
+    return true;
+}
+
+bool StringFieldSize(const wchar_t* value, int length, size_t* out) {
+    if (length < -1) {
         return false;
     }
-    return count == 0 || WriteBytes(s, count * sizeof(wchar_t));
+    int chars = 0;
+    if (value != nullptr) {
+        if (length == -1) {
+            chars = lstrlenW(value);
+        } else {
+            chars = length;
+        }
+    }
+    const size_t count = static_cast<size_t>(chars);
+    if (count > (static_cast<size_t>(MAXDWORD) - sizeof(DWORD)) /
+                    sizeof(wchar_t)) {
+        return false;
+    }
+    *out = sizeof(DWORD) + count * sizeof(wchar_t);
+    return true;
+}
+
+bool AppendStringField(BYTE* destination, size_t capacity, size_t* offset,
+                       const wchar_t* value, int length) {
+    size_t fieldSize = 0;
+    if (!StringFieldSize(value, length, &fieldSize) ||
+        fieldSize > capacity - *offset) {
+        return false;
+    }
+    int chars = 0;
+    if (value != nullptr) {
+        chars = length == -1 ? lstrlenW(value) : length;
+    }
+    const DWORD count = static_cast<DWORD>(chars);
+    memcpy(destination + *offset, &count, sizeof(count));
+    *offset += sizeof(count);
+    if (count != 0) {
+        memcpy(destination + *offset, value,
+               static_cast<size_t>(count) * sizeof(wchar_t));
+        *offset += static_cast<size_t>(count) * sizeof(wchar_t);
+    }
+    return true;
+}
+
+// Header fields retain the v0 writer's established frame boundaries.  Unlike
+// records, header emission is a one-time lazy-open path rather than the hot
+// per-hook operation; every failed frame still disables tracing terminally.
+bool WriteStringFieldLocked(const wchar_t* value, int length) {
+    size_t fieldSize = 0;
+    if (!StringFieldSize(value, length, &fieldSize)) {
+        DisableLocked();
+        return false;
+    }
+    const int chars = value == nullptr ? 0 :
+                      (length == -1 ? lstrlenW(value) : length);
+    const DWORD count = static_cast<DWORD>(chars);
+    if (!WriteAllLocked(reinterpret_cast<const BYTE*>(&count), sizeof(count))) {
+        return false;
+    }
+    return count == 0 || WriteAllLocked(reinterpret_cast<const BYTE*>(value),
+                                         count * sizeof(wchar_t));
+}
+
+// Build a complete v0 payload without holding g_lock.  Heap allocation is
+// deliberately reserved for valid, long records; malformed/overflow inputs
+// never put a partial byte on disk.
+bool BuildRecord(const RecordHeader& header, const wchar_t* path, int pathLen,
+                 const wchar_t* aux, int auxLen, BYTE* stack,
+                 size_t stackCapacity, BYTE** bytes, DWORD* byteCount,
+                 bool* heapAllocated) {
+    size_t pathBytes = 0;
+    size_t auxBytes = 0;
+    if (!StringFieldSize(path, pathLen, &pathBytes) ||
+        !StringFieldSize(aux, auxLen, &auxBytes) ||
+        pathBytes > static_cast<size_t>(MAXDWORD) - sizeof(header) ||
+        auxBytes > static_cast<size_t>(MAXDWORD) - sizeof(header) - pathBytes) {
+        return false;
+    }
+    const size_t total = sizeof(header) + pathBytes + auxBytes;
+    BYTE* target = stack;
+    *heapAllocated = false;
+    if (total > stackCapacity) {
+        target = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), 0, total));
+        if (target == nullptr) {
+            return false;
+        }
+        *heapAllocated = true;
+    }
+    size_t offset = 0;
+    memcpy(target + offset, &header, sizeof(header));
+    offset += sizeof(header);
+    const bool complete =
+        AppendStringField(target, total, &offset, path, pathLen) &&
+        AppendStringField(target, total, &offset, aux, auxLen) && offset == total;
+    if (!complete) {
+        if (*heapAllocated) {
+            HeapFree(GetProcessHeap(), 0, target);
+        }
+        return false;
+    }
+    *bytes = target;
+    *byteCount = static_cast<DWORD>(total);
+    return true;
 }
 
 // Caller holds g_lock. Opens the trace file and writes the header on the
@@ -169,13 +286,14 @@ void EnsureOpenLocked() {
     hdr.qpcFrequency = g_qpcFrequency;
     hdr.startQpc = g_startQpc;
     hdr.startFiletime = g_startFiletime;
-    WriteBytes(&hdr, sizeof(hdr));
-
     wchar_t exe[1024];
     DWORD exeLen = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
-    WriteStringField(exe, static_cast<int>(exeLen));
-    WriteStringField(GetCommandLineW(), -1);
-    WriteStringField(g_cwdLen > 0 ? g_cwdW : nullptr, g_cwdLen);
+    if (!WriteAllLocked(reinterpret_cast<const BYTE*>(&hdr), sizeof(hdr)) ||
+        !WriteStringFieldLocked(exe, static_cast<int>(exeLen)) ||
+        !WriteStringFieldLocked(GetCommandLineW(), -1) ||
+        !WriteStringFieldLocked(g_cwdLen > 0 ? g_cwdW : nullptr, g_cwdLen)) {
+        return;
+    }
 }
 
 }  // namespace
@@ -266,14 +384,27 @@ void Record(BYTE type, BYTE op, DWORD status, ULONGLONG extra,
     hdr.qpc = static_cast<ULONGLONG>(li.QuadPart);
     hdr.extra = extra;
 
+    BYTE stack[kStackRecordBytes];
+    BYTE* bytes = nullptr;
+    DWORD byteCount = 0;
+    bool heapAllocated = false;
+    if (!BuildRecord(hdr, path, pathLen, aux, auxLen, stack, ARRAYSIZE(stack),
+                     &bytes, &byteCount, &heapAllocated)) {
+        AcquireSRWLockExclusive(&g_lock);
+        DisableLocked();
+        ReleaseSRWLockExclusive(&g_lock);
+        return;
+    }
+
     AcquireSRWLockExclusive(&g_lock);
     EnsureOpenLocked();
     if (g_file != INVALID_HANDLE_VALUE) {
-        WriteBytes(&hdr, sizeof(hdr));
-        WriteStringField(path, pathLen);
-        WriteStringField(aux, auxLen);
+        WriteAllLocked(bytes, byteCount);
     }
     ReleaseSRWLockExclusive(&g_lock);
+    if (heapAllocated) {
+        HeapFree(GetProcessHeap(), 0, bytes);
+    }
 }
 
 }  // namespace trace

@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 project(sembazuru-hooks LANGUAGES CXX)
+enable_testing()
 
 # The hook layer is deliberately thin C++ on Win32; everything else is Rust.
 # See docs/DESIGN.md §4.
@@ -56,3 +57,12 @@ add_executable(probe test/probe.cpp)
 add_executable(process_injection_failure_probe
   test/process_injection_failure_probe.cpp
 )
+
+# Trace writer tests include the implementation directly with Win32 I/O seams
+# substituted in the test translation unit.  This keeps the injected DLL free
+# of test-only exports, globals, and runtime switches.
+add_executable(trace_writer_faults test/trace_writer_faults.cpp)
+add_test(NAME trace_writer_faults COMMAND trace_writer_faults)
+
+add_executable(trace_write_probe test/trace_write_probe.cpp)
+add_test(NAME trace_write_probe_help COMMAND trace_write_probe --help)
