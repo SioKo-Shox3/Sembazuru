@@ -1039,8 +1039,59 @@ function Format-InstalledWorkerApplicationEvent {
     return ($fields -join ' ')
 }
 
+function Get-InstalledWorkerEventQueryStatus {
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    if ($ErrorRecord.FullyQualifiedErrorId -clike 'NoMatchingEventsFound,*GetWinEventCommand') {
+        return 'empty'
+    }
+    if ($ErrorRecord.Exception -is [UnauthorizedAccessException]) {
+        return 'access-denied'
+    }
+    if ($ErrorRecord.Exception -is [System.Diagnostics.Eventing.Reader.EventLogNotFoundException]) {
+        return 'log-not-found'
+    }
+    if ($ErrorRecord.Exception -is [System.Diagnostics.Eventing.Reader.EventLogException]) {
+        return 'query-invalid'
+    }
+    return 'query-failed'
+}
+
 function Assert-InstalledWorkerEventFormatter {
     $sentinel = 'SENTINEL-MUST-NOT-LEAK-7d1c'
+    $emptyQueryRecord = [System.Management.Automation.ErrorRecord]::new(
+        [System.InvalidOperationException]::new($sentinel),
+        'NoMatchingEventsFound,Microsoft.PowerShell.Commands.GetWinEventCommand',
+        [System.Management.Automation.ErrorCategory]::ObjectNotFound,
+        $null)
+    $unknownQueryRecord = [System.Management.Automation.ErrorRecord]::new(
+        [System.InvalidOperationException]::new($sentinel),
+        'UnexpectedGetWinEventFailure,Microsoft.PowerShell.Commands.GetWinEventCommand',
+        [System.Management.Automation.ErrorCategory]::NotSpecified,
+        $null)
+    $queryStatusCases = @(
+        @{ Record = $emptyQueryRecord; Expected = 'empty' }
+        @{ Record = [System.Management.Automation.ErrorRecord]::new(
+                [UnauthorizedAccessException]::new($sentinel), 'AccessDenied',
+                [System.Management.Automation.ErrorCategory]::PermissionDenied, $null); Expected = 'access-denied' }
+        @{ Record = [System.Management.Automation.ErrorRecord]::new(
+                [System.Diagnostics.Eventing.Reader.EventLogNotFoundException]::new($sentinel), 'LogMissing',
+                [System.Management.Automation.ErrorCategory]::ObjectNotFound, $null); Expected = 'log-not-found' }
+        @{ Record = [System.Management.Automation.ErrorRecord]::new(
+                [System.Diagnostics.Eventing.Reader.EventLogException]::new($sentinel), 'BadQuery',
+                [System.Management.Automation.ErrorCategory]::InvalidArgument, $null); Expected = 'query-invalid' }
+        @{ Record = $unknownQueryRecord; Expected = 'query-failed' }
+    )
+    foreach ($case in $queryStatusCases) {
+        $status = Get-InstalledWorkerEventQueryStatus -ErrorRecord $case.Record
+        if ($status -cne $case.Expected) {
+            throw "installed worker event query classification changed: expected=$($case.Expected) actual=$status"
+        }
+        if ($status -notin @('empty', 'access-denied', 'log-not-found', 'query-invalid', 'query-failed') -or
+            $status -match [regex]::Escape($sentinel)) {
+            throw 'installed worker event query classification emitted non-fixed or unsafe output'
+        }
+    }
     $xml = @"
 <Event><System><Execution ProcessID="1234" /></System><EventData>
 <Data Name="AppPath">C:\Windows\System32\cmd.exe</Data>
@@ -1169,12 +1220,17 @@ function Write-InstalledWorkerApplicationDiagnostics {
             $events = @(Get-WinEvent -LogName Application -FilterXPath $filterXPath `
                 -MaxEvents 8 -ErrorAction Stop)
         }
-        catch [UnauthorizedAccessException] {
-            Write-Host "$prefix unavailable=access-denied"
-            return
-        }
         catch {
-            Write-Host "$prefix unavailable=query-failed"
+            $status = Get-InstalledWorkerEventQueryStatus -ErrorRecord $_
+            if ($status -ceq 'empty') {
+                $events = @()
+                if ($query -eq 1) {
+                    Start-Sleep -Milliseconds 250
+                    continue
+                }
+                break
+            }
+            Write-Host "$prefix unavailable=$status"
             return
         }
         if ($events.Count -ne 0 -or $query -eq 2) { break }
