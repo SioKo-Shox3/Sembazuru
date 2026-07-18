@@ -536,6 +536,145 @@ static bool IsDirectActionScratch(const wchar_t* path,
     return _wcsnicmp(leaf, L"action-", 7) == 0 && leaf[7] != L'\0' &&
            wcschr(leaf, L'\\') == nullptr && wcschr(leaf, L'/') == nullptr;
 }
+static const int kScratchCanaryATemp = 30;
+static const int kScratchCanaryAOpen = 31;
+static const int kScratchCanaryAMapping = 32;
+static const int kScratchCanaryAMap = 33;
+static const int kScratchCanaryAUnmap = 34;
+static const int kScratchCanaryAMapClose = 35;
+static const int kScratchCanaryADisposition = 36;
+static const int kScratchCanaryAFileClose = 37;
+static const int kScratchCanaryAAbsence = 38;
+static const int kScratchCanaryACleanup = 39;
+static const int kScratchCanaryBTemp = 40;
+static const int kScratchCanaryBOpen = 41;
+static const int kScratchCanaryBMapping = 42;
+static const int kScratchCanaryBMap = 43;
+static const int kScratchCanaryBUnmap = 44;
+static const int kScratchCanaryBMapClose = 45;
+static const int kScratchCanaryBFileClose = 46;
+static const int kScratchCanaryBAbsence = 47;
+static const int kScratchCanaryBCleanup = 48;
+static const int kScratchCanaryNegativeSentinel = 49;
+static BOOL ScratchCanaryIsAbsent(const wchar_t* path, DWORD expectedError) {
+    SetLastError(ERROR_SUCCESS);
+    return GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES &&
+           GetLastError() == expectedError;
+}
+static BOOL ScratchCanaryRemoveResidue(const wchar_t* path) {
+    SetLastError(ERROR_SUCCESS);
+    DWORD attributes = GetFileAttributesW(path);
+    DWORD error = GetLastError();
+    if (attributes == INVALID_FILE_ATTRIBUTES)
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+    if (DeleteFileW(path)) return TRUE;
+    error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+static int RunScratchCanaryCase(const wchar_t* tmp, BOOL deleteOnClose,
+                                DWORD* primaryError, BOOL* cleanupFailed) {
+    static const char kKnownBytes[] = "sembazuru-scratch-canary";
+    wchar_t path[32768]{};
+    HANDLE file = INVALID_HANDLE_VALUE;
+    HANDLE mapping = nullptr;
+    void* view = nullptr;
+    const int tempFailure = deleteOnClose ? kScratchCanaryBTemp : kScratchCanaryATemp;
+    const int openFailure = deleteOnClose ? kScratchCanaryBOpen : kScratchCanaryAOpen;
+    const int mappingFailure = deleteOnClose ? kScratchCanaryBMapping : kScratchCanaryAMapping;
+    const int mapFailure = deleteOnClose ? kScratchCanaryBMap : kScratchCanaryAMap;
+    const int unmapFailure = deleteOnClose ? kScratchCanaryBUnmap : kScratchCanaryAUnmap;
+    const int mapCloseFailure = deleteOnClose ? kScratchCanaryBMapClose : kScratchCanaryAMapClose;
+    const int fileCloseFailure = deleteOnClose ? kScratchCanaryBFileClose : kScratchCanaryAFileClose;
+    const int absenceFailure = deleteOnClose ? kScratchCanaryBAbsence : kScratchCanaryAAbsence;
+    const int cleanupFailure = deleteOnClose ? kScratchCanaryBCleanup : kScratchCanaryACleanup;
+    int result = tempFailure;
+    DWORD attributes = INVALID_FILE_ATTRIBUTES;
+    DWORD absenceError = ERROR_SUCCESS;
+    *primaryError = ERROR_SUCCESS;
+    *cleanupFailed = FALSE;
+    if (GetTempFileNameW(tmp, L"SBZ", 0, path) == 0) {
+        *primaryError = GetLastError();
+        goto cleanup;
+    }
+    file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE | DELETE,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       nullptr, OPEN_EXISTING,
+                       deleteOnClose ? FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE
+                                     : FILE_ATTRIBUTE_TEMPORARY,
+                       nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        result = openFailure;
+        *primaryError = GetLastError();
+        goto cleanup;
+    }
+    mapping = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 4096, nullptr);
+    if (mapping == nullptr) {
+        result = mappingFailure;
+        *primaryError = GetLastError();
+        goto cleanup;
+    }
+    view = MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 4096);
+    if (view == nullptr) {
+        result = mapFailure;
+        *primaryError = GetLastError();
+        goto cleanup;
+    }
+    memcpy(view, kKnownBytes, sizeof(kKnownBytes));
+    if (!UnmapViewOfFile(view)) {
+        result = unmapFailure;
+        *primaryError = GetLastError();
+        goto cleanup;
+    }
+    view = nullptr;
+    if (!CloseHandle(mapping)) {
+        result = mapCloseFailure;
+        *primaryError = GetLastError();
+        goto cleanup;
+    }
+    mapping = nullptr;
+    if (!deleteOnClose) {
+        FILE_DISPOSITION_INFO disposition{};
+        disposition.DeleteFile = TRUE;
+        if (!SetFileInformationByHandle(file, FileDispositionInfo, &disposition,
+                                        sizeof(disposition))) {
+            result = kScratchCanaryADisposition;
+            *primaryError = GetLastError();
+            goto cleanup;
+        }
+    }
+    if (!CloseHandle(file)) {
+        result = fileCloseFailure;
+        *primaryError = GetLastError();
+        goto cleanup;
+    }
+    file = INVALID_HANDLE_VALUE;
+    SetLastError(ERROR_SUCCESS);
+    attributes = GetFileAttributesW(path);
+    absenceError = GetLastError();
+    if (attributes != INVALID_FILE_ATTRIBUTES || absenceError != ERROR_FILE_NOT_FOUND) {
+        result = absenceFailure;
+        *primaryError = absenceError;
+        goto cleanup;
+    }
+    return 0;
+cleanup:
+    BOOL cleanupOk = TRUE;
+    if (view != nullptr && !UnmapViewOfFile(view)) cleanupOk = FALSE;
+    if (mapping != nullptr && !CloseHandle(mapping)) cleanupOk = FALSE;
+    if (file != INVALID_HANDLE_VALUE && !CloseHandle(file)) cleanupOk = FALSE;
+    if (path[0] != L'\0' && !ScratchCanaryRemoveResidue(path)) cleanupOk = FALSE;
+    if (!cleanupOk) {
+        *cleanupFailed = TRUE;
+        return cleanupFailure;
+    }
+    return result;
+}
+static int RunScratchCanary(const wchar_t* tmp, DWORD* primaryError,
+                            BOOL* cleanupFailed) {
+    int result = RunScratchCanaryCase(tmp, FALSE, primaryError, cleanupFailed);
+    if (result != 0) return result;
+    return RunScratchCanaryCase(tmp, TRUE, primaryError, cleanupFailed);
+}
 static const ULONGLONG kClGlTimeoutMs = 30000;
 static const ULONGLONG kClGlTerminateGraceMs = 2000;
 static const int kClGlSetupGetStdin = 60;
@@ -573,7 +712,12 @@ static void EmitClGlSpawnFailure(const char* stage, DWORD error) {
     fprintf(stderr, "CL_GL_SPAWN: stage=%s error=%lu\n", stage,
             static_cast<unsigned long>(error));
 }
-static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
+static void EmitScratchCanaryFailure(int stage, DWORD error, BOOL cleanupFailed) {
+    fprintf(stderr, "M6_CL_GL_SCRATCH_CANARY_FAIL stage=%d error=%lu cleanup=%d\n",
+            stage, static_cast<unsigned long>(error), cleanupFailed ? 1 : 0);
+}
+static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
+                     BOOL scratchCanaryNegative) {
     wchar_t tmp[32768];
     wchar_t temp[32768];
     wchar_t scratch[32768];
@@ -590,6 +734,30 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
         wcscmp(tmp, temp) != 0 || wcscmp(tmp, scratch) != 0 ||
         !IsDirectActionScratch(tmp, expectedScratchRoot))
         return 21;
+    wchar_t missingScratch[32768]{};
+    wchar_t marker[32768]{};
+    if (scratchCanaryNegative) {
+        int missingLength = _snwprintf_s(
+            missingScratch, sizeof(missingScratch) / sizeof(missingScratch[0]),
+            _TRUNCATE, L"%s\\missing-scratch-canary", tmp);
+        int markerLength = _snwprintf_s(
+            marker, sizeof(marker) / sizeof(marker[0]), _TRUNCATE,
+            L"%s\\scratch-canary-sentinel.marker", tmp);
+        if (missingLength < 0 || markerLength < 0 ||
+            !ScratchCanaryIsAbsent(marker, ERROR_FILE_NOT_FOUND))
+            return kScratchCanaryNegativeSentinel;
+    }
+    const wchar_t* canaryRoot = scratchCanaryNegative ? missingScratch : tmp;
+    DWORD canaryError = ERROR_SUCCESS;
+    BOOL canaryCleanupFailed = FALSE;
+    int canaryResult = RunScratchCanary(canaryRoot, &canaryError, &canaryCleanupFailed);
+    if (canaryResult != 0) {
+        if (scratchCanaryNegative && marker[0] != L'\0')
+            ScratchCanaryRemoveResidue(marker);
+        EmitScratchCanaryFailure(canaryResult, canaryError, canaryCleanupFailed);
+        return canaryResult;
+    }
+    wprintf(L"M6_CL_GL_SCRATCH_CANARY PASS A=delete-disposition B=delete-on-close\n");
     wchar_t object[32768];
     int objectLength = _snwprintf_s(
         object, sizeof(object) / sizeof(object[0]), _TRUNCATE, L"%s\\gl_tmp.obj", tmp);
@@ -597,9 +765,16 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (GetFileAttributesW(object) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(object))
         return 23;
     wchar_t command[32768];
-    int commandLength = _snwprintf_s(
-        command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
-        L"\"%s\" /nologo /c /GL \"Src\\gl_tmp.cpp\" /Fo\"%s\"", clExe, object);
+    int commandLength = 0;
+    if (scratchCanaryNegative) {
+        commandLength = _snwprintf_s(
+            command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
+            L"\"%s\" --scratch-canary-sentinel \"%s\"", clExe, marker);
+    } else {
+        commandLength = _snwprintf_s(
+            command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
+            L"\"%s\" /nologo /c /GL \"Src\\gl_tmp.cpp\" /Fo\"%s\"", clExe, object);
+    }
     if (commandLength < 0) return 22;
     SetEnvironmentVariableW(L"CL", nullptr);
     SetEnvironmentVariableW(L"_CL_", nullptr);
@@ -739,6 +914,12 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
         goto cleanup;
     }
     if (exitCode != 0) { result = 26; goto cleanup; }
+    if (scratchCanaryNegative) {
+        BOOL sentinelCreated = !ScratchCanaryIsAbsent(marker, ERROR_FILE_NOT_FOUND);
+        if (sentinelCreated) ScratchCanaryRemoveResidue(marker);
+        result = kScratchCanaryNegativeSentinel;
+        goto cleanup;
+    }
     objectHandle = CreateFileW(object, GENERIC_READ,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -783,7 +964,17 @@ int wmain(int argc, wchar_t** argv) {
         return SpawnReadChild(argv[2], argv[3], TRUE);
     }
     if (argc >= 4 && wcscmp(argv[1], L"--spawn-cl-gl") == 0) {
-        return SpawnClGl(argv[2], argv[3]);
+        return SpawnClGl(argv[2], argv[3], FALSE);
+    }
+    if (argc >= 4 && wcscmp(argv[1], L"--spawn-cl-gl-negative") == 0) {
+        return SpawnClGl(argv[2], argv[3], TRUE);
+    }
+    if (argc >= 3 && wcscmp(argv[1], L"--scratch-canary-sentinel") == 0) {
+        HANDLE marker = CreateFileW(argv[2], GENERIC_WRITE, 0, nullptr,
+                                    CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (marker == INVALID_HANDLE_VALUE) return 1;
+        BOOL closed = CloseHandle(marker);
+        return closed ? 0 : 1;
     }
     if (argc >= 3 && wcscmp(argv[1], L"--chdir") == 0) {
         return SetCurrentDirectoryW(argv[2]) ? 0 : 8;
@@ -907,6 +1098,57 @@ int wmain(int argc, wchar_t** argv) {
     return memcmp(buf, exp, elen) == 0 ? 0 : 3;
 }
 '@
+$scratchCanaryStaticRequirements = @(
+    'static int RunScratchCanary(const wchar_t* tmp, DWORD* primaryError,',
+    'GetTempFileNameW(tmp, L"SBZ", 0,',
+    'GENERIC_READ | GENERIC_WRITE | DELETE',
+    'FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE',
+    'CreateFileMappingW(',
+    'MapViewOfFile(',
+    'SetFileInformationByHandle(',
+    'FileDispositionInfo',
+    'M6_CL_GL_SCRATCH_CANARY PASS A=delete-disposition B=delete-on-close',
+    '--spawn-cl-gl-negative',
+    '--scratch-canary-sentinel',
+    'kScratchCanaryATemp = 30',
+    'kScratchCanaryACleanup = 39',
+    'kScratchCanaryBTemp = 40',
+    'kScratchCanaryBCleanup = 48',
+    'kScratchCanaryNegativeSentinel = 49',
+    'const wchar_t* canaryRoot = scratchCanaryNegative ? missingScratch : tmp;',
+    'int canaryResult = RunScratchCanary(canaryRoot, &canaryError, &canaryCleanupFailed);',
+    'M6_CL_GL_SCRATCH_CANARY_FAIL stage=%d error=%lu cleanup=%d',
+    'BOOL sentinelCreated = !ScratchCanaryIsAbsent(marker, ERROR_FILE_NOT_FOUND);'
+)
+foreach ($requirement in $scratchCanaryStaticRequirements) {
+    if (-not $probeSrc.Contains($requirement)) {
+        throw "scratch canary source contract missing: $requirement"
+    }
+}
+$scratchCanarySpawnClGl = $probeSrc.IndexOf('static int SpawnClGl(')
+if ($scratchCanarySpawnClGl -lt 0) {
+    throw 'scratch canary SpawnClGl source contract missing'
+}
+$scratchCanarySpawnBody = $probeSrc.Substring($scratchCanarySpawnClGl)
+$scratchCanaryRoot = $scratchCanarySpawnBody.IndexOf('const wchar_t* canaryRoot = scratchCanaryNegative ? missingScratch : tmp;')
+$scratchCanaryCall = $scratchCanarySpawnBody.IndexOf('int canaryResult = RunScratchCanary(canaryRoot, &canaryError, &canaryCleanupFailed);')
+$scratchCanaryCommonReturn = $scratchCanarySpawnBody.IndexOf('if (canaryResult != 0) {')
+$scratchCanaryCreateProcess = $scratchCanarySpawnBody.IndexOf('CreateProcessW(')
+$scratchCanaryReturnBody = if ($scratchCanaryCommonReturn -ge 0) {
+    $scratchCanarySpawnBody.Substring($scratchCanaryCommonReturn, 300)
+} else { '' }
+if ($scratchCanaryRoot -lt 0 -or $scratchCanaryCall -lt 0 -or
+    $scratchCanaryCommonReturn -lt 0 -or $scratchCanaryCreateProcess -lt 0 -or
+    $scratchCanaryRoot -ge $scratchCanaryCall -or
+    $scratchCanaryCall -ge $scratchCanaryCommonReturn -or
+    $scratchCanaryCommonReturn -ge $scratchCanaryCreateProcess -or
+    -not $scratchCanaryReturnBody.Contains('return canaryResult;') -or
+    $scratchCanarySpawnBody.Contains('RunScratchCanary(tmp)') -or
+    $scratchCanarySpawnBody.Contains('RunScratchCanary(missingScratch)') -or
+    $scratchCanarySpawnBody.Contains('return kScratchCanaryATemp;')) {
+    throw 'scratch canary is not statically ordered before CreateProcessW'
+}
+Write-Host 'M6_CL_GL_SCRATCH_CANARY_STATIC PASS'
 Set-Content (Join-Path $WorkRoot 'probe.cpp') $probeSrc -Encoding ascii
 Push-Location $WorkRoot
 try {
@@ -984,6 +1226,7 @@ $emptyTraceExit = 99
 $emptyTraceChildWExit = 99
 $emptyTraceChildAExit = 99
 $metadataExit = 99
+$glNegativeCanaryExit = 99
 $glExit = 99
 $glDiagnosticExit = 99
 $glDiagnosticText = ''
@@ -1080,6 +1323,11 @@ try {
                 $probe --write-output 'out.txt' 2>&1 |
                 Out-String | Write-Host
             $outputExit = $LASTEXITCODE
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
+                $probe --spawn-cl-gl-negative $scratchRoot $probe 2>&1 |
+                Out-String | Write-Host
+            $glNegativeCanaryExit = $LASTEXITCODE
 
             & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $glTraceDir -- `
                 $probe --spawn-cl-gl $scratchRoot $clExe 2>&1 |
@@ -1207,6 +1455,51 @@ if ($verbatimFindExWExit -ne 0) {
 if ($outputExit -eq 0) {
     $failures += 'a scratch-cwd action that wrote a relative output completed remotely; outputs would be stranded without WriteBack'
 }
+$glScratchCanaryStages = @{
+    30 = 'A GetTempFileNameW'
+    31 = 'A CreateFileW'
+    32 = 'A CreateFileMappingW'
+    33 = 'A MapViewOfFile'
+    34 = 'A UnmapViewOfFile'
+    35 = 'A CloseHandle mapping'
+    36 = 'A SetFileInformationByHandle FileDispositionInfo'
+    37 = 'A CloseHandle file'
+    38 = 'A GetFileAttributesW absence'
+    39 = 'A cleanup DeleteFileW'
+    40 = 'B GetTempFileNameW'
+    41 = 'B CreateFileW delete-on-close'
+    42 = 'B CreateFileMappingW'
+    43 = 'B MapViewOfFile'
+    44 = 'B UnmapViewOfFile'
+    45 = 'B CloseHandle mapping'
+    46 = 'B CloseHandle file delete-on-close'
+    47 = 'B GetFileAttributesW absence'
+    48 = 'B cleanup DeleteFileW'
+    49 = 'negative sentinel child or residual'
+}
+switch ($glNegativeCanaryExit) {
+    30 { Write-Host 'M6_CL_GL_SCRATCH_CANARY_NEGATIVE PASS exit=30' }
+    31 { $failures += 'scratch canary negative action unexpectedly reached A CreateFileW (exit=31)' }
+    32 { $failures += 'scratch canary negative action unexpectedly reached A CreateFileMappingW (exit=32)' }
+    33 { $failures += 'scratch canary negative action unexpectedly reached A MapViewOfFile (exit=33)' }
+    34 { $failures += 'scratch canary negative action unexpectedly reached A UnmapViewOfFile (exit=34)' }
+    35 { $failures += 'scratch canary negative action unexpectedly reached A CloseHandle mapping (exit=35)' }
+    36 { $failures += 'scratch canary negative action unexpectedly reached A SetFileInformationByHandle (exit=36)' }
+    37 { $failures += 'scratch canary negative action unexpectedly reached A CloseHandle file (exit=37)' }
+    38 { $failures += 'scratch canary negative action unexpectedly reached A absence check (exit=38)' }
+    39 { $failures += 'scratch canary negative action cleanup failed (exit=39)' }
+    40 { $failures += 'scratch canary negative action unexpectedly reached B GetTempFileNameW (exit=40)' }
+    41 { $failures += 'scratch canary negative action unexpectedly reached B CreateFileW (exit=41)' }
+    42 { $failures += 'scratch canary negative action unexpectedly reached B CreateFileMappingW (exit=42)' }
+    43 { $failures += 'scratch canary negative action unexpectedly reached B MapViewOfFile (exit=43)' }
+    44 { $failures += 'scratch canary negative action unexpectedly reached B UnmapViewOfFile (exit=44)' }
+    45 { $failures += 'scratch canary negative action unexpectedly reached B CloseHandle mapping (exit=45)' }
+    46 { $failures += 'scratch canary negative action unexpectedly reached B CloseHandle file (exit=46)' }
+    47 { $failures += 'scratch canary negative action unexpectedly reached B absence check (exit=47)' }
+    48 { $failures += 'scratch canary negative action cleanup failed (exit=48)' }
+    49 { $failures += 'scratch canary negative action created its sentinel or left a residue (exit=49)' }
+    default { $failures += "scratch canary negative action returned unexpected exit=$glNegativeCanaryExit; expected 30" }
+}
 $glSetupStages = @{
     60 = 'get-stdin'
     61 = 'get-stdout'
@@ -1234,6 +1527,26 @@ if ($glSetupStages.ContainsKey([int]$glExit)) {
         27 { $failures += 'hosted cl.exe /GL did not create %TMP%\\gl_tmp.obj' }
         28 { $failures += 'hosted cl.exe /GL created an empty %TMP%\\gl_tmp.obj' }
         29 { $failures += 'hosted cl.exe /GL could not delete %TMP%\\gl_tmp.obj' }
+        30 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[30]) (exit=30)" }
+        31 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[31]) (exit=31)" }
+        32 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[32]) (exit=32)" }
+        33 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[33]) (exit=33)" }
+        34 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[34]) (exit=34)" }
+        35 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[35]) (exit=35)" }
+        36 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[36]) (exit=36)" }
+        37 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[37]) (exit=37)" }
+        38 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[38]) (exit=38)" }
+        39 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[39]) (exit=39)" }
+        40 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[40]) (exit=40)" }
+        41 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[41]) (exit=41)" }
+        42 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[42]) (exit=42)" }
+        43 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[43]) (exit=43)" }
+        44 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[44]) (exit=44)" }
+        45 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[45]) (exit=45)" }
+        46 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[46]) (exit=46)" }
+        47 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[47]) (exit=47)" }
+        48 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[48]) (exit=48)" }
+        49 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[49]) (exit=49)" }
         default { $failures += "hosted cl.exe /GL VFS probe failed (exit=$glExit)" }
     }
 }
