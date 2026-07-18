@@ -688,6 +688,7 @@ static const int kClGlSetupAllocateAttributes = 67;
 static const int kClGlSetupInitializeAttributes = 68;
 static const int kClGlSetupUpdateHandleList = 69;
 static const int kClGlSetupCreateProcess = 70;
+static const int kPlainClGlInconclusive = 74;
 static BOOL WaitForClGlExit(HANDLE process, ULONGLONG deadline) {
     for (;;) {
         ULONGLONG now = GetTickCount64();
@@ -716,8 +717,12 @@ static void EmitScratchCanaryFailure(int stage, DWORD error, BOOL cleanupFailed)
     fprintf(stderr, "M6_CL_GL_SCRATCH_CANARY_FAIL stage=%d error=%lu cleanup=%d\n",
             stage, static_cast<unsigned long>(error), cleanupFailed ? 1 : 0);
 }
+static void EmitPlainClGlFailure(int stage, DWORD error) {
+    fprintf(stderr, "M6_CL_GL_PLAIN_DIRECT_FAIL stage=%d error=%lu\n", stage,
+            static_cast<unsigned long>(error));
+}
 static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
-                     BOOL scratchCanaryNegative) {
+                     BOOL scratchCanaryNegative, BOOL plainDirect) {
     wchar_t tmp[32768];
     wchar_t temp[32768];
     wchar_t scratch[32768];
@@ -725,45 +730,102 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
         L"TMP", tmp, static_cast<DWORD>(sizeof(tmp) / sizeof(tmp[0])));
     DWORD tempLength = GetEnvironmentVariableW(
         L"TEMP", temp, static_cast<DWORD>(sizeof(temp) / sizeof(temp[0])));
-    DWORD scratchLength = GetEnvironmentVariableW(
-        L"SEMBAZURU_VFS_SCRATCH", scratch,
-        static_cast<DWORD>(sizeof(scratch) / sizeof(scratch[0])));
+    DWORD scratchLength = 0;
+    if (!plainDirect) {
+        scratchLength = GetEnvironmentVariableW(
+            L"SEMBAZURU_VFS_SCRATCH", scratch,
+            static_cast<DWORD>(sizeof(scratch) / sizeof(scratch[0])));
+    }
     if (tmpLength == 0 || tmpLength >= sizeof(tmp) / sizeof(tmp[0]) ||
         tempLength == 0 || tempLength >= sizeof(temp) / sizeof(temp[0]) ||
-        scratchLength == 0 || scratchLength >= sizeof(scratch) / sizeof(scratch[0]) ||
-        wcscmp(tmp, temp) != 0 || wcscmp(tmp, scratch) != 0 ||
-        !IsDirectActionScratch(tmp, expectedScratchRoot))
+        !IsDirectActionScratch(tmp, expectedScratchRoot) ||
+        (!plainDirect && (scratchLength == 0 ||
+                          scratchLength >= sizeof(scratch) / sizeof(scratch[0]) ||
+                          wcscmp(tmp, scratch) != 0)) ||
+        wcscmp(tmp, temp) != 0) {
+        if (plainDirect) {
+            EmitPlainClGlFailure(71, ERROR_INVALID_DATA);
+            return 71;
+        }
         return 21;
+    }
     wchar_t missingScratch[32768]{};
     wchar_t marker[32768]{};
-    if (scratchCanaryNegative) {
-        int missingLength = _snwprintf_s(
-            missingScratch, sizeof(missingScratch) / sizeof(missingScratch[0]),
-            _TRUNCATE, L"%s\\missing-scratch-canary", tmp);
-        int markerLength = _snwprintf_s(
-            marker, sizeof(marker) / sizeof(marker[0]), _TRUNCATE,
-            L"%s\\scratch-canary-sentinel.marker", tmp);
-        if (missingLength < 0 || markerLength < 0 ||
-            !ScratchCanaryIsAbsent(marker, ERROR_FILE_NOT_FOUND))
-            return kScratchCanaryNegativeSentinel;
+    if (!plainDirect) {
+        if (scratchCanaryNegative) {
+            int missingLength = _snwprintf_s(
+                missingScratch, sizeof(missingScratch) / sizeof(missingScratch[0]),
+                _TRUNCATE, L"%s\\missing-scratch-canary", tmp);
+            int markerLength = _snwprintf_s(
+                marker, sizeof(marker) / sizeof(marker[0]), _TRUNCATE,
+                L"%s\\scratch-canary-sentinel.marker", tmp);
+            if (missingLength < 0 || markerLength < 0 ||
+                !ScratchCanaryIsAbsent(marker, ERROR_FILE_NOT_FOUND))
+                return kScratchCanaryNegativeSentinel;
+        }
+        const wchar_t* canaryRoot = scratchCanaryNegative ? missingScratch : tmp;
+        DWORD canaryError = ERROR_SUCCESS;
+        BOOL canaryCleanupFailed = FALSE;
+        int canaryResult = RunScratchCanary(canaryRoot, &canaryError, &canaryCleanupFailed);
+        if (canaryResult != 0) {
+            if (scratchCanaryNegative && marker[0] != L'\0')
+                ScratchCanaryRemoveResidue(marker);
+            EmitScratchCanaryFailure(canaryResult, canaryError, canaryCleanupFailed);
+            return canaryResult;
+        }
+        wprintf(L"M6_CL_GL_SCRATCH_CANARY PASS A=delete-disposition B=delete-on-close\n");
     }
-    const wchar_t* canaryRoot = scratchCanaryNegative ? missingScratch : tmp;
-    DWORD canaryError = ERROR_SUCCESS;
-    BOOL canaryCleanupFailed = FALSE;
-    int canaryResult = RunScratchCanary(canaryRoot, &canaryError, &canaryCleanupFailed);
-    if (canaryResult != 0) {
-        if (scratchCanaryNegative && marker[0] != L'\0')
-            ScratchCanaryRemoveResidue(marker);
-        EmitScratchCanaryFailure(canaryResult, canaryError, canaryCleanupFailed);
-        return canaryResult;
-    }
-    wprintf(L"M6_CL_GL_SCRATCH_CANARY PASS A=delete-disposition B=delete-on-close\n");
-    wchar_t object[32768];
+    wchar_t source[32768]{};
+    wchar_t object[32768]{};
     int objectLength = _snwprintf_s(
         object, sizeof(object) / sizeof(object[0]), _TRUNCATE, L"%s\\gl_tmp.obj", tmp);
-    if (objectLength < 0) return 22;
-    if (GetFileAttributesW(object) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(object))
+    if (plainDirect) {
+        objectLength = _snwprintf_s(
+            object, sizeof(object) / sizeof(object[0]), _TRUNCATE,
+            L"%s\\gl_plain_tmp.obj", tmp);
+        int sourceLength = _snwprintf_s(
+            source, sizeof(source) / sizeof(source[0]), _TRUNCATE,
+            L"%s\\gl_plain_tmp.cpp", tmp);
+        if (objectLength < 0 || sourceLength < 0) {
+            EmitPlainClGlFailure(71, ERROR_BUFFER_OVERFLOW);
+            return 71;
+        }
+    } else if (objectLength < 0) {
+        return 22;
+    }
+    if (GetFileAttributesW(object) != INVALID_FILE_ATTRIBUTES && !DeleteFileW(object)) {
+        if (plainDirect) {
+            EmitPlainClGlFailure(71, GetLastError());
+            return 71;
+        }
         return 23;
+    }
+    if (plainDirect) {
+        HANDLE sourceHandle = CreateFileW(source, GENERIC_WRITE, FILE_SHARE_READ,
+                                          nullptr, CREATE_ALWAYS,
+                                          FILE_ATTRIBUTE_TEMPORARY, nullptr);
+        if (sourceHandle == INVALID_HANDLE_VALUE) {
+            EmitPlainClGlFailure(71, GetLastError());
+            return 71;
+        }
+        static const char kPlainSource[] = {
+            'i', 'n', 't', ' ', 'm', 'a', 'i', 'n', '(', ')', '{',
+            'r', 'e', 't', 'u', 'r', 'n', ' ', '0', ';', '}', '\n',
+        };
+        DWORD written = 0;
+        BOOL sourceWritten = WriteFile(sourceHandle, kPlainSource,
+                                       sizeof(kPlainSource), &written, nullptr);
+        DWORD sourceError = sourceWritten
+            ? (written == sizeof(kPlainSource) ? ERROR_SUCCESS : ERROR_WRITE_FAULT)
+            : GetLastError();
+        if (!CloseHandle(sourceHandle) && sourceError == ERROR_SUCCESS)
+            sourceError = GetLastError();
+        if (sourceError != ERROR_SUCCESS) {
+            DeleteFileW(source);
+            EmitPlainClGlFailure(71, sourceError);
+            return 71;
+        }
+    }
     wchar_t command[32768];
     int commandLength = 0;
     if (scratchCanaryNegative) {
@@ -771,11 +833,25 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
             command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
             L"\"%s\" --scratch-canary-sentinel \"%s\"", clExe, marker);
     } else {
-        commandLength = _snwprintf_s(
-            command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
-            L"\"%s\" /nologo /c /GL \"Src\\gl_tmp.cpp\" /Fo\"%s\"", clExe, object);
+        if (plainDirect) {
+            commandLength = _snwprintf_s(
+                command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
+                L"\"%s\" /nologo /c /GL \"%s\" /Fo\"%s\"",
+                clExe, source, object);
+        } else {
+            commandLength = _snwprintf_s(
+                command, sizeof(command) / sizeof(command[0]), _TRUNCATE,
+                L"\"%s\" /nologo /c /GL \"Src\\gl_tmp.cpp\" /Fo\"%s\"", clExe, object);
+        }
     }
-    if (commandLength < 0) return 22;
+    if (commandLength < 0) {
+        if (plainDirect) {
+            DeleteFileW(source);
+            EmitPlainClGlFailure(71, ERROR_BUFFER_OVERFLOW);
+            return 71;
+        }
+        return 22;
+    }
     SetEnvironmentVariableW(L"CL", nullptr);
     SetEnvironmentVariableW(L"_CL_", nullptr);
     HANDLE parentStdin = INVALID_HANDLE_VALUE;
@@ -795,32 +871,20 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
     LARGE_INTEGER objectSize{};
     HANDLE objectHandle = INVALID_HANDLE_VALUE;
     BOOL hasContent = FALSE;
+    BOOL objectSized = FALSE;
     ULONGLONG hardDeadline = 0;
     ULONGLONG executionDeadline = 0;
     const char* spawnStage = nullptr;
     DWORD spawnError = ERROR_SUCCESS;
     BOOL attributeSizeQueried = FALSE;
     DWORD attributeSizeError = ERROR_SUCCESS;
+    DWORD plainError = ERROR_SUCCESS;
     HANDLE inheritableHandles[3]{};
     parentStdin = GetStdHandle(STD_INPUT_HANDLE);
     if (parentStdin == nullptr || parentStdin == INVALID_HANDLE_VALUE) {
         spawnStage = "get-stdin";
         spawnError = GetLastError();
         result = kClGlSetupGetStdin;
-        goto cleanup;
-    }
-    parentStdout = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (parentStdout == nullptr || parentStdout == INVALID_HANDLE_VALUE) {
-        spawnStage = "get-stdout";
-        spawnError = GetLastError();
-        result = kClGlSetupGetStdout;
-        goto cleanup;
-    }
-    parentStderr = GetStdHandle(STD_ERROR_HANDLE);
-    if (parentStderr == nullptr || parentStderr == INVALID_HANDLE_VALUE) {
-        spawnStage = "get-stderr";
-        spawnError = GetLastError();
-        result = kClGlSetupGetStderr;
         goto cleanup;
     }
     if (!DuplicateHandle(GetCurrentProcess(), parentStdin, GetCurrentProcess(),
@@ -830,19 +894,59 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
         result = kClGlSetupDuplicateStdin;
         goto cleanup;
     }
-    if (!DuplicateHandle(GetCurrentProcess(), parentStdout, GetCurrentProcess(),
-                         &inheritedStdout, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
-        spawnStage = "duplicate-stdout";
-        spawnError = GetLastError();
-        result = kClGlSetupDuplicateStdout;
-        goto cleanup;
-    }
-    if (!DuplicateHandle(GetCurrentProcess(), parentStderr, GetCurrentProcess(),
-                         &inheritedStderr, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
-        spawnStage = "duplicate-stderr";
-        spawnError = GetLastError();
-        result = kClGlSetupDuplicateStderr;
-        goto cleanup;
+    if (plainDirect) {
+        SECURITY_ATTRIBUTES inheritable{};
+        inheritable.nLength = sizeof(inheritable);
+        inheritable.bInheritHandle = TRUE;
+        inheritedStdout = CreateFileW(L"NUL", GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      &inheritable, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (inheritedStdout == INVALID_HANDLE_VALUE) {
+            spawnStage = "open-plain-stdout-sink";
+            spawnError = GetLastError();
+            result = kClGlSetupDuplicateStdout;
+            goto cleanup;
+        }
+        inheritedStderr = CreateFileW(L"NUL", GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      &inheritable, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (inheritedStderr == INVALID_HANDLE_VALUE) {
+            spawnStage = "open-plain-stderr-sink";
+            spawnError = GetLastError();
+            result = kClGlSetupDuplicateStderr;
+            goto cleanup;
+        }
+    } else {
+        parentStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        if (parentStdout == nullptr || parentStdout == INVALID_HANDLE_VALUE) {
+            spawnStage = "get-stdout";
+            spawnError = GetLastError();
+            result = kClGlSetupGetStdout;
+            goto cleanup;
+        }
+        parentStderr = GetStdHandle(STD_ERROR_HANDLE);
+        if (parentStderr == nullptr || parentStderr == INVALID_HANDLE_VALUE) {
+            spawnStage = "get-stderr";
+            spawnError = GetLastError();
+            result = kClGlSetupGetStderr;
+            goto cleanup;
+        }
+        if (!DuplicateHandle(GetCurrentProcess(), parentStdout, GetCurrentProcess(),
+                             &inheritedStdout, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+            spawnStage = "duplicate-stdout";
+            spawnError = GetLastError();
+            result = kClGlSetupDuplicateStdout;
+            goto cleanup;
+        }
+        if (!DuplicateHandle(GetCurrentProcess(), parentStderr, GetCurrentProcess(),
+                             &inheritedStderr, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+            spawnStage = "duplicate-stderr";
+            spawnError = GetLastError();
+            result = kClGlSetupDuplicateStderr;
+            goto cleanup;
+        }
     }
     attributeSizeQueried = InitializeProcThreadAttributeList(
         nullptr, 1, 0, &attributesSize);
@@ -910,10 +1014,11 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
         goto cleanup;
     }
     if (!GetExitCodeProcess(process.hProcess, &exitCode)) {
+        if (plainDirect) plainError = GetLastError();
         result = 25;
         goto cleanup;
     }
-    if (exitCode != 0) { result = 26; goto cleanup; }
+    if (exitCode != 0) { result = plainDirect ? 72 : 26; goto cleanup; }
     if (scratchCanaryNegative) {
         BOOL sentinelCreated = !ScratchCanaryIsAbsent(marker, ERROR_FILE_NOT_FOUND);
         if (sentinelCreated) ScratchCanaryRemoveResidue(marker);
@@ -924,14 +1029,21 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (objectHandle == INVALID_HANDLE_VALUE) {
-        result = 27;
+        plainError = GetLastError();
+        result = plainDirect ? 73 : 27;
         goto cleanup;
     }
-    hasContent = GetFileSizeEx(objectHandle, &objectSize) && objectSize.QuadPart > 0;
+    objectSized = GetFileSizeEx(objectHandle, &objectSize);
+    hasContent = objectSized && objectSize.QuadPart > 0;
+    if (!objectSized && plainDirect) plainError = GetLastError();
     CloseHandle(objectHandle);
     objectHandle = INVALID_HANDLE_VALUE;
     if (!hasContent) {
-        result = 28;
+        result = plainDirect ? 73 : 28;
+        goto cleanup;
+    }
+    if (plainDirect) {
+        result = 0;
         goto cleanup;
     }
     result = DeleteFileW(object) ? 0 : 29;
@@ -948,6 +1060,18 @@ cleanup:
     if (inheritedStderr != INVALID_HANDLE_VALUE) CloseHandle(inheritedStderr);
     if (inheritedStdout != INVALID_HANDLE_VALUE) CloseHandle(inheritedStdout);
     if (inheritedStdin != INVALID_HANDLE_VALUE) CloseHandle(inheritedStdin);
+    if (plainDirect) {
+        if (object[0] != L'\0') DeleteFileW(object);
+        if (source[0] != L'\0') DeleteFileW(source);
+        if (result != 0) {
+            int plainStage = result == 25 ? kPlainClGlInconclusive :
+                             result == 72 ? 72 : result == 73 ? 73 : 71;
+            if (plainError == ERROR_SUCCESS && spawnError != ERROR_SUCCESS)
+                plainError = spawnError;
+            EmitPlainClGlFailure(plainStage, plainError);
+            result = plainStage;
+        }
+    }
     if (result == 24 && spawnStage != nullptr)
         EmitClGlSpawnFailure(spawnStage, spawnError);
     return result;
@@ -964,10 +1088,13 @@ int wmain(int argc, wchar_t** argv) {
         return SpawnReadChild(argv[2], argv[3], TRUE);
     }
     if (argc >= 4 && wcscmp(argv[1], L"--spawn-cl-gl") == 0) {
-        return SpawnClGl(argv[2], argv[3], FALSE);
+        return SpawnClGl(argv[2], argv[3], FALSE, FALSE);
     }
     if (argc >= 4 && wcscmp(argv[1], L"--spawn-cl-gl-negative") == 0) {
-        return SpawnClGl(argv[2], argv[3], TRUE);
+        return SpawnClGl(argv[2], argv[3], TRUE, FALSE);
+    }
+    if (argc >= 4 && wcscmp(argv[1], L"--spawn-cl-gl-plain") == 0) {
+        return SpawnClGl(argv[2], argv[3], FALSE, TRUE);
     }
     if (argc >= 3 && wcscmp(argv[1], L"--scratch-canary-sentinel") == 0) {
         HANDLE marker = CreateFileW(argv[2], GENERIC_WRITE, 0, nullptr,
@@ -1149,6 +1276,88 @@ if ($scratchCanaryRoot -lt 0 -or $scratchCanaryCall -lt 0 -or
     throw 'scratch canary is not statically ordered before CreateProcessW'
 }
 Write-Host 'M6_CL_GL_SCRATCH_CANARY_STATIC PASS'
+$plainNewlineByte = "'" + '\' + "n'"
+$plainDirectStaticRequirements = @(
+    'static void EmitPlainClGlFailure(int stage, DWORD error)',
+    'M6_CL_GL_PLAIN_DIRECT_FAIL stage=%d error=%lu',
+    '--spawn-cl-gl-plain',
+    'return SpawnClGl(argv[2], argv[3], FALSE, TRUE);',
+    'L"%s\\gl_plain_tmp.cpp", tmp',
+    'L"%s\\gl_plain_tmp.obj", tmp',
+    'CreateFileW(source, GENERIC_WRITE, FILE_SHARE_READ,',
+    'static const char kPlainSource[] = {',
+    $plainNewlineByte,
+    'sizeof(kPlainSource), &written, nullptr)',
+    'CreateFileW(L"NUL", GENERIC_WRITE,',
+    'spawnStage = "open-plain-stdout-sink";',
+    'spawnStage = "open-plain-stderr-sink";',
+    'L"\"%s\" /nologo /c /GL \"%s\" /Fo\"%s\""',
+    'plainDirect ? 72 : 26',
+    'plainDirect ? 73 : 27',
+    'static const int kPlainClGlInconclusive = 74;',
+    'result == 25 ? kPlainClGlInconclusive',
+    'return SpawnClGl(argv[2], argv[3], TRUE, FALSE);'
+)
+foreach ($requirement in $plainDirectStaticRequirements) {
+    if (-not $probeSrc.Contains($requirement)) {
+        throw "plain direct /GL source contract missing: $requirement"
+    }
+}
+if (-not [regex]::IsMatch(
+        $probeSrc,
+        'if \(!plainDirect\) \{\s*scratchLength = GetEnvironmentVariableW\(\s*L"SEMBAZURU_VFS_SCRATCH"') -or
+    $probeSrc.Contains('SetEnvironmentVariableW(L"SEMBAZURU_VFS_SCRATCH"')) {
+    throw 'plain direct /GL must not consume or alter VFS-specific environment state'
+}
+$plainLegacySource = '"' + 'int main(){return 0;}' + '\' + 'n"'
+if ($probeSrc.Contains($plainLegacySource) -or
+    $probeSrc.Contains('sizeof(kPlainSource) - 1')) {
+    throw 'plain direct /GL source must write an explicit newline byte'
+}
+$scriptStaticText = [System.IO.File]::ReadAllText($PSCommandPath)
+$plainActionStart = $scriptStaticText.LastIndexOf('Push-Location $logicalRoot')
+$plainNegativeIndex = $scriptStaticText.IndexOf('$glNegativeCanaryExit = $LASTEXITCODE', $plainActionStart)
+$plainVfsIndex = $scriptStaticText.IndexOf('$glExit = $LASTEXITCODE', $plainActionStart)
+$plainDiagnosticIndex = $scriptStaticText.IndexOf('$glDiagnosticLines = @(', $plainActionStart)
+$plainNoVfsIndex = $scriptStaticText.IndexOf('--no-vfs', $plainDiagnosticIndex)
+$plainExitIndex = $scriptStaticText.IndexOf('$glPlainExit = $LASTEXITCODE', $plainNoVfsIndex)
+$plainInconclusiveIndex = $scriptStaticText.IndexOf('elseif ($glPlainExit -eq 74)', $plainExitIndex)
+$plainBothFailedIndex = $scriptStaticText.IndexOf(
+    'elseif ($glPlainExit -eq 72 -and $glExit -ne 0)', $plainExitIndex)
+$plainDriverIndex = $scriptStaticText.IndexOf(
+    'elseif ($glPlainExit -ne 0)', $plainExitIndex)
+$plainPassIndex = $scriptStaticText.IndexOf(
+    'M6_CL_GL_PLAIN_DIRECT PASS exit=0 object=present', $plainExitIndex)
+$plainInconclusiveCategoryIndex = $scriptStaticText.IndexOf(
+    'M6_CL_GL_PLAIN_DIRECT FAIL category=inconclusive exit=74', $plainExitIndex)
+$plainDriverCategoryIndex = $scriptStaticText.IndexOf(
+    'M6_CL_GL_PLAIN_DIRECT FAIL category=driver-inconclusive exit=$glPlainExit',
+    $plainExitIndex)
+$plainVfsDifferentialIndex = $scriptStaticText.IndexOf(
+    'M6_CL_GL_DIFFERENTIAL cause=vfs-or-injection', $plainExitIndex)
+$plainBothFailedObservationIndex = $scriptStaticText.IndexOf(
+    'M6_CL_GL_DIFFERENTIAL observation=both-failed-common-boundary-consistent',
+    $plainExitIndex)
+$plainSetupDifferentialIndex = $scriptStaticText.IndexOf(
+    'M6_CL_GL_DIFFERENTIAL cause=inconclusive-plain-setup', $plainExitIndex)
+$plainLegacyBothFailedIndex = $scriptStaticText.IndexOf(
+    'elseif ($glPlainExit -ne 0 -and $glExit -ne 0)', $plainExitIndex)
+if ($plainActionStart -lt 0 -or $plainNegativeIndex -lt 0 -or $plainVfsIndex -lt 0 -or
+    $plainDiagnosticIndex -lt 0 -or $plainNoVfsIndex -lt 0 -or $plainExitIndex -lt 0 -or
+    $plainInconclusiveIndex -lt 0 -or $plainBothFailedIndex -lt 0 -or
+    $plainDriverIndex -lt 0 -or $plainPassIndex -lt 0 -or
+    $plainInconclusiveCategoryIndex -lt 0 -or $plainDriverCategoryIndex -lt 0 -or
+    $plainVfsDifferentialIndex -lt 0 -or $plainBothFailedObservationIndex -lt 0 -or
+    $plainSetupDifferentialIndex -lt 0 -or $plainLegacyBothFailedIndex -ge 0 -or
+    $plainInconclusiveIndex -ge $plainBothFailedIndex -or
+    $plainBothFailedIndex -ge $plainDriverIndex -or
+    $plainNegativeIndex -ge $plainVfsIndex -or $plainVfsIndex -ge $plainDiagnosticIndex -or
+    $plainDiagnosticIndex -ge $plainNoVfsIndex -or $plainNoVfsIndex -ge $plainExitIndex -or
+    -not $scriptStaticText.Substring($plainNoVfsIndex, $plainExitIndex - $plainNoVfsIndex).
+        Contains('--spawn-cl-gl-plain')) {
+    throw 'plain direct /GL ordering or --no-vfs control contract failed'
+}
+Write-Host 'M6_CL_GL_PLAIN_DIRECT_STATIC PASS'
 Set-Content (Join-Path $WorkRoot 'probe.cpp') $probeSrc -Encoding ascii
 Push-Location $WorkRoot
 try {
@@ -1230,6 +1439,7 @@ $glNegativeCanaryExit = 99
 $glExit = 99
 $glDiagnosticExit = 99
 $glDiagnosticText = ''
+$glPlainExit = 99
 $oldSmuggledVfsCwd = $env:SEMBAZURU_VFS_CWD
 $oldSmuggledTraceDir = $env:SEMBAZURU_TRACE_DIR
 $hadRestrictionCanary = Test-Path Env:\SBZ_M6_RESTRICTION_CANARY
@@ -1340,6 +1550,11 @@ try {
             if ($glDiagnosticLines.Count -eq 1) {
                 $glDiagnosticText = [string]$glDiagnosticLines[0]
             }
+
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir --no-vfs -- `
+                $probe --spawn-cl-gl-plain $scratchRoot $clExe 2>&1 |
+                Out-String | Write-Host
+            $glPlainExit = $LASTEXITCODE
 
             & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --wildcard-enum 'Src\*.txt' 2>&1 |
@@ -1549,6 +1764,46 @@ if ($glSetupStages.ContainsKey([int]$glExit)) {
         49 { $failures += "hosted cl.exe /GL scratch canary failed: $($glScratchCanaryStages[49]) (exit=49)" }
         default { $failures += "hosted cl.exe /GL VFS probe failed (exit=$glExit)" }
     }
+}
+switch ($glPlainExit) {
+    0 { Write-Host 'M6_CL_GL_PLAIN_DIRECT PASS exit=0 object=present' }
+    71 {
+        $failures += 'plain direct /GL setup failed (exit=71)'
+        Write-Host 'M6_CL_GL_PLAIN_DIRECT FAIL category=setup exit=71'
+    }
+    72 {
+        $failures += 'plain direct /GL compiler failed (exit=72)'
+        Write-Host 'M6_CL_GL_PLAIN_DIRECT FAIL category=compiler exit=72'
+    }
+    73 {
+        $failures += 'plain direct /GL object validation failed (exit=73)'
+        Write-Host 'M6_CL_GL_PLAIN_DIRECT FAIL category=object exit=73'
+    }
+    74 {
+        $failures += 'plain direct /GL completion was inconclusive (exit=74)'
+        Write-Host 'M6_CL_GL_PLAIN_DIRECT FAIL category=inconclusive exit=74'
+    }
+    default {
+        $failures += "plain direct /GL returned unexpected exit=$glPlainExit"
+        Write-Host "M6_CL_GL_PLAIN_DIRECT FAIL category=driver-inconclusive exit=$glPlainExit"
+    }
+}
+if ($glPlainExit -eq 71) {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL cause=inconclusive-plain-setup'
+} elseif ($glPlainExit -eq 0 -and $glExit -ne 0) {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL cause=vfs-or-injection'
+} elseif ($glPlainExit -eq 74) {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL cause=inconclusive-plain-completion'
+} elseif ($glPlainExit -eq 72 -and $glExit -ne 0) {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL observation=both-failed-common-boundary-consistent'
+} elseif ($glPlainExit -eq 72) {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL cause=inconclusive-plain-compiler-control'
+} elseif ($glPlainExit -eq 73) {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL cause=inconclusive-plain-object'
+} elseif ($glPlainExit -ne 0) {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL cause=inconclusive-plain-driver'
+} else {
+    Write-Host 'M6_CL_GL_DIFFERENTIAL cause=both-pass'
 }
 $glSafeDiagnostic = Get-M6SafeClGlDiagnostic -RawText $glDiagnosticText `
     -KnownSecrets @($scratchRoot, $clExe, 'secret')
