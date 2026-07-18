@@ -311,32 +311,19 @@ static bool IsDirectActionScratch(const wchar_t* path,
     return _wcsnicmp(leaf, L"action-", 7) == 0 && leaf[7] != L'\0' &&
            wcschr(leaf, L'\\') == nullptr && wcschr(leaf, L'/') == nullptr;
 }
-static void AppendClGlDiagnostic(const char* source, DWORD sourceLength,
-                                 char* diagnostic, DWORD diagnosticCapacity,
-                                 DWORD* diagnosticLength, BOOL* truncated) {
-    DWORD remaining = *diagnosticLength < diagnosticCapacity
-                          ? diagnosticCapacity - *diagnosticLength
-                          : 0;
-    DWORD copied = sourceLength < remaining ? sourceLength : remaining;
-    if (copied != 0) {
-        memcpy(diagnostic + *diagnosticLength, source, copied);
-        *diagnosticLength += copied;
-    }
-    if (copied != sourceLength) *truncated = TRUE;
-}
 static const ULONGLONG kClGlTimeoutMs = 30000;
 static const ULONGLONG kClGlTerminateGraceMs = 2000;
-static const int kClGlSetupCreatePipe = 60;
-static const int kClGlSetupClearReadInherit = 61;
-static const int kClGlSetupOpenStdinNul = 62;
-static const int kClGlSetupSetStdinInherit = 63;
-static const int kClGlSetupQueryAttributeSize = 64;
-static const int kClGlSetupAllocateAttributes = 65;
-static const int kClGlSetupInitializeAttributes = 66;
-static const int kClGlSetupUpdateHandleList = 67;
-static const int kClGlSetupCreateProcess = 68;
-static const int kClGlSetupCloseParentWrite = 69;
-static const int kClGlSetupCloseParentStdin = 70;
+static const int kClGlSetupGetStdin = 60;
+static const int kClGlSetupGetStdout = 61;
+static const int kClGlSetupGetStderr = 62;
+static const int kClGlSetupDuplicateStdin = 63;
+static const int kClGlSetupDuplicateStdout = 64;
+static const int kClGlSetupDuplicateStderr = 65;
+static const int kClGlSetupQueryAttributeSize = 66;
+static const int kClGlSetupAllocateAttributes = 67;
+static const int kClGlSetupInitializeAttributes = 68;
+static const int kClGlSetupUpdateHandleList = 69;
+static const int kClGlSetupCreateProcess = 70;
 static BOOL WaitForClGlExit(HANDLE process, ULONGLONG deadline) {
     for (;;) {
         ULONGLONG now = GetTickCount64();
@@ -356,66 +343,6 @@ static BOOL StopClGlProcess(HANDLE process, ULONGLONG hardDeadline) {
     if (graceDeadline > hardDeadline) graceDeadline = hardDeadline;
     BOOL stopped = WaitForClGlExit(process, graceDeadline);
     return terminated && stopped;
-}
-static BOOL CaptureClGlOutput(HANDLE readPipe, HANDLE process,
-                              char* diagnostic, DWORD diagnosticCapacity,
-                              DWORD* diagnosticLength, BOOL* truncated,
-                              ULONGLONG hardDeadline) {
-    ULONGLONG captureDeadline = hardDeadline - kClGlTerminateGraceMs;
-    BOOL processExited = FALSE;
-    for (;;) {
-        if (GetTickCount64() >= captureDeadline) return FALSE;
-        DWORD available = 0;
-        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr)) {
-            if (GetLastError() == ERROR_BROKEN_PIPE)
-                return processExited || WaitForClGlExit(process, captureDeadline);
-            return FALSE;
-        }
-        while (available != 0) {
-            if (GetTickCount64() >= captureDeadline) return FALSE;
-            char buffer[4096];
-            DWORD toRead = available < sizeof(buffer) ? available : sizeof(buffer);
-            DWORD read = 0;
-            if (!ReadFile(readPipe, buffer, toRead, &read, nullptr) || read == 0)
-                return FALSE;
-            AppendClGlDiagnostic(buffer, read, diagnostic, diagnosticCapacity,
-                                  diagnosticLength, truncated);
-            if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr)) {
-                if (GetLastError() == ERROR_BROKEN_PIPE)
-                    return processExited || WaitForClGlExit(process, captureDeadline);
-                return FALSE;
-            }
-        }
-        if (processExited) {
-            // Wait for EOF after the compiler signaled. This final drain keeps
-            // output written during CRT/process teardown in the diagnostic.
-            ULONGLONG now = GetTickCount64();
-            if (now >= captureDeadline) return FALSE;
-            DWORD remaining = static_cast<DWORD>(captureDeadline - now);
-            Sleep(remaining < 10 ? remaining : 10);
-            continue;
-        }
-        ULONGLONG now = GetTickCount64();
-        DWORD remaining = static_cast<DWORD>(captureDeadline - now);
-        DWORD wait = WaitForSingleObject(process, remaining < 25 ? remaining : 25);
-        if (wait == WAIT_OBJECT_0) {
-            processExited = TRUE;
-            continue;
-        }
-        if (wait != WAIT_TIMEOUT) return FALSE;
-    }
-}
-static void EmitClGlDiagnostic(const char* diagnostic, DWORD diagnosticLength,
-                               BOOL truncated) {
-    fputs("CL_GL_DIAGNOSTIC: ", stderr);
-    if (diagnosticLength != 0) {
-        fwrite(diagnostic, 1, diagnosticLength, stderr);
-    } else {
-        fputs("<no compiler output>", stderr);
-    }
-    if (truncated) fputs("\nCL_GL_DIAGNOSTIC: <truncated>", stderr);
-    if (diagnosticLength == 0 || diagnostic[diagnosticLength - 1] != '\n')
-        fputc('\n', stderr);
 }
 static void EmitClGlSpawnFailure(const char* stage, DWORD error) {
     fprintf(stderr, "CL_GL_SPAWN: stage=%s error=%lu\n", stage,
@@ -451,9 +378,12 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (commandLength < 0) return 22;
     SetEnvironmentVariableW(L"CL", nullptr);
     SetEnvironmentVariableW(L"_CL_", nullptr);
-    HANDLE readPipe = INVALID_HANDLE_VALUE;
-    HANDLE writePipe = INVALID_HANDLE_VALUE;
-    HANDLE stdinNul = INVALID_HANDLE_VALUE;
+    HANDLE parentStdin = INVALID_HANDLE_VALUE;
+    HANDLE parentStdout = INVALID_HANDLE_VALUE;
+    HANDLE parentStderr = INVALID_HANDLE_VALUE;
+    HANDLE inheritedStdin = INVALID_HANDLE_VALUE;
+    HANDLE inheritedStdout = INVALID_HANDLE_VALUE;
+    HANDLE inheritedStderr = INVALID_HANDLE_VALUE;
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = nullptr;
     BOOL attributesInitialized = FALSE;
     PROCESS_INFORMATION process{};
@@ -461,56 +391,57 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     int result = 24;
     SIZE_T attributesSize = 0;
     STARTUPINFOEXW startup{};
-    // Keep retained diagnostics bounded while CaptureClGlOutput continues to
-    // drain the pipe, so a noisy compiler cannot block on a full pipe buffer.
-    char diagnostic[65536];
-    DWORD diagnosticLength = 0;
-    BOOL diagnosticTruncated = FALSE;
     DWORD exitCode = 25;
     LARGE_INTEGER objectSize{};
     HANDLE objectHandle = INVALID_HANDLE_VALUE;
     BOOL hasContent = FALSE;
     ULONGLONG hardDeadline = 0;
+    ULONGLONG executionDeadline = 0;
     const char* spawnStage = nullptr;
     DWORD spawnError = ERROR_SUCCESS;
     BOOL attributeSizeQueried = FALSE;
     DWORD attributeSizeError = ERROR_SUCCESS;
-    HANDLE inheritableHandles[2]{};
-    SECURITY_ATTRIBUTES pipeSecurity{};
-    pipeSecurity.nLength = sizeof(pipeSecurity);
-    pipeSecurity.bInheritHandle = TRUE;
-    // CreatePipe leaves output parameters unspecified on failure. Do not make
-    // them owned until it has succeeded.
-    HANDLE createdRead;
-    HANDLE createdWrite;
-    if (!CreatePipe(&createdRead, &createdWrite, &pipeSecurity, 0)) {
-        spawnStage = "create-pipe";
+    HANDLE inheritableHandles[3]{};
+    parentStdin = GetStdHandle(STD_INPUT_HANDLE);
+    if (parentStdin == nullptr || parentStdin == INVALID_HANDLE_VALUE) {
+        spawnStage = "get-stdin";
         spawnError = GetLastError();
-        result = kClGlSetupCreatePipe;
+        result = kClGlSetupGetStdin;
         goto cleanup;
     }
-    readPipe = createdRead;
-    writePipe = createdWrite;
-    if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
-        spawnStage = "clear-read-inherit";
+    parentStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (parentStdout == nullptr || parentStdout == INVALID_HANDLE_VALUE) {
+        spawnStage = "get-stdout";
         spawnError = GetLastError();
-        result = kClGlSetupClearReadInherit;
+        result = kClGlSetupGetStdout;
         goto cleanup;
     }
-    stdinNul = CreateFileW(L"NUL", GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE, &pipeSecurity,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (stdinNul == INVALID_HANDLE_VALUE) {
-        spawnStage = "open-stdin-nul";
+    parentStderr = GetStdHandle(STD_ERROR_HANDLE);
+    if (parentStderr == nullptr || parentStderr == INVALID_HANDLE_VALUE) {
+        spawnStage = "get-stderr";
         spawnError = GetLastError();
-        result = kClGlSetupOpenStdinNul;
+        result = kClGlSetupGetStderr;
         goto cleanup;
     }
-    if (!SetHandleInformation(stdinNul, HANDLE_FLAG_INHERIT,
-                              HANDLE_FLAG_INHERIT)) {
-        spawnStage = "set-stdin-inherit";
+    if (!DuplicateHandle(GetCurrentProcess(), parentStdin, GetCurrentProcess(),
+                         &inheritedStdin, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        spawnStage = "duplicate-stdin";
         spawnError = GetLastError();
-        result = kClGlSetupSetStdinInherit;
+        result = kClGlSetupDuplicateStdin;
+        goto cleanup;
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), parentStdout, GetCurrentProcess(),
+                         &inheritedStdout, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        spawnStage = "duplicate-stdout";
+        spawnError = GetLastError();
+        result = kClGlSetupDuplicateStdout;
+        goto cleanup;
+    }
+    if (!DuplicateHandle(GetCurrentProcess(), parentStderr, GetCurrentProcess(),
+                         &inheritedStderr, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
+        spawnStage = "duplicate-stderr";
+        spawnError = GetLastError();
+        result = kClGlSetupDuplicateStderr;
         goto cleanup;
     }
     attributeSizeQueried = InitializeProcThreadAttributeList(
@@ -537,8 +468,9 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
         goto cleanup;
     }
     attributesInitialized = TRUE;
-    inheritableHandles[0] = stdinNul;
-    inheritableHandles[1] = writePipe;
+    inheritableHandles[0] = inheritedStdin;
+    inheritableHandles[1] = inheritedStdout;
+    inheritableHandles[2] = inheritedStderr;
     if (!UpdateProcThreadAttribute(
             attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritableHandles,
             sizeof(inheritableHandles), nullptr, nullptr)) {
@@ -549,9 +481,9 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     }
     startup.StartupInfo.cb = sizeof(startup);
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = stdinNul;
-    startup.StartupInfo.hStdOutput = writePipe;
-    startup.StartupInfo.hStdError = writePipe;
+    startup.StartupInfo.hStdInput = inheritedStdin;
+    startup.StartupInfo.hStdOutput = inheritedStdout;
+    startup.StartupInfo.hStdError = inheritedStderr;
     startup.lpAttributeList = attributes;
     if (!CreateProcessW(clExe, command, nullptr, nullptr, TRUE,
                         EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
@@ -569,23 +501,11 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     }
     HeapFree(GetProcessHeap(), 0, attributes);
     attributes = nullptr;
-    if (!CloseHandle(writePipe)) {
-        spawnStage = "close-parent-write";
-        spawnError = GetLastError();
-        result = kClGlSetupCloseParentWrite;
-        goto cleanup;
-    }
-    writePipe = INVALID_HANDLE_VALUE;
-    if (!CloseHandle(stdinNul)) {
-        spawnStage = "close-parent-stdin";
-        spawnError = GetLastError();
-        result = kClGlSetupCloseParentStdin;
-        goto cleanup;
-    }
-    stdinNul = INVALID_HANDLE_VALUE;
-    if (!CaptureClGlOutput(readPipe, process.hProcess, diagnostic,
-                           sizeof(diagnostic), &diagnosticLength,
-                           &diagnosticTruncated, hardDeadline)) {
+    if (CloseHandle(inheritedStderr)) inheritedStderr = INVALID_HANDLE_VALUE;
+    if (CloseHandle(inheritedStdout)) inheritedStdout = INVALID_HANDLE_VALUE;
+    if (CloseHandle(inheritedStdin)) inheritedStdin = INVALID_HANDLE_VALUE;
+    executionDeadline = hardDeadline - kClGlTerminateGraceMs;
+    if (!WaitForClGlExit(process.hProcess, executionDeadline)) {
         result = 25;
         goto cleanup;
     }
@@ -593,11 +513,7 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
         result = 25;
         goto cleanup;
     }
-    if (exitCode != 0) {
-        EmitClGlDiagnostic(diagnostic, diagnosticLength, diagnosticTruncated);
-        result = 26;
-        goto cleanup;
-    }
+    if (exitCode != 0) { result = 26; goto cleanup; }
     objectHandle = CreateFileW(object, GENERIC_READ,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -623,9 +539,9 @@ cleanup:
     if (process.hProcess != nullptr) CloseHandle(process.hProcess);
     if (attributesInitialized) DeleteProcThreadAttributeList(attributes);
     if (attributes != nullptr) HeapFree(GetProcessHeap(), 0, attributes);
-    if (stdinNul != INVALID_HANDLE_VALUE) CloseHandle(stdinNul);
-    if (writePipe != INVALID_HANDLE_VALUE) CloseHandle(writePipe);
-    if (readPipe != INVALID_HANDLE_VALUE) CloseHandle(readPipe);
+    if (inheritedStderr != INVALID_HANDLE_VALUE) CloseHandle(inheritedStderr);
+    if (inheritedStdout != INVALID_HANDLE_VALUE) CloseHandle(inheritedStdout);
+    if (inheritedStdin != INVALID_HANDLE_VALUE) CloseHandle(inheritedStdin);
     if (result == 24 && spawnStage != nullptr)
         EmitClGlSpawnFailure(spawnStage, spawnError);
     return result;
@@ -1057,17 +973,17 @@ if ($outputExit -eq 0) {
     $failures += 'a scratch-cwd action that wrote a relative output completed remotely; outputs would be stranded without WriteBack'
 }
 $glSetupStages = @{
-    60 = 'create-pipe'
-    61 = 'clear-read-inherit'
-    62 = 'open-stdin-nul'
-    63 = 'set-stdin-inherit'
-    64 = 'query-attribute-size'
-    65 = 'allocate-attributes'
-    66 = 'initialize-attributes'
-    67 = 'update-handle-list'
-    68 = 'create-process'
-    69 = 'close-parent-write'
-    70 = 'close-parent-stdin'
+    60 = 'get-stdin'
+    61 = 'get-stdout'
+    62 = 'get-stderr'
+    63 = 'duplicate-stdin'
+    64 = 'duplicate-stdout'
+    65 = 'duplicate-stderr'
+    66 = 'query-attribute-size'
+    67 = 'allocate-attributes'
+    68 = 'initialize-attributes'
+    69 = 'update-handle-list'
+    70 = 'create-process'
 }
 if ($glSetupStages.ContainsKey([int]$glExit)) {
     $failures += "hosted cl.exe /GL setup failed: stage=$($glSetupStages[[int]$glExit]) exit=$glExit"

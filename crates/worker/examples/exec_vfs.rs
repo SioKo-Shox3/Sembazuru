@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::ptr::null_mut;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -254,6 +254,21 @@ fn is_worker_identity_mismatch(error: &ExecuteError) -> bool {
     )
 }
 
+fn replay_action_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    stdout_writer: &mut dyn Write,
+    stderr_writer: &mut dyn Write,
+) -> Result<(), DriverError> {
+    stdout_writer
+        .write_all(stdout)
+        .map_err(|_| DriverError::Message("action stdout replay failed"))?;
+    stderr_writer
+        .write_all(stderr)
+        .map_err(|_| DriverError::Message("action stderr replay failed"))?;
+    Ok(())
+}
+
 async fn run() -> Result<i32, DriverError> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let args = parse_driver_args(&raw)?;
@@ -302,6 +317,14 @@ async fn run() -> Result<i32, DriverError> {
         }
     };
     let code = outcome.exit_code.unwrap_or(-1);
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    replay_action_output(
+        &outcome.stdout,
+        &outcome.stderr,
+        &mut stdout.lock(),
+        &mut stderr.lock(),
+    )?;
     println!("exec_vfs: states={:?} exit={code}", outcome.states);
     Ok(code)
 }
@@ -326,6 +349,19 @@ async fn main() {
 mod tests {
     use super::*;
     use sembazuru_proto::capability;
+    use std::io::Write;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("test writer failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
@@ -538,5 +574,46 @@ mod tests {
             "capability not for this worker",
         ));
         assert!(!is_worker_identity_mismatch(&other_code));
+    }
+
+    #[test]
+    fn replays_action_output_to_its_separate_streams_without_loss() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        replay_action_output(b"stdout\0bytes", b"stderr\nbytes", &mut stdout, &mut stderr).unwrap();
+
+        assert_eq!(stdout, b"stdout\0bytes");
+        assert_eq!(stderr, b"stderr\nbytes");
+    }
+
+    #[test]
+    fn replay_reports_fixed_context_when_stdout_write_fails() {
+        let mut stdout = FailingWriter;
+        let mut stderr = Vec::new();
+
+        let error =
+            replay_action_output(b"stdout", b"stderr", &mut stdout, &mut stderr).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DriverError::Message("action stdout replay failed")
+        ));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn replay_reports_fixed_context_when_stderr_write_fails() {
+        let mut stdout = Vec::new();
+        let mut stderr = FailingWriter;
+
+        let error =
+            replay_action_output(b"stdout", b"stderr", &mut stdout, &mut stderr).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DriverError::Message("action stderr replay failed")
+        ));
+        assert_eq!(stdout, b"stdout");
     }
 }
