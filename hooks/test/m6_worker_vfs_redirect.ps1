@@ -29,6 +29,231 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+function Test-M6AsciiPrintable {
+    param([string]$Value, [int]$Maximum)
+
+    if ([string]::IsNullOrEmpty($Value) -or $Value.Length -gt $Maximum) { return $false }
+    foreach ($character in $Value.ToCharArray()) {
+        $code = [int][char]$character
+        if ($code -lt 0x20 -or $code -gt 0x7e) { return $false }
+    }
+    return $true
+}
+
+function Test-M6JsonIntegerUInt32 {
+    param([object]$Value)
+
+    return ($Value -is [int] -or $Value -is [long]) -and
+        $Value -ge 0 -and $Value -le 4294967295
+}
+
+function Test-M6ExactPropertySet {
+    param([object]$Value, [string[]]$Expected)
+
+    if ($null -eq $Value) { return $false }
+    $actual = @($Value.PSObject.Properties.Name | Sort-Object)
+    $wanted = @($Expected | Sort-Object)
+    return ($actual.Count -eq $wanted.Count) -and (($actual -join ',') -eq ($wanted -join ','))
+}
+
+function Test-M6RenderedLine {
+    param([string]$Line, [string[]]$KnownSecrets)
+
+    if (-not (Test-M6AsciiPrintable $Line 1024)) { return $false }
+    foreach ($secret in $KnownSecrets) {
+        if (-not [string]::IsNullOrEmpty($secret) -and
+            $Line.IndexOf($secret, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Compare-M6FailureTuple {
+    param([object]$Left, [object]$Right)
+
+    $leftDenied = $Left.status -eq 5
+    $rightDenied = $Right.status -eq 5
+    if ($leftDenied -ne $rightDenied) { return $(if ($leftDenied) { -1 } else { 1 }) }
+    $pathComparison = [string]::CompareOrdinal($Left.path, $Right.path)
+    if ($pathComparison -ne 0) { return $pathComparison }
+    foreach ($name in @('status', 'access', 'disposition')) {
+        if ($Left.$name -lt $Right.$name) { return -1 }
+        if ($Left.$name -gt $Right.$name) { return 1 }
+    }
+    return 0
+}
+
+function Get-M6SafeClGlDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RawText,
+        [string[]]$KnownSecrets = @('secret')
+    )
+
+    if (-not (Test-M6AsciiPrintable $RawText 8192)) { return $null }
+    try {
+        $diagnostic = $RawText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    $envelopeProperties = @('schema', 'complete', 'result', 'process', 'target_traces', 'total_failed', 'emitted', 'omitted', 'reason', 'failures')
+    if (-not (Test-M6ExactPropertySet $diagnostic $envelopeProperties) -or
+        $diagnostic.schema -cne 'sembazuru.createfile-diagnostic.v1' -or
+        $diagnostic.process -cne 'cl.exe' -or
+        -not ($diagnostic.complete -is [bool]) -or
+        -not ($diagnostic.result -is [string]) -or
+        -not (Test-M6JsonIntegerUInt32 $diagnostic.target_traces) -or
+        -not (Test-M6JsonIntegerUInt32 $diagnostic.total_failed) -or
+        -not (Test-M6JsonIntegerUInt32 $diagnostic.emitted) -or
+        -not (Test-M6JsonIntegerUInt32 $diagnostic.omitted) -or
+        $diagnostic.emitted -gt 32 -or
+        $diagnostic.total_failed -ne ($diagnostic.emitted + $diagnostic.omitted) -or
+        -not ($diagnostic.reason -is [string]) -or
+        -not ($diagnostic.failures -is [array]) -or
+        @($diagnostic.failures).Count -ne $diagnostic.emitted) {
+        return $null
+    }
+    $incompleteReasons = @{
+        'trace-load-incomplete' = 'trace-load-incomplete'
+        'target-trace-missing' = 'target-trace-missing'
+        'target-trace-truncated' = 'target-trace-truncated'
+        'diagnostic-root-invalid' = 'diagnostic-root-invalid'
+        'target-unknown-failed-event' = 'target-unknown-failed-event'
+        'target-failed-probe-ambiguous' = 'target-failed-probe-ambiguous'
+        'target-failed-open-path-not-absolute' = 'target-failed-open-path-not-absolute'
+        'target-failed-open-path-ambiguous' = 'target-failed-open-path-ambiguous'
+        'diagnostic-path-too-long' = 'diagnostic-path-too-long'
+    }
+    $completeReasons = @{
+        'no-failed-target-opens' = 'no-failed-target-opens'
+        'target-failed-open-outside-scratch' = 'target-failed-open-outside-scratch'
+        'failed-target-opens-under-scratch' = 'failed-target-opens-under-scratch'
+    }
+    $reason = $null
+    $safeResult = $null
+    if ($diagnostic.complete) {
+        if ($diagnostic.target_traces -lt 1) { return $null }
+        if ($diagnostic.result -ceq 'clean' -and $diagnostic.total_failed -eq 0 -and
+            $diagnostic.emitted -eq 0 -and $diagnostic.omitted -eq 0 -and
+            $diagnostic.reason -ceq 'no-failed-target-opens') {
+            $reason = $completeReasons['no-failed-target-opens']
+            $safeResult = 'clean'
+        } elseif ($diagnostic.result -ceq 'failed' -and $diagnostic.total_failed -gt 0 -and
+            $completeReasons.ContainsKey($diagnostic.reason) -and
+            $diagnostic.reason -cne 'no-failed-target-opens') {
+            $reason = $completeReasons[$diagnostic.reason]
+            $safeResult = 'failed'
+        } else {
+            return $null
+        }
+    } else {
+        if ($diagnostic.result -cne 'incomplete' -or $diagnostic.total_failed -ne 0 -or
+            $diagnostic.emitted -ne 0 -or $diagnostic.omitted -ne 0 -or
+            -not $incompleteReasons.ContainsKey($diagnostic.reason)) {
+            return $null
+        }
+        if ($diagnostic.reason -ceq 'target-trace-missing' -and $diagnostic.target_traces -ne 0) {
+            return $null
+        }
+        $reason = $incompleteReasons[$diagnostic.reason]
+        $safeResult = 'incomplete'
+    }
+
+    $records = @()
+    $previous = $null
+    foreach ($failure in @($diagnostic.failures)) {
+        if (-not (Test-M6ExactPropertySet $failure @('path', 'status', 'access', 'disposition')) -or
+            -not ($failure.path -is [string]) -or
+            -not ($failure.path -cmatch '^<scratch>(\\[A-Za-z0-9_.\-]{1,64}){1,8}$') -or
+            $failure.path.Length -gt 200 -or
+            [System.Text.Encoding]::UTF8.GetByteCount($failure.path) -gt 512 -or
+            -not (Test-M6JsonIntegerUInt32 $failure.status) -or
+            -not (Test-M6JsonIntegerUInt32 $failure.access) -or
+            -not (Test-M6JsonIntegerUInt32 $failure.disposition)) {
+            return $null
+        }
+        foreach ($component in $failure.path.Substring(9).Split('\')) {
+            if ($component -in @('.', '..') -or $component.EndsWith('.')) { return $null }
+        }
+        if ($null -ne $previous -and (Compare-M6FailureTuple $previous $failure) -gt 0) {
+            return $null
+        }
+        $safeRecord = [pscustomobject][ordered]@{
+            schema = 'sembazuru.createfile-diagnostic.v1'
+            path = $failure.path
+            status = [uint32]$failure.status
+            access = [uint32]$failure.access
+            disposition = [uint32]$failure.disposition
+        }
+        $line = 'M6_CL_GL_CREATEFILE_FAILURE ' + ($safeRecord | ConvertTo-Json -Compress)
+        if (-not (Test-M6RenderedLine $line $KnownSecrets)) { return $null }
+        $records += $line
+        $previous = $failure
+    }
+    $safeComplete = if ($diagnostic.complete) { 'true' } else { 'false' }
+    $summary = "M6_CL_GL_CREATEFILE_DIAGNOSTIC schema=sembazuru.createfile-diagnostic.v1 complete=$safeComplete result=$safeResult target_traces=$([uint32]$diagnostic.target_traces) total_failed=$([uint32]$diagnostic.total_failed) emitted=$([uint32]$diagnostic.emitted) omitted=$([uint32]$diagnostic.omitted) reason=$reason"
+    if (-not (Test-M6RenderedLine $summary $KnownSecrets)) { return $null }
+    return [pscustomobject]@{
+        summary = $summary
+        records = @($records)
+        complete = $diagnostic.complete
+        result = $safeResult
+    }
+}
+
+function Assert-M6DiagnosticRawAccepted {
+    param([string]$RawText, [int]$ExpectedRecords)
+
+    $safe = Get-M6SafeClGlDiagnostic -RawText $RawText
+    if ($null -eq $safe -or @($safe.records).Count -ne $ExpectedRecords) {
+        throw 'golden CreateFile diagnostic fixture was rejected'
+    }
+    $lines = @($safe.summary) + @($safe.records)
+    $invalidLines = @($lines | Where-Object { -not (Test-M6RenderedLine $_ @('secret')) })
+    if ($lines.Count -ne (1 + $ExpectedRecords) -or $invalidLines.Count -ne 0) {
+        throw 'safe CreateFile diagnostic fixture rendered an invalid line'
+    }
+}
+
+function Assert-M6DiagnosticRawRejected {
+    param([string]$RawText)
+
+    $safe = Get-M6SafeClGlDiagnostic -RawText $RawText
+    if ($null -ne $safe) { throw 'unsafe CreateFile diagnostic fixture was accepted' }
+    $fixtureFailures = @('hosted cl.exe /GL CreateFile diagnostic was unsafe or invalid')
+    $lines = @('M6_CL_GL_CREATEFILE_DIAGNOSTIC_UNSAFE')
+    if ($fixtureFailures.Count -ne 1 -or $lines.Count -ne 1 -or
+        -not (Test-M6RenderedLine $lines[0] @('secret'))) {
+        throw 'unsafe CreateFile diagnostic render was not one fixed safe line'
+    }
+}
+
+$m6DiagnosticFailedGolden = '{"schema":"sembazuru.createfile-diagnostic.v1","complete":true,"result":"failed","process":"cl.exe","target_traces":1,"total_failed":2,"emitted":2,"omitted":0,"reason":"failed-target-opens-under-scratch","failures":[{"path":"<scratch>\\_CL.tmp","status":5,"access":0,"disposition":3},{"path":"<scratch>\\_CL2.tmp","status":3,"access":1,"disposition":3}]}'
+$m6DiagnosticCleanGolden = '{"schema":"sembazuru.createfile-diagnostic.v1","complete":true,"result":"clean","process":"cl.exe","target_traces":1,"total_failed":0,"emitted":0,"omitted":0,"reason":"no-failed-target-opens","failures":[]}'
+$m6DiagnosticMissingGolden = '{"schema":"sembazuru.createfile-diagnostic.v1","complete":false,"result":"incomplete","process":"cl.exe","target_traces":0,"total_failed":0,"emitted":0,"omitted":0,"reason":"target-trace-missing","failures":[]}'
+$m6DiagnosticDuplicateGolden = '{"schema":"sembazuru.createfile-diagnostic.v1","complete":true,"result":"failed","process":"cl.exe","target_traces":1,"total_failed":2,"emitted":2,"omitted":0,"reason":"failed-target-opens-under-scratch","failures":[{"path":"<scratch>\\_CL.tmp","status":5,"access":0,"disposition":3},{"path":"<scratch>\\_CL.tmp","status":5,"access":0,"disposition":3}]}'
+Assert-M6DiagnosticRawAccepted $m6DiagnosticFailedGolden 2
+Assert-M6DiagnosticRawAccepted $m6DiagnosticCleanGolden 0
+Assert-M6DiagnosticRawAccepted $m6DiagnosticMissingGolden 0
+Assert-M6DiagnosticRawAccepted $m6DiagnosticDuplicateGolden 2
+$m6Diagnostic201Path = $m6DiagnosticFailedGolden.Replace('<scratch>\\_CL.tmp', "<scratch>\\$($('a' * 191))")
+$m6Diagnostic513BytePath = $m6DiagnosticFailedGolden.Replace('<scratch>\\_CL.tmp', "<scratch>\\$($('a' * 503))")
+foreach ($raw in @(
+    $m6DiagnosticFailedGolden.Replace('failed-target-opens-under-scratch', "failed`ntarget"),
+    $m6DiagnosticFailedGolden.Replace('<scratch>\\_CL.tmp', '<scratch>\\secret space.tmp'),
+    $m6DiagnosticFailedGolden.Replace('"status":5', '"status":"5"'),
+    $m6DiagnosticFailedGolden.Replace('"access":0', '"access":4294967296'),
+    $m6DiagnosticFailedGolden.Replace('"emitted":2', '"emitted":33'),
+    $m6DiagnosticFailedGolden.Replace('<scratch>\\_CL.tmp","status":5', '<scratch>\\z.tmp","status":3'),
+    $m6Diagnostic201Path,
+    $m6Diagnostic513BytePath,
+    ($m6DiagnosticFailedGolden + "`r`n"),
+    ('{' + ('a' * 8192) + '}'),
+    '',
+    '{bad json}'
+)) { Assert-M6DiagnosticRawRejected $raw }
+Write-Host 'M6_DIAGNOSTIC_STATIC_FIXTURES PASS'
+
 function Remove-RestrictionCanary {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -697,6 +922,7 @@ $scratchRoot = Join-Path $WorkRoot 'scratch'
 $casRoot = Join-Path $WorkRoot 'cas'
 $traceDir = Join-Path $WorkRoot 'trace'
 $miscTraceDir = Join-Path $WorkRoot 'trace-misc'
+$glTraceDir = Join-Path $WorkRoot 'trace-gl'
 $verbatimTraceDir = Join-Path $WorkRoot 'trace-verbatim'
 $smuggledTraceDir = Join-Path $WorkRoot 'smuggled-trace'
 $fakeVfsCwd = Join-Path $WorkRoot 'fake-vfs-cwd'
@@ -710,7 +936,7 @@ $glStale = 'int gl_tmp( { return 0; }'
 $glCorrect = 'int gl_tmp() { return 42; }'
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $logicalRoot $rel)) | Out-Null
 New-Item -ItemType Directory -Force (Split-Path (Join-Path $backingRoot $rel)) | Out-Null
-foreach ($d in @($scratchRoot, $casRoot, $traceDir, $miscTraceDir, $verbatimTraceDir, $smuggledTraceDir, $fakeVfsCwd)) {
+foreach ($d in @($scratchRoot, $casRoot, $traceDir, $miscTraceDir, $glTraceDir, $verbatimTraceDir, $smuggledTraceDir, $fakeVfsCwd)) {
     New-Item -ItemType Directory -Force $d | Out-Null
 }
 Set-Content (Join-Path $logicalRoot $rel) $stale -Encoding ascii -NoNewline
@@ -759,6 +985,8 @@ $emptyTraceChildWExit = 99
 $emptyTraceChildAExit = 99
 $metadataExit = 99
 $glExit = 99
+$glDiagnosticExit = 99
+$glDiagnosticText = ''
 $oldSmuggledVfsCwd = $env:SEMBAZURU_VFS_CWD
 $oldSmuggledTraceDir = $env:SEMBAZURU_TRACE_DIR
 $hadRestrictionCanary = Test-Path Env:\SBZ_M6_RESTRICTION_CANARY
@@ -853,10 +1081,17 @@ try {
                 Out-String | Write-Host
             $outputExit = $LASTEXITCODE
 
-            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
+            & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $glTraceDir -- `
                 $probe --spawn-cl-gl $scratchRoot $clExe 2>&1 |
                 Out-String | Write-Host
             $glExit = $LASTEXITCODE
+
+            $glDiagnosticLines = @(& cargo run -q -p sembazuru-tracer --bin sembazuru-trace -- `
+                diagnose-createfile --trace-dir $glTraceDir --exe-name cl.exe --under $scratchRoot 2>&1)
+            $glDiagnosticExit = $LASTEXITCODE
+            if ($glDiagnosticLines.Count -eq 1) {
+                $glDiagnosticText = [string]$glDiagnosticLines[0]
+            }
 
             & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
                 $probe --wildcard-enum 'Src\*.txt' 2>&1 |
@@ -1001,6 +1236,28 @@ if ($glSetupStages.ContainsKey([int]$glExit)) {
         29 { $failures += 'hosted cl.exe /GL could not delete %TMP%\\gl_tmp.obj' }
         default { $failures += "hosted cl.exe /GL VFS probe failed (exit=$glExit)" }
     }
+}
+$glSafeDiagnostic = Get-M6SafeClGlDiagnostic -RawText $glDiagnosticText `
+    -KnownSecrets @($scratchRoot, $clExe, 'secret')
+if ($null -eq $glSafeDiagnostic) {
+    $failures += 'hosted cl.exe /GL CreateFile diagnostic was unsafe or invalid'
+    Write-Host 'M6_CL_GL_CREATEFILE_DIAGNOSTIC_UNSAFE'
+} else {
+    $glDiagnosticExpectedExit = if (-not $glSafeDiagnostic.complete) { 3 } elseif ($glSafeDiagnostic.result -eq 'clean') { 0 } else { 1 }
+    if ($glDiagnosticExit -ne $glDiagnosticExpectedExit) {
+        $failures += "hosted cl.exe /GL CreateFile diagnostic exit disagreed with validated result (exit=$glDiagnosticExit)"
+    }
+    if ($glDiagnosticExit -notin @(0, 1)) {
+        $failures += "hosted cl.exe /GL CreateFile diagnostic was incomplete or invalid (exit=$glDiagnosticExit)"
+    }
+    if ($glExit -eq 0 -and $glDiagnosticExit -ne 0) {
+        $failures += 'hosted cl.exe /GL succeeded but its CreateFile diagnostic was not clean'
+    }
+    if ($glExit -eq 26 -and $glDiagnosticExit -notin @(0, 1)) {
+        $failures += 'hosted cl.exe /GL failed but its CreateFile diagnostic was incomplete'
+    }
+    Write-Host $glSafeDiagnostic.summary
+    foreach ($record in @($glSafeDiagnostic.records)) { Write-Host $record }
 }
 if ($wildcardExit -ne -1) {
     $failures += "wildcard enumeration under the logical cwd completed remotely (exit=$wildcardExit); expected worker fallback exit=-1"
