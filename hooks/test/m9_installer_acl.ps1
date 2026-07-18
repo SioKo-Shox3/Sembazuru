@@ -921,6 +921,237 @@ function Get-InstalledWorkerIdentity {
     return "${computer}#$($worker.ProcessId)"
 }
 
+function Test-ExecVfsReachedRunningAndCompleted {
+    param([string]$Output)
+
+    return $Output -match 'exec_vfs:\s*states=\[[^\]]*\b3\b[^\]]*\b4\b[^\]]*\]\s*exit='
+}
+
+function ConvertTo-SafeEventBasename {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $candidate = [IO.Path]::GetFileName($Value.Trim())
+    if ($candidate -notmatch '\A[A-Za-z0-9][A-Za-z0-9._ -]{0,127}\.(?:exe|dll|sys)\z') {
+        return $null
+    }
+    return $candidate
+}
+
+function ConvertTo-SafeHexCode {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $trimmed = $Value.Trim()
+    if ($trimmed -match '\A0x([0-9A-Fa-f]{1,8})\z') {
+        return "0x$($Matches[1].ToUpperInvariant())"
+    }
+    if ($trimmed -match '\A([0-9A-Fa-f]{8})\z') {
+        return "0x$($Matches[1].ToUpperInvariant())"
+    }
+    return $null
+}
+
+function ConvertTo-SafeUInt32 {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $trimmed = $Value.Trim()
+    [uint64]$parsed = 0
+    if ($trimmed -match '\A0x([0-9A-Fa-f]{1,8})\z') {
+        if (-not [uint64]::TryParse($Matches[1], [Globalization.NumberStyles]::AllowHexSpecifier,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+            return $null
+        }
+    }
+    elseif (-not [uint64]::TryParse($trimmed, [ref]$parsed)) {
+        return $null
+    }
+    if ($parsed -gt [uint32]::MaxValue) { return $null }
+    return [uint32]$parsed
+}
+
+function Get-NamedEventDataValue {
+    param(
+        [xml]$Document,
+        [string[]]$Names
+    )
+
+    foreach ($data in @($Document.Event.EventData.Data)) {
+        if ($Names -contains [string]$data.Name) {
+            return [string]$data.InnerText
+        }
+    }
+    return $null
+}
+
+function Format-InstalledWorkerApplicationEvent {
+    param(
+        [string]$Provider,
+        [int]$Id,
+        [AllowNull()][long]$RecordId,
+        [datetime]$TimeCreated,
+        [string]$Xml
+    )
+
+    if (($Provider -cne 'Application Error' -or $Id -ne 1000) -and
+        ($Provider -cne 'Windows Error Reporting' -or $Id -ne 1001) -and
+        ($Provider -cne 'SideBySide' -or $Id -notin @(33, 59))) {
+        return $null
+    }
+    $time = $TimeCreated.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    if ($Provider -ceq 'SideBySide') {
+        return "provider=$Provider id=$Id time=$time"
+    }
+    try { [xml]$document = $Xml }
+    catch { return $null }
+
+    $systemPid = ConvertTo-SafeUInt32 -Value ([string]$document.Event.System.Execution.ProcessID)
+    if ($Provider -ceq 'Application Error') {
+        $app = ConvertTo-SafeEventBasename -Value (Get-NamedEventDataValue -Document $document `
+            -Names @('AppPath', 'FaultingApplicationPath'))
+        $module = ConvertTo-SafeEventBasename -Value (Get-NamedEventDataValue -Document $document `
+            -Names @('ModulePath', 'FaultingModulePath'))
+        $code = ConvertTo-SafeHexCode -Value (Get-NamedEventDataValue -Document $document `
+            -Names @('ExceptionCode'))
+        $eventPid = ConvertTo-SafeUInt32 -Value (Get-NamedEventDataValue -Document $document `
+            -Names @('ProcessId'))
+        if ($null -eq $eventPid) { $eventPid = $systemPid }
+    }
+    else {
+        # WER 1001 problem-signature mapping: P1=application, P4=module,
+        # P7=exception code. Other P fields and attached files are never emitted.
+        $app = ConvertTo-SafeEventBasename -Value (Get-NamedEventDataValue -Document $document -Names @('P1'))
+        $module = ConvertTo-SafeEventBasename -Value (Get-NamedEventDataValue -Document $document -Names @('P4'))
+        $code = ConvertTo-SafeHexCode -Value (Get-NamedEventDataValue -Document $document -Names @('P7'))
+        $eventPid = $systemPid
+    }
+
+    $fields = [Collections.Generic.List[string]]::new()
+    $fields.Add("provider=$Provider")
+    $fields.Add("id=$Id")
+    $fields.Add("record=$RecordId")
+    $fields.Add("time=$time")
+    if ($null -ne $app) { $fields.Add("app=$app") }
+    if ($null -ne $module) { $fields.Add("module=$module") }
+    if ($null -ne $code) { $fields.Add("code=$code") }
+    if ($null -ne $eventPid) { $fields.Add("pid=$eventPid") }
+    return ($fields -join ' ')
+}
+
+function Assert-InstalledWorkerEventFormatter {
+    $sentinel = 'SENTINEL-MUST-NOT-LEAK-7d1c'
+    $xml = @"
+<Event><System><Execution ProcessID="1234" /></System><EventData>
+<Data Name="AppPath">C:\Windows\System32\cmd.exe</Data>
+<Data Name="ModulePath">C:\Windows\System32\kernel32.dll</Data>
+<Data Name="ExceptionCode">c0000142</Data>
+<Data Name="Secret">$sentinel</Data>
+</EventData></Event>
+"@
+    $formatted = Format-InstalledWorkerApplicationEvent -Provider 'Application Error' -Id 1000 `
+        -RecordId 9 -TimeCreated ([datetime]'2026-07-18T00:00:00Z') -Xml $xml
+    foreach ($field in @('provider=Application Error', 'id=1000', 'record=9',
+            'time=2026-07-18T00:00:00.0000000Z', 'app=cmd.exe', 'module=kernel32.dll',
+            'code=0xC0000142', 'pid=1234')) {
+        if ($formatted -notmatch [regex]::Escape($field)) {
+            throw "installed worker event formatter omitted expected field: $field"
+        }
+    }
+    if ($formatted -match [regex]::Escape($sentinel)) {
+        throw 'installed worker event formatter leaked a non-allowlisted EventData value'
+    }
+    $sideBySide = Format-InstalledWorkerApplicationEvent -Provider 'SideBySide' -Id 33 `
+        -RecordId 9 -TimeCreated ([datetime]'2026-07-18T00:00:00Z') -Xml $xml
+    if ($sideBySide -cne 'provider=SideBySide id=33 time=2026-07-18T00:00:00.0000000Z') {
+        throw 'installed worker SideBySide formatter emitted data beyond provider/id/time'
+    }
+    $werXml = @"
+<Event><System><Execution ProcessID="4321" /></System><EventData>
+<Data Name="P1">cmd.exe</Data><Data Name="P4">kernel32.dll</Data>
+<Data Name="P7">0xc0000142</Data><Data Name="P8">$sentinel</Data>
+</EventData></Event>
+"@
+    $wer = Format-InstalledWorkerApplicationEvent -Provider 'Windows Error Reporting' -Id 1001 `
+        -RecordId 10 -TimeCreated ([datetime]'2026-07-18T00:00:00Z') -Xml $werXml
+    foreach ($field in @('app=cmd.exe', 'module=kernel32.dll', 'code=0xC0000142', 'pid=4321')) {
+        if ($wer -notmatch [regex]::Escape($field)) {
+            throw "installed worker WER formatter omitted fixed P mapping field: $field"
+        }
+    }
+    if ($wer -match [regex]::Escape($sentinel)) {
+        throw 'installed worker WER formatter leaked a non-allowlisted P field'
+    }
+    Write-Host 'STATIC INSTALLED WORKER EVENT FORMATTER PASS: allowlisted fields render and sentinel EventData does not leak.'
+}
+
+function Write-InstalledWorkerApplicationDiagnostics {
+    param(
+        [string]$Output,
+        [int]$ExitCode,
+        [datetime]$StartedUtc,
+        [datetime]$EndedUtc
+    )
+
+    if ($ExitCode -eq 0 -or -not (Test-ExecVfsReachedRunningAndCompleted -Output $Output)) {
+        return
+    }
+    $start = $StartedUtc.AddSeconds(-2).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    $end = $EndedUtc.AddSeconds(2).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+    $filterXPath = "*[System[TimeCreated[@SystemTime >= '$start' and @SystemTime <= '$end'] and ((Provider[@Name='Application Error'] and EventID=1000) or (Provider[@Name='Windows Error Reporting'] and EventID=1001) or (Provider[@Name='SideBySide'] and (EventID=33 or EventID=59)))]]"
+    $events = @()
+    for ($query = 1; $query -le 2; $query++) {
+        try {
+            $events = @(Get-WinEvent -LogName Application -FilterXPath $filterXPath `
+                -MaxEvents 8 -ErrorAction Stop)
+        }
+        catch [UnauthorizedAccessException] {
+            Write-Host 'INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: unavailable=access-denied'
+            return
+        }
+        catch {
+            Write-Host 'INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: unavailable=query-failed'
+            return
+        }
+        if ($events.Count -ne 0 -or $query -eq 2) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    $reported = 0
+    foreach ($event in $events) {
+        try {
+            $line = Format-InstalledWorkerApplicationEvent -Provider ([string]$event.ProviderName) `
+                -Id ([int]$event.Id) -RecordId ([long]$event.RecordId) `
+                -TimeCreated ([datetime]$event.TimeCreated) -Xml $event.ToXml()
+            if ($null -ne $line) {
+                Write-Host "INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: $line"
+                $reported++
+            }
+        }
+        catch {
+            # A malformed event is diagnostic-only and must not replace the action failure.
+        }
+    }
+    if ($reported -eq 0) {
+        Write-Host 'INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: no-allowlisted-event'
+    }
+}
+
+function Test-ExecVfsExpectedStates {
+    param([string]$Output)
+
+    return $Output -match 'exec_vfs:\s*states=\[\s*1\s*,\s*2\s*,\s*3\s*,\s*4\s*\]\s*exit='
+}
+
+function Test-ExecVfsIdentityChanged {
+    param(
+        [int]$ExitCode,
+        [string]$Output
+    )
+
+    return $ExitCode -eq 86 -and $Output.Contains(
+        'exec_vfs: worker identity changed before action admission')
+}
+
 function Invoke-InstalledWorkerVfsGate {
     param(
         [string]$Driver,
@@ -937,6 +1168,8 @@ function Invoke-InstalledWorkerVfsGate {
         throw "System32 VFS probe command is missing: where=$whereExe cmd=$cmdExe"
     }
 
+    $plainOutput = ''
+    $plainExitCode = $null
     $output = ''
     $exitCode = $null
     $gateError = $null
@@ -952,16 +1185,43 @@ function Invoke-InstalledWorkerVfsGate {
             for ($attempt = 1; $attempt -le 2; $attempt++) {
                 # Read immediately before launching the driver: default_worker_id is
                 # COMPUTERNAME#PID, and a service restart invalidates the capability.
+                # The plain control and injected action deliberately share this one identity.
                 $workerId = Get-InstalledWorkerIdentity
+                $plainOutput = & $Driver 'http://127.0.0.1:50061' '127.0.0.1:50072' `
+                    $RepoRoot $traceDestination --no-vfs --worker-id $workerId -- $cmdExe /d /c `
+                    'exit 0' 2>&1 | Out-String
+                $plainExitCode = $LASTEXITCODE
+                if (Test-ExecVfsIdentityChanged -ExitCode $plainExitCode -Output $plainOutput) {
+                    if ($attempt -eq 1) {
+                        Write-Host 'INSTALLED WORKER ACTION PAIR RETRY: service PID changed before plain control admission; refreshing identity once.'
+                        continue
+                    }
+                    throw "installed worker plain control identity changed twice: stdout/stderr=$plainOutput"
+                }
+
+                $plainTraceFiles = @(Get-ChildItem -LiteralPath $traceDestination -Filter '*.sbzt' `
+                    -File -ErrorAction Stop)
+                if ($plainExitCode -ne 0 -or -not (Test-ExecVfsExpectedStates -Output $plainOutput) -or
+                    $plainTraceFiles.Count -ne 0) {
+                    throw "installed worker plain control failed: exit=$plainExitCode states-ok=$(Test-ExecVfsExpectedStates -Output $plainOutput) traces=$($plainTraceFiles.Count) stdout/stderr=$plainOutput"
+                }
+
+                $injectedStartedUtc = [DateTime]::UtcNow
                 $output = & $Driver 'http://127.0.0.1:50061' '127.0.0.1:50072' `
                     $RepoRoot $traceDestination --worker-id $workerId -- $whereExe /R `
                     ([Environment]::SystemDirectory) 'cmd.exe' 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE
-                $identityChanged = $exitCode -eq 86 -and $output.Contains(
-                    'exec_vfs: worker identity changed before action admission')
-                if ($identityChanged -and $attempt -eq 1) {
-                    Write-Host 'INSTALLED WORKER VFS RETRY: service PID changed before action admission; refreshing worker identity once.'
-                    continue
+                $injectedEndedUtc = [DateTime]::UtcNow
+                if (Test-ExecVfsIdentityChanged -ExitCode $exitCode -Output $output) {
+                    if ($attempt -eq 1) {
+                        Write-Host 'INSTALLED WORKER ACTION PAIR RETRY: service PID changed before VFS admission; rerunning plain control and injected action once.'
+                        continue
+                    }
+                    throw "installed worker VFS action identity changed twice: stdout/stderr=$output"
+                }
+                if ($exitCode -ne 0) {
+                    Write-InstalledWorkerApplicationDiagnostics -Output $output -ExitCode $exitCode `
+                        -StartedUtc $injectedStartedUtc -EndedUtc $injectedEndedUtc
                 }
                 break
             }
@@ -979,6 +1239,7 @@ function Invoke-InstalledWorkerVfsGate {
         if ($exitCode -ne 0 -or $traceFiles.Count -eq 0) {
             throw "installed worker VFS action failed: exit=$exitCode traces=$($traceFiles.Count) services=$services stdout/stderr=$output"
         }
+        Write-Host "INSTALLED WORKER PLAIN CONTROL PASS: restricted non-VFS action exit=$plainExitCode states=[1,2,3,4] traces=0 worker=$workerId"
         Write-Host "INSTALLED WORKER VFS PASS: restricted VFS action through staged launcher/DLL exit=$exitCode traces=$($traceFiles.Count)"
         Write-Host "INSTALLED WORKER VFS COMMAND: $whereExe /R $([Environment]::SystemDirectory) cmd.exe"
         Write-Host "INSTALLED WORKER VFS SERVICES: $services"
@@ -1346,6 +1607,7 @@ function Wait-ForUninstallCleanup {
 
 Assert-StaticLifecycleSource -Path $Source
 Assert-OfflineTokenSetupSource -Path $PSCommandPath
+Assert-InstalledWorkerEventFormatter
 $staticChildScript = New-StandardUserProbeScript `
     -DataRoot 'C:\ProgramData\Sembazuru' `
     -ScratchRoot 'C:\ProgramData\Sembazuru\scratch' `

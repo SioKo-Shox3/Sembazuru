@@ -6,10 +6,10 @@
 //! DLL and supplies inputs on demand.
 //!
 //! Usage:
-//!   exec_vfs <worker_endpoint> <agent_fileserver> <vfs_root> <trace_dir|--empty-trace-dir> [--worker-id <id>] -- <argv...>
+//!   exec_vfs <worker_endpoint> <agent_fileserver> <vfs_root> <trace_dir|--empty-trace-dir> [--no-vfs] [--worker-id <id>] -- <argv...>
 //! e.g.
 //!   exec_vfs http://127.0.0.1:50061 127.0.0.1:50072 C:\src C:\trace -- probe.exe C:\src\a.txt
-//!   exec_vfs http://127.0.0.1:50061 127.0.0.1:50072 C:\src C:\trace --worker-id HOST#1234 -- probe.exe
+//!   exec_vfs http://127.0.0.1:50061 127.0.0.1:50072 C:\src C:\trace --no-vfs --worker-id HOST#1234 -- probe.exe
 
 use std::collections::HashMap;
 use std::fmt;
@@ -28,6 +28,7 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 
 const EMPTY_TRACE_DIR_SENTINEL: &str = "--empty-trace-dir";
+const NO_VFS_FLAG: &str = "--no-vfs";
 const WORKER_ID_FLAG: &str = "--worker-id";
 const ACTION_ID: &str = "exec-vfs";
 const NEGATIVE_ACTION_ID: &str = "exec-vfs-negative-control";
@@ -35,11 +36,12 @@ const WORKER_ID_MISMATCH_EXIT: i32 = 86;
 const DRIVER_FAILURE_EXIT: i32 = 87;
 const WORKER_ID_MISMATCH_DIAGNOSTIC: &str =
     "exec_vfs: worker identity changed before action admission";
-const USAGE: &str = "usage: exec_vfs <worker> <agent_fileserver> <vfs_root> <trace_dir|--empty-trace-dir> [--worker-id <id>] -- <argv...>";
+const USAGE: &str = "usage: exec_vfs <worker> <agent_fileserver> <vfs_root> <trace_dir|--empty-trace-dir> [--no-vfs] [--worker-id <id>] -- <argv...>";
 
 struct DriverArgs {
     worker_endpoint: String,
     worker_id: Option<String>,
+    no_vfs: bool,
     agent_fileserver: String,
     vfs_root: String,
     trace_dir: String,
@@ -74,9 +76,20 @@ fn parse_driver_args(args: &[String]) -> Result<DriverArgs, DriverError> {
         .iter()
         .position(|arg| arg == "--")
         .ok_or(DriverError::Usage)?;
-    let worker_id = match sep {
-        4 => None,
-        6 if args[4] == WORKER_ID_FLAG && !args[5].is_empty() => Some(args[5].clone()),
+    if sep < 4 {
+        return Err(DriverError::Usage);
+    }
+    let (no_vfs, worker_id) = match &args[4..sep] {
+        [] => (false, None),
+        [flag] if flag == NO_VFS_FLAG => (true, None),
+        [flag, worker_id] if flag == WORKER_ID_FLAG && !worker_id.is_empty() => {
+            (false, Some(worker_id.clone()))
+        }
+        [no_vfs, flag, worker_id]
+            if no_vfs == NO_VFS_FLAG && flag == WORKER_ID_FLAG && !worker_id.is_empty() =>
+        {
+            (true, Some(worker_id.clone()))
+        }
         _ => return Err(DriverError::Usage),
     };
     if args[..4].iter().any(String::is_empty) || sep + 1 >= args.len() {
@@ -90,6 +103,7 @@ fn parse_driver_args(args: &[String]) -> Result<DriverArgs, DriverError> {
     Ok(DriverArgs {
         worker_endpoint: args[0].clone(),
         worker_id,
+        no_vfs,
         agent_fileserver: args[1].clone(),
         vfs_root: args[2].clone(),
         trace_dir,
@@ -111,7 +125,7 @@ fn request_parts(args: &DriverArgs) -> (Command, ExecOptions) {
     };
     let opts = ExecOptions {
         predicted_paths: Vec::new(),
-        vfs: Some(VfsExecution {
+        vfs: (!args.no_vfs).then(|| VfsExecution {
             agent_fileserver: args.agent_fileserver.clone(),
             vfs_root: args.vfs_root.clone(),
             trace_dir: args.trace_dir.clone(),
@@ -329,6 +343,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(legacy.worker_id, None);
+        assert!(!legacy.no_vfs);
 
         let installed = parse_driver_args(&strings(&[
             "http://127.0.0.1:50061",
@@ -342,6 +357,115 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(installed.worker_id.as_deref(), Some("HOST#1234"));
+        assert!(!installed.no_vfs);
+    }
+
+    #[test]
+    fn parses_no_vfs_only_at_the_fixed_position_and_binds_no_vfs_digest() {
+        let plain = parse_driver_args(&strings(&[
+            "http://127.0.0.1:50061",
+            "127.0.0.1:50072",
+            r"C:\src",
+            r"C:\trace",
+            "--no-vfs",
+            "--worker-id",
+            "HOST#1234",
+            "--",
+            "probe.exe",
+        ]))
+        .unwrap();
+        assert!(plain.no_vfs);
+        assert_eq!(plain.worker_id.as_deref(), Some("HOST#1234"));
+
+        let (_, opts) = request_parts(&plain);
+        assert!(opts.vfs.is_none());
+        assert_eq!(
+            capability::vfs_digest(opts.vfs.as_ref()),
+            capability::vfs_digest(None)
+        );
+        let key = capability::cap_key("test-only-secret");
+        let encoded = encode_action_capability(
+            "HOST#1234",
+            &request_parts(&plain).0,
+            &opts,
+            &key,
+            1_000,
+            [8; 16],
+        );
+        let decoded = capability::decode_and_verify(&encoded, &key, 1_001).unwrap();
+        assert_eq!(decoded.vfs_digest, capability::vfs_digest(None));
+
+        for invalid in [
+            strings(&[
+                "http://127.0.0.1:50061",
+                "127.0.0.1:50072",
+                r"C:\src",
+                r"C:\trace",
+                "--worker-id",
+                "HOST#1234",
+                "--worker-id",
+                "HOST#5678",
+                "--",
+                "probe.exe",
+            ]),
+            strings(&[
+                "http://127.0.0.1:50061",
+                "127.0.0.1:50072",
+                r"C:\src",
+                r"C:\trace",
+                "--worker-id",
+                "HOST#1234",
+                "--no-vfs",
+                "--",
+                "probe.exe",
+            ]),
+            strings(&[
+                "http://127.0.0.1:50061",
+                "127.0.0.1:50072",
+                r"C:\src",
+                r"C:\trace",
+                "--no-vfs",
+                "--no-vfs",
+                "--",
+                "probe.exe",
+            ]),
+            strings(&[
+                "http://127.0.0.1:50061",
+                "127.0.0.1:50072",
+                r"C:\src",
+                r"C:\trace",
+                "--no-vfs",
+                "--worker-id",
+                "",
+                "--",
+                "probe.exe",
+            ]),
+            strings(&["http://127.0.0.1:50061", "--", "probe.exe"]),
+        ] {
+            assert!(matches!(
+                parse_driver_args(&invalid),
+                Err(DriverError::Usage)
+            ));
+        }
+    }
+
+    #[test]
+    fn empty_trace_sentinel_remains_a_vfs_request() {
+        let parsed = parse_driver_args(&strings(&[
+            "http://127.0.0.1:50061",
+            "127.0.0.1:50072",
+            r"C:\src",
+            EMPTY_TRACE_DIR_SENTINEL,
+            "--",
+            "probe.exe",
+        ]))
+        .unwrap();
+        assert!(!parsed.no_vfs);
+        let (_, opts) = request_parts(&parsed);
+        assert_eq!(
+            opts.vfs.as_ref().map(|vfs| vfs.trace_dir.as_str()),
+            Some("")
+        );
     }
 
     #[test]
