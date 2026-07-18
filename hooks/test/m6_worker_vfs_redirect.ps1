@@ -326,6 +326,17 @@ static void AppendClGlDiagnostic(const char* source, DWORD sourceLength,
 }
 static const ULONGLONG kClGlTimeoutMs = 30000;
 static const ULONGLONG kClGlTerminateGraceMs = 2000;
+static const int kClGlSetupCreatePipe = 60;
+static const int kClGlSetupClearReadInherit = 61;
+static const int kClGlSetupOpenStdinNul = 62;
+static const int kClGlSetupSetStdinInherit = 63;
+static const int kClGlSetupQueryAttributeSize = 64;
+static const int kClGlSetupAllocateAttributes = 65;
+static const int kClGlSetupInitializeAttributes = 66;
+static const int kClGlSetupUpdateHandleList = 67;
+static const int kClGlSetupCreateProcess = 68;
+static const int kClGlSetupCloseParentWrite = 69;
+static const int kClGlSetupCloseParentStdin = 70;
 static BOOL WaitForClGlExit(HANDLE process, ULONGLONG deadline) {
     for (;;) {
         ULONGLONG now = GetTickCount64();
@@ -475,6 +486,7 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (!CreatePipe(&createdRead, &createdWrite, &pipeSecurity, 0)) {
         spawnStage = "create-pipe";
         spawnError = GetLastError();
+        result = kClGlSetupCreatePipe;
         goto cleanup;
     }
     readPipe = createdRead;
@@ -482,6 +494,7 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
         spawnStage = "clear-read-inherit";
         spawnError = GetLastError();
+        result = kClGlSetupClearReadInherit;
         goto cleanup;
     }
     stdinNul = CreateFileW(L"NUL", GENERIC_READ,
@@ -490,12 +503,14 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (stdinNul == INVALID_HANDLE_VALUE) {
         spawnStage = "open-stdin-nul";
         spawnError = GetLastError();
+        result = kClGlSetupOpenStdinNul;
         goto cleanup;
     }
     if (!SetHandleInformation(stdinNul, HANDLE_FLAG_INHERIT,
                               HANDLE_FLAG_INHERIT)) {
         spawnStage = "set-stdin-inherit";
         spawnError = GetLastError();
+        result = kClGlSetupSetStdinInherit;
         goto cleanup;
     }
     attributeSizeQueried = InitializeProcThreadAttributeList(
@@ -504,6 +519,7 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (attributeSizeQueried || attributeSizeError != ERROR_INSUFFICIENT_BUFFER) {
         spawnStage = "query-attribute-size";
         spawnError = attributeSizeQueried ? ERROR_SUCCESS : attributeSizeError;
+        result = kClGlSetupQueryAttributeSize;
         goto cleanup;
     }
     attributes = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
@@ -511,11 +527,13 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (attributes == nullptr) {
         spawnStage = "allocate-attributes";
         spawnError = GetLastError();
+        result = kClGlSetupAllocateAttributes;
         goto cleanup;
     }
     if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributesSize)) {
         spawnStage = "initialize-attributes";
         spawnError = GetLastError();
+        result = kClGlSetupInitializeAttributes;
         goto cleanup;
     }
     attributesInitialized = TRUE;
@@ -526,6 +544,7 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
             sizeof(inheritableHandles), nullptr, nullptr)) {
         spawnStage = "update-handle-list";
         spawnError = GetLastError();
+        result = kClGlSetupUpdateHandleList;
         goto cleanup;
     }
     startup.StartupInfo.cb = sizeof(startup);
@@ -539,6 +558,7 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
                         &startup.StartupInfo, &process)) {
         spawnStage = "create-process";
         spawnError = GetLastError();
+        result = kClGlSetupCreateProcess;
         goto cleanup;
     }
     processCreated = TRUE;
@@ -552,12 +572,14 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (!CloseHandle(writePipe)) {
         spawnStage = "close-parent-write";
         spawnError = GetLastError();
+        result = kClGlSetupCloseParentWrite;
         goto cleanup;
     }
     writePipe = INVALID_HANDLE_VALUE;
     if (!CloseHandle(stdinNul)) {
         spawnStage = "close-parent-stdin";
         spawnError = GetLastError();
+        result = kClGlSetupCloseParentStdin;
         goto cleanup;
     }
     stdinNul = INVALID_HANDLE_VALUE;
@@ -1034,18 +1056,35 @@ if ($verbatimFindExWExit -ne 0) {
 if ($outputExit -eq 0) {
     $failures += 'a scratch-cwd action that wrote a relative output completed remotely; outputs would be stranded without WriteBack'
 }
-switch ($glExit) {
-    0 { }
-    21 { $failures += 'hosted cl.exe /GL saw mismatched TMP, TEMP, and SEMBAZURU_VFS_SCRATCH; private scratch was not staged consistently' }
-    22 { $failures += 'hosted cl.exe /GL could not construct its private-scratch object path' }
-    23 { $failures += 'hosted cl.exe /GL could not clear a pre-existing private-scratch object' }
-    24 { $failures += 'hosted cl.exe /GL could not be created through the staged launcher/interceptor path' }
-    25 { $failures += 'hosted cl.exe /GL did not finish before the probe timeout' }
-    26 { $failures += 'hosted cl.exe /GL failed; expected backing Src\\gl_tmp.cpp and writable private scratch (inspect compiler output above)' }
-    27 { $failures += 'hosted cl.exe /GL did not create %TMP%\\gl_tmp.obj' }
-    28 { $failures += 'hosted cl.exe /GL created an empty %TMP%\\gl_tmp.obj' }
-    29 { $failures += 'hosted cl.exe /GL could not delete %TMP%\\gl_tmp.obj' }
-    default { $failures += "hosted cl.exe /GL VFS probe failed (exit=$glExit)" }
+$glSetupStages = @{
+    60 = 'create-pipe'
+    61 = 'clear-read-inherit'
+    62 = 'open-stdin-nul'
+    63 = 'set-stdin-inherit'
+    64 = 'query-attribute-size'
+    65 = 'allocate-attributes'
+    66 = 'initialize-attributes'
+    67 = 'update-handle-list'
+    68 = 'create-process'
+    69 = 'close-parent-write'
+    70 = 'close-parent-stdin'
+}
+if ($glSetupStages.ContainsKey([int]$glExit)) {
+    $failures += "hosted cl.exe /GL setup failed: stage=$($glSetupStages[[int]$glExit]) exit=$glExit"
+} else {
+    switch ($glExit) {
+        0 { }
+        21 { $failures += 'hosted cl.exe /GL saw mismatched TMP, TEMP, and SEMBAZURU_VFS_SCRATCH; private scratch was not staged consistently' }
+        22 { $failures += 'hosted cl.exe /GL could not construct its private-scratch object path' }
+        23 { $failures += 'hosted cl.exe /GL could not clear a pre-existing private-scratch object' }
+        24 { $failures += 'hosted cl.exe /GL could not be created through the staged launcher/interceptor path' }
+        25 { $failures += 'hosted cl.exe /GL did not finish before the probe timeout' }
+        26 { $failures += 'hosted cl.exe /GL failed; expected backing Src\\gl_tmp.cpp and writable private scratch (inspect compiler output above)' }
+        27 { $failures += 'hosted cl.exe /GL did not create %TMP%\\gl_tmp.obj' }
+        28 { $failures += 'hosted cl.exe /GL created an empty %TMP%\\gl_tmp.obj' }
+        29 { $failures += 'hosted cl.exe /GL could not delete %TMP%\\gl_tmp.obj' }
+        default { $failures += "hosted cl.exe /GL VFS probe failed (exit=$glExit)" }
+    }
 }
 if ($wildcardExit -ne -1) {
     $failures += "wildcard enumeration under the logical cwd completed remotely (exit=$wildcardExit); expected worker fallback exit=-1"
