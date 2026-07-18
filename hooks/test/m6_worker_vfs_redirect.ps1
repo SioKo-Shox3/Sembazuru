@@ -406,6 +406,10 @@ static void EmitClGlDiagnostic(const char* diagnostic, DWORD diagnosticLength,
     if (diagnosticLength == 0 || diagnostic[diagnosticLength - 1] != '\n')
         fputc('\n', stderr);
 }
+static void EmitClGlSpawnFailure(const char* stage, DWORD error) {
+    fprintf(stderr, "CL_GL_SPAWN: stage=%s error=%lu\n", stage,
+            static_cast<unsigned long>(error));
+}
 static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     wchar_t tmp[32768];
     wchar_t temp[32768];
@@ -456,6 +460,10 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     HANDLE objectHandle = INVALID_HANDLE_VALUE;
     BOOL hasContent = FALSE;
     ULONGLONG hardDeadline = 0;
+    const char* spawnStage = nullptr;
+    DWORD spawnError = ERROR_SUCCESS;
+    BOOL attributeSizeQueried = FALSE;
+    DWORD attributeSizeError = ERROR_SUCCESS;
     HANDLE inheritableHandles[2]{};
     SECURITY_ATTRIBUTES pipeSecurity{};
     pipeSecurity.nLength = sizeof(pipeSecurity);
@@ -464,25 +472,50 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     // them owned until it has succeeded.
     HANDLE createdRead;
     HANDLE createdWrite;
-    if (!CreatePipe(&createdRead, &createdWrite, &pipeSecurity, 0)) return 24;
+    if (!CreatePipe(&createdRead, &createdWrite, &pipeSecurity, 0)) {
+        spawnStage = "create-pipe";
+        spawnError = GetLastError();
+        goto cleanup;
+    }
     readPipe = createdRead;
     writePipe = createdWrite;
     if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
+        spawnStage = "clear-read-inherit";
+        spawnError = GetLastError();
         goto cleanup;
     }
     stdinNul = CreateFileW(L"NUL", GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE, &pipeSecurity,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (stdinNul == INVALID_HANDLE_VALUE ||
-        !SetHandleInformation(stdinNul, HANDLE_FLAG_INHERIT,
-                              HANDLE_FLAG_INHERIT)) {
+    if (stdinNul == INVALID_HANDLE_VALUE) {
+        spawnStage = "open-stdin-nul";
+        spawnError = GetLastError();
         goto cleanup;
     }
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributesSize);
+    if (!SetHandleInformation(stdinNul, HANDLE_FLAG_INHERIT,
+                              HANDLE_FLAG_INHERIT)) {
+        spawnStage = "set-stdin-inherit";
+        spawnError = GetLastError();
+        goto cleanup;
+    }
+    attributeSizeQueried = InitializeProcThreadAttributeList(
+        nullptr, 1, 0, &attributesSize);
+    attributeSizeError = GetLastError();
+    if (attributeSizeQueried || attributeSizeError != ERROR_INSUFFICIENT_BUFFER) {
+        spawnStage = "query-attribute-size";
+        spawnError = attributeSizeQueried ? ERROR_SUCCESS : attributeSizeError;
+        goto cleanup;
+    }
     attributes = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
         HeapAlloc(GetProcessHeap(), 0, attributesSize));
-    if (attributes == nullptr ||
-        !InitializeProcThreadAttributeList(attributes, 1, 0, &attributesSize)) {
+    if (attributes == nullptr) {
+        spawnStage = "allocate-attributes";
+        spawnError = GetLastError();
+        goto cleanup;
+    }
+    if (!InitializeProcThreadAttributeList(attributes, 1, 0, &attributesSize)) {
+        spawnStage = "initialize-attributes";
+        spawnError = GetLastError();
         goto cleanup;
     }
     attributesInitialized = TRUE;
@@ -491,6 +524,8 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (!UpdateProcThreadAttribute(
             attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritableHandles,
             sizeof(inheritableHandles), nullptr, nullptr)) {
+        spawnStage = "update-handle-list";
+        spawnError = GetLastError();
         goto cleanup;
     }
     startup.StartupInfo.cb = sizeof(startup);
@@ -502,6 +537,8 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (!CreateProcessW(clExe, command, nullptr, nullptr, TRUE,
                         EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
                         &startup.StartupInfo, &process)) {
+        spawnStage = "create-process";
+        spawnError = GetLastError();
         goto cleanup;
     }
     processCreated = TRUE;
@@ -512,9 +549,17 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     }
     HeapFree(GetProcessHeap(), 0, attributes);
     attributes = nullptr;
-    if (!CloseHandle(writePipe)) goto cleanup;
+    if (!CloseHandle(writePipe)) {
+        spawnStage = "close-parent-write";
+        spawnError = GetLastError();
+        goto cleanup;
+    }
     writePipe = INVALID_HANDLE_VALUE;
-    if (!CloseHandle(stdinNul)) goto cleanup;
+    if (!CloseHandle(stdinNul)) {
+        spawnStage = "close-parent-stdin";
+        spawnError = GetLastError();
+        goto cleanup;
+    }
     stdinNul = INVALID_HANDLE_VALUE;
     if (!CaptureClGlOutput(readPipe, process.hProcess, diagnostic,
                            sizeof(diagnostic), &diagnosticLength,
@@ -559,6 +604,8 @@ cleanup:
     if (stdinNul != INVALID_HANDLE_VALUE) CloseHandle(stdinNul);
     if (writePipe != INVALID_HANDLE_VALUE) CloseHandle(writePipe);
     if (readPipe != INVALID_HANDLE_VALUE) CloseHandle(readPipe);
+    if (result == 24 && spawnStage != nullptr)
+        EmitClGlSpawnFailure(spawnStage, spawnError);
     return result;
 }
 int wmain(int argc, wchar_t** argv) {
