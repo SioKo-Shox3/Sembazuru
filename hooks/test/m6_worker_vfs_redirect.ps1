@@ -311,6 +311,101 @@ static bool IsDirectActionScratch(const wchar_t* path,
     return _wcsnicmp(leaf, L"action-", 7) == 0 && leaf[7] != L'\0' &&
            wcschr(leaf, L'\\') == nullptr && wcschr(leaf, L'/') == nullptr;
 }
+static void AppendClGlDiagnostic(const char* source, DWORD sourceLength,
+                                 char* diagnostic, DWORD diagnosticCapacity,
+                                 DWORD* diagnosticLength, BOOL* truncated) {
+    DWORD remaining = *diagnosticLength < diagnosticCapacity
+                          ? diagnosticCapacity - *diagnosticLength
+                          : 0;
+    DWORD copied = sourceLength < remaining ? sourceLength : remaining;
+    if (copied != 0) {
+        memcpy(diagnostic + *diagnosticLength, source, copied);
+        *diagnosticLength += copied;
+    }
+    if (copied != sourceLength) *truncated = TRUE;
+}
+static const ULONGLONG kClGlTimeoutMs = 30000;
+static const ULONGLONG kClGlTerminateGraceMs = 2000;
+static BOOL WaitForClGlExit(HANDLE process, ULONGLONG deadline) {
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return FALSE;
+        DWORD remaining = static_cast<DWORD>(deadline - now);
+        DWORD wait = WaitForSingleObject(process, remaining < 25 ? remaining : 25);
+        if (wait == WAIT_OBJECT_0) return TRUE;
+        if (wait != WAIT_TIMEOUT) return FALSE;
+    }
+}
+static BOOL StopClGlProcess(HANDLE process, ULONGLONG hardDeadline) {
+    DWORD state = WaitForSingleObject(process, 0);
+    if (state == WAIT_OBJECT_0) return TRUE;
+    BOOL terminated = TerminateProcess(process, 1);
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG graceDeadline = now + kClGlTerminateGraceMs;
+    if (graceDeadline > hardDeadline) graceDeadline = hardDeadline;
+    BOOL stopped = WaitForClGlExit(process, graceDeadline);
+    return terminated && stopped;
+}
+static BOOL CaptureClGlOutput(HANDLE readPipe, HANDLE process,
+                              char* diagnostic, DWORD diagnosticCapacity,
+                              DWORD* diagnosticLength, BOOL* truncated,
+                              ULONGLONG hardDeadline) {
+    ULONGLONG captureDeadline = hardDeadline - kClGlTerminateGraceMs;
+    BOOL processExited = FALSE;
+    for (;;) {
+        if (GetTickCount64() >= captureDeadline) return FALSE;
+        DWORD available = 0;
+        if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr)) {
+            if (GetLastError() == ERROR_BROKEN_PIPE)
+                return processExited || WaitForClGlExit(process, captureDeadline);
+            return FALSE;
+        }
+        while (available != 0) {
+            if (GetTickCount64() >= captureDeadline) return FALSE;
+            char buffer[4096];
+            DWORD toRead = available < sizeof(buffer) ? available : sizeof(buffer);
+            DWORD read = 0;
+            if (!ReadFile(readPipe, buffer, toRead, &read, nullptr) || read == 0)
+                return FALSE;
+            AppendClGlDiagnostic(buffer, read, diagnostic, diagnosticCapacity,
+                                  diagnosticLength, truncated);
+            if (!PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr)) {
+                if (GetLastError() == ERROR_BROKEN_PIPE)
+                    return processExited || WaitForClGlExit(process, captureDeadline);
+                return FALSE;
+            }
+        }
+        if (processExited) {
+            // Wait for EOF after the compiler signaled. This final drain keeps
+            // output written during CRT/process teardown in the diagnostic.
+            ULONGLONG now = GetTickCount64();
+            if (now >= captureDeadline) return FALSE;
+            DWORD remaining = static_cast<DWORD>(captureDeadline - now);
+            Sleep(remaining < 10 ? remaining : 10);
+            continue;
+        }
+        ULONGLONG now = GetTickCount64();
+        DWORD remaining = static_cast<DWORD>(captureDeadline - now);
+        DWORD wait = WaitForSingleObject(process, remaining < 25 ? remaining : 25);
+        if (wait == WAIT_OBJECT_0) {
+            processExited = TRUE;
+            continue;
+        }
+        if (wait != WAIT_TIMEOUT) return FALSE;
+    }
+}
+static void EmitClGlDiagnostic(const char* diagnostic, DWORD diagnosticLength,
+                               BOOL truncated) {
+    fputs("CL_GL_DIAGNOSTIC: ", stderr);
+    if (diagnosticLength != 0) {
+        fwrite(diagnostic, 1, diagnosticLength, stderr);
+    } else {
+        fputs("<no compiler output>", stderr);
+    }
+    if (truncated) fputs("\nCL_GL_DIAGNOSTIC: <truncated>", stderr);
+    if (diagnosticLength == 0 || diagnostic[diagnosticLength - 1] != '\n')
+        fputc('\n', stderr);
+}
 static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     wchar_t tmp[32768];
     wchar_t temp[32768];
@@ -341,35 +436,130 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (commandLength < 0) return 22;
     SetEnvironmentVariableW(L"CL", nullptr);
     SetEnvironmentVariableW(L"_CL_", nullptr);
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
+    HANDLE readPipe = INVALID_HANDLE_VALUE;
+    HANDLE writePipe = INVALID_HANDLE_VALUE;
+    HANDLE stdinNul = INVALID_HANDLE_VALUE;
+    LPPROC_THREAD_ATTRIBUTE_LIST attributes = nullptr;
+    BOOL attributesInitialized = FALSE;
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(clExe, command, nullptr, nullptr, FALSE, 0, nullptr,
-                        nullptr, &startup, &process)) return 24;
-    DWORD wait = WaitForSingleObject(process.hProcess, 30000);
-    if (wait != WAIT_OBJECT_0) {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-        return 25;
-    }
+    BOOL processCreated = FALSE;
+    int result = 24;
+    SIZE_T attributesSize = 0;
+    STARTUPINFOEXW startup{};
+    // Keep retained diagnostics bounded while CaptureClGlOutput continues to
+    // drain the pipe, so a noisy compiler cannot block on a full pipe buffer.
+    char diagnostic[65536];
+    DWORD diagnosticLength = 0;
+    BOOL diagnosticTruncated = FALSE;
     DWORD exitCode = 25;
-    if (!GetExitCodeProcess(process.hProcess, &exitCode)) {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-        return 25;
-    }
-    CloseHandle(process.hThread);
-    CloseHandle(process.hProcess);
-    if (exitCode != 0) return 26;
     LARGE_INTEGER objectSize{};
-    HANDLE objectHandle = CreateFileW(object, GENERIC_READ,
-                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                      nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (objectHandle == INVALID_HANDLE_VALUE) return 27;
-    BOOL hasContent = GetFileSizeEx(objectHandle, &objectSize) && objectSize.QuadPart > 0;
+    HANDLE objectHandle = INVALID_HANDLE_VALUE;
+    BOOL hasContent = FALSE;
+    ULONGLONG hardDeadline = 0;
+    HANDLE inheritableHandles[2]{};
+    SECURITY_ATTRIBUTES pipeSecurity{};
+    pipeSecurity.nLength = sizeof(pipeSecurity);
+    pipeSecurity.bInheritHandle = TRUE;
+    // CreatePipe leaves output parameters unspecified on failure. Do not make
+    // them owned until it has succeeded.
+    HANDLE createdRead;
+    HANDLE createdWrite;
+    if (!CreatePipe(&createdRead, &createdWrite, &pipeSecurity, 0)) return 24;
+    readPipe = createdRead;
+    writePipe = createdWrite;
+    if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0)) {
+        goto cleanup;
+    }
+    stdinNul = CreateFileW(L"NUL", GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, &pipeSecurity,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (stdinNul == INVALID_HANDLE_VALUE ||
+        !SetHandleInformation(stdinNul, HANDLE_FLAG_INHERIT,
+                              HANDLE_FLAG_INHERIT)) {
+        goto cleanup;
+    }
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributesSize);
+    attributes = static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(
+        HeapAlloc(GetProcessHeap(), 0, attributesSize));
+    if (attributes == nullptr ||
+        !InitializeProcThreadAttributeList(attributes, 1, 0, &attributesSize)) {
+        goto cleanup;
+    }
+    attributesInitialized = TRUE;
+    inheritableHandles[0] = stdinNul;
+    inheritableHandles[1] = writePipe;
+    if (!UpdateProcThreadAttribute(
+            attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritableHandles,
+            sizeof(inheritableHandles), nullptr, nullptr)) {
+        goto cleanup;
+    }
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdinNul;
+    startup.StartupInfo.hStdOutput = writePipe;
+    startup.StartupInfo.hStdError = writePipe;
+    startup.lpAttributeList = attributes;
+    if (!CreateProcessW(clExe, command, nullptr, nullptr, TRUE,
+                        EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+                        &startup.StartupInfo, &process)) {
+        goto cleanup;
+    }
+    processCreated = TRUE;
+    hardDeadline = GetTickCount64() + kClGlTimeoutMs;
+    if (attributesInitialized) {
+        DeleteProcThreadAttributeList(attributes);
+        attributesInitialized = FALSE;
+    }
+    HeapFree(GetProcessHeap(), 0, attributes);
+    attributes = nullptr;
+    if (!CloseHandle(writePipe)) goto cleanup;
+    writePipe = INVALID_HANDLE_VALUE;
+    if (!CloseHandle(stdinNul)) goto cleanup;
+    stdinNul = INVALID_HANDLE_VALUE;
+    if (!CaptureClGlOutput(readPipe, process.hProcess, diagnostic,
+                           sizeof(diagnostic), &diagnosticLength,
+                           &diagnosticTruncated, hardDeadline)) {
+        result = 25;
+        goto cleanup;
+    }
+    if (!GetExitCodeProcess(process.hProcess, &exitCode)) {
+        result = 25;
+        goto cleanup;
+    }
+    if (exitCode != 0) {
+        EmitClGlDiagnostic(diagnostic, diagnosticLength, diagnosticTruncated);
+        result = 26;
+        goto cleanup;
+    }
+    objectHandle = CreateFileW(object, GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (objectHandle == INVALID_HANDLE_VALUE) {
+        result = 27;
+        goto cleanup;
+    }
+    hasContent = GetFileSizeEx(objectHandle, &objectSize) && objectSize.QuadPart > 0;
     CloseHandle(objectHandle);
-    if (!hasContent) return 28;
-    return DeleteFileW(object) ? 0 : 29;
+    objectHandle = INVALID_HANDLE_VALUE;
+    if (!hasContent) {
+        result = 28;
+        goto cleanup;
+    }
+    result = DeleteFileW(object) ? 0 : 29;
+cleanup:
+    // A grace expiry reports exit 25; the enclosing worker action Job owns
+    // kill-on-close containment after this probe releases its local handles.
+    if (processCreated && !StopClGlProcess(process.hProcess, hardDeadline))
+        result = 25;
+    if (objectHandle != INVALID_HANDLE_VALUE) CloseHandle(objectHandle);
+    if (process.hThread != nullptr) CloseHandle(process.hThread);
+    if (process.hProcess != nullptr) CloseHandle(process.hProcess);
+    if (attributesInitialized) DeleteProcThreadAttributeList(attributes);
+    if (attributes != nullptr) HeapFree(GetProcessHeap(), 0, attributes);
+    if (stdinNul != INVALID_HANDLE_VALUE) CloseHandle(stdinNul);
+    if (writePipe != INVALID_HANDLE_VALUE) CloseHandle(writePipe);
+    if (readPipe != INVALID_HANDLE_VALUE) CloseHandle(readPipe);
+    return result;
 }
 int wmain(int argc, wchar_t** argv) {
     int canary = CheckRestrictionCanary();
