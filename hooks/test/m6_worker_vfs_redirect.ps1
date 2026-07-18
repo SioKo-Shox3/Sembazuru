@@ -275,12 +275,46 @@ static int SpawnReadChild(const wchar_t* path, const wchar_t* expected,
     CloseHandle(process.hProcess);
     return static_cast<int>(exitCode);
 }
+static bool IsPathSeparator(wchar_t value) {
+    return value == L'\\' || value == L'/';
+}
+static bool IsFullyQualifiedWindowsPath(const wchar_t* path) {
+    if (path == nullptr || path[0] == L'\0') return false;
+    bool driveAbsolute = ((path[0] >= L'A' && path[0] <= L'Z') ||
+                          (path[0] >= L'a' && path[0] <= L'z')) &&
+                         path[1] == L':' && IsPathSeparator(path[2]);
+    if (driveAbsolute) return true;
+    if (!IsPathSeparator(path[0]) || !IsPathSeparator(path[1])) return false;
+    const wchar_t* server = path + 2;
+    const wchar_t* cursor = server;
+    while (*cursor != L'\0' && !IsPathSeparator(*cursor)) ++cursor;
+    if (cursor == server || *cursor == L'\0') return false;
+    const wchar_t* share = cursor + 1;
+    cursor = share;
+    while (*cursor != L'\0' && !IsPathSeparator(*cursor)) ++cursor;
+    return cursor != share;
+}
+static bool IsDirectActionScratch(const wchar_t* path,
+                                  const wchar_t* expectedRoot) {
+    if (!IsFullyQualifiedWindowsPath(path) ||
+        !IsFullyQualifiedWindowsPath(expectedRoot)) return false;
+    size_t rootLength = wcslen(expectedRoot);
+    while (rootLength > 0 && IsPathSeparator(expectedRoot[rootLength - 1]))
+        --rootLength;
+    size_t pathLength = wcslen(path);
+    if (rootLength == 0 || pathLength <= rootLength + 1 ||
+        _wcsnicmp(path, expectedRoot, rootLength) != 0 ||
+        !IsPathSeparator(path[rootLength])) return false;
+    const wchar_t* leaf = path + rootLength + 1;
+    if ((leaf[0] == L'.' && leaf[1] == L'\0') ||
+        (leaf[0] == L'.' && leaf[1] == L'.' && leaf[2] == L'\0')) return false;
+    return _wcsnicmp(leaf, L"action-", 7) == 0 && leaf[7] != L'\0' &&
+           wcschr(leaf, L'\\') == nullptr && wcschr(leaf, L'/') == nullptr;
+}
 static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     wchar_t tmp[32768];
     wchar_t temp[32768];
     wchar_t scratch[32768];
-    wchar_t canonicalTmp[32768];
-    wchar_t canonicalRoot[32768];
     DWORD tmpLength = GetEnvironmentVariableW(
         L"TMP", tmp, static_cast<DWORD>(sizeof(tmp) / sizeof(tmp[0])));
     DWORD tempLength = GetEnvironmentVariableW(
@@ -291,24 +325,8 @@ static int SpawnClGl(const wchar_t* expectedScratchRoot, const wchar_t* clExe) {
     if (tmpLength == 0 || tmpLength >= sizeof(tmp) / sizeof(tmp[0]) ||
         tempLength == 0 || tempLength >= sizeof(temp) / sizeof(temp[0]) ||
         scratchLength == 0 || scratchLength >= sizeof(scratch) / sizeof(scratch[0]) ||
-        wcscmp(tmp, temp) != 0 || wcscmp(tmp, scratch) != 0) return 21;
-    DWORD canonicalTmpLength = GetFullPathNameW(
-        tmp, static_cast<DWORD>(sizeof(canonicalTmp) / sizeof(canonicalTmp[0])),
-        canonicalTmp, nullptr);
-    DWORD canonicalRootLength = GetFullPathNameW(
-        expectedScratchRoot,
-        static_cast<DWORD>(sizeof(canonicalRoot) / sizeof(canonicalRoot[0])),
-        canonicalRoot, nullptr);
-    if (canonicalTmpLength == 0 ||
-        canonicalTmpLength >= sizeof(canonicalTmp) / sizeof(canonicalTmp[0]) ||
-        canonicalRootLength == 0 ||
-        canonicalRootLength >= sizeof(canonicalRoot) / sizeof(canonicalRoot[0])) return 21;
-    size_t rootLength = wcslen(canonicalRoot);
-    if (_wcsnicmp(canonicalTmp, canonicalRoot, rootLength) != 0 ||
-        canonicalTmp[rootLength] != L'\\') return 21;
-    const wchar_t* leaf = canonicalTmp + rootLength + 1;
-    if (_wcsnicmp(leaf, L"action-", 7) != 0 || leaf[7] == L'\0' ||
-        wcschr(leaf, L'\\') != nullptr)
+        wcscmp(tmp, temp) != 0 || wcscmp(tmp, scratch) != 0 ||
+        !IsDirectActionScratch(tmp, expectedScratchRoot))
         return 21;
     wchar_t object[32768];
     int objectLength = _snwprintf_s(
