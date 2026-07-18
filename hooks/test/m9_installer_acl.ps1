@@ -1082,11 +1082,74 @@ function Assert-InstalledWorkerEventFormatter {
     if ($wer -match [regex]::Escape($sentinel)) {
         throw 'installed worker WER formatter leaked a non-allowlisted P field'
     }
+    $plainPrefix = Get-InstalledWorkerEventDiagnosticPrefix -Label PLAIN
+    if ($plainPrefix -cne 'INSTALLED WORKER PLAIN EVENT DIAGNOSTIC:') {
+        throw 'installed worker event diagnostic formatter changed the fixed PLAIN prefix'
+    }
+    $labelParameter = (Get-Command Write-InstalledWorkerApplicationDiagnostics `
+        -ErrorAction Stop).Parameters['Label']
+    $validateSetAttributes = @($labelParameter.Attributes | Where-Object {
+        $_.GetType().FullName -ceq 'System.Management.Automation.ValidateSetAttribute'
+    })
+    if ($validateSetAttributes.Count -ne 1) {
+        throw 'installed worker event diagnostic Label must have one ValidateSet attribute'
+    }
+    $validLabels = @($validateSetAttributes[0].ValidValues)
+    $labelDifference = @(Compare-Object -ReferenceObject @('PLAIN', 'INJECTED') `
+        -DifferenceObject $validLabels -CaseSensitive)
+    if ($validLabels.Count -ne 2 -or $labelDifference.Count -ne 0) {
+        throw 'installed worker event diagnostic Label must allow exactly PLAIN and INJECTED'
+    }
+
+    $originalStateTest = (Get-Item Function:\Test-ExecVfsReachedRunningAndCompleted `
+        -ErrorAction Stop).ScriptBlock
+    $script:eventDiagnosticBodyEntered = $false
+    $invalidLabelRejected = $false
+    $Error.Clear()
+    try {
+        Set-Item Function:\Test-ExecVfsReachedRunningAndCompleted -Value {
+            $script:eventDiagnosticBodyEntered = $true
+            return $false
+        }
+        Write-InstalledWorkerApplicationDiagnostics -Label '__NOT_A_LABEL__' -Output '' `
+            -ExitCode 1 -StartedUtc ([datetime]'2026-07-18T00:00:00Z') `
+            -EndedUtc ([datetime]'2026-07-18T00:00:01Z')
+    }
+    catch {
+        $invalidLabelRejected =
+            $_.Exception -is [System.Management.Automation.ParameterBindingException] -and
+            $_.FullyQualifiedErrorId -ceq
+                'ParameterArgumentValidationError,Write-InstalledWorkerApplicationDiagnostics' -and
+            $_.Exception.ErrorId -ceq 'ParameterArgumentValidationError' -and
+            $_.Exception.ParameterName -ceq 'Label' -and
+            $_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::InvalidData -and
+            $_.CategoryInfo.Reason -ceq 'ParameterBindingValidationException' -and
+            $null -eq $_.TargetObject
+    }
+    finally {
+        Set-Item Function:\Test-ExecVfsReachedRunningAndCompleted -Value $originalStateTest
+        $Error.Clear()
+    }
+    if (-not $invalidLabelRejected -or $script:eventDiagnosticBodyEntered) {
+        throw 'installed worker event diagnostic Label validation did not reject before body entry'
+    }
+    Remove-Variable -Name eventDiagnosticBodyEntered -Scope Script -ErrorAction SilentlyContinue
     Write-Host 'STATIC INSTALLED WORKER EVENT FORMATTER PASS: allowlisted fields render and sentinel EventData does not leak.'
+}
+
+function Get-InstalledWorkerEventDiagnosticPrefix {
+    param(
+        [ValidateSet('PLAIN', 'INJECTED')]
+        [string]$Label
+    )
+
+    return "INSTALLED WORKER $Label EVENT DIAGNOSTIC:"
 }
 
 function Write-InstalledWorkerApplicationDiagnostics {
     param(
+        [ValidateSet('PLAIN', 'INJECTED')]
+        [string]$Label,
         [string]$Output,
         [int]$ExitCode,
         [datetime]$StartedUtc,
@@ -1096,6 +1159,7 @@ function Write-InstalledWorkerApplicationDiagnostics {
     if ($ExitCode -eq 0 -or -not (Test-ExecVfsReachedRunningAndCompleted -Output $Output)) {
         return
     }
+    $prefix = Get-InstalledWorkerEventDiagnosticPrefix -Label $Label
     $start = $StartedUtc.AddSeconds(-2).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
     $end = $EndedUtc.AddSeconds(2).ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture)
     $filterXPath = "*[System[TimeCreated[@SystemTime >= '$start' and @SystemTime <= '$end'] and ((Provider[@Name='Application Error'] and EventID=1000) or (Provider[@Name='Windows Error Reporting'] and EventID=1001) or (Provider[@Name='SideBySide'] and (EventID=33 or EventID=59)))]]"
@@ -1106,11 +1170,11 @@ function Write-InstalledWorkerApplicationDiagnostics {
                 -MaxEvents 8 -ErrorAction Stop)
         }
         catch [UnauthorizedAccessException] {
-            Write-Host 'INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: unavailable=access-denied'
+            Write-Host "$prefix unavailable=access-denied"
             return
         }
         catch {
-            Write-Host 'INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: unavailable=query-failed'
+            Write-Host "$prefix unavailable=query-failed"
             return
         }
         if ($events.Count -ne 0 -or $query -eq 2) { break }
@@ -1123,7 +1187,7 @@ function Write-InstalledWorkerApplicationDiagnostics {
                 -Id ([int]$event.Id) -RecordId ([long]$event.RecordId) `
                 -TimeCreated ([datetime]$event.TimeCreated) -Xml $event.ToXml()
             if ($null -ne $line) {
-                Write-Host "INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: $line"
+                Write-Host "$prefix $line"
                 $reported++
             }
         }
@@ -1132,7 +1196,7 @@ function Write-InstalledWorkerApplicationDiagnostics {
         }
     }
     if ($reported -eq 0) {
-        Write-Host 'INSTALLED WORKER INJECTED EVENT DIAGNOSTIC: no-allowlisted-event'
+        Write-Host "$prefix no-allowlisted-event"
     }
 }
 
@@ -1187,10 +1251,16 @@ function Invoke-InstalledWorkerVfsGate {
                 # COMPUTERNAME#PID, and a service restart invalidates the capability.
                 # The plain control and injected action deliberately share this one identity.
                 $workerId = Get-InstalledWorkerIdentity
+                $plainStartedUtc = [DateTime]::UtcNow
                 $plainOutput = & $Driver 'http://127.0.0.1:50061' '127.0.0.1:50072' `
                     $RepoRoot $traceDestination --no-vfs --worker-id $workerId -- $cmdExe /d /c `
                     'exit 0' 2>&1 | Out-String
                 $plainExitCode = $LASTEXITCODE
+                $plainEndedUtc = [DateTime]::UtcNow
+                if ($plainExitCode -ne 0) {
+                    Write-InstalledWorkerApplicationDiagnostics -Label PLAIN -Output $plainOutput `
+                        -ExitCode $plainExitCode -StartedUtc $plainStartedUtc -EndedUtc $plainEndedUtc
+                }
                 if (Test-ExecVfsIdentityChanged -ExitCode $plainExitCode -Output $plainOutput) {
                     if ($attempt -eq 1) {
                         Write-Host 'INSTALLED WORKER ACTION PAIR RETRY: service PID changed before plain control admission; refreshing identity once.'
@@ -1220,8 +1290,8 @@ function Invoke-InstalledWorkerVfsGate {
                     throw "installed worker VFS action identity changed twice: stdout/stderr=$output"
                 }
                 if ($exitCode -ne 0) {
-                    Write-InstalledWorkerApplicationDiagnostics -Output $output -ExitCode $exitCode `
-                        -StartedUtc $injectedStartedUtc -EndedUtc $injectedEndedUtc
+                    Write-InstalledWorkerApplicationDiagnostics -Label INJECTED -Output $output `
+                        -ExitCode $exitCode -StartedUtc $injectedStartedUtc -EndedUtc $injectedEndedUtc
                 }
                 break
             }
