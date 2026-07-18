@@ -3,9 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::OpenOptionsExt;
-#[cfg(test)]
-use std::os::windows::io::OwnedHandle;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -16,8 +14,9 @@ use windows_sys::Wdk::Storage::FileSystem::{
     NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, HANDLE, LocalFree, RtlNtStatusToDosError,
-    STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_EXISTS, UNICODE_STRING,
+    ERROR_NO_MORE_FILES, ERROR_NO_TOKEN, ERROR_NOT_ALL_ASSIGNED, ERROR_SHARING_VIOLATION, HANDLE,
+    LUID, LocalFree, RtlNtStatusToDosError, STATUS_INVALID_OWNER, STATUS_OBJECT_NAME_COLLISION,
+    STATUS_OBJECT_NAME_EXISTS, SetLastError, UNICODE_STRING,
 };
 #[cfg(test)]
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -30,12 +29,16 @@ use windows_sys::Win32::Security::Cryptography::{
     CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, EqualSid, GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorOwner,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
+    AdjustTokenPrivileges, DACL_SECURITY_INFORMATION, DuplicateTokenEx, EqualSid,
+    GROUP_SECURITY_INFORMATION, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetSecurityDescriptorGroup, GetSecurityDescriptorOwner, LUID_AND_ATTRIBUTES,
+    LookupPrivilegeValueW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, SecurityImpersonation,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    TokenImpersonation,
 };
 #[cfg(test)]
-use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
     FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
@@ -49,8 +52,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::Kernel::OBJ_CASE_INSENSITIVE;
-#[cfg(test)]
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
+};
 use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -201,6 +205,159 @@ impl Drop for SecurityDescriptor {
         // released exactly once using its documented allocator pair.
         unsafe {
             LocalFree(self.0.cast());
+        }
+    }
+}
+
+struct RestorePrivilegeGuard {
+    previous_thread_token: Option<OwnedHandle>,
+    _impersonation_token: OwnedHandle,
+    restored: bool,
+}
+
+impl RestorePrivilegeGuard {
+    fn enable_for_machine_store_create() -> Result<Self, MachineStoreError> {
+        let (source, had_thread_token) = Self::open_effective_token()?;
+        let mut impersonation_token = std::ptr::null_mut();
+        // SAFETY: source is a live token with TOKEN_DUPLICATE; the output pointer
+        // is valid and receives one owned impersonation-token handle.
+        let ok = unsafe {
+            DuplicateTokenEx(
+                source.as_raw_handle().cast(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY | TOKEN_IMPERSONATE,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut impersonation_token,
+            )
+        };
+        if ok == 0 {
+            return Err(io_error(
+                "duplicate effective token for machine-store create",
+            ));
+        }
+        // SAFETY: DuplicateTokenEx returned one owned handle.
+        let impersonation_token =
+            unsafe { OwnedHandle::from_raw_handle(impersonation_token.cast()) };
+        let mut luid = LUID {
+            LowPart: 0,
+            HighPart: 0,
+        };
+        // SAFETY: SE_RESTORE_NAME is static NUL-terminated data and luid is valid.
+        let ok = unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_RESTORE_NAME, &mut luid) };
+        if ok == 0 {
+            return Err(io_error(
+                "lookup SeRestorePrivilege for machine-store create",
+            ));
+        }
+        let requested = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        // SAFETY: impersonation_token is live and requested contains one valid LUID.
+        unsafe {
+            SetLastError(0);
+        }
+        let ok = unsafe {
+            AdjustTokenPrivileges(
+                impersonation_token.as_raw_handle().cast(),
+                0,
+                &requested,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let error = io::Error::last_os_error();
+        if ok == 0 || error.raw_os_error() == Some(ERROR_NOT_ALL_ASSIGNED as i32) {
+            return Err(map_io(
+                "enable SeRestorePrivilege for machine-store create",
+                error,
+            ));
+        }
+        // SAFETY: a null thread pointer selects the current thread, and the
+        // duplicate handle has TOKEN_IMPERSONATE access.
+        let ok =
+            unsafe { SetThreadToken(std::ptr::null(), impersonation_token.as_raw_handle().cast()) };
+        if ok == 0 {
+            return Err(io_error(
+                "install privileged thread token for machine-store create",
+            ));
+        }
+        Ok(Self {
+            previous_thread_token: had_thread_token.then_some(source),
+            _impersonation_token: impersonation_token,
+            restored: false,
+        })
+    }
+
+    fn open_effective_token() -> Result<(OwnedHandle, bool), MachineStoreError> {
+        let mut token = std::ptr::null_mut();
+        // SAFETY: GetCurrentThread returns the current pseudo-handle; output is valid.
+        let ok = unsafe {
+            OpenThreadToken(
+                GetCurrentThread(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE,
+                1,
+                &mut token,
+            )
+        };
+        if ok != 0 {
+            // SAFETY: OpenThreadToken returned one owned handle.
+            return Ok((unsafe { OwnedHandle::from_raw_handle(token.cast()) }, true));
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_NO_TOKEN as i32) {
+            return Err(map_io(
+                "open current thread token for machine-store create",
+                error,
+            ));
+        }
+        // SAFETY: output pointer is valid; successful process-token handle is
+        // transferred to OwnedHandle immediately.
+        let ok = unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY,
+                &mut token,
+            )
+        };
+        if ok == 0 {
+            return Err(io_error(
+                "open process token fallback for machine-store create",
+            ));
+        }
+        // SAFETY: OpenProcessToken returned one owned handle.
+        Ok((unsafe { OwnedHandle::from_raw_handle(token.cast()) }, false))
+    }
+
+    fn restore(&mut self) -> Result<(), MachineStoreError> {
+        if self.restored {
+            return Ok(());
+        }
+        let previous = self
+            .previous_thread_token
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |token| token.as_raw_handle().cast());
+        // SAFETY: a null thread pointer selects the current thread. `previous`
+        // is either the retained original thread token or null to remove impersonation.
+        if unsafe { SetThreadToken(std::ptr::null(), previous) } == 0 {
+            return Err(io_error("restore thread token after machine-store create"));
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for RestorePrivilegeGuard {
+    fn drop(&mut self) {
+        if !self.restored && self.restore().is_err() {
+            // Continuing with the privileged impersonation token would leak
+            // authority into unrelated work. Abort if the Drop retry cannot restore it.
+            std::process::abort();
         }
     }
 }
@@ -581,9 +738,9 @@ fn nt_relative_with_share(
     };
     // SAFETY: parent/name/attributes/output storage stay valid for this
     // synchronous call. A successful handle is transferred once to `File`.
-    let status = unsafe {
+    let create = |handle: &mut HANDLE, io_status: &mut std::mem::MaybeUninit<IO_STATUS_BLOCK>| unsafe {
         NtCreateFile(
-            &mut handle,
+            handle,
             desired_access,
             &attributes,
             io_status.as_mut_ptr(),
@@ -596,6 +753,39 @@ fn nt_relative_with_share(
             0,
         )
     };
+    let mut status = create(&mut handle, &mut io_status);
+    if descriptor.is_some() && disposition == FILE_CREATE && status == STATUS_INVALID_OWNER {
+        // STATUS_INVALID_OWNER creates no object. Retry only this exact failure
+        // under a short-lived privileged token on the current thread.
+        let mut retry_handle = std::ptr::null_mut();
+        let mut retry_io_status = std::mem::MaybeUninit::uninit();
+        let mut restore_privilege = RestorePrivilegeGuard::enable_for_machine_store_create()
+            .map_err(CreateFailure::Error)?;
+        status = create(&mut retry_handle, &mut retry_io_status);
+        if let Err(restore_error) = restore_privilege.restore() {
+            if status >= 0 {
+                // SAFETY: only successful NtCreateFile status guarantees that
+                // retry_handle contains one owned kernel handle.
+                let retry_file = unsafe { File::from_raw_handle(retry_handle.cast()) };
+                let cleanup = delete_held_handle(&retry_file);
+                drop(retry_file);
+                return Err(CreateFailure::Error(MachineStoreError::with_io(
+                    MachineStoreErrorClass::IntegrityViolation,
+                    "machine-store create succeeded but thread-token restoration failed",
+                    io::Error::other(match cleanup {
+                        Ok(()) => {
+                            format!("restore: {restore_error}; identity-bound cleanup: completed")
+                        }
+                        Err(cleanup_error) => format!(
+                            "restore: {restore_error}; identity-bound cleanup: {cleanup_error}"
+                        ),
+                    }),
+                )));
+            }
+            return Err(CreateFailure::Error(restore_error));
+        }
+        handle = retry_handle;
+    }
     if status == STATUS_OBJECT_NAME_COLLISION {
         return Err(CreateFailure::Collision);
     }
