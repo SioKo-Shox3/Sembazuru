@@ -74,6 +74,7 @@ impl Drop for TempDir {
 struct HoldingExecution {
     requests: mpsc::Sender<ExecuteRequest>,
     release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    resolved_tool_digest: String,
 }
 
 fn state_event(state: ActionState) -> ExecuteEvent {
@@ -104,6 +105,7 @@ impl Execution for HoldingExecution {
             .take()
             .ok_or_else(|| Status::resource_exhausted("release already consumed"))?;
         let (tx, rx) = mpsc::channel(8);
+        let resolved_tool_digest = self.resolved_tool_digest.clone();
         tokio::spawn(async move {
             for state in [ActionState::Queued, ActionState::Running] {
                 if tx.send(Ok(state_event(state))).await.is_err() {
@@ -125,7 +127,7 @@ impl Execution for HoldingExecution {
                         wall_time_us: 0,
                         user_time_us: 0,
                         kernel_time_us: 0,
-                        resolved_tool_digest: String::new(),
+                        resolved_tool_digest,
                     })),
                 }))
                 .await;
@@ -145,11 +147,20 @@ async fn start_worker(
     requests: mpsc::Sender<ExecuteRequest>,
     release: oneshot::Receiver<()>,
 ) -> (String, tokio::task::JoinHandle<()>) {
+    start_worker_with_tool_digest(requests, release, String::new()).await
+}
+
+async fn start_worker_with_tool_digest(
+    requests: mpsc::Sender<ExecuteRequest>,
+    release: oneshot::Receiver<()>,
+    resolved_tool_digest: String,
+) -> (String, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let service = HoldingExecution {
         requests,
         release: Arc::new(Mutex::new(Some(release))),
+        resolved_tool_digest,
     };
     let task = tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -176,6 +187,43 @@ fn command(root: &Path) -> Command {
         env: Default::default(),
         cwd: root.to_string_lossy().into_owned(),
     }
+}
+
+fn push_trace_string(bytes: &mut Vec<u8>, value: &str) {
+    let units: Vec<u16> = value.encode_utf16().collect();
+    bytes.extend_from_slice(&(units.len() as u32).to_le_bytes());
+    for unit in units {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+}
+
+fn write_trace_file_record(bytes: &mut Vec<u8>, op: u8, path: &str) {
+    bytes.push(1); // FILE record
+    bytes.push(op);
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    push_trace_string(bytes, path);
+    push_trace_string(bytes, "");
+}
+
+fn write_cacheable_trace(trace_dir: &str, root: &Path, tool: &Path, input: &Path, output: &Path) {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"SBZT");
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&100u32.to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    bytes.extend_from_slice(&0u64.to_le_bytes());
+    push_trace_string(&mut bytes, &tool.to_string_lossy());
+    push_trace_string(&mut bytes, "clang-cl /c src\\in.h /Foobj\\out.obj");
+    push_trace_string(&mut bytes, &root.to_string_lossy());
+    write_trace_file_record(&mut bytes, 1, &input.to_string_lossy());
+    write_trace_file_record(&mut bytes, 2, &output.to_string_lossy());
+    std::fs::write(Path::new(trace_dir).join("p100.sbzt"), bytes).unwrap();
 }
 
 #[test]
@@ -361,6 +409,7 @@ fn non_deterministic_submission_bypasses_cache_and_prefetch() {
         let cache_dir = TempDir::new("non-deterministic-cache");
         let scratch = TempDir::new("non-deterministic-scratch");
         let input = root.write("src/in.h", b"stable-input");
+        let input_normalized = normalize_requested(&input.to_string_lossy()).unwrap();
 
         let cache = Arc::new(AgentCache::open(&cache_dir.path).unwrap());
         let command = command(&root.path);
@@ -383,6 +432,15 @@ fn non_deterministic_submission_bypasses_cache_and_prefetch() {
                 Ok(sembazuru_agent::action_cache::CacheLookup::Hit { .. })
             ),
             "test precondition: the matching cache entry resolves"
+        );
+        let cached_predictions = cache.predicted_paths(&weak, None).unwrap();
+        assert!(
+            !cached_predictions.is_empty(),
+            "test precondition: the matching cache entry predicts content inputs"
+        );
+        assert!(
+            cached_predictions.contains(&input_normalized),
+            "test precondition: cached predictions include the traced input"
         );
 
         let (request_tx, mut request_rx) = mpsc::channel(1);
@@ -461,6 +519,141 @@ fn non_deterministic_submission_bypasses_cache_and_prefetch() {
                 Ok(sembazuru_agent::action_cache::CacheLookup::Hit { .. })
             ),
             "the pre-existing cache entry remains usable"
+        );
+
+        for task in [intake_task, worker_task, fileserver_task] {
+            task.abort();
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("server task stops within timeout");
+            assert!(
+                result.unwrap_err().is_cancelled(),
+                "server task was not cancelled"
+            );
+        }
+
+        [root, cache_dir, scratch]
+    });
+    runtime.shutdown_timeout(Duration::from_secs(5));
+
+    for dir in dirs {
+        dir.cleanup();
+    }
+}
+
+#[test]
+fn non_deterministic_submission_does_not_record_a_cacheable_remote_run() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dirs = runtime.block_on(async {
+        let root = TempDir::new("non-deterministic-record-root");
+        let cache_dir = TempDir::new("non-deterministic-record-cache");
+        let scratch = TempDir::new("non-deterministic-record-scratch");
+        let tool = root.write("clang-cl.exe", b"content-identified-test-tool");
+        let input = root.write("src/in.h", b"stable-input");
+        let output = root.write("obj/out.obj", b"deterministic-output");
+        let command = command(&root.path);
+        let command_cwd = command.cwd.clone();
+        let cache = Arc::new(AgentCache::open(&cache_dir.path).unwrap());
+        let (weak, identity) = cache.weak_key_and_tool(&command.argv, &[], &command.cwd);
+        assert!(
+            identity.is_content(),
+            "test precondition: the verified tool has a content identity"
+        );
+
+        let (request_tx, mut request_rx) = mpsc::channel(1);
+        let (release_tx, release_rx) = oneshot::channel();
+        let (worker_endpoint, worker_task) =
+            start_worker_with_tool_digest(request_tx, release_rx, identity.digest().to_string())
+                .await;
+        let table = WorkerTable::new(Duration::from_secs(60));
+        table.upsert_register(
+            "non-deterministic-record-worker".into(),
+            worker_endpoint,
+            Capabilities {
+                cpu_count: 1,
+                worker_version: env!("CARGO_PKG_VERSION").into(),
+                ..Default::default()
+            },
+        );
+
+        let registry = Arc::new(SessionRegistry::new().unwrap());
+        let fileserver_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fileserver_addr = fileserver_listener.local_addr().unwrap();
+        let fileserver_registry = Arc::clone(&registry);
+        let fileserver_task = tokio::spawn(async move {
+            serve_files_with_stats_token(
+                fileserver_listener,
+                Arc::new(ServerStats::default()),
+                None,
+                fileserver_registry,
+                false,
+            )
+            .await
+            .unwrap();
+        });
+
+        let intake = IntakeService::with_vfs(
+            Scheduler::new(table),
+            IntakeVfsContext {
+                agent_fileserver: fileserver_addr.to_string(),
+                cache: Some(Arc::clone(&cache)),
+                scratch_root: scratch.path.clone(),
+                registry,
+            },
+        );
+        let intake_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let intake_addr = intake_listener.local_addr().unwrap();
+        let intake_task = tokio::spawn(async move {
+            serve_intake_service(intake_listener, intake).await.unwrap();
+        });
+
+        let submit = tokio::spawn(submit_to_loopback_fixture(
+            format!("http://{intake_addr}"),
+            command,
+            SubmitOptions {
+                declared_outputs: vec!["obj\\out.obj".into()],
+                input_root: root.path.to_string_lossy().into_owned(),
+                non_deterministic: true,
+                ..Default::default()
+            },
+        ));
+        let request = tokio::time::timeout(Duration::from_secs(2), request_rx.recv())
+            .await
+            .expect("non-deterministic cacheable action reaches the worker")
+            .expect("request channel remains open");
+        let trace_dir = &request.vfs.as_ref().expect("VFS request").trace_dir;
+        assert!(
+            !trace_dir.is_empty(),
+            "test precondition: a cache-configured submission receives a trace directory"
+        );
+        write_cacheable_trace(trace_dir, &root.path, &tool, &input, &output);
+        let manifest = cache
+            .manifest_from_trace_dir_verified_tool(trace_dir, Some(&command_cwd), &identity)
+            .expect("test precondition: trace is valid for the verified tool");
+        assert!(
+            manifest.cacheable,
+            "test precondition: trace inputs and side effects permit cache record"
+        );
+        assert!(
+            matches!(
+                cache.resolve(&weak, &root.path),
+                Ok(sembazuru_agent::action_cache::CacheLookup::Miss)
+            ),
+            "test precondition: the fresh weak key has no cached result"
+        );
+
+        release_tx.send(()).unwrap();
+        let (exit_code, _) = submit.await.unwrap().unwrap();
+        assert_eq!(exit_code, 0);
+        assert!(
+            matches!(
+                cache.resolve(&weak, &root.path),
+                Ok(sembazuru_agent::action_cache::CacheLookup::Miss)
+            ),
+            "non-deterministic actions must not record an otherwise cacheable remote run"
         );
 
         for task in [intake_task, worker_task, fileserver_task] {
