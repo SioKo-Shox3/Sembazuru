@@ -1296,16 +1296,20 @@ mod tests {
                 return Err("escalation mask/order");
             }
         }
-        if values.iter().any(|(_, succeeded, _)| *succeeded) {
+        let (maximum, specific) = values.split_last().expect("matrix is non-empty");
+        if specific.iter().any(|(_, succeeded, _)| *succeeded) {
             return Ok(EscalationAssessment::Unsafe);
         }
-        if values
+        if specific
             .iter()
-            .all(|(_, _, error)| *error == ERROR_ACCESS_DENIED)
+            .any(|(_, _, error)| *error != ERROR_ACCESS_DENIED)
         {
-            Ok(EscalationAssessment::Denied)
-        } else {
+            return Ok(EscalationAssessment::Indeterminate);
+        }
+        if maximum.1 || maximum.2 != ERROR_ACCESS_DENIED {
             Ok(EscalationAssessment::Indeterminate)
+        } else {
+            Ok(EscalationAssessment::Denied)
         }
     }
 
@@ -1324,6 +1328,12 @@ mod tests {
         assert_eq!(
             assess_escalation_matrix(&unsafe_value).unwrap(),
             EscalationAssessment::Unsafe
+        );
+        let mut maximum_only = valid.clone();
+        *maximum_only.last_mut().unwrap() = (MAXIMUM_ALLOWED, true, 0);
+        assert_eq!(
+            assess_escalation_matrix(&maximum_only).unwrap(),
+            EscalationAssessment::Indeterminate
         );
         let mut indeterminate = valid.clone();
         indeterminate[0].2 = 0;
