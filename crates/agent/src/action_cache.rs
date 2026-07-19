@@ -1850,10 +1850,11 @@ mod tests {
         std::fs::write(&input, b"#include \"gen.h\"\nint main(){return 0;}").unwrap();
         std::fs::write(build.join("a.obj"), b"OBJ-compiled-without-gen").unwrap();
 
-        // gen.h is absent at record time. It lives outside the build tree, so it
-        // is a genuine Absent dependency (not a dropped under-root transient).
-        let inc = tmp("appear-inc");
-        let gen_h = inc.join("gen.h");
+        // gen.h is absent at record time, but its parent exists inside the build
+        // root. This exercises a generated header that an earlier build did not
+        // produce, rather than an absent dependency outside the build tree.
+        let gen_h = build.join("generated").join("gen.h");
+        std::fs::create_dir_all(gen_h.parent().unwrap()).unwrap();
         let _ = std::fs::remove_file(&gen_h);
 
         let argv = vec!["clang-cl".to_string(), "/c".into(), "a.cpp".into()];
