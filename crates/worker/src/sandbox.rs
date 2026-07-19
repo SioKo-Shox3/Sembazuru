@@ -1080,10 +1080,10 @@ mod tests {
         FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
-    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::JobObjects::{IsProcessInJob, JOB_OBJECT_UILIMIT_HANDLES};
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseWindowStation, CreateWindowStationW, GetProcessWindowStation,
-        GetUserObjectInformationW, SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+        GetUserObjectInformationW, OpenWindowStationW, SetProcessWindowStation, UOI_NAME, UOI_TYPE,
     };
     use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
     use windows_sys::Win32::System::Threading::{
@@ -1211,6 +1211,185 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct UiHandleSourceRecord {
+        handle_info_succeeded: bool,
+        handle_info_error: u32,
+        inheritable: bool,
+        identity_succeeded: bool,
+        identity_error: u32,
+        object_type: String,
+        object_name: String,
+        same_access_succeeded: bool,
+        same_access_error: u32,
+        escalation: Vec<(u32, bool, u32)>,
+    }
+
+    impl UiHandleSourceRecord {
+        fn empty() -> Self {
+            Self {
+                handle_info_succeeded: false,
+                handle_info_error: 0,
+                inheritable: false,
+                identity_succeeded: false,
+                identity_error: 0,
+                object_type: String::new(),
+                object_name: String::new(),
+                same_access_succeeded: false,
+                same_access_error: 0,
+                escalation: Vec::new(),
+            }
+        }
+
+        fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
+            payload.bool(self.handle_info_succeeded);
+            payload.u32(self.handle_info_error);
+            payload.bool(self.inheritable);
+            payload.bool(self.identity_succeeded);
+            payload.u32(self.identity_error);
+            write_text(payload, &self.object_type)?;
+            write_text(payload, &self.object_name)?;
+            payload.bool(self.same_access_succeeded);
+            payload.u32(self.same_access_error);
+            validate_escalation_matrix_shape(&self.escalation).map_err(str::to_owned)?;
+            payload.u32(self.escalation.len() as u32);
+            for &(mask, succeeded, error) in &self.escalation {
+                payload.u32(mask);
+                payload.bool(succeeded);
+                payload.u32(error);
+            }
+            Ok(())
+        }
+
+        fn decode_from(payload: &mut Reader<'_>) -> Result<Self, String> {
+            let handle_info_succeeded = read_strict_bool(payload)?;
+            let handle_info_error = payload.u32().map_err(|_| "UI handle info error")?;
+            let inheritable = read_strict_bool(payload)?;
+            let identity_succeeded = read_strict_bool(payload)?;
+            let identity_error = payload.u32().map_err(|_| "UI identity error")?;
+            let object_type = read_text(payload)?;
+            let object_name = read_text(payload)?;
+            let same_access_succeeded = read_strict_bool(payload)?;
+            let same_access_error = payload.u32().map_err(|_| "UI same-access error")?;
+            let count = payload.u32().map_err(|_| "UI escalation count")? as usize;
+            if count > HandleDeliveryRecord::MAX_ESCALATION {
+                return Err("UI escalation count".into());
+            }
+            let mut escalation = Vec::with_capacity(count);
+            for _ in 0..count {
+                escalation.push((
+                    payload.u32().map_err(|_| "UI escalation mask")?,
+                    read_strict_bool(payload)?,
+                    payload.u32().map_err(|_| "UI escalation error")?,
+                ));
+            }
+            validate_escalation_matrix_shape(&escalation).map_err(str::to_owned)?;
+            Ok(Self {
+                handle_info_succeeded,
+                handle_info_error,
+                inheritable,
+                identity_succeeded,
+                identity_error,
+                object_type,
+                object_name,
+                same_access_succeeded,
+                same_access_error,
+                escalation,
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum UiNameOpenRecord {
+        NotOpened { raw_error: u32 },
+        Opened(UiHandleSourceRecord),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct UiHandleLimitRecord {
+        nonce: String,
+        raw_lease: UiHandleSourceRecord,
+        ambient_current: UiHandleSourceRecord,
+        name_open: UiNameOpenRecord,
+    }
+
+    impl UiHandleLimitRecord {
+        const MAGIC: u32 = 0x5548_4c52;
+        const VERSION: u32 = 1;
+        const MAX_BYTES: usize = 8192;
+
+        fn encode(&self) -> Result<Vec<u8>, String> {
+            validate_nonce(&self.nonce)?;
+            let mut payload = Writer::new();
+            self.raw_lease.encode_into(&mut payload)?;
+            self.ambient_current.encode_into(&mut payload)?;
+            match &self.name_open {
+                UiNameOpenRecord::NotOpened { raw_error } => {
+                    payload.bool(false);
+                    payload.u32(*raw_error);
+                }
+                UiNameOpenRecord::Opened(source) => {
+                    payload.bool(true);
+                    source.encode_into(&mut payload)?;
+                }
+            }
+            let payload = payload.into_bytes();
+            if payload.len() > Self::MAX_BYTES {
+                return Err("UI handle-limit record too large".into());
+            }
+            let mut bytes = Vec::with_capacity(40 + payload.len());
+            bytes.extend_from_slice(&Self::MAGIC.to_le_bytes());
+            bytes.extend_from_slice(&Self::VERSION.to_le_bytes());
+            bytes.extend_from_slice(self.nonce.as_bytes());
+            bytes.extend_from_slice(&payload);
+            Ok(bytes)
+        }
+
+        fn decode(bytes: &[u8], expected_nonce: &str) -> Result<Self, String> {
+            validate_nonce(expected_nonce)?;
+            if !(40..=40 + Self::MAX_BYTES).contains(&bytes.len())
+                || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != Self::MAGIC
+                || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != Self::VERSION
+            {
+                return Err("UI handle-limit record header/length".into());
+            }
+            let nonce = std::str::from_utf8(&bytes[8..40]).map_err(|_| "UI nonce utf8")?;
+            if nonce != expected_nonce {
+                return Err("UI nonce mismatch".into());
+            }
+            let mut payload = Reader::new(&bytes[40..]);
+            let raw_lease = UiHandleSourceRecord::decode_from(&mut payload)?;
+            let ambient_current = UiHandleSourceRecord::decode_from(&mut payload)?;
+            let name_open = if read_strict_bool(&mut payload)? {
+                UiNameOpenRecord::Opened(UiHandleSourceRecord::decode_from(&mut payload)?)
+            } else {
+                UiNameOpenRecord::NotOpened {
+                    raw_error: payload.u32().map_err(|_| "UI name-open error")?,
+                }
+            };
+            payload.finish().map_err(|_| "UI record trailing")?;
+            Ok(Self {
+                nonce: nonce.into(),
+                raw_lease,
+                ambient_current,
+                name_open,
+            })
+        }
+
+        fn publish(&self, directory: &Path) -> io::Result<()> {
+            let record = directory.join(format!("{}.ui.rec", self.nonce));
+            let temporary = directory.join(format!("{}.ui.tmp", self.nonce));
+            let bytes = self.encode().map_err(io::Error::other)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(temporary, record)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn accept_handle_delivery(
         record: &HandleDeliveryRecord,
@@ -1312,9 +1491,7 @@ mod tests {
         }
     }
 
-    fn assess_escalation_matrix(
-        values: &[(u32, bool, u32)],
-    ) -> Result<EscalationAssessment, &'static str> {
+    fn validate_escalation_matrix_shape(values: &[(u32, bool, u32)]) -> Result<(), &'static str> {
         if values.len() != ESCALATION_MASKS.len() {
             return Err("escalation cardinality");
         }
@@ -1323,6 +1500,13 @@ mod tests {
                 return Err("escalation mask/order");
             }
         }
+        Ok(())
+    }
+
+    fn assess_escalation_matrix(
+        values: &[(u32, bool, u32)],
+    ) -> Result<EscalationAssessment, &'static str> {
+        validate_escalation_matrix_shape(values)?;
         let (maximum, specific) = values.split_last().expect("matrix is non-empty");
         if specific.iter().any(|(_, succeeded, _)| *succeeded) {
             return Ok(EscalationAssessment::Unsafe);
@@ -1581,6 +1765,7 @@ mod tests {
         stdout: Option<JoinHandle<io::Result<()>>>,
         stderr: Option<JoinHandle<io::Result<String>>>,
         child_restricted: bool,
+        ui_restrictions: u32,
         reaped: bool,
     }
 
@@ -1628,9 +1813,19 @@ mod tests {
         command: &RestrictedCommand,
         station: HANDLE,
         wire_station: bool,
+        with_ui_handle_limit: bool,
     ) -> io::Result<RawDeliveryProcess> {
         let mut prepared = prepare_command(command)?;
-        let job = Arc::new(JobObject::new_kill_on_close()?);
+        let job = Arc::new(if with_ui_handle_limit {
+            JobObject::new_kill_on_close_with_ui_handle_limit_for_test()?
+        } else {
+            JobObject::new_kill_on_close()?
+        });
+        let ui_restrictions = job.ui_restrictions_for_test()?;
+        // SAFETY: the current-process pseudo-handle is valid for this membership query.
+        if job.contains(unsafe { GetCurrentProcess() } as RawHandle)? {
+            return Err(io::Error::other("parent unexpectedly belongs to probe job"));
+        }
         let (stdin, stdin_parent) = stdio_pipe(true)?;
         let (stdout, stdout_parent) = stdio_pipe(false)?;
         let (stderr, stderr_parent) = stdio_pipe(false)?;
@@ -1723,11 +1918,14 @@ mod tests {
             stdout: Some(stdout),
             stderr: Some(stderr),
             child_restricted,
+            ui_restrictions,
             reaped: false,
         })
     }
 
-    fn wait_for_delivery_child(mut child: RawDeliveryProcess) -> io::Result<(bool, String, bool)> {
+    fn wait_for_delivery_child(
+        mut child: RawDeliveryProcess,
+    ) -> io::Result<(bool, String, bool, u32)> {
         let wait = unsafe { WaitForSingleObject(child.process.as_raw_handle() as HANDLE, 30_000) };
         if wait != WAIT_OBJECT_0 {
             // SAFETY: the bounded wait expired or failed; terminate then bounded-reap this test child.
@@ -1765,7 +1963,12 @@ mod tests {
             .expect("stderr drain is owned")
             .join()
             .map_err(|_| io::Error::other("stderr drain panicked"))??;
-        Ok((code == 0, text, child.child_restricted))
+        Ok((
+            code == 0,
+            text,
+            child.child_restricted,
+            child.ui_restrictions,
+        ))
     }
 
     fn handle_delivery_evidence(wire_station: bool) -> Result<HandleDeliveryEvidence, String> {
@@ -1859,9 +2062,10 @@ mod tests {
             &command,
             low.as_raw_handle() as HANDLE,
             wire_station,
+            false,
         )
         .map_err(|error| format!("delivery not confirmed: {error}"))?;
-        let (status_success, stderr, child_restricted) =
+        let (status_success, stderr, child_restricted, _) =
             wait_for_delivery_child(child).map_err(|error| format!("wait child: {error}"))?;
         let entry = scratch.path().join(format!("{nonce}.entry"));
         let record_path = scratch.path().join(format!("{nonce}.rec"));
@@ -1949,6 +2153,452 @@ mod tests {
             EscalationAssessment::Unsafe,
             "all-denied/indeterminate result requires a fresh lease-design review"
         );
+    }
+
+    #[test]
+    fn ui_handle_limit_cannot_replace_private_station() {
+        let ordinary = ui_handle_limit_evidence(false).expect("ordinary UI evidence");
+        assert_eq!(
+            ordinary.ui_restrictions & JOB_OBJECT_UILIMIT_HANDLES,
+            0,
+            "ordinary test job unexpectedly has UILIMIT_HANDLES"
+        );
+        assert_eq!(
+            ordinary.raw_lease,
+            UiHandleAssessment::Unsafe,
+            "ordinary raw lease must prove the probe remains live"
+        );
+        assert_eq!(
+            ordinary.ambient,
+            UiHandleAssessment::Unsafe,
+            "ordinary ambient station must prove the probe remains live"
+        );
+        let evidence = ui_handle_limit_evidence(true).expect("UI handle-limit evidence");
+        assert_ne!(
+            evidence.ui_restrictions & JOB_OBJECT_UILIMIT_HANDLES,
+            0,
+            "handle-limited test job lacks UILIMIT_HANDLES"
+        );
+        assert!(
+            !matches!(evidence.ambient, UiHandleAssessment::Indeterminate)
+                && !matches!(evidence.name_open, UiHandleAssessment::Indeterminate),
+            "UILIMIT_HANDLES result is indeterminate: ambient={:?} name={:?}",
+            evidence.ambient,
+            evidence.name_open
+        );
+        assert!(
+            matches!(evidence.ambient, UiHandleAssessment::Unsafe)
+                || matches!(evidence.name_open, UiHandleAssessment::Unsafe),
+            "UILIMIT_HANDLES unexpectedly confined both ambient and name-open handles"
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct UiHandleLimitEvidence {
+        raw_lease: UiHandleAssessment,
+        ambient: UiHandleAssessment,
+        name_open: UiHandleAssessment,
+        ui_restrictions: u32,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum UiHandleAssessment {
+        Denied,
+        IdentityOnlyOrConfined,
+        Unsafe,
+        Indeterminate,
+    }
+
+    fn raw_error(error: io::Error) -> u32 {
+        error.raw_os_error().unwrap_or(0) as u32
+    }
+
+    fn probe_window_station_source(handle: HANDLE) -> UiHandleSourceRecord {
+        let mut source = UiHandleSourceRecord::empty();
+        let mut flags = 0;
+        // SAFETY: `flags` is writable; failure is captured as a typed result below.
+        if unsafe { GetHandleInformation(handle, &mut flags) } != 0 {
+            source.handle_info_succeeded = true;
+            source.inheritable = flags & HANDLE_FLAG_INHERIT != 0;
+        } else {
+            source.handle_info_error = raw_error(io::Error::last_os_error());
+        }
+        match user_object_identity(handle) {
+            Ok((object_type, object_name)) => {
+                source.identity_succeeded = true;
+                source.object_type = object_type;
+                source.object_name = object_name;
+            }
+            Err(error) => source.identity_error = raw_error(error),
+        }
+        let mut same_access = null_mut();
+        // SAFETY: source handle belongs to this process or is a documented pseudo-handle;
+        // the duplicate out pointer is writable and success is immediately owned below.
+        source.same_access_succeeded = unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle,
+                GetCurrentProcess(),
+                &mut same_access,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            ) != 0
+        };
+        if source.same_access_succeeded {
+            // SAFETY: successful DuplicateHandle returns a normal kernel-handle ownership.
+            drop(unsafe { OwnedHandle::from_raw_handle(same_access as RawHandle) });
+        } else {
+            source.same_access_error = raw_error(io::Error::last_os_error());
+        }
+        for &mask in ESCALATION_MASKS {
+            let mut duplicate = null_mut();
+            // SAFETY: `duplicate` is a writable out pointer; every successful duplicate is
+            // immediately closed using ordinary kernel-handle ownership.
+            unsafe { SetLastError(0) };
+            let succeeded = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    handle,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    mask,
+                    0,
+                    0,
+                ) != 0
+            };
+            let error = if succeeded {
+                0
+            } else {
+                unsafe { GetLastError() }
+            };
+            if succeeded {
+                // SAFETY: successful DuplicateHandle returns a normal kernel-handle ownership.
+                drop(unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) });
+            }
+            source.escalation.push((mask, succeeded, error));
+        }
+        source
+    }
+
+    fn assess_ui_handle_source(
+        source: &UiHandleSourceRecord,
+        expected_handle_list_identity: Option<&(String, String)>,
+    ) -> Result<UiHandleAssessment, &'static str> {
+        if let Some(expected) = expected_handle_list_identity
+            && (!source.handle_info_succeeded
+                || !source.inheritable
+                || !source.identity_succeeded
+                || source.object_type != expected.0
+                || source.object_name != expected.1)
+        {
+            return Ok(UiHandleAssessment::Indeterminate);
+        }
+        match assess_escalation_matrix(&source.escalation)? {
+            EscalationAssessment::Unsafe => Ok(UiHandleAssessment::Unsafe),
+            EscalationAssessment::Indeterminate => Ok(UiHandleAssessment::Indeterminate),
+            EscalationAssessment::Denied if source.identity_succeeded => {
+                Ok(UiHandleAssessment::IdentityOnlyOrConfined)
+            }
+            EscalationAssessment::Denied => Ok(UiHandleAssessment::Indeterminate),
+        }
+    }
+
+    fn assess_ui_name_open(record: &UiNameOpenRecord) -> Result<UiHandleAssessment, &'static str> {
+        match record {
+            UiNameOpenRecord::NotOpened {
+                raw_error: 5 | 6 | 1400,
+            } => Ok(UiHandleAssessment::Denied),
+            UiNameOpenRecord::NotOpened { .. } => Ok(UiHandleAssessment::Indeterminate),
+            UiNameOpenRecord::Opened(source) => assess_ui_handle_source(source, None),
+        }
+    }
+
+    fn ui_handle_limit_evidence(with_handle_limit: bool) -> Result<UiHandleLimitEvidence, String> {
+        let token = ActionToken::create().map_err(|error| format!("token setup: {error}"))?;
+        struct RootCleanup(PathBuf);
+        impl Drop for RootCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root_path = std::env::temp_dir().join(format!(
+            "sembazuru-ui-handle-limit-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let broker =
+            sid_string(token.broker_sid()).map_err(|error| format!("broker SID: {error}"))?;
+        let action =
+            sid_string(token.action_sid.0).map_err(|error| format!("action SID: {error}"))?;
+        create_secured_directory(
+            &root_path,
+            &format!("O:{broker}D:P(A;OICI;FA;;;{broker})(A;OICI;GRGX;;;{action})"),
+        )
+        .map_err(|error| format!("root setup: {error}"))?;
+        let root = RootCleanup(root_path);
+        let scratch = PrivateScratch::create(&root.0, "ui-handle-limit", &token)
+            .map_err(|error| format!("scratch setup: {error}"))?;
+        let executable = scratch.path().join("ui-handle-limit-probe.exe");
+        std::fs::copy(
+            std::env::current_exe().map_err(|error| format!("probe executable: {error}"))?,
+            &executable,
+        )
+        .map_err(|error| format!("probe copy: {error}"))?;
+        let nonce = secure_random_hex().map_err(|error| format!("nonce: {error}"))?;
+        let current = unsafe { GetProcessWindowStation() };
+        if current.is_null() {
+            return Err("parent current station missing".into());
+        }
+        let parent = user_object_identity(current)
+            .map_err(|error| format!("parent current identity: {error}"))?;
+        let mut low = null_mut();
+        // SAFETY: current is live; success returns an independently-owned, inheritable lease.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                current,
+                GetCurrentProcess(),
+                &mut low,
+                WINSTA_READATTRIBUTES as u32,
+                1,
+                0,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "parent low-right lease: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let low = unsafe { OwnedHandle::from_raw_handle(low as RawHandle) };
+        if user_object_identity(low.as_raw_handle() as HANDLE)
+            .map_err(|error| format!("parent low identity: {error}"))?
+            != parent
+            || !inheritable(low.as_raw_handle() as HANDLE)
+                .map_err(|error| format!("parent low inheritance: {error}"))?
+        {
+            return Err("parent low-right lease validation failed".into());
+        }
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").ok_or("preflight SystemRoot missing")?);
+        let command = RestrictedCommand::new(&executable, scratch.path())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("sandbox::tests::ui_handle_limit_child")
+            .arg("--quiet")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--")
+            .arg(scratch.path())
+            .arg(&nonce)
+            .env("Path", system_root.join("System32"))
+            .env(
+                "SystemDrive",
+                std::env::var_os("SystemDrive").ok_or("preflight SystemDrive missing")?,
+            )
+            .env("SystemRoot", system_root)
+            .env("SBZ_HANDLE_RAW", (low.as_raw_handle() as usize).to_string())
+            .env("SBZ_PARENT_STATION", &parent.1);
+        let child = spawn_handle_delivery_child(
+            &token,
+            &command,
+            low.as_raw_handle() as HANDLE,
+            true,
+            with_handle_limit,
+        )
+        .map_err(|error| format!("spawn/assign/restricted evidence: {error}"))?;
+        let (status_success, stderr, child_restricted, ui_restrictions) =
+            wait_for_delivery_child(child).map_err(|error| format!("child reap: {error}"))?;
+        if !status_success {
+            return Err(format!("child nonzero; stderr={stderr:?}"));
+        }
+        if !child_restricted {
+            return Err("child token was not restricted".into());
+        }
+        let entry = scratch.path().join(format!("{nonce}.entry"));
+        let record_path = scratch.path().join(format!("{nonce}.ui.rec"));
+        if !entry.is_file() || !record_path.is_file() {
+            return Err(format!(
+                "child bounded evidence missing: entry={} record={}",
+                entry.is_file(),
+                record_path.is_file()
+            ));
+        }
+        let record = UiHandleLimitRecord::decode(
+            &std::fs::read(&record_path).map_err(|error| format!("record read: {error}"))?,
+            &nonce,
+        )
+        .map_err(|error| format!("record decode: {error}"))?;
+        let raw_lease = assess_ui_handle_source(&record.raw_lease, Some(&parent))
+            .map_err(|error| format!("raw lease classifier: {error}"))?;
+        let ambient = assess_ui_handle_source(&record.ambient_current, None)
+            .map_err(|error| format!("ambient classifier: {error}"))?;
+        let name_open = assess_ui_name_open(&record.name_open)
+            .map_err(|error| format!("name-open classifier: {error}"))?;
+        eprintln!(
+            "ui-handle-limit={} flags={ui_restrictions:#x} raw={raw_lease:?} ambient={ambient:?} name={name_open:?}; raw-matrix={:x?}; ambient-matrix={:x?}; name={:?}",
+            with_handle_limit,
+            record.raw_lease.escalation,
+            record.ambient_current.escalation,
+            record.name_open,
+        );
+        Ok(UiHandleLimitEvidence {
+            raw_lease,
+            ambient,
+            name_open,
+            ui_restrictions,
+        })
+    }
+
+    #[test]
+    #[ignore]
+    fn ui_handle_limit_child() {
+        let args: Vec<_> = std::env::args_os().collect();
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("record separator");
+        let values = &args[separator + 1..];
+        assert_eq!(values.len(), 2, "record argv");
+        let directory = PathBuf::from(&values[0]);
+        let nonce = values[1].to_str().expect("nonce utf8").to_owned();
+        validate_nonce(&nonce).expect("nonce format");
+        let entry = directory.join(format!("{nonce}.entry"));
+        let mut entry_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&entry)
+            .expect("entry create_new");
+        entry_file.write_all(b"entry").expect("entry write");
+        entry_file.sync_all().expect("entry sync");
+        drop(entry_file);
+        let raw = std::env::var("SBZ_HANDLE_RAW")
+            .expect("raw handle env")
+            .parse::<usize>()
+            .expect("raw handle integer") as HANDLE;
+        let ambient = unsafe { GetProcessWindowStation() };
+        let station_name = std::env::var("SBZ_PARENT_STATION").expect("parent station name");
+        let station_name: Vec<u16> = OsStr::new(&station_name)
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: the UTF-16 station name is NUL-terminated and remains live for the call.
+        let opened =
+            unsafe { OpenWindowStationW(station_name.as_ptr(), 0, WINSTA_READATTRIBUTES as u32) };
+        let name_open = if opened.is_null() {
+            UiNameOpenRecord::NotOpened {
+                raw_error: raw_error(io::Error::last_os_error()),
+            }
+        } else {
+            let source = probe_window_station_source(opened);
+            // SAFETY: OpenWindowStationW grants this distinct USER-object ownership.
+            if unsafe { CloseWindowStation(opened) } == 0 {
+                panic!(
+                    "OpenWindowStationW handle close failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            UiNameOpenRecord::Opened(source)
+        };
+        UiHandleLimitRecord {
+            nonce,
+            raw_lease: probe_window_station_source(raw),
+            ambient_current: probe_window_station_source(ambient),
+            name_open,
+        }
+        .publish(&directory)
+        .expect("publish UI handle-limit record");
+    }
+
+    #[test]
+    fn ui_handle_limit_raw_classifier_requires_parent_identity() {
+        let parent: (String, String) = ("WindowStation".into(), "WinSta0".into());
+        let valid = UiHandleSourceRecord {
+            handle_info_succeeded: true,
+            handle_info_error: 0,
+            inheritable: true,
+            identity_succeeded: true,
+            identity_error: 0,
+            object_type: parent.0.clone(),
+            object_name: parent.1.clone(),
+            same_access_succeeded: true,
+            same_access_error: 0,
+            escalation: ESCALATION_MASKS
+                .iter()
+                .map(|&mask| (mask, true, 0))
+                .collect(),
+        };
+        assert_eq!(
+            assess_ui_handle_source(&valid, Some(&parent)).unwrap(),
+            UiHandleAssessment::Unsafe
+        );
+        let mut missing = valid.clone();
+        missing.identity_succeeded = false;
+        assert_eq!(
+            assess_ui_handle_source(&missing, Some(&parent)).unwrap(),
+            UiHandleAssessment::Indeterminate
+        );
+        let mut mismatch = valid;
+        mismatch.object_name = "other".into();
+        assert_eq!(
+            assess_ui_handle_source(&mismatch, Some(&parent)).unwrap(),
+            UiHandleAssessment::Indeterminate
+        );
+    }
+
+    #[test]
+    fn ui_handle_limit_record_codec_rejects_malformed_inputs() {
+        let source = UiHandleSourceRecord {
+            handle_info_succeeded: true,
+            handle_info_error: 0,
+            inheritable: false,
+            identity_succeeded: true,
+            identity_error: 0,
+            object_type: "WindowStation".into(),
+            object_name: "WinSta0".into(),
+            same_access_succeeded: true,
+            same_access_error: 0,
+            escalation: ESCALATION_MASKS
+                .iter()
+                .map(|&mask| (mask, false, ERROR_ACCESS_DENIED))
+                .collect(),
+        };
+        let record = UiHandleLimitRecord {
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            raw_lease: source.clone(),
+            ambient_current: source.clone(),
+            name_open: UiNameOpenRecord::Opened(source),
+        };
+        let bytes = record.encode().expect("record encode");
+        assert_eq!(
+            UiHandleLimitRecord::decode(&bytes, &record.nonce).unwrap(),
+            record
+        );
+        let mut magic = bytes.clone();
+        magic[0] ^= 1;
+        let mut version = bytes.clone();
+        version[4] ^= 1;
+        let mut strict_bool = bytes.clone();
+        strict_bool[40] = 2;
+        let mut nonce = bytes.clone();
+        nonce[8] ^= 1;
+        for bad in [
+            magic,
+            version,
+            strict_bool,
+            bytes[..39].to_vec(),
+            [bytes.clone(), vec![0]].concat(),
+            nonce,
+        ] {
+            assert!(UiHandleLimitRecord::decode(&bad, &record.nonce).is_err());
+        }
+        let mut missing = record.clone();
+        missing.raw_lease.escalation.pop();
+        assert!(missing.encode().is_err(), "short matrix encoded");
+        let mut reordered = record;
+        reordered.ambient_current.escalation.swap(0, 1);
+        assert!(reordered.encode().is_err(), "reordered matrix encoded");
     }
 
     #[test]

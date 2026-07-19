@@ -28,6 +28,10 @@ use windows_sys::Win32::System::JobObjects::{
     JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
     TerminateJobObject,
 };
+#[cfg(test)]
+use windows_sys::Win32::System::JobObjects::{
+    JOB_OBJECT_UILIMIT_HANDLES, QueryInformationJobObject,
+};
 
 /// An owned Job Object that kills every process in it when the handle closes
 /// (drop) or [`terminate`](JobObject::terminate) is called. `Send`/`Sync`: the
@@ -57,6 +61,18 @@ impl JobObject {
     /// `SILENT_BREAKAWAY_OK`), so a child cannot escape the job — that is what
     /// makes the tree-kill and these limits inescapable.
     pub fn new_kill_on_close() -> io::Result<JobObject> {
+        Self::new_kill_on_close_with_ui_restrictions(Self::STANDARD_UI_RESTRICTIONS)
+    }
+
+    const STANDARD_UI_RESTRICTIONS: u32 = JOB_OBJECT_UILIMIT_DESKTOP
+        | JOB_OBJECT_UILIMIT_EXITWINDOWS
+        | JOB_OBJECT_UILIMIT_READCLIPBOARD
+        | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+        | JOB_OBJECT_UILIMIT_GLOBALATOMS
+        | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+        | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;
+
+    fn new_kill_on_close_with_ui_restrictions(ui_restrictions: u32) -> io::Result<JobObject> {
         // SAFETY: standard Win32 calls; the out-param structs are zero-initialized
         // and fully written before use, and the handle is checked for null.
         unsafe {
@@ -83,13 +99,7 @@ impl JobObject {
             )?;
 
             let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = std::mem::zeroed();
-            ui.UIRestrictionsClass = JOB_OBJECT_UILIMIT_DESKTOP
-                | JOB_OBJECT_UILIMIT_EXITWINDOWS
-                | JOB_OBJECT_UILIMIT_READCLIPBOARD
-                | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
-                | JOB_OBJECT_UILIMIT_GLOBALATOMS
-                | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
-                | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;
+            ui.UIRestrictionsClass = ui_restrictions;
             set(
                 JobObjectBasicUIRestrictions,
                 (&ui as *const JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
@@ -98,6 +108,32 @@ impl JobObject {
 
             Ok(JobObject(handle as isize))
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_kill_on_close_with_ui_handle_limit_for_test() -> io::Result<JobObject> {
+        Self::new_kill_on_close_with_ui_restrictions(
+            Self::STANDARD_UI_RESTRICTIONS | JOB_OBJECT_UILIMIT_HANDLES,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ui_restrictions_for_test(&self) -> io::Result<u32> {
+        let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = unsafe { std::mem::zeroed() };
+        // SAFETY: this owned job handle is live and `ui` is a correctly-sized writable buffer.
+        if unsafe {
+            QueryInformationJobObject(
+                self.0 as _,
+                JobObjectBasicUIRestrictions,
+                (&mut ui as *mut JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ui.UIRestrictionsClass)
     }
 
     /// Assigns `process` (a child's raw handle) to this job. The process's own
