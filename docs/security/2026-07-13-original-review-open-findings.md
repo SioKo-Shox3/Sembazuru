@@ -49,12 +49,19 @@
 - Done: 標準Usersは設定・CAS・scratchのprivate ACLを通れず、秘密は平文保存されない。先置き、hardlink／reparse、wrong owner／DACL、
   root／journal置換、途中faultはfail closedまたはjournalから前進回復し、canonical serviceとtoken保守は同時に成立しない。
 
-### OPEN: workerのプロセス・scratch分離の残部
+### RESOLVED: workerのプロセス・scratch分離
 
-- 根拠: `crates/worker/src/lib.rs:803-815,819-838,933-958`。
-- 現状: actionはbrokerと同じservice tokenで動き、scratchにaction固有private ACLがない。processをspawnした後でJob Objectへ割り当てる短い逃走窓も残る。
-- 修正方向: action固有SID/private ACL、restricted tokenまたはAppContainer executorを導入し、`CREATE_SUSPENDED`または`PROC_THREAD_ATTRIBUTE_JOB_LIST`で起動時からJobへ所属させる。
-- Done: actionからbroker秘密・他action scratchへアクセスできず、最初の命令実行前から全子孫がkill-on-close Jobに拘束されるテストが通る。
+- 対応: `73026ce`（action固有restricted primary token、private scratch/runtime、plain／VFS production結線、
+  `CREATE_SUSPENDED`→restricted token確認→exact Job割当て確認→`ResumeThread`）、`0c84462`（restricted token判定を正式APIで固定）、
+  `2a9bb72`（productionと同じrestricted processによるbroker秘密／別action scratch拒否のnative E2E証拠）。
+- 境界: action leafはbroker full＋action SIDのread/write/execute/deleteだけを持つprotected DACLとし、scratch root名の列挙は
+  秘密境界に含めない。失敗時はsuspended guardianがchildをterminate/reapし、Jobはkill-on-closeかつbreakawayなしを維持する。
+- ローカル検証: isolation evidence `1 passed; 0 failed`、restricted process群 `7 passed; 0 failed; 3 ignored`、
+  `process_isolation` `2 passed; 0 failed`、`env_isolation` `1 passed; 0 failed`、worker lib `142 passed; 0 failed; 8 ignored`。
+  `cargo fmt --all -- --check`、worker all-targets clippy `-D warnings`、scope、差分／行末検査も成功。
+- レビュー: Codex round 1の既存file write拒否・失敗時fixture cleanup指摘を修正し、round 2 APPROVE。Claude統合二次確認もAPPROVE。
+- Done: restricted primary childはbroker-onlyなconfig／machine token／CAS相当fileと別action scratchをread・既存write・新規createできず、
+  exact kill-on-close Jobへの割当て確認後にだけresumeされ、setup失敗時は最初の命令を実行しない。
 
 ## P0 correctness
 
