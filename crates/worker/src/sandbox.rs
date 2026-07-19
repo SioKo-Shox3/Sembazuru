@@ -4110,6 +4110,196 @@ mod tests {
         );
     }
 
+    const RESTRICTED_ISOLATION_MAGIC: u32 = 0x5349_534f;
+    const RESTRICTED_ISOLATION_VERSION: u32 = 1;
+    const RESTRICTED_ISOLATION_FIELDS: u32 = 13;
+
+    #[derive(Debug)]
+    struct RestrictedIsolationRecord {
+        nonce: String,
+        broker_file_access_denied: [[bool; 3]; 3],
+        other_action_read_denied: bool,
+        other_action_write_denied: bool,
+        other_action_create_denied: bool,
+        in_job: bool,
+    }
+
+    impl RestrictedIsolationRecord {
+        fn encode(&self) -> Result<Vec<u8>, String> {
+            validate_nonce(&self.nonce)?;
+            let mut payload = Writer::new();
+            for access_denied in self.broker_file_access_denied {
+                for denied in access_denied {
+                    payload.bool(denied);
+                }
+            }
+            payload.bool(self.other_action_read_denied);
+            payload.bool(self.other_action_write_denied);
+            payload.bool(self.other_action_create_denied);
+            payload.bool(self.in_job);
+            let payload = payload.into_bytes();
+            let mut bytes = Vec::with_capacity(44 + payload.len());
+            bytes.extend_from_slice(&RESTRICTED_ISOLATION_MAGIC.to_le_bytes());
+            bytes.extend_from_slice(&RESTRICTED_ISOLATION_VERSION.to_le_bytes());
+            bytes.extend_from_slice(self.nonce.as_bytes());
+            bytes.extend_from_slice(&RESTRICTED_ISOLATION_FIELDS.to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            Ok(bytes)
+        }
+
+        fn decode(bytes: &[u8], expected_nonce: &str) -> Result<Self, String> {
+            validate_nonce(expected_nonce)?;
+            if bytes.len() != 44 + RESTRICTED_ISOLATION_FIELDS as usize {
+                return Err("record length".into());
+            }
+            let u32_at = |offset: usize| -> u32 {
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            };
+            if u32_at(0) != RESTRICTED_ISOLATION_MAGIC
+                || u32_at(4) != RESTRICTED_ISOLATION_VERSION
+                || u32_at(40) != RESTRICTED_ISOLATION_FIELDS
+            {
+                return Err("header".into());
+            }
+            let nonce = std::str::from_utf8(&bytes[8..40])
+                .map_err(|_| "nonce utf8")?
+                .to_owned();
+            validate_nonce(&nonce)?;
+            if nonce != expected_nonce {
+                return Err("nonce".into());
+            }
+            let mut payload = Reader::new(&bytes[44..]);
+            let record = Self {
+                nonce,
+                broker_file_access_denied: [
+                    [
+                        read_strict_bool(&mut payload)?,
+                        read_strict_bool(&mut payload)?,
+                        read_strict_bool(&mut payload)?,
+                    ],
+                    [
+                        read_strict_bool(&mut payload)?,
+                        read_strict_bool(&mut payload)?,
+                        read_strict_bool(&mut payload)?,
+                    ],
+                    [
+                        read_strict_bool(&mut payload)?,
+                        read_strict_bool(&mut payload)?,
+                        read_strict_bool(&mut payload)?,
+                    ],
+                ],
+                other_action_read_denied: read_strict_bool(&mut payload)?,
+                other_action_write_denied: read_strict_bool(&mut payload)?,
+                other_action_create_denied: read_strict_bool(&mut payload)?,
+                in_job: read_strict_bool(&mut payload)?,
+            };
+            payload.finish().map_err(|_| "trailing")?;
+            Ok(record)
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn restricted_process_isolation_child() {
+        fn permission_denied<T>(result: io::Result<T>) -> bool {
+            matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        }
+
+        let args: Vec<_> = std::env::args_os().collect();
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("isolation record separator");
+        assert_eq!(
+            Path::new(&args[0]).file_name(),
+            Some(OsStr::new(RESTRICTED_ISOLATION_PROBE_BASENAME)),
+            "isolation probe basename"
+        );
+        let expected: Vec<_> = [
+            "--ignored",
+            "--exact",
+            RESTRICTED_ISOLATION_PROBE_SELECTOR,
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            &args[1..separator],
+            expected.as_slice(),
+            "isolation probe argv"
+        );
+        let values = &args[separator + 1..];
+        assert_eq!(values.len(), 5, "isolation probe argument count");
+        let fixture_directory = PathBuf::from(&values[0]);
+        let other_known = PathBuf::from(&values[1]);
+        let other_new = PathBuf::from(&values[2]);
+        let record_directory = PathBuf::from(&values[3]);
+        let nonce = values[4].to_str().expect("isolation nonce utf8").to_owned();
+        validate_nonce(&nonce).expect("isolation nonce format");
+
+        let broker_file_access_denied = ["worker.toml", "machine.token", "cas-blob"].map(|name| {
+            let path = fixture_directory.join(name);
+            let read_denied = permission_denied(File::open(&path));
+            let write_denied =
+                permission_denied(std::fs::OpenOptions::new().write(true).open(&path));
+            let create_denied = permission_denied(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(fixture_directory.join(format!("{nonce}-{name}.create"))),
+            );
+            [read_denied, write_denied, create_denied]
+        });
+        let other_action_read_denied = permission_denied(File::open(&other_known));
+        let other_action_write_denied =
+            permission_denied(std::fs::OpenOptions::new().write(true).open(&other_known));
+        let other_action_create_denied = permission_denied(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&other_new),
+        );
+        let mut in_job = 0;
+        assert_ne!(
+            unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) },
+            0,
+            "isolation child job query"
+        );
+        let record = RestrictedIsolationRecord {
+            nonce: nonce.clone(),
+            broker_file_access_denied,
+            other_action_read_denied,
+            other_action_write_denied,
+            other_action_create_denied,
+            in_job: in_job != 0,
+        };
+        let record_path = record_directory.join(format!("{nonce}.isolation.rec"));
+        let temporary = record_directory.join(format!("{nonce}.isolation.tmp"));
+        assert!(!record_path.exists(), "stale isolation record");
+        struct TempCleanup(Option<PathBuf>);
+        impl Drop for TempCleanup {
+            fn drop(&mut self) {
+                if let Some(path) = self.0.take() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let mut cleanup = TempCleanup(Some(temporary.clone()));
+        let bytes = record.encode().expect("encode isolation record");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .expect("create isolation record");
+        file.write_all(&bytes).expect("write isolation record");
+        file.sync_all().expect("sync isolation record");
+        drop(file);
+        std::fs::rename(&temporary, &record_path).expect("publish isolation record");
+        cleanup.0.take();
+    }
+
     #[test]
     #[ignore]
     fn restricted_process_child_probe() {
@@ -4174,6 +4364,113 @@ mod tests {
             command = command.env("SBZ_SPAWN_GRANDCHILD", "1");
         }
         RestrictedProcess::spawn(token, &command).unwrap()
+    }
+
+    const RESTRICTED_ISOLATION_PROBE_BASENAME: &str = "restricted-isolation-probe.exe";
+    const RESTRICTED_ISOLATION_PROBE_SELECTOR: &str =
+        "sandbox::tests::restricted_process_isolation_child";
+
+    fn broker_only_scratch_root(token: &ActionToken) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sembazuru-restricted-isolation-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let broker = sid_string(token.broker_sid()).unwrap();
+        create_secured_directory(&path, &format!("O:{broker}D:P(A;OICI;FA;;;{broker})")).unwrap();
+        path
+    }
+
+    fn stage_restricted_isolation_probe(scratch: &PrivateScratch) -> PathBuf {
+        let probe = scratch.path().join(RESTRICTED_ISOLATION_PROBE_BASENAME);
+        let mut source = File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .unwrap();
+        io::copy(&mut source, &mut target).unwrap();
+        target.sync_all().unwrap();
+        probe
+    }
+
+    #[tokio::test]
+    async fn restricted_process_blocks_broker_and_other_action_storage() {
+        let action_a = ActionToken::create().unwrap();
+        let action_b = ActionToken::create().unwrap();
+        let root = RecordScratch(broker_only_scratch_root(&action_a));
+        let (owner, control, aces) = scratch_acl(&root.0).unwrap();
+        assert_eq!(owner, sid_string(action_a.broker_sid()).unwrap());
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        assert_eq!(
+            aces,
+            vec![(
+                sid_string(action_a.broker_sid()).unwrap(),
+                (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8,
+                FILE_ALL_ACCESS,
+            )]
+        );
+        let scratch_a = PrivateScratch::create(&root.0, "action-a", &action_a).unwrap();
+        let scratch_b = PrivateScratch::create(&root.0, "action-b", &action_b).unwrap();
+        for (name, contents) in [
+            ("worker.toml", b"worker configuration".as_slice()),
+            ("machine.token", b"machine credential".as_slice()),
+            ("cas-blob", b"cas blob".as_slice()),
+        ] {
+            std::fs::write(root.0.join(name), contents).unwrap();
+        }
+        let other_known = scratch_b.path().join("known-from-action-b");
+        let other_new = scratch_b.path().join("new-from-action-a");
+        std::fs::write(&other_known, b"action-b-private").unwrap();
+        let probe = stage_restricted_isolation_probe(&scratch_a);
+        let nonce = secure_random_hex().unwrap();
+        let system_root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let command = RestrictedCommand::new(probe, scratch_a.path())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(RESTRICTED_ISOLATION_PROBE_SELECTOR)
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--")
+            .arg(&root.0)
+            .arg(&other_known)
+            .arg(&other_new)
+            .arg(scratch_a.path())
+            .arg(&nonce)
+            .env("Path", system_root.join("System32"))
+            .env("SystemDrive", std::env::var_os("SystemDrive").unwrap())
+            .env("SystemRoot", system_root);
+        let process = RestrictedProcess::spawn(&action_a, &command).unwrap();
+        // The parent-side exact Job membership query immediately after spawn is the
+        // authoritative ordering evidence; the child record below corroborates it.
+        assert!(process.is_in_job().unwrap());
+        let (code, stdout, stderr) = process.wait_with_output().await.unwrap();
+        assert_eq!(code, 0, "stdout={stdout:?} stderr={stderr:?}");
+        let record_path = scratch_a.path().join(format!("{nonce}.isolation.rec"));
+        let record =
+            RestrictedIsolationRecord::decode(&std::fs::read(&record_path).unwrap(), &nonce)
+                .unwrap();
+        assert!(
+            record
+                .broker_file_access_denied
+                .into_iter()
+                .flatten()
+                .all(|denied| denied)
+        );
+        assert!(record.other_action_read_denied);
+        assert!(record.other_action_write_denied);
+        assert!(record.other_action_create_denied);
+        // Child-side Job state is corroborating evidence, not the ordering proof.
+        assert!(record.in_job);
+        assert!(
+            !scratch_a
+                .path()
+                .join(format!("{nonce}.isolation.tmp"))
+                .exists()
+        );
+        assert!(!other_new.exists());
+        drop(scratch_b);
+        drop(scratch_a);
     }
 
     #[tokio::test]
