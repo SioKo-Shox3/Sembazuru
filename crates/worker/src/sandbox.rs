@@ -1058,7 +1058,9 @@ mod tests {
     use sembazuru_dataplane::wire::{Reader, Writer};
 
     use windows_sys::Win32::Foundation::{
-        GENERIC_WRITE, GetHandleInformation, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_TIMEOUT,
+        ERROR_ACCESS_DENIED, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
+        GetHandleInformation, GetLastError, INVALID_HANDLE_VALUE, LUID, LocalFree, SetLastError,
+        WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1082,11 +1084,15 @@ mod tests {
     use windows_sys::Win32::System::StationsAndDesktops::{
         GetProcessWindowStation, GetUserObjectInformationW, UOI_NAME, UOI_TYPE,
     };
-    use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+    use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
     use windows_sys::Win32::System::Threading::{
         CreateEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::WINSTA_READATTRIBUTES;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WINSTA_ACCESSCLIPBOARD, WINSTA_ACCESSGLOBALATOMS, WINSTA_CREATEDESKTOP,
+        WINSTA_ENUMDESKTOPS, WINSTA_ENUMERATE, WINSTA_EXITWINDOWS, WINSTA_READATTRIBUTES,
+        WINSTA_READSCREEN, WINSTA_WRITEATTRIBUTES,
+    };
 
     use super::*;
 
@@ -1104,12 +1110,14 @@ mod tests {
         duplicate_type: String,
         duplicate_name: String,
         duplicate_inheritable: bool,
+        escalation: Vec<(u32, bool, u32)>,
     }
 
     impl HandleDeliveryRecord {
         const MAGIC: u32 = 0x4844_4c52;
-        const VERSION: u32 = 1;
+        const VERSION: u32 = 2;
         const MAX_BYTES: usize = 4096;
+        const MAX_ESCALATION: usize = 32;
 
         fn encode(&self) -> Result<Vec<u8>, String> {
             validate_nonce(&self.nonce)?;
@@ -1123,6 +1131,15 @@ mod tests {
             write_text(&mut payload, &self.duplicate_type)?;
             write_text(&mut payload, &self.duplicate_name)?;
             payload.bool(self.duplicate_inheritable);
+            if self.escalation.len() > Self::MAX_ESCALATION {
+                return Err("escalation count".into());
+            }
+            payload.u32(self.escalation.len() as u32);
+            for &(mask, succeeded, error) in &self.escalation {
+                payload.u32(mask);
+                payload.bool(succeeded);
+                payload.u32(error);
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("delivery record too large".into());
@@ -1159,6 +1176,21 @@ mod tests {
                 duplicate_type: read_text(&mut payload)?,
                 duplicate_name: read_text(&mut payload)?,
                 duplicate_inheritable: read_strict_bool(&mut payload)?,
+                escalation: {
+                    let count = payload.u32().map_err(|_| "escalation count")? as usize;
+                    if count > Self::MAX_ESCALATION {
+                        return Err("escalation count".into());
+                    }
+                    let mut values = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        values.push((
+                            payload.u32().map_err(|_| "escalation mask")?,
+                            read_strict_bool(&mut payload)?,
+                            payload.u32().map_err(|_| "escalation error")?,
+                        ));
+                    }
+                    values
+                },
             };
             payload.finish().map_err(|_| "delivery record trailing")?;
             Ok(record)
@@ -1226,6 +1258,101 @@ mod tests {
         Ok(())
     }
 
+    const ESCALATION_MASKS: &[u32] = &[
+        DELETE,
+        READ_CONTROL,
+        WRITE_DAC,
+        WRITE_OWNER,
+        WINSTA_ENUMDESKTOPS as u32,
+        WINSTA_ACCESSCLIPBOARD as u32,
+        WINSTA_CREATEDESKTOP as u32,
+        WINSTA_ENUMERATE as u32,
+        WINSTA_EXITWINDOWS as u32,
+        WINSTA_ACCESSGLOBALATOMS as u32,
+        WINSTA_WRITEATTRIBUTES as u32,
+        WINSTA_READSCREEN as u32,
+        GENERIC_READ,
+        GENERIC_WRITE,
+        GENERIC_EXECUTE,
+        GENERIC_ALL,
+        MAXIMUM_ALLOWED,
+    ];
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum EscalationAssessment {
+        Denied,
+        Unsafe,
+        Indeterminate,
+    }
+
+    fn assess_escalation_matrix(
+        values: &[(u32, bool, u32)],
+    ) -> Result<EscalationAssessment, &'static str> {
+        if values.len() != ESCALATION_MASKS.len() {
+            return Err("escalation cardinality");
+        }
+        for ((mask, _, _), expected) in values.iter().zip(ESCALATION_MASKS) {
+            if mask != expected {
+                return Err("escalation mask/order");
+            }
+        }
+        if values.iter().any(|(_, succeeded, _)| *succeeded) {
+            return Ok(EscalationAssessment::Unsafe);
+        }
+        if values
+            .iter()
+            .all(|(_, _, error)| *error == ERROR_ACCESS_DENIED)
+        {
+            Ok(EscalationAssessment::Denied)
+        } else {
+            Ok(EscalationAssessment::Indeterminate)
+        }
+    }
+
+    #[test]
+    fn window_handle_escalation_classifier_classifies_exact_matrix() {
+        let valid: Vec<_> = ESCALATION_MASKS
+            .iter()
+            .map(|&mask| (mask, false, ERROR_ACCESS_DENIED))
+            .collect();
+        assert_eq!(
+            assess_escalation_matrix(&valid).unwrap(),
+            EscalationAssessment::Denied
+        );
+        let mut unsafe_value = valid.clone();
+        unsafe_value[0].1 = true;
+        assert_eq!(
+            assess_escalation_matrix(&unsafe_value).unwrap(),
+            EscalationAssessment::Unsafe
+        );
+        let mut indeterminate = valid.clone();
+        indeterminate[0].2 = 0;
+        assert_eq!(
+            assess_escalation_matrix(&indeterminate).unwrap(),
+            EscalationAssessment::Indeterminate
+        );
+        for mut invalid in [
+            Vec::new(),
+            valid[..valid.len() - 1].to_vec(),
+            {
+                let mut v = valid.clone();
+                v.push(valid[0]);
+                v
+            },
+            {
+                let mut v = valid.clone();
+                v[0].0 ^= 1;
+                v
+            },
+        ] {
+            assert!(
+                assess_escalation_matrix(&invalid).is_err(),
+                "invalid matrix accepted: {invalid:?}"
+            );
+            invalid.clear();
+        }
+    }
+
     #[test]
     fn window_handle_delivery_classifier_rejects_every_invalid_outcome() {
         let valid = HandleDeliveryRecord {
@@ -1239,6 +1366,7 @@ mod tests {
             duplicate_type: "WindowStation".into(),
             duplicate_name: "WinSta0".into(),
             duplicate_inheritable: false,
+            escalation: Vec::new(),
         };
         let accept = |record: &HandleDeliveryRecord,
                       nonce,
@@ -1760,6 +1888,33 @@ mod tests {
     }
 
     #[test]
+    fn window_handle_escalation_probe_rejects_current_station_lease() {
+        let evidence = handle_delivery_evidence(true).expect("delivery evidence");
+        accept_handle_delivery(
+            &evidence.record,
+            &evidence.record.nonce,
+            &evidence.parent.0,
+            &evidence.parent.1,
+            evidence.parent_inheritable,
+            evidence.child_restricted,
+            evidence.status_success,
+            evidence.entry_exists,
+            evidence.record_exists,
+        )
+        .expect("delivery confirmed");
+        eprintln!(
+            "current-station escalation results: {:x?}",
+            evidence.record.escalation
+        );
+        // Any successful duplicate proves that this current-station lease must remain forbidden.
+        assert_eq!(
+            assess_escalation_matrix(&evidence.record.escalation).expect("matrix shape"),
+            EscalationAssessment::Unsafe,
+            "all-denied/indeterminate result requires a fresh lease-design review"
+        );
+    }
+
+    #[test]
     #[ignore]
     fn window_handle_delivery_child() {
         let args: Vec<_> = std::env::args_os().collect();
@@ -1796,6 +1951,7 @@ mod tests {
             duplicate_type: String::new(),
             duplicate_name: String::new(),
             duplicate_inheritable: false,
+            escalation: Vec::new(),
         };
         match user_object_identity(raw) {
             Ok(identity) => {
@@ -1823,6 +1979,30 @@ mod tests {
                     record.duplicate_name = identity.1;
                     record.duplicate_inheritable = inheritable(duplicate.as_raw_handle() as HANDLE)
                         .expect("duplicate inherit flag");
+                }
+                for &mask in ESCALATION_MASKS {
+                    let mut duplicate = null_mut();
+                    unsafe { SetLastError(0) };
+                    let succeeded = unsafe {
+                        DuplicateHandle(
+                            GetCurrentProcess(),
+                            raw,
+                            GetCurrentProcess(),
+                            &mut duplicate,
+                            mask,
+                            0,
+                            0,
+                        ) != 0
+                    };
+                    let error = if succeeded {
+                        0
+                    } else {
+                        unsafe { GetLastError() }
+                    };
+                    if succeeded {
+                        drop(unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) });
+                    }
+                    record.escalation.push((mask, succeeded, error));
                 }
             }
             Err(error) => record.raw_error = error.raw_os_error().unwrap_or(0) as u32,
