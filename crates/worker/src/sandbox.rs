@@ -1082,14 +1082,15 @@ mod tests {
     };
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::StationsAndDesktops::{
-        GetProcessWindowStation, GetUserObjectInformationW, UOI_NAME, UOI_TYPE,
+        CloseWindowStation, CreateWindowStationW, GetProcessWindowStation,
+        GetUserObjectInformationW, SetProcessWindowStation, UOI_NAME, UOI_TYPE,
     };
     use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
     use windows_sys::Win32::System::Threading::{
         CreateEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        WINSTA_ACCESSCLIPBOARD, WINSTA_ACCESSGLOBALATOMS, WINSTA_CREATEDESKTOP,
+        CWF_CREATE_ONLY, WINSTA_ACCESSCLIPBOARD, WINSTA_ACCESSGLOBALATOMS, WINSTA_CREATEDESKTOP,
         WINSTA_ENUMDESKTOPS, WINSTA_ENUMERATE, WINSTA_EXITWINDOWS, WINSTA_READATTRIBUTES,
         WINSTA_READSCREEN, WINSTA_WRITEATTRIBUTES,
     };
@@ -1283,6 +1284,32 @@ mod tests {
         Denied,
         Unsafe,
         Indeterminate,
+    }
+
+    struct AuditWindowStation(Option<HANDLE>);
+    impl AuditWindowStation {
+        fn handle(&self) -> HANDLE {
+            self.0.unwrap()
+        }
+        fn close(mut self) -> io::Result<()> {
+            let handle = self.0.unwrap();
+            // SAFETY: handle is the unique CreateWindowStationW result consumed here.
+            if unsafe { CloseWindowStation(handle) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.0.take();
+            Ok(())
+        }
+    }
+    impl Drop for AuditWindowStation {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                // SAFETY: early-error cleanup owns the remaining CreateWindowStationW result.
+                unsafe {
+                    CloseWindowStation(handle);
+                }
+            }
+        }
     }
 
     fn assess_escalation_matrix(
@@ -1922,6 +1949,77 @@ mod tests {
             EscalationAssessment::Unsafe,
             "all-denied/indeterminate result requires a fresh lease-design review"
         );
+    }
+
+    #[test]
+    fn private_station_unnamed_create_rejects_connected_logon_station() {
+        let token = ActionToken::create().expect("action token");
+        let broker = sid_string(token.broker_sid()).expect("broker SID");
+        let current = unsafe { GetProcessWindowStation() };
+        let before = user_object_identity(current).expect("current identity before create");
+        let sddl = format!("O:{broker}D:P(D;;WD;;;OW)(A;;0x00020002;;;{broker})");
+        let created = ActionPipeSecurity(sddl).with_attributes(|attributes| {
+            // SAFETY: attributes points to the live protected descriptor for this synchronous call.
+            let handle = unsafe {
+                CreateWindowStationW(
+                    null(),
+                    CWF_CREATE_ONLY,
+                    READ_CONTROL | WINSTA_READATTRIBUTES as u32,
+                    attributes.cast(),
+                )
+            };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(AuditWindowStation(Some(handle)))
+        });
+        match created {
+            Err(error) => {
+                let after = user_object_identity(unsafe { GetProcessWindowStation() })
+                    .expect("current identity after failed create");
+                assert_eq!(before, after, "current station changed after failed create");
+                if matches!(error.raw_os_error(), Some(183 | 5)) {
+                    eprintln!(
+                        "unsupported unnamed station identity: raw_error={:?}",
+                        error.raw_os_error()
+                    );
+                } else {
+                    panic!(
+                        "indeterminate unnamed create: raw_error={:?}",
+                        error.raw_os_error()
+                    );
+                }
+            }
+            Ok(station) => {
+                // SAFETY: current is the original live process window-station handle.
+                let restore_ok = unsafe { SetProcessWindowStation(current) } != 0;
+                let restore_error = (!restore_ok).then(io::Error::last_os_error);
+                let restored =
+                    restore_ok.then(|| user_object_identity(unsafe { GetProcessWindowStation() }));
+                let identity = user_object_identity(station.handle());
+                let close = station.close();
+                eprintln!(
+                    "unnamed station cleanup: restore_ok={restore_ok} restore_error={:?} close_error={:?}",
+                    restore_error.as_ref().and_then(io::Error::raw_os_error),
+                    close.as_ref().err().and_then(io::Error::raw_os_error),
+                );
+                assert!(
+                    restore_ok,
+                    "original process station restore failed: {restore_error:?}"
+                );
+                assert_eq!(
+                    restored.unwrap().expect("restored identity"),
+                    before,
+                    "restored process station identity differs"
+                );
+                let identity = identity.expect("created identity");
+                assert!(close.is_ok(), "created station close failed: {close:?}");
+                if identity != before {
+                    panic!("fresh unnamed station supported; design review required: {identity:?}");
+                }
+                eprintln!("unsupported unnamed station aliases current: {identity:?}");
+            }
+        }
     }
 
     #[test]
