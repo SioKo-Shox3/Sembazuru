@@ -1053,6 +1053,8 @@ mod tests {
     use std::os::windows::ffi::OsStrExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use sembazuru_dataplane::wire::{Reader, Writer};
+
     use windows_sys::Win32::Foundation::{
         GENERIC_WRITE, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_TIMEOUT,
     };
@@ -1064,15 +1066,17 @@ mod tests {
         ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
         GetSecurityDescriptorControl, ImpersonateLoggedOnUser, LookupPrivilegeValueW,
         OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, RevertToSelf, SE_CHANGE_NOTIFY_NAME,
-        SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_GROUPS,
-        TOKEN_PRIVILEGES, TOKEN_USER, TokenGroups, TokenPrivileges, TokenRestrictedSids, TokenUser,
-        WinCreatorOwnerRightsSid,
+        SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
+        TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_PRIVILEGES, TOKEN_USER,
+        TokenAppContainerSid, TokenCapabilities, TokenGroups, TokenIsAppContainer, TokenPrivileges,
+        TokenRestrictedSids, TokenUser, WinCreatorOwnerRightsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{
         CreateEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
@@ -1081,6 +1085,615 @@ mod tests {
     use super::*;
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn sandbox_probe_record_codec_round_trips() {
+        let record = SandboxProbeRecord::fixture();
+        let bytes = record.encode().unwrap();
+        assert_eq!(
+            SandboxProbeRecord::decode(&bytes, &record.nonce).unwrap(),
+            record
+        );
+    }
+
+    #[test]
+    fn sandbox_probe_record_rejects_malformed_inputs() {
+        let record = SandboxProbeRecord::fixture();
+        let bytes = record.encode().unwrap();
+        for mutation in [
+            (0usize, 0u8),  // magic
+            (4usize, 0u8),  // version
+            (40usize, 0u8), // field count
+            (44usize, 0u8), // payload length
+        ] {
+            let mut bad = bytes.clone();
+            bad[mutation.0] ^= mutation.1.wrapping_add(1);
+            assert!(SandboxProbeRecord::decode(&bad, &record.nonce).is_err());
+        }
+        for end in [0usize, 1, 7, 8, 39, 40, 47, 48, bytes.len() - 1] {
+            assert!(SandboxProbeRecord::decode(&bytes[..end], &record.nonce).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(SandboxProbeRecord::decode(&trailing, &record.nonce).is_err());
+        let mut invalid_utf8 = bytes.clone();
+        // AppContainer SID's length prefix starts at payload offset 49; point it at one byte.
+        invalid_utf8[49..53].copy_from_slice(&1u32.to_le_bytes());
+        invalid_utf8[53] = 0xff;
+        assert!(SandboxProbeRecord::decode(&invalid_utf8, &record.nonce).is_err());
+        let mut duplicate_env = SandboxProbeRecord::fixture();
+        duplicate_env.environment = vec![("Path".into(), "a".into()), ("PATH".into(), "b".into())];
+        assert!(duplicate_env.encode().is_err());
+        let mut unsorted_sids = SandboxProbeRecord::fixture();
+        unsorted_sids.groups = vec![
+            ProbeSid {
+                sid: "S-2".into(),
+                attributes: 0,
+            },
+            ProbeSid {
+                sid: "S-1".into(),
+                attributes: 0,
+            },
+        ];
+        assert!(unsorted_sids.encode().is_err());
+        assert!(SandboxProbeRecord::decode(&bytes, "ffffffffffffffffffffffffffffffff").is_err());
+        let mut duplicate_sid = SandboxProbeRecord::fixture();
+        duplicate_sid.capabilities = vec![
+            ProbeSid {
+                sid: "S-1".into(),
+                attributes: 0,
+            },
+            ProbeSid {
+                sid: "S-1".into(),
+                attributes: 0,
+            },
+        ];
+        assert!(duplicate_sid.encode().is_err());
+        let mut oversized = SandboxProbeRecord::fixture();
+        oversized.privileges = vec![(0, 0, 0); SANDBOX_PROBE_MAX_LIST as usize + 1];
+        assert!(oversized.encode().is_err());
+        let mut oversized_env = SandboxProbeRecord::fixture();
+        oversized_env.environment = (0..=SANDBOX_PROBE_MAX_LIST)
+            .map(|index| (format!("V{index:03}"), "x".into()))
+            .collect();
+        assert!(oversized_env.encode().is_err());
+        let mut overflow = bytes.clone();
+        overflow[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(SandboxProbeRecord::decode(&overflow, &record.nonce).is_err());
+        assert!(read_strict_bool(&mut Reader::new(&[2])).is_err());
+        overflow[40..44].copy_from_slice(&SANDBOX_PROBE_FIELDS.to_le_bytes());
+        overflow[44..48].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(SandboxProbeRecord::decode(&overflow, &record.nonce).is_err());
+        let mut bad_bool = bytes.clone();
+        bad_bool[48] = 2;
+        assert!(SandboxProbeRecord::decode(&bad_bool, &record.nonce).is_err());
+        let mut attributes = SandboxProbeRecord::fixture();
+        attributes.groups[0].attributes ^= 1;
+        assert_ne!(attributes.encode().unwrap(), bytes);
+    }
+
+    const SANDBOX_PROBE_MAGIC: u32 = 0x5350_5252;
+    const SANDBOX_PROBE_VERSION: u32 = 1;
+    const SANDBOX_PROBE_FIELDS: u32 = 9;
+    const SANDBOX_PROBE_MAX_TOTAL: usize = 1 << 20;
+    const SANDBOX_PROBE_MAX_LIST: u32 = 256;
+    const SANDBOX_PROBE_MAX_TEXT: usize = 32 * 1024;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ProbeSid {
+        sid: String,
+        attributes: u32,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SandboxProbeRecord {
+        nonce: String,
+        is_appcontainer: bool,
+        appcontainer_sid: String,
+        restricted_sids: Vec<ProbeSid>,
+        groups: Vec<ProbeSid>,
+        capabilities: Vec<ProbeSid>,
+        integrity_rid: u32,
+        privileges: Vec<(u32, i32, u32)>,
+        environment: Vec<(String, String)>,
+        in_job: bool,
+    }
+
+    impl SandboxProbeRecord {
+        fn fixture() -> Self {
+            Self {
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+                is_appcontainer: false,
+                appcontainer_sid: String::new(),
+                restricted_sids: vec![ProbeSid {
+                    sid: "S-1-1-0".into(),
+                    attributes: 0,
+                }],
+                groups: vec![ProbeSid {
+                    sid: "S-1-5-32-545".into(),
+                    attributes: 4,
+                }],
+                capabilities: Vec::new(),
+                integrity_rid: 0x2000,
+                privileges: vec![(23, 0, 2)],
+                environment: vec![("Path".into(), "C:\\Windows\\System32".into())],
+                in_job: true,
+            }
+        }
+
+        fn encode(&self) -> Result<Vec<u8>, String> {
+            validate_nonce(&self.nonce)?;
+            validate_sids(&self.restricted_sids, "restricted SID")?;
+            validate_sids(&self.groups, "group")?;
+            validate_sids(&self.capabilities, "capability")?;
+            validate_environment(&self.environment)?;
+            write_text(&mut Writer::new(), &self.appcontainer_sid)?;
+            if self.privileges.len() as u32 > SANDBOX_PROBE_MAX_LIST
+                || self.environment.len() as u32 > SANDBOX_PROBE_MAX_LIST
+            {
+                return Err("list count".into());
+            }
+            let mut payload = Writer::new();
+            payload.bool(self.is_appcontainer);
+            payload.str(&self.appcontainer_sid);
+            write_sid_list(&mut payload, &self.restricted_sids)?;
+            write_sid_list(&mut payload, &self.groups)?;
+            write_sid_list(&mut payload, &self.capabilities)?;
+            payload.u32(self.integrity_rid);
+            payload.u32(self.privileges.len() as u32);
+            for &(low, high, attributes) in &self.privileges {
+                payload.u32(low);
+                payload.u32(high as u32);
+                payload.u32(attributes);
+            }
+            payload.u32(self.environment.len() as u32);
+            for (name, value) in &self.environment {
+                write_text(&mut payload, name)?;
+                write_text(&mut payload, value)?;
+            }
+            payload.bool(self.in_job);
+            let payload = payload.into_bytes();
+            if payload.len() > SANDBOX_PROBE_MAX_TOTAL {
+                return Err("payload too large".into());
+            }
+            let mut bytes = Vec::with_capacity(48 + payload.len());
+            bytes.extend_from_slice(&SANDBOX_PROBE_MAGIC.to_le_bytes());
+            bytes.extend_from_slice(&SANDBOX_PROBE_VERSION.to_le_bytes());
+            bytes.extend_from_slice(self.nonce.as_bytes());
+            bytes.extend_from_slice(&SANDBOX_PROBE_FIELDS.to_le_bytes());
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            Ok(bytes)
+        }
+
+        fn decode(bytes: &[u8], expected_nonce: &str) -> Result<Self, String> {
+            validate_nonce(expected_nonce)?;
+            if bytes.len() < 48 || bytes.len() > 48 + SANDBOX_PROBE_MAX_TOTAL {
+                return Err("record length".into());
+            }
+            let u32_at = |offset: usize| -> u32 {
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            };
+            if u32_at(0) != SANDBOX_PROBE_MAGIC || u32_at(4) != SANDBOX_PROBE_VERSION {
+                return Err("header".into());
+            }
+            let nonce = std::str::from_utf8(&bytes[8..40])
+                .map_err(|_| "nonce utf8")?
+                .to_owned();
+            validate_nonce(&nonce)?;
+            if nonce != expected_nonce || u32_at(40) != SANDBOX_PROBE_FIELDS {
+                return Err("nonce or fields".into());
+            }
+            let total = u32_at(44) as usize;
+            if total != bytes.len() - 48 {
+                return Err("total length".into());
+            }
+            let mut reader = Reader::new(&bytes[48..]);
+            let result = Self {
+                nonce,
+                is_appcontainer: read_strict_bool(&mut reader)?,
+                appcontainer_sid: read_text(&mut reader)?,
+                restricted_sids: read_sid_list(&mut reader, "restricted SID")?,
+                groups: read_sid_list(&mut reader, "group")?,
+                capabilities: read_sid_list(&mut reader, "capability")?,
+                integrity_rid: reader.u32().map_err(|_| "integrity")?,
+                privileges: read_privileges(&mut reader)?,
+                environment: read_environment(&mut reader)?,
+                in_job: read_strict_bool(&mut reader)?,
+            };
+            reader.finish().map_err(|_| "trailing")?;
+            validate_sids(&result.restricted_sids, "restricted SID")?;
+            validate_sids(&result.groups, "group")?;
+            validate_sids(&result.capabilities, "capability")?;
+            validate_environment(&result.environment)?;
+            Ok(result)
+        }
+
+        fn collect(nonce: String) -> Result<Self, String> {
+            validate_nonce(&nonce)?;
+            let token = current_token(TOKEN_QUERY).map_err(|error| error.to_string())?;
+            let handle = token.as_raw_handle() as HANDLE;
+            let flag =
+                token_info(handle, TokenIsAppContainer).map_err(|error| error.to_string())?;
+            let is_appcontainer = unsafe { *flag.as_ptr().cast::<u32>() } == 1;
+            let appcontainer_sid = {
+                let info =
+                    token_info(handle, TokenAppContainerSid).map_err(|error| error.to_string())?;
+                let sid = unsafe {
+                    (*(info.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>())).TokenAppContainer
+                };
+                if sid.is_null() {
+                    String::new()
+                } else {
+                    sid_string(sid).map_err(|error| error.to_string())?
+                }
+            };
+            let mut in_job = 0;
+            if unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } == 0 {
+                return Err(io::Error::last_os_error().to_string());
+            }
+            let mut record = Self {
+                nonce,
+                is_appcontainer,
+                appcontainer_sid,
+                restricted_sids: token_sid_list(handle, TokenRestrictedSids)?,
+                groups: token_sid_list(handle, TokenGroups)?,
+                capabilities: token_sid_list(handle, TokenCapabilities)?,
+                integrity_rid: integrity_rid(handle).map_err(|error| error.to_string())?,
+                privileges: token_privileges(handle)?,
+                environment: normalized_environment()?,
+                in_job: in_job != 0,
+            };
+            // The record is a canonical comparison surface, so Windows group duplication is
+            // intentionally represented as one SID rather than a transport ambiguity.
+            for values in [
+                &mut record.restricted_sids,
+                &mut record.groups,
+                &mut record.capabilities,
+            ] {
+                values.sort_unstable_by(|left, right| {
+                    (&left.sid, left.attributes).cmp(&(&right.sid, right.attributes))
+                });
+                values.dedup_by(|left, right| {
+                    left.sid == right.sid && left.attributes == right.attributes
+                });
+            }
+            record.privileges.sort_unstable();
+            record
+                .environment
+                .sort_by_key(|(name, _)| name.to_ascii_lowercase());
+            Ok(record)
+        }
+    }
+
+    fn token_sid_list(token: HANDLE, class: i32) -> Result<Vec<ProbeSid>, String> {
+        let info = token_info(token, class).map_err(|error| error.to_string())?;
+        let groups = unsafe { &*(info.as_ptr().cast::<TOKEN_GROUPS>()) };
+        let header = std::mem::offset_of!(TOKEN_GROUPS, Groups);
+        let entries_len = (groups.GroupCount as usize)
+            .checked_mul(size_of::<SID_AND_ATTRIBUTES>())
+            .ok_or("group count overflow")?;
+        let required = header
+            .checked_add(entries_len)
+            .ok_or("group bytes overflow")?;
+        if required
+            > info
+                .len()
+                .checked_mul(size_of::<usize>())
+                .ok_or("group buffer overflow")?
+        {
+            return Err("group buffer truncated".into());
+        }
+        // SAFETY: the checked header plus GroupCount array byte length is within the owned
+        // `token_info` allocation, and TOKEN_GROUPS guarantees each entry is initialized.
+        let entries = unsafe {
+            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+        };
+        entries
+            .iter()
+            .map(|entry| {
+                Ok(ProbeSid {
+                    sid: sid_string(entry.Sid).map_err(|error| error.to_string())?,
+                    attributes: entry.Attributes,
+                })
+            })
+            .collect()
+    }
+
+    fn token_privileges(token: HANDLE) -> Result<Vec<(u32, i32, u32)>, String> {
+        let info = token_info(token, TokenPrivileges).map_err(|error| error.to_string())?;
+        let value = unsafe { &*(info.as_ptr().cast::<TOKEN_PRIVILEGES>()) };
+        let header = std::mem::offset_of!(TOKEN_PRIVILEGES, Privileges);
+        let entries_len = (value.PrivilegeCount as usize)
+            .checked_mul(size_of::<windows_sys::Win32::Security::LUID_AND_ATTRIBUTES>())
+            .ok_or("privilege count overflow")?;
+        let required = header
+            .checked_add(entries_len)
+            .ok_or("privilege bytes overflow")?;
+        if required
+            > info
+                .len()
+                .checked_mul(size_of::<usize>())
+                .ok_or("privilege buffer overflow")?
+        {
+            return Err("privilege buffer truncated".into());
+        }
+        // SAFETY: the checked header plus PrivilegeCount array byte length is inside the
+        // owned `token_info` allocation returned for TOKEN_PRIVILEGES.
+        let entries = unsafe {
+            std::slice::from_raw_parts(value.Privileges.as_ptr(), value.PrivilegeCount as usize)
+        };
+        Ok(entries
+            .iter()
+            .map(|entry| (entry.Luid.LowPart, entry.Luid.HighPart, entry.Attributes))
+            .collect())
+    }
+
+    fn normalized_environment() -> Result<Vec<(String, String)>, String> {
+        let mut values: Vec<_> = std::env::vars_os()
+            .map(|(name, value)| {
+                Ok((
+                    name.into_string().map_err(|_| "non-utf8 env")?,
+                    value.into_string().map_err(|_| "non-utf8 env")?,
+                ))
+            })
+            .collect::<Result<_, &str>>()?;
+        values.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+        validate_environment(&values)?;
+        Ok(values)
+    }
+
+    #[test]
+    #[ignore]
+    fn sandbox_probe_record_child() {
+        let args: Vec<_> = std::env::args_os().collect();
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("record separator");
+        let values = &args[separator + 1..];
+        assert_eq!(values.len(), 2, "record argv");
+        let directory = PathBuf::from(&values[0]);
+        let nonce = values[1].to_str().expect("nonce utf8").to_owned();
+        validate_nonce(&nonce).expect("nonce format");
+        assert!(directory.is_dir(), "record directory");
+        let record = directory.join(format!("{nonce}.rec"));
+        let temporary = directory.join(format!("{nonce}.tmp"));
+        assert!(!record.exists(), "stale destination");
+        struct TempCleanup(Option<PathBuf>);
+        impl Drop for TempCleanup {
+            fn drop(&mut self) {
+                if let Some(path) = self.0.take() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let mut cleanup = TempCleanup(Some(temporary.clone()));
+        let bytes = SandboxProbeRecord::collect(nonce)
+            .expect("collect record")
+            .encode()
+            .expect("encode record");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .expect("create tmp");
+        file.write_all(&bytes).expect("write tmp");
+        file.sync_all().expect("sync tmp");
+        drop(file);
+        std::fs::rename(&temporary, &record).expect("publish record");
+        cleanup.0.take();
+    }
+
+    fn record_child_command(directory: &Path, nonce: &str) -> std::process::Command {
+        let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .env_clear()
+            .env("SystemRoot", &root)
+            .env("SystemDrive", std::env::var_os("SystemDrive").unwrap())
+            .env("Path", root.join("System32"))
+            .env("MiXeD_CaSe", "record-only-test")
+            .args([
+                "--ignored",
+                "--exact",
+                "sandbox::tests::sandbox_probe_record_child",
+                "--nocapture",
+                "--test-threads=1",
+                "--",
+            ])
+            .arg(directory)
+            .arg(nonce);
+        command
+    }
+
+    fn accepts_record(status_success: bool, record_exists: bool) -> bool {
+        status_success && record_exists
+    }
+
+    struct RecordScratch(PathBuf);
+    impl Drop for RecordScratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn record_scratch_root() -> RecordScratch {
+        let path = std::env::temp_dir().join(format!(
+            "sembazuru-record-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed),
+        ));
+        let sid = current_user_sid_string().unwrap();
+        create_secured_directory(&path, &format!("D:P(A;OICI;FA;;;{sid})")).unwrap();
+        RecordScratch(path)
+    }
+
+    #[test]
+    fn sandbox_probe_record_round_trip_uses_file_not_stdout() {
+        let root = record_scratch_root();
+        let directory = root.0.join("record");
+        std::fs::create_dir(&directory).unwrap();
+        let nonce = secure_random_hex().unwrap();
+        let status = record_child_command(&directory, &nonce).status().unwrap();
+        let path = directory.join(format!("{nonce}.rec"));
+        assert!(
+            accepts_record(status.success(), path.exists()),
+            "status={status}"
+        );
+        let record = SandboxProbeRecord::decode(&std::fs::read(&path).unwrap(), &nonce).unwrap();
+        let expected = SandboxProbeRecord::collect(nonce.clone()).unwrap();
+        assert_eq!(record.is_appcontainer, expected.is_appcontainer);
+        assert_eq!(record.appcontainer_sid, expected.appcontainer_sid);
+        assert_eq!(record.restricted_sids, expected.restricted_sids);
+        assert_eq!(record.groups, expected.groups);
+        assert_eq!(record.capabilities, expected.capabilities);
+        assert_eq!(record.integrity_rid, expected.integrity_rid);
+        assert_eq!(record.privileges, expected.privileges);
+        // A plain probe is not assigned a new Job, but inherits the test harness Job when
+        // one exists; the parent-side process observation is the exact expectation.
+        assert_eq!(record.in_job, expected.in_job);
+        assert_eq!(record.environment, normalized_environment_for_child());
+    }
+
+    #[test]
+    fn sandbox_probe_record_stale_destination_is_not_success() {
+        let root = record_scratch_root();
+        let directory = root.0.join("record");
+        std::fs::create_dir(&directory).unwrap();
+        let nonce = secure_random_hex().unwrap();
+        let path = directory.join(format!("{nonce}.rec"));
+        std::fs::write(&path, b"sentinel").unwrap();
+        let status = record_child_command(&directory, &nonce).status().unwrap();
+        assert!(!accepts_record(status.success(), path.exists()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+        assert!(!directory.join(format!("{nonce}.tmp")).exists());
+    }
+
+    #[test]
+    fn sandbox_probe_record_acceptance_rejects_noop_and_record_only() {
+        assert!(!accepts_record(true, false));
+        assert!(!accepts_record(false, true));
+    }
+
+    fn normalized_environment_for_child() -> Vec<(String, String)> {
+        let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+        let mut values: Vec<(String, String)> = vec![
+            ("MiXeD_CaSe".into(), "record-only-test".into()),
+            ("Path".into(), root.join("System32").display().to_string()),
+            ("SystemDrive".into(), std::env::var("SystemDrive").unwrap()),
+            ("SystemRoot".into(), root.display().to_string()),
+        ];
+        values.sort_by_key(|(name, _)| name.to_ascii_lowercase());
+        values
+    }
+
+    fn validate_nonce(nonce: &str) -> Result<(), String> {
+        if nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            Ok(())
+        } else {
+            Err("nonce".into())
+        }
+    }
+    fn write_text(writer: &mut Writer, text: &str) -> Result<(), String> {
+        if text.len() > SANDBOX_PROBE_MAX_TEXT {
+            Err("text too long".into())
+        } else {
+            writer.str(text);
+            Ok(())
+        }
+    }
+    fn write_sid_list(writer: &mut Writer, values: &[ProbeSid]) -> Result<(), String> {
+        if values.len() as u32 > SANDBOX_PROBE_MAX_LIST {
+            return Err("list count".into());
+        }
+        writer.u32(values.len() as u32);
+        for value in values {
+            write_text(writer, &value.sid)?;
+            writer.u32(value.attributes);
+        }
+        Ok(())
+    }
+    fn read_text(reader: &mut Reader<'_>) -> Result<String, String> {
+        let value = reader.str().map_err(|_| "utf8 or truncation")?;
+        if value.len() > SANDBOX_PROBE_MAX_TEXT {
+            Err("text too long".into())
+        } else {
+            Ok(value)
+        }
+    }
+    fn read_sid_list(reader: &mut Reader<'_>, label: &str) -> Result<Vec<ProbeSid>, String> {
+        let count = reader.u32().map_err(|_| "count")?;
+        if count > SANDBOX_PROBE_MAX_LIST {
+            return Err(format!("{label} count"));
+        }
+        (0..count)
+            .map(|_| {
+                Ok(ProbeSid {
+                    sid: read_text(reader)?,
+                    attributes: reader.u32().map_err(|_| "SID attributes")?,
+                })
+            })
+            .collect()
+    }
+    fn read_privileges(reader: &mut Reader<'_>) -> Result<Vec<(u32, i32, u32)>, String> {
+        let count = reader.u32().map_err(|_| "priv count")?;
+        if count > SANDBOX_PROBE_MAX_LIST {
+            return Err("priv count".into());
+        }
+        (0..count)
+            .map(|_| {
+                Ok((
+                    reader.u32().map_err(|_| "priv")?,
+                    reader.u32().map_err(|_| "priv")? as i32,
+                    reader.u32().map_err(|_| "priv")?,
+                ))
+            })
+            .collect()
+    }
+    fn read_environment(reader: &mut Reader<'_>) -> Result<Vec<(String, String)>, String> {
+        let count = reader.u32().map_err(|_| "env count")?;
+        if count > SANDBOX_PROBE_MAX_LIST {
+            return Err("env count".into());
+        }
+        (0..count)
+            .map(|_| Ok((read_text(reader)?, read_text(reader)?)))
+            .collect()
+    }
+    fn validate_sids(values: &[ProbeSid], label: &str) -> Result<(), String> {
+        if values.windows(2).all(|pair| {
+            (pair[0].sid.as_str(), pair[0].attributes) < (pair[1].sid.as_str(), pair[1].attributes)
+        }) {
+            Ok(())
+        } else {
+            Err(format!("{label} order"))
+        }
+    }
+    fn read_strict_bool(reader: &mut Reader<'_>) -> Result<bool, String> {
+        match reader.u8().map_err(|_| "bool")? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("bool value".into()),
+        }
+    }
+    fn validate_environment(values: &[(String, String)]) -> Result<(), String> {
+        if values.iter().any(|(name, value)| {
+            name.is_empty()
+                || name.contains('=')
+                || name.len() > SANDBOX_PROBE_MAX_TEXT
+                || value.len() > SANDBOX_PROBE_MAX_TEXT
+        }) {
+            return Err("environment text".into());
+        }
+        if values
+            .windows(2)
+            .all(|pair| pair[0].0.to_ascii_lowercase() < pair[1].0.to_ascii_lowercase())
+        {
+            Ok(())
+        } else {
+            Err("environment order".into())
+        }
+    }
 
     struct RevertGuard;
     impl Drop for RevertGuard {
