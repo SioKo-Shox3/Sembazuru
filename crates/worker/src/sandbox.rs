@@ -1099,6 +1099,177 @@ mod tests {
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
+    const WINDOW_STATION_SCM_SMOKE_BASENAME: &str = "SbzWindowStationScmSmoke.exe";
+    const WINDOW_STATION_SCM_SMOKE_SERVICE: &str = "SembazuruWindowStationProbeSmoke";
+    const WINDOW_STATION_SCM_SMOKE_SELECTOR: &str =
+        "sandbox::tests::window_station_scm_dispatcher_smoke_role";
+    const WINDOW_STATION_SCM_SMOKE_SUCCESS: u32 = 0x5342_5a31;
+    const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
+
+    fn validate_window_station_scm_process_argv(argv: &[OsString]) -> Result<(), &'static str> {
+        let expected = [
+            "--ignored",
+            "--exact",
+            WINDOW_STATION_SCM_SMOKE_SELECTOR,
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        if argv.len() != expected.len() + 1 {
+            return Err("process argv cardinality");
+        }
+        if Path::new(&argv[0]).file_name() != Some(OsStr::new(WINDOW_STATION_SCM_SMOKE_BASENAME)) {
+            return Err("process executable basename");
+        }
+        if argv[1..]
+            .iter()
+            .zip(expected)
+            .any(|(actual, expected)| actual != OsStr::new(expected))
+        {
+            return Err("process argv exact order/value");
+        }
+        Ok(())
+    }
+
+    fn validate_window_station_scm_main_args(args: &[OsString]) -> Result<(), &'static str> {
+        if args.len() != 1 {
+            return Err("ServiceMain args cardinality");
+        }
+        if args[0] != OsStr::new(WINDOW_STATION_SCM_SMOKE_SERVICE) {
+            return Err("ServiceMain service name");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn window_station_scm_contract_rejects_aliases_and_extra_arguments() {
+        assert_ne!(
+            WINDOW_STATION_SCM_SMOKE_SUCCESS,
+            WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE
+        );
+        let valid_process: Vec<OsString> = [
+            WINDOW_STATION_SCM_SMOKE_BASENAME,
+            "--ignored",
+            "--exact",
+            WINDOW_STATION_SCM_SMOKE_SELECTOR,
+            "--nocapture",
+            "--test-threads=1",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert!(validate_window_station_scm_process_argv(&valid_process).is_ok());
+        assert!(
+            validate_window_station_scm_main_args(&[OsString::from(
+                WINDOW_STATION_SCM_SMOKE_SERVICE
+            )])
+            .is_ok()
+        );
+        for invalid in [
+            valid_process[..valid_process.len() - 1].to_vec(),
+            [valid_process.clone(), vec![OsString::from("extra")]].concat(),
+            {
+                let mut value = valid_process.clone();
+                value[0] = OsString::from("SbzWindowStationScmSmoke-copy.exe");
+                value
+            },
+            {
+                let mut value = valid_process.clone();
+                value.swap(1, 2);
+                value
+            },
+            {
+                let mut value = valid_process.clone();
+                value[3] = OsString::from("sandbox::tests::other");
+                value
+            },
+        ] {
+            assert!(validate_window_station_scm_process_argv(&invalid).is_err());
+        }
+        for index in 1..valid_process.len() {
+            let mut invalid = valid_process.clone();
+            invalid[index].push("-not-exact");
+            assert!(validate_window_station_scm_process_argv(&invalid).is_err());
+        }
+        for invalid in [
+            Vec::new(),
+            vec![OsString::from("other")],
+            vec![
+                OsString::from(WINDOW_STATION_SCM_SMOKE_SERVICE),
+                OsString::from("extra-start-argument"),
+            ],
+        ] {
+            assert!(validate_window_station_scm_main_args(&invalid).is_err());
+        }
+    }
+
+    windows_service::define_windows_service!(
+        ffi_window_station_scm_smoke_main,
+        window_station_scm_smoke_main
+    );
+
+    fn window_station_scm_smoke_main(args: Vec<OsString>) {
+        let exit_code = if validate_window_station_scm_main_args(&args).is_ok() {
+            WINDOW_STATION_SCM_SMOKE_SUCCESS
+        } else {
+            WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE
+        };
+        let _ = run_window_station_scm_smoke(exit_code);
+    }
+
+    fn run_window_station_scm_smoke(exit_code: u32) -> windows_service::Result<()> {
+        use windows_service::service::{
+            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceType,
+        };
+        use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+
+        let handler = |control| match control {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            _ => ServiceControlHandlerResult::NotImplemented,
+        };
+        let status = service_control_handler::register(WINDOW_STATION_SCM_SMOKE_SERVICE, handler)?;
+        let set = |current_state, service_exit_code, wait_hint| {
+            status.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: service_exit_code,
+                checkpoint: 0,
+                wait_hint,
+                process_id: None,
+            })
+        };
+        set(
+            ServiceState::StartPending,
+            ServiceExitCode::Win32(0),
+            std::time::Duration::from_secs(10),
+        )?;
+        if exit_code == WINDOW_STATION_SCM_SMOKE_SUCCESS {
+            set(
+                ServiceState::Running,
+                ServiceExitCode::Win32(0),
+                std::time::Duration::default(),
+            )?;
+        }
+        set(
+            ServiceState::Stopped,
+            ServiceExitCode::ServiceSpecific(exit_code),
+            std::time::Duration::default(),
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn window_station_scm_dispatcher_smoke_role() {
+        let argv: Vec<_> = std::env::args_os().collect();
+        validate_window_station_scm_process_argv(&argv).expect("SCM smoke process argv contract");
+        windows_service::service_dispatcher::start(
+            WINDOW_STATION_SCM_SMOKE_SERVICE,
+            ffi_window_station_scm_smoke_main,
+        )
+        .expect("SCM dispatcher smoke");
+    }
+
     #[derive(Clone, Debug)]
     struct HandleDeliveryRecord {
         nonce: String,
