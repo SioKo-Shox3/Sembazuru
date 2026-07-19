@@ -76,11 +76,16 @@
 - レビュー: 独立Codex実装レビューは、事前条件・record gate・手書きtrace・cleanupを確認してAPPROVE（blocking／non-blocking所見なし）。
 - Done: 既存entryの有無にかかわらずnon-deterministic actionは必ずworkerで実行され、cache hit／prefetch／recordを行わない。
 
-### OPEN: build root内のabsent probeをcache keyから落とす
+### RESOLVED: build root内のabsent probeをcache keyから落とす
 
-- 根拠: `crates/tracer/src/action_key.rs:418-453`（特に`447-448`）。
-- 修正方向: build root内外ではなくtrace event種別で一時ファイルを分類し、通常のprobe missは`InputKind::Absent`に残す。不明な観測はuncacheableへ倒す。
-- Done: `__has_include`等で初回absentだったheaderを後から生成するとcache missになり、run-varying一時ファイルは誤ってkeyを不安定化しない。
+- 対応: `c1e10d0`で場所による分類を廃止し、traceの`ProbeMiss`はroot内外を問わず`InputKind::Absent`へ残し、
+  probe根拠のないunreadable観測はuncacheableへ倒した。自己生成tempはgraphの成功したwrite→delete／rename event sequenceでのみ除外する。
+  `7ada953`でbuild root内`generated/gen.h`を使うproduction AgentCacheのrecord→Hit→出現後MissをE2E固定した。
+- ローカル検証: root内absent exact testは`1 passed; 0 failed`、agent libは`280 passed; 0 failed; 2 ignored`、
+  tracer libは`79 passed; 0 failed`。fmt、agent／tracer all-targets clippy `-D warnings`、scope、差分／行末検査も成功。
+- レビュー: LIGHT path。orchestrator差分レビューでcache storeとbuild fixtureの独立を維持するよう最小化し、再検証後に着地した。
+- Done: `__has_include`等のroot内absent headerはcache keyへ保持され、後の生成でresolveがmissする。場所名だけでinputを落とさず、
+  run-varyingな自己生成tempだけをevent sequenceにより除外し、不明なvanished readはcache記録を拒否する。
 
 ### OPEN: VFS子process注入がtrace依存かつfail-open
 
