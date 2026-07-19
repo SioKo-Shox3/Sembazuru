@@ -65,11 +65,16 @@
 
 ## P0 correctness
 
-### OPEN: `non_deterministic`でも既存cacheをresolveする
+### RESOLVED: `non_deterministic`でも既存cacheをresolveする
 
-- 根拠: `crates/agent/src/intake.rs:573-578,711-720`。
-- 修正方向: resolveとprefetchも`!non_deterministic`で囲み、recordだけでなく全cache利用を無効化する。
-- Done: 既存entryがあってもnon-deterministic actionは必ず実行され、cache hit/prefetch/recordが発生しない回帰テストが通る。
+- 対応: `e72174d`でnon-deterministic actionのweak key／tool identity生成を止め、resolve／prefetch／recordの全cache利用を遮断した。
+  `fc0e3d3`で既存hit、非空の予測入力、record可能なverified tool／trace／declared outputを用意したproduction経路の回帰証拠を追加した。
+- ローカル検証: 既存hitでもworkerへ到達してpredicted pathsが空、cache hit／miss counterがともに0となるexact testと、
+  record条件を満たすremote成功後もfresh weak keyがmissのままであるexact testが各`1 passed; 0 failed`。
+  `prefetch_scope`全体は`3 passed; 0 failed`、agent libは`280 passed; 0 failed; 2 ignored`。fmt、agent all-targets clippy
+  `-D warnings`、scope、差分／行末検査も成功。
+- レビュー: 独立Codex実装レビューは、事前条件・record gate・手書きtrace・cleanupを確認してAPPROVE（blocking／non-blocking所見なし）。
+- Done: 既存entryの有無にかかわらずnon-deterministic actionは必ずworkerで実行され、cache hit／prefetch／recordを行わない。
 
 ### OPEN: build root内のabsent probeをcache keyから落とす
 
