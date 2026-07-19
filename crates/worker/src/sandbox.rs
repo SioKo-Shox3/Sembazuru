@@ -1049,14 +1049,16 @@ impl Drop for RestrictedProcess {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::IntoRawHandle;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread::JoinHandle;
 
     use sembazuru_dataplane::wire::{Reader, Writer};
 
     use windows_sys::Win32::Foundation::{
-        GENERIC_WRITE, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_TIMEOUT,
+        GENERIC_WRITE, GetHandleInformation, INVALID_HANDLE_VALUE, LUID, LocalFree, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1077,14 +1079,756 @@ mod tests {
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        GetProcessWindowStation, GetUserObjectInformationW, UOI_NAME, UOI_TYPE,
+    };
     use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
     use windows_sys::Win32::System::Threading::{
         CreateEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::WINSTA_READATTRIBUTES;
 
     use super::*;
 
     static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Debug)]
+    struct HandleDeliveryRecord {
+        nonce: String,
+        raw_lookup_succeeded: bool,
+        raw_error: u32,
+        raw_type: String,
+        raw_name: String,
+        raw_inheritable: bool,
+        same_access_succeeded: bool,
+        duplicate_type: String,
+        duplicate_name: String,
+        duplicate_inheritable: bool,
+    }
+
+    impl HandleDeliveryRecord {
+        const MAGIC: u32 = 0x4844_4c52;
+        const VERSION: u32 = 1;
+        const MAX_BYTES: usize = 4096;
+
+        fn encode(&self) -> Result<Vec<u8>, String> {
+            validate_nonce(&self.nonce)?;
+            let mut payload = Writer::new();
+            payload.bool(self.raw_lookup_succeeded);
+            payload.u32(self.raw_error);
+            write_text(&mut payload, &self.raw_type)?;
+            write_text(&mut payload, &self.raw_name)?;
+            payload.bool(self.raw_inheritable);
+            payload.bool(self.same_access_succeeded);
+            write_text(&mut payload, &self.duplicate_type)?;
+            write_text(&mut payload, &self.duplicate_name)?;
+            payload.bool(self.duplicate_inheritable);
+            let payload = payload.into_bytes();
+            if payload.len() > Self::MAX_BYTES {
+                return Err("delivery record too large".into());
+            }
+            let mut bytes = Vec::with_capacity(40 + payload.len());
+            bytes.extend_from_slice(&Self::MAGIC.to_le_bytes());
+            bytes.extend_from_slice(&Self::VERSION.to_le_bytes());
+            bytes.extend_from_slice(self.nonce.as_bytes());
+            bytes.extend_from_slice(&payload);
+            Ok(bytes)
+        }
+
+        fn decode(bytes: &[u8], expected_nonce: &str) -> Result<Self, String> {
+            validate_nonce(expected_nonce)?;
+            if !(40..=40 + Self::MAX_BYTES).contains(&bytes.len())
+                || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != Self::MAGIC
+                || u32::from_le_bytes(bytes[4..8].try_into().unwrap()) != Self::VERSION
+            {
+                return Err("delivery record header/length".into());
+            }
+            let nonce = std::str::from_utf8(&bytes[8..40]).map_err(|_| "delivery nonce utf8")?;
+            if nonce != expected_nonce {
+                return Err("delivery nonce mismatch".into());
+            }
+            let mut payload = Reader::new(&bytes[40..]);
+            let record = Self {
+                nonce: nonce.into(),
+                raw_lookup_succeeded: read_strict_bool(&mut payload)?,
+                raw_error: payload.u32().map_err(|_| "delivery raw error")?,
+                raw_type: read_text(&mut payload)?,
+                raw_name: read_text(&mut payload)?,
+                raw_inheritable: read_strict_bool(&mut payload)?,
+                same_access_succeeded: read_strict_bool(&mut payload)?,
+                duplicate_type: read_text(&mut payload)?,
+                duplicate_name: read_text(&mut payload)?,
+                duplicate_inheritable: read_strict_bool(&mut payload)?,
+            };
+            payload.finish().map_err(|_| "delivery record trailing")?;
+            Ok(record)
+        }
+
+        fn publish(&self, directory: &Path) -> io::Result<()> {
+            let record = directory.join(format!("{}.rec", self.nonce));
+            let temporary = directory.join(format!("{}.tmp", self.nonce));
+            let bytes = self.encode().map_err(io::Error::other)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(temporary, record)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn accept_handle_delivery(
+        record: &HandleDeliveryRecord,
+        expected_nonce: &str,
+        parent_type: &str,
+        parent_name: &str,
+        parent_inheritable: bool,
+        child_restricted: bool,
+        status_success: bool,
+        entry_exists: bool,
+        record_exists: bool,
+    ) -> Result<(), &'static str> {
+        if !status_success {
+            return Err("child failed");
+        }
+        if !entry_exists {
+            return Err("child entry marker missing");
+        }
+        if !record_exists {
+            return Err("child record missing");
+        }
+        if record.nonce != expected_nonce {
+            return Err("nonce mismatch");
+        }
+        if !record.raw_lookup_succeeded || record.raw_error != 0 {
+            return Err("raw lookup failed");
+        }
+        if !child_restricted {
+            return Err("child token is unrestricted");
+        }
+        if record.raw_type != parent_type || record.raw_name != parent_name {
+            return Err("raw object identity mismatch");
+        }
+        if !parent_inheritable || !record.raw_inheritable {
+            return Err("raw inheritance flag mismatch");
+        }
+        if !record.same_access_succeeded {
+            return Err("same-access duplicate failed");
+        }
+        if record.duplicate_type != parent_type || record.duplicate_name != parent_name {
+            return Err("duplicate object identity mismatch");
+        }
+        if record.duplicate_inheritable {
+            return Err("same-access duplicate remained inheritable");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn window_handle_delivery_classifier_rejects_every_invalid_outcome() {
+        let valid = HandleDeliveryRecord {
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            raw_lookup_succeeded: true,
+            raw_error: 0,
+            raw_type: "WindowStation".into(),
+            raw_name: "WinSta0".into(),
+            raw_inheritable: true,
+            same_access_succeeded: true,
+            duplicate_type: "WindowStation".into(),
+            duplicate_name: "WinSta0".into(),
+            duplicate_inheritable: false,
+        };
+        let accept = |record: &HandleDeliveryRecord,
+                      nonce,
+                      parent_type,
+                      parent_name,
+                      parent_inheritable,
+                      child_restricted,
+                      status_success,
+                      entry_exists,
+                      record_exists| {
+            accept_handle_delivery(
+                record,
+                nonce,
+                parent_type,
+                parent_name,
+                parent_inheritable,
+                child_restricted,
+                status_success,
+                entry_exists,
+                record_exists,
+            )
+        };
+        assert!(
+            accept(
+                &valid,
+                &valid.nonce,
+                "WindowStation",
+                "WinSta0",
+                true,
+                true,
+                true,
+                true,
+                true
+            )
+            .is_ok(),
+            "valid delivery fixture must be accepted"
+        );
+        let bytes = valid.encode().unwrap();
+        assert_eq!(
+            HandleDeliveryRecord::decode(&bytes, &valid.nonce)
+                .unwrap()
+                .raw_type,
+            "WindowStation"
+        );
+        let mut magic = bytes.clone();
+        magic[0] ^= 1;
+        let mut version = bytes.clone();
+        version[4] ^= 1;
+        let mut strict_bool = bytes.clone();
+        strict_bool[40] = 2;
+        let mut nonce = bytes.clone();
+        nonce[8] ^= 1;
+        for bad in [
+            magic,
+            version,
+            strict_bool,
+            bytes[..39].to_vec(),
+            [bytes.clone(), vec![0]].concat(),
+            nonce,
+        ] {
+            assert!(HandleDeliveryRecord::decode(&bad, &valid.nonce).is_err());
+        }
+        for mutate in [
+            Box::new(|value: &mut HandleDeliveryRecord| {
+                value.nonce = "ffffffffffffffffffffffffffffffff".into()
+            }) as Box<dyn Fn(&mut HandleDeliveryRecord)>,
+            Box::new(|value| value.raw_type = "Desktop".into()),
+            Box::new(|value| value.raw_name = "other".into()),
+            Box::new(|value| value.raw_lookup_succeeded = false),
+            Box::new(|value| value.raw_error = 5),
+            Box::new(|value| value.raw_inheritable = false),
+            Box::new(|value| value.same_access_succeeded = false),
+            Box::new(|value| value.duplicate_type = "Desktop".into()),
+            Box::new(|value| value.duplicate_name = "other".into()),
+            Box::new(|value| value.duplicate_inheritable = true),
+        ] {
+            let mut invalid = valid.clone();
+            mutate(&mut invalid);
+            assert!(
+                accept(
+                    &invalid,
+                    &valid.nonce,
+                    "WindowStation",
+                    "WinSta0",
+                    true,
+                    true,
+                    true,
+                    true,
+                    true
+                )
+                .is_err(),
+                "invalid child record was accepted: {invalid:?}"
+            );
+        }
+        for (status_success, entry_exists, record_exists) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            assert!(
+                accept(
+                    &valid,
+                    &valid.nonce,
+                    "WindowStation",
+                    "WinSta0",
+                    true,
+                    true,
+                    status_success,
+                    entry_exists,
+                    record_exists,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            accept(
+                &valid,
+                &valid.nonce,
+                "WindowStation",
+                "WinSta0",
+                true,
+                false,
+                true,
+                true,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    fn user_object_text(handle: HANDLE, index: i32) -> io::Result<String> {
+        let mut buffer = vec![0u16; 1024];
+        let mut used = 0;
+        // SAFETY: buffer is writable and the live USER object handle belongs to this process.
+        if unsafe {
+            GetUserObjectInformationW(
+                handle,
+                index,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * size_of::<u16>()) as u32,
+                &mut used,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let length = (used as usize / size_of::<u16>()).min(buffer.len());
+        if length == 0 || buffer[length - 1] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unterminated USER object text",
+            ));
+        }
+        Ok(String::from_utf16_lossy(&buffer[..length - 1]))
+    }
+
+    fn user_object_identity(handle: HANDLE) -> io::Result<(String, String)> {
+        Ok((
+            user_object_text(handle, UOI_TYPE)?,
+            user_object_text(handle, UOI_NAME)?,
+        ))
+    }
+
+    fn inheritable(handle: HANDLE) -> io::Result<bool> {
+        let mut flags = 0;
+        if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(flags & HANDLE_FLAG_INHERIT != 0)
+    }
+
+    struct RawDeliveryProcess {
+        process: OwnedHandle,
+        _job: Arc<JobObject>,
+        stdout: Option<JoinHandle<io::Result<()>>>,
+        stderr: Option<JoinHandle<io::Result<String>>>,
+        child_restricted: bool,
+        reaped: bool,
+    }
+
+    struct HandleDeliveryEvidence {
+        record: HandleDeliveryRecord,
+        child_restricted: bool,
+        status_success: bool,
+        entry_exists: bool,
+        record_exists: bool,
+        parent: (String, String),
+        parent_inheritable: bool,
+    }
+
+    impl Drop for RawDeliveryProcess {
+        fn drop(&mut self) {
+            if !self.reaped {
+                // SAFETY: this process is uniquely owned by the test probe; bounded reap avoids orphans.
+                unsafe {
+                    TerminateProcess(self.process.as_raw_handle() as HANDLE, 1);
+                    WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 30_000);
+                }
+            }
+        }
+    }
+
+    fn drain_delivery_pipe(handle: OwnedHandle, retain: bool) -> io::Result<String> {
+        let mut file = unsafe { File::from_raw_handle(handle.into_raw_handle()) };
+        let mut buffer = [0u8; 8192];
+        let mut output = Vec::new();
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            if retain && output.len() < 64 * 1024 {
+                let take = (64 * 1024 - output.len()).min(read);
+                output.extend_from_slice(&buffer[..take]);
+            }
+        }
+        Ok(String::from_utf8_lossy(&output).into_owned())
+    }
+
+    fn spawn_handle_delivery_child(
+        token: &ActionToken,
+        command: &RestrictedCommand,
+        station: HANDLE,
+        wire_station: bool,
+    ) -> io::Result<RawDeliveryProcess> {
+        let mut prepared = prepare_command(command)?;
+        let job = Arc::new(JobObject::new_kill_on_close()?);
+        let (stdin, stdin_parent) = stdio_pipe(true)?;
+        let (stdout, stdout_parent) = stdio_pipe(false)?;
+        let (stderr, stderr_parent) = stdio_pipe(false)?;
+        drop(stdin_parent);
+        let mut inherited = vec![
+            stdin.as_raw_handle() as HANDLE,
+            stdout.as_raw_handle() as HANDLE,
+            stderr.as_raw_handle() as HANDLE,
+        ];
+        if wire_station {
+            inherited.push(station);
+        }
+        let mut attributes = AttributeList::handles(&inherited)?;
+        let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
+        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = inherited[0];
+        startup.StartupInfo.hStdOutput = inherited[1];
+        startup.StartupInfo.hStdError = inherited[2];
+        startup.lpAttributeList = attributes.ptr();
+        let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the command buffers and only-listed inheritable handles remain live.
+        if unsafe {
+            CreateProcessAsUserW(
+                token.handle(),
+                prepared.application.as_ptr(),
+                prepared.command_line.as_mut_ptr(),
+                null(),
+                null(),
+                1,
+                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                prepared.environment.as_ptr().cast(),
+                prepared.cwd.as_ptr(),
+                &startup.StartupInfo,
+                &mut info,
+            )
+        } == 0
+        {
+            return Err(io::Error::other(format!(
+                "spawn API error {}",
+                io::Error::last_os_error().raw_os_error().unwrap_or(0)
+            )));
+        }
+        let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess as RawHandle) };
+        let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread as RawHandle) };
+        let child_token = match process_token(process.as_raw_handle() as HANDLE, TOKEN_QUERY) {
+            Ok(token) => token,
+            Err(error) => {
+                unsafe {
+                    TerminateProcess(process.as_raw_handle() as HANDLE, 1);
+                    WaitForSingleObject(process.as_raw_handle() as HANDLE, 30_000);
+                }
+                return Err(error);
+            }
+        };
+        let child_restricted = is_token_restricted(child_token.as_raw_handle() as HANDLE);
+        if !child_restricted {
+            unsafe {
+                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
+                WaitForSingleObject(process.as_raw_handle() as HANDLE, 30_000);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "suspended child token is not restricted",
+            ));
+        }
+        if let Err(error) = job.assign_verified(process.as_raw_handle()) {
+            unsafe {
+                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
+                WaitForSingleObject(process.as_raw_handle() as HANDLE, 30_000);
+            }
+            return Err(error);
+        }
+        drop(attributes);
+        drop((stdin, stdout, stderr));
+        if unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) } != 1 {
+            // SAFETY: resume failed before the child could run; bounded reap prevents a suspended orphan.
+            unsafe {
+                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
+                WaitForSingleObject(process.as_raw_handle() as HANDLE, 30_000);
+            }
+            return Err(io::Error::other("resume child failed"));
+        }
+        let stdout =
+            std::thread::spawn(move || drain_delivery_pipe(stdout_parent, false).map(|_| ()));
+        let stderr = std::thread::spawn(move || drain_delivery_pipe(stderr_parent, true));
+        Ok(RawDeliveryProcess {
+            process,
+            _job: job,
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            child_restricted,
+            reaped: false,
+        })
+    }
+
+    fn wait_for_delivery_child(mut child: RawDeliveryProcess) -> io::Result<(bool, String, bool)> {
+        let wait = unsafe { WaitForSingleObject(child.process.as_raw_handle() as HANDLE, 30_000) };
+        if wait != WAIT_OBJECT_0 {
+            // SAFETY: the bounded wait expired or failed; terminate then bounded-reap this test child.
+            let (terminated, reap) = unsafe {
+                (
+                    TerminateProcess(child.process.as_raw_handle() as HANDLE, 1),
+                    WaitForSingleObject(child.process.as_raw_handle() as HANDLE, 30_000),
+                )
+            };
+            child.reaped = reap == WAIT_OBJECT_0;
+            return Err(io::Error::new(
+                if wait == WAIT_TIMEOUT {
+                    io::ErrorKind::TimedOut
+                } else {
+                    io::ErrorKind::Other
+                },
+                format!("child wait={wait}; terminate={terminated}; reap={reap}"),
+            ));
+        }
+        child.reaped = true;
+        let mut code = 0;
+        // SAFETY: process is live and code is writable.
+        if unsafe { GetExitCodeProcess(child.process.as_raw_handle() as HANDLE, &mut code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        child
+            .stdout
+            .take()
+            .expect("stdout drain is owned")
+            .join()
+            .map_err(|_| io::Error::other("stdout drain panicked"))??;
+        let text = child
+            .stderr
+            .take()
+            .expect("stderr drain is owned")
+            .join()
+            .map_err(|_| io::Error::other("stderr drain panicked"))??;
+        Ok((code == 0, text, child.child_restricted))
+    }
+
+    fn handle_delivery_evidence(wire_station: bool) -> Result<HandleDeliveryEvidence, String> {
+        let token = ActionToken::create().map_err(|error| format!("token setup: {error}"))?;
+        struct RootCleanup(PathBuf);
+        impl Drop for RootCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let root_path = std::env::temp_dir().join(format!(
+            "sembazuru-handle-delivery-{}-{}",
+            std::process::id(),
+            NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root_sddl = format!(
+            "O:{}D:P(A;OICI;FA;;;{})(A;OICI;GRGX;;;{})",
+            sid_string(token.broker_sid()).map_err(|error| format!("root broker SID: {error}"))?,
+            sid_string(token.broker_sid()).map_err(|error| format!("root broker SID: {error}"))?,
+            sid_string(token.action_sid.0).map_err(|error| format!("root action SID: {error}"))?,
+        );
+        create_secured_directory(&root_path, &root_sddl)
+            .map_err(|error| format!("root setup: {error}"))?;
+        let root = RootCleanup(root_path);
+        let scratch = PrivateScratch::create(&root.0, "handle-delivery", &token)
+            .map_err(|error| format!("scratch setup: {error}"))?;
+        let executable = scratch.path().join("handle-delivery-probe.exe");
+        std::fs::copy(
+            std::env::current_exe().map_err(|error| format!("preflight exe: {error}"))?,
+            &executable,
+        )
+        .map_err(|error| format!("preflight copy: {error}"))?;
+        if !executable.is_absolute() || !executable.is_file() || !scratch.path().is_dir() {
+            return Err("preflight absolute exe/cwd/record dir failed".into());
+        }
+        let nonce = secure_random_hex().map_err(|error| format!("nonce: {error}"))?;
+        let current = unsafe { GetProcessWindowStation() };
+        if current.is_null() {
+            return Err("parent current station missing".into());
+        }
+        let mut low = null_mut();
+        // SAFETY: current is live; low receives an independently owned, inheritable low-rights handle.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                current,
+                GetCurrentProcess(),
+                &mut low,
+                WINSTA_READATTRIBUTES as u32,
+                1,
+                0,
+            )
+        } == 0
+        {
+            return Err(format!(
+                "parent low-rights duplicate: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let low = unsafe { OwnedHandle::from_raw_handle(low as RawHandle) };
+        let parent = user_object_identity(current)
+            .map_err(|error| format!("parent current identity: {error}"))?;
+        let low_identity = user_object_identity(low.as_raw_handle() as HANDLE)
+            .map_err(|error| format!("parent low identity: {error}"))?;
+        let low_inheritable = inheritable(low.as_raw_handle() as HANDLE)
+            .map_err(|error| format!("parent low inherit: {error}"))?;
+        if parent != low_identity || !low_inheritable {
+            return Err("parent low-rights station validation failed".into());
+        }
+        let system_root =
+            PathBuf::from(std::env::var_os("SystemRoot").ok_or("preflight SystemRoot missing")?);
+        let command = RestrictedCommand::new(&executable, scratch.path())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("sandbox::tests::window_handle_delivery_child")
+            .arg("--quiet")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--")
+            .arg(scratch.path())
+            .arg(&nonce)
+            .env("Path", system_root.join("System32"))
+            .env(
+                "SystemDrive",
+                std::env::var_os("SystemDrive").ok_or("preflight SystemDrive missing")?,
+            )
+            .env("SystemRoot", system_root)
+            .env("SBZ_HANDLE_RAW", (low.as_raw_handle() as usize).to_string());
+        let child = spawn_handle_delivery_child(
+            &token,
+            &command,
+            low.as_raw_handle() as HANDLE,
+            wire_station,
+        )
+        .map_err(|error| format!("delivery not confirmed: {error}"))?;
+        let (status_success, stderr, child_restricted) =
+            wait_for_delivery_child(child).map_err(|error| format!("wait child: {error}"))?;
+        let entry = scratch.path().join(format!("{nonce}.entry"));
+        let record_path = scratch.path().join(format!("{nonce}.rec"));
+        if !status_success {
+            return Err(format!(
+                "delivery not confirmed: child nonzero; stderr={stderr:?}"
+            ));
+        }
+        if !entry.is_file() {
+            return Err("delivery not confirmed: child entry marker missing".into());
+        }
+        if !record_path.is_file() {
+            return Err("delivery not confirmed: child record missing".into());
+        }
+        let bytes = std::fs::read(&record_path).map_err(|error| format!("record read: {error}"))?;
+        let record = HandleDeliveryRecord::decode(&bytes, &nonce)
+            .map_err(|error| format!("record decode/nonce: {error}"))?;
+        Ok(HandleDeliveryEvidence {
+            record,
+            child_restricted,
+            status_success,
+            entry_exists: entry.is_file(),
+            record_exists: record_path.is_file(),
+            parent,
+            parent_inheritable: low_inheritable,
+        })
+    }
+
+    #[test]
+    fn window_handle_delivery_probe_requires_handle_list_delivery() {
+        let evidence = handle_delivery_evidence(false).unwrap();
+        assert!(
+            evidence.child_restricted
+                && evidence.status_success
+                && evidence.entry_exists
+                && evidence.record_exists,
+            "spawn/token/entry/record evidence missing"
+        );
+        assert!(
+            !evidence.record.raw_lookup_succeeded,
+            "numeric alias unexpectedly resolved"
+        );
+        eprintln!("unwired raw lookup error={}", evidence.record.raw_error);
+    }
+
+    #[test]
+    fn window_handle_delivery_probe_confirms_handle_list_delivery() {
+        let evidence = handle_delivery_evidence(true).unwrap();
+        accept_handle_delivery(
+            &evidence.record,
+            &evidence.record.nonce,
+            &evidence.parent.0,
+            &evidence.parent.1,
+            evidence.parent_inheritable,
+            evidence.child_restricted,
+            evidence.status_success,
+            evidence.entry_exists,
+            evidence.record_exists,
+        )
+        .expect("delivery confirmed");
+    }
+
+    #[test]
+    #[ignore]
+    fn window_handle_delivery_child() {
+        let args: Vec<_> = std::env::args_os().collect();
+        let separator = args
+            .iter()
+            .position(|arg| arg == "--")
+            .expect("record separator");
+        let values = &args[separator + 1..];
+        assert_eq!(values.len(), 2, "record argv");
+        let directory = PathBuf::from(&values[0]);
+        let nonce = values[1].to_str().expect("nonce utf8").to_owned();
+        validate_nonce(&nonce).expect("nonce format");
+        let entry = directory.join(format!("{nonce}.entry"));
+        let mut entry_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&entry)
+            .expect("entry create_new");
+        entry_file.write_all(b"entry").expect("entry write");
+        entry_file.sync_all().expect("entry sync");
+        drop(entry_file);
+        let raw = std::env::var("SBZ_HANDLE_RAW")
+            .expect("raw handle env")
+            .parse::<usize>()
+            .expect("raw handle integer") as HANDLE;
+        let mut record = HandleDeliveryRecord {
+            nonce,
+            raw_lookup_succeeded: false,
+            raw_error: 0,
+            raw_type: String::new(),
+            raw_name: String::new(),
+            raw_inheritable: false,
+            same_access_succeeded: false,
+            duplicate_type: String::new(),
+            duplicate_name: String::new(),
+            duplicate_inheritable: false,
+        };
+        match user_object_identity(raw) {
+            Ok(identity) => {
+                record.raw_lookup_succeeded = true;
+                record.raw_type = identity.0;
+                record.raw_name = identity.1;
+                record.raw_inheritable = inheritable(raw).expect("raw inherit flag");
+                let mut duplicate = null_mut();
+                record.same_access_succeeded = unsafe {
+                    DuplicateHandle(
+                        GetCurrentProcess(),
+                        raw,
+                        GetCurrentProcess(),
+                        &mut duplicate,
+                        0,
+                        0,
+                        DUPLICATE_SAME_ACCESS,
+                    ) != 0
+                };
+                if record.same_access_succeeded {
+                    let duplicate = unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) };
+                    let identity = user_object_identity(duplicate.as_raw_handle() as HANDLE)
+                        .expect("duplicate identity");
+                    record.duplicate_type = identity.0;
+                    record.duplicate_name = identity.1;
+                    record.duplicate_inheritable = inheritable(duplicate.as_raw_handle() as HANDLE)
+                        .expect("duplicate inherit flag");
+                }
+            }
+            Err(error) => record.raw_error = error.raw_os_error().unwrap_or(0) as u32,
+        }
+        record.publish(&directory).expect("publish delivery record");
+    }
 
     #[test]
     fn sandbox_probe_record_codec_round_trips() {
