@@ -121,11 +121,13 @@
 - 対応commit: `94b1905` (`Performance: VFS pipe接続をthread単位で再利用する`)。outer callはthread-local接続を再利用し、再入時は短命接続へ分離、transport破損時だけfresh接続で1回再試行する。
 - 検証証拠: `pwsh -NoProfile -File hooks/test/vfs_bench.ps1 -BuildDir hooks/build/Release -WorkRoot <TEMP> -ConnectionReuseOnly` は `VFS PIPE REUSE GATE PASS`。1000 requestでpersistent接続`1`対forced reconnect`1000`、paired median差`42.8 us`、再利用優位`9/9`に加え、8/16/32-thread frame分離・1回再接続・strict fallbackが通過した。
 
-### OPEN: metadata probeがfull hydrateする
+### RESOLVED (2026-07-20): metadata probeがfull hydrateする
 
 - 根拠: `hooks/src/interceptor.cpp:760-794,1300-1403`。
 - 修正方向: stat/batch-stat応答だけで属性probeを処理し、content open時だけhydrateする。
 - Done: `GetFileAttributes*`主体のbenchmarkでcontent転送が発生せず、属性・absent結果が通常openと一致する。
+- 対応commit: `be5d011` (`Performance: metadata probeのfull hydrateを廃止する`)。metadata専用wire/agent/worker/hook経路を追加し、legacy応答だけを安全にhydrateへfallbackする。
+- 検証証拠: workerの`metadata_batch_chunks_10000_requests_without_content_ops`とagentの`metadata_probes_10000_transfer_no_content_or_scratch_bytes`は各`1 passed; 0 failed`。fresh DLLのnative gateは`METADATA_NATIVE PASS calls=10004 wall_ms=3000 present=W/A/ExW/ExA absent=PASS sparse_4GiB=PASS`かつaction `states=[1,2,3,4] exit=0`で、content/scratch転送0、present/absent、64-bit size・FILETIME・LastError整合を固定した。
 
 ### OPEN: trace recordごとに複数の同期`WriteFile`を行う
 
