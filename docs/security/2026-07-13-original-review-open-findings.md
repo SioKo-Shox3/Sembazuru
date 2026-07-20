@@ -113,11 +113,13 @@
 
 ## Performance
 
-### OPEN: hook→worker named pipeをoperationごとに再接続する
+### RESOLVED (2026-07-20): hook→worker named pipeをoperationごとに再接続する
 
 - 根拠: `hooks/src/interceptor.cpp:482-542`（`CreateFileW`は`502-508`、`CloseHandle`は`541`）。
 - 修正方向: 測定を追加したうえで、再入・終了処理を安全にしたper-thread接続再利用または小規模poolを導入する。
 - Done: production相当benchmarkで接続回数とopen latencyが低下し、切断時の再接続・fallback回帰テストが通る。
+- 対応commit: `94b1905` (`Performance: VFS pipe接続をthread単位で再利用する`)。outer callはthread-local接続を再利用し、再入時は短命接続へ分離、transport破損時だけfresh接続で1回再試行する。
+- 検証証拠: `pwsh -NoProfile -File hooks/test/vfs_bench.ps1 -BuildDir hooks/build/Release -WorkRoot <TEMP> -ConnectionReuseOnly` は `VFS PIPE REUSE GATE PASS`。1000 requestでpersistent接続`1`対forced reconnect`1000`、paired median差`42.8 us`、再利用優位`9/9`に加え、8/16/32-thread frame分離・1回再接続・strict fallbackが通過した。
 
 ### OPEN: metadata probeがfull hydrateする
 
