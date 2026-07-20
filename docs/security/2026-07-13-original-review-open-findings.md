@@ -129,11 +129,13 @@
 - 対応commit: `be5d011` (`Performance: metadata probeのfull hydrateを廃止する`)。metadata専用wire/agent/worker/hook経路を追加し、legacy応答だけを安全にhydrateへfallbackする。
 - 検証証拠: workerの`metadata_batch_chunks_10000_requests_without_content_ops`とagentの`metadata_probes_10000_transfer_no_content_or_scratch_bytes`は各`1 passed; 0 failed`。fresh DLLのnative gateは`METADATA_NATIVE PASS calls=10004 wall_ms=3000 present=W/A/ExW/ExA absent=PASS sparse_4GiB=PASS`かつaction `states=[1,2,3,4] exit=0`で、content/scratch転送0、present/absent、64-bit size・FILETIME・LastError整合を固定した。
 
-### OPEN: trace recordごとに複数の同期`WriteFile`を行う
+### RESOLVED (2026-07-20): trace recordごとに複数の同期`WriteFile`を行う
 
 - 根拠: `hooks/src/trace_writer.cpp:112-129,255-278`。
 - 修正方向: production条件の計測後、thread-local bufferまたは一括frameで同期write回数を削減し、process終了時のflushを保証する。
 - Done: trace完全性とdeterminism gateを維持したまま、record当たりの`WriteFile`回数とwall timeが測定上減る。
+- 対応commit: `c0918ac` (`Performance: trace recordの同期writeを1回へ集約する`)でv0 record全体を1回の同期writeへまとめ、short write継続・失敗時terminal disable・明示unload時closeを固定した。`b1c3390` (`Performance: trace write削減のwall効果を安定実証する`)で、結果非依存canary、同一DLLのnegative control、全sampleのtrace構造検証を備えたproduction wall gateを追加した。
+- 検証証拠: 100,000 recordでcandidateは`WriteOperationCount=100000`、旧baselineは`400000`、双方`records=100001`でnormalized v0が一致した。20 valid pair（canaryでinvalid 3）では片側Wilcoxon `p=0.000002`、bootstrap中央値95%下限`399.963 ms`、paired median差`474.665 ms`、baseline median`4599.480 ms`、改善率`10.320%`。同一DLLのnegative controlは通常gateを棄却し、x64/x86 CTestは各`2/2`、MSVC/clang-cl determinismは各2 output byte一致。実装・security review round 2はいずれもAPPROVE（blocking 0）。
 
 ## 解決済み（再修正しない）
 
