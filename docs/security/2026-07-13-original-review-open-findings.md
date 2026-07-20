@@ -95,11 +95,13 @@
 
 ## P1
 
-### OPEN: cancel済みqueued actionがpermit取得後にspawnする
+### RESOLVED (2026-07-20): cancel済みqueued actionがpermit取得後にspawnする
 
 - 根拠: `crates/worker/src/lib.rs:516-520,572-617`。
 - 修正方向: QUEUED送信失敗／receiver closeとpermit待ちを同時監視し、取消しをspawnより前に確定する。
 - Done: capacity待ち中にclientを切断したactionが、permit解放後もprocess・scratch・Jobを作成しない競合テストが通る。
+- 対応commit: `d354a05` (`P1: queued actionの切断をadmission前に取消す`)。`QUEUED`送信失敗を即時終了し、`tx.closed()`とpermit待ちを`biased`に同時監視したうえで、permit取得直後にもreceiver closeを再確認する。
+- 検証証拠: `cargo test -p sembazuru-worker --test admission -- --nocapture` は `3 passed; 0 failed`。`dropping_a_queued_stream_cancels_before_admission`がpermit解放後も`served=1`、`running=0`、scratch空を維持し、取消済みactionがadmission・process/scratch/Job作成へ進まないことを固定する。
 
 ### OPEN: FileClient reader taskの自己保持リーク
 
