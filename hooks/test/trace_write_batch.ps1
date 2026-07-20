@@ -8,6 +8,12 @@ param(
     [switch]$ExpectNoDifference
 )
 $ErrorActionPreference = 'Stop'
+$script:NegativeControlIterations = 10000
+$script:BootstrapReplicates = 10000
+$script:WallGateIterations = 100000
+$script:RequiredValidPairs = 20
+$script:InvalidPairLimit = 8
+$script:CanaryMaxMinRatio = 1.25
 
 if ($Iterations -le 0) { throw 'Iterations must be positive' }
 if (-not (Test-Path $CandidateDll)) { throw "missing candidate: $CandidateDll" }
@@ -15,7 +21,7 @@ if ($BaselineDll -and -not (Test-Path $BaselineDll)) { throw "missing baseline: 
 if ($ExpectNoDifference) {
     if (-not $BaselineDll) { throw 'ExpectNoDifference requires BaselineDll' }
     if ($FunctionalOnly) { throw 'ExpectNoDifference cannot be combined with FunctionalOnly' }
-    if ($Iterations -ne 10000) { throw 'the negative-control sanity gate is fixed at Iterations=10000' }
+    if ($Iterations -ne $script:NegativeControlIterations) { throw "the negative-control sanity gate is fixed at Iterations=$script:NegativeControlIterations" }
     $candidatePath = (Resolve-Path -LiteralPath $CandidateDll).ProviderPath
     $baselinePath = (Resolve-Path -LiteralPath $BaselineDll).ProviderPath
     if (-not [StringComparer]::OrdinalIgnoreCase.Equals($candidatePath, $baselinePath)) {
@@ -117,12 +123,10 @@ function Invoke-TraceProbe {
             throw "$Label expected WriteOperationCount delta $Iterations, got $writes"
         }
         return [pscustomobject]@{
-            Label = $Label
             Writes = $writes
             Records = $records
             Normalized = $normalized
             ProcessElapsedMilliseconds = [double]$processWatch.Elapsed.TotalMilliseconds
-            ProcessExitCode = [int]$processExitCode
             CanaryTicks = $canaryTicks
             HookLoopTicks = $hookLoopTicks
         }
@@ -145,11 +149,11 @@ if (-not $BaselineDll) {
     Remove-Item -LiteralPath $script:ProbeInput -Force -ErrorAction SilentlyContinue
     exit 0
 }
-if (-not $FunctionalOnly -and -not $ExpectNoDifference -and $Iterations -ne 100000) {
-    throw 'the local wall gate is fixed at Iterations=100000'
+if (-not $FunctionalOnly -and -not $ExpectNoDifference -and $Iterations -ne $script:WallGateIterations) {
+    throw "the local wall gate is fixed at Iterations=$script:WallGateIterations"
 }
-if ($ExpectNoDifference -and $Iterations -ne 10000) {
-    throw 'the negative-control sanity gate is fixed at Iterations=10000'
+if ($ExpectNoDifference -and $Iterations -ne $script:NegativeControlIterations) {
+    throw "the negative-control sanity gate is fixed at Iterations=$script:NegativeControlIterations"
 }
 
 function Get-Median {
@@ -171,17 +175,14 @@ function Measure-Leg {
         $canaryTicks += [UInt64]$result.CanaryTicks
         $hookLoopTicks += [UInt64]$result.HookLoopTicks
     }
-    $minimum = @($launcherChildSamples | Measure-Object -Minimum).Minimum
+    $launcherChildMinimum = @($launcherChildSamples | Measure-Object -Minimum).Minimum
     $hookLoopMinimum = @($hookLoopTicks | Measure-Object -Minimum).Minimum
     Write-Host ("{0} launcher-child-samples-ms=[{1}] launcher-child-min-ms={2:N3} canary-ticks=[{3}] hook-loop-ticks=[{4}] hook-loop-min-ticks={5}" -f $Label,
                 (($launcherChildSamples | ForEach-Object { '{0:N3}' -f $_ }) -join ', '),
-                $minimum, ($canaryTicks -join ', '), ($hookLoopTicks -join ', '), $hookLoopMinimum)
+                $launcherChildMinimum, ($canaryTicks -join ', '), ($hookLoopTicks -join ', '), $hookLoopMinimum)
     return [pscustomobject]@{
-        LauncherChildSamples = [double[]]$launcherChildSamples
-        LauncherChildMinimum = [double]$minimum
+        LauncherChildMinimum = [double]$launcherChildMinimum
         CanaryTicks = [UInt64[]]$canaryTicks
-        HookLoopTicks = [UInt64[]]$hookLoopTicks
-        Minimum = [double]$minimum
         HookLoopMinimum = [UInt64]$hookLoopMinimum
     }
 }
@@ -218,7 +219,7 @@ function Get-OneSidedWilcoxonP {
 function Get-BootstrapMedianLower {
     param([double[]]$Deltas)
     $random = [System.Random]::new(20260717)
-    $replicates = New-Object double[] 10000
+    $replicates = New-Object double[] $script:BootstrapReplicates
     for ($replicate = 0; $replicate -lt $replicates.Length; ++$replicate) {
         $resample = New-Object double[] $Deltas.Length
         for ($i = 0; $i -lt $Deltas.Length; ++$i) { $resample[$i] = $Deltas[$random.Next($Deltas.Length)] }
@@ -232,6 +233,8 @@ function Get-BootstrapMedianLower {
 # positive median, so they are intentionally not pooled here.  This one set is
 # the only decision: AB/BA order and three fresh processes per leg.  A pair is
 # accepted only when its six fixed-work canary samples are within 1.25x.
+# Pair eligibility is based on the fixed-work canary, independent of the
+# measured delta, so scheduling noise cannot select favorable observations.
 $baselineSanity = Invoke-TraceProbe $BaselineDll 'baseline'
 if (-not $ExpectNoDifference -and $baselineSanity.Writes -le $Iterations) {
     throw "baseline did not prove the pre-batching write amplification: $($baselineSanity.Writes)"
@@ -252,7 +255,7 @@ $baselineMins = @()
 $validPairs = 0
 $invalidPairs = 0
 $attempt = 0
-while ($validPairs -lt 20) {
+while ($validPairs -lt $script:RequiredValidPairs) {
     $firstCandidate = ($validPairs % 2 -eq 0)
     if ($firstCandidate) {
         $candidateLeg = Measure-Leg $CandidateDll "pair-$attempt-candidate" -Candidate -Runs 3
@@ -265,19 +268,19 @@ while ($validPairs -lt 20) {
     $canaryMinimum = @($canarySamples | Measure-Object -Minimum).Minimum
     $canaryMaximum = @($canarySamples | Measure-Object -Maximum).Maximum
     $canaryRatio = [double]$canaryMaximum / [double]$canaryMinimum
-    if ($canaryRatio -gt 1.25) {
+    if ($canaryRatio -gt $script:CanaryMaxMinRatio) {
         ++$invalidPairs
         Write-Host ("pair={0} order={1} INVALID canary-max-min-ratio={2:N3} canary-min-ticks={3} canary-max-ticks={4} candidate-hook-min-ticks={5} baseline-hook-min-ticks={6}" -f
                     $attempt, $(if ($firstCandidate) { 'AB' } else { 'BA' }), $canaryRatio,
                     $canaryMinimum, $canaryMaximum, $candidateLeg.HookLoopMinimum, $baselineLeg.HookLoopMinimum)
-        if ($invalidPairs -gt 8) { throw "wall gate exceeded invalid-pair limit: invalid=$invalidPairs valid=$validPairs" }
+        if ($invalidPairs -gt $script:InvalidPairLimit) { throw "wall gate exceeded invalid-pair limit: invalid=$invalidPairs valid=$validPairs" }
         ++$attempt
         continue
     }
     $delta = $baselineLeg.LauncherChildMinimum - $candidateLeg.LauncherChildMinimum
     $deltas += [double]$delta
     $baselineMins += [double]$baselineLeg.LauncherChildMinimum
-    Write-Host ("pair={0} valid={1}/20 order={2} canary-max-min-ratio={3:N3} candidate-min-ms={4:N3} baseline-min-ms={5:N3} delta-ms={6:N3} candidate-hook-min-ticks={7} baseline-hook-min-ticks={8}" -f
+    Write-Host ("pair={0} valid={1}/$script:RequiredValidPairs order={2} canary-max-min-ratio={3:N3} candidate-min-ms={4:N3} baseline-min-ms={5:N3} delta-ms={6:N3} candidate-hook-min-ticks={7} baseline-hook-min-ticks={8}" -f
                 $attempt, ($validPairs + 1), $(if ($firstCandidate) { 'AB' } else { 'BA' }), $canaryRatio,
                 $candidateLeg.LauncherChildMinimum, $baselineLeg.LauncherChildMinimum, $delta,
                 $candidateLeg.HookLoopMinimum, $baselineLeg.HookLoopMinimum)
@@ -291,7 +294,7 @@ $ratio = $medianDelta / $medianBaseline
 $p = Get-OneSidedWilcoxonP ([double[]]$deltas)
 $lower = Get-BootstrapMedianLower ([double[]]$deltas)
 $gatePassed = $p -le 0.05 -and $lower -gt 0 -and $ratio -ge 0.02
-Write-Host ("wall-gate valid-pairs=20 invalid-pairs={0} wilcoxon-one-sided-p={1:N6} bootstrap-median-95-lower-ms={2:N3} paired-median-ms={3:N3} baseline-median-ms={4:N3} improvement-ratio={5:P3}" -f
+Write-Host ("wall-gate valid-pairs=$script:RequiredValidPairs invalid-pairs={0} wilcoxon-one-sided-p={1:N6} bootstrap-median-95-lower-ms={2:N3} paired-median-ms={3:N3} baseline-median-ms={4:N3} improvement-ratio={5:P3}" -f
             $invalidPairs, $p, $lower, $medianDelta, $medianBaseline, $ratio)
 if ($ExpectNoDifference) {
     if ($gatePassed) { throw 'negative-control sanity unexpectedly passed the normal wall gate' }
