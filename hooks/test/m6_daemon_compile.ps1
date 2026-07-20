@@ -22,14 +22,35 @@ param(
     # runs AUTHENTICATED end to end. The .obj must still be byte-identical — auth
     # is connection-level and does not touch compiler output. Empty = M5/M6
     # unauthenticated path (back-compat), which is the default gate.
-    [string]$AuthToken = ''
+    [string]$AuthToken = '',
+    # P0: run the production VFS child-injection failure path after the normal
+    # remote compile. This is opt-in so the historical M6.1 contract remains
+    # unchanged for callers that do not request the additional failure gate.
+    [switch]$RequireInjectionFallback
 )
 $ErrorActionPreference = 'Stop'
+
+if ($RequireInjectionFallback -and $AuthToken) {
+    throw 'RequireInjectionFallback is only defined for the unauthenticated M6.1 gate'
+}
+if ($RequireInjectionFallback -and [IntPtr]::Size -ne 8) {
+    throw 'RequireInjectionFallback requires a 64-bit PowerShell host'
+}
 
 $launcherExe = Join-Path $BuildDir 'launcher.exe'
 $dll = Join-Path $BuildDir 'sbz_interceptor64.dll'
 foreach ($f in @($launcherExe, $dll)) {
     if (-not (Test-Path $f)) { throw "missing build artifact: $f" }
+}
+if ($RequireInjectionFallback) {
+    $dll32 = Join-Path $BuildDir 'sbz_interceptor32.dll'
+    $system32Cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $sysWow64Cmd = Join-Path $env:SystemRoot 'SysWOW64\cmd.exe'
+    foreach ($f in @($dll32, $system32Cmd, $sysWow64Cmd)) {
+        if (-not (Test-Path -LiteralPath $f -PathType Leaf)) {
+            throw "missing injection-fallback artifact: $f"
+        }
+    }
 }
 
 # clang-cl is the byte-identity gate (path-independent); cl is best-effort but
@@ -88,19 +109,38 @@ function Dump-Diff($label, $a, $b) {
 }
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$workerBuildExtra = @()
+if ($RequireInjectionFallback) { $workerBuildExtra = @('--example', 'exec_vfs') }
 Push-Location $repo
 try {
     & cargo build -q -p sembazuru-agent --bin sembazuru-daemon --bin sembazuru `
-        -p sembazuru-worker --bin sembazuru-worker 2>&1 | Out-String | Write-Host
+        -p sembazuru-worker --bin sembazuru-worker @workerBuildExtra 2>&1 | Out-String | Write-Host
     if ($LASTEXITCODE -ne 0) { throw 'bin build failed' }
 } finally { Pop-Location }
 $daemonExe = Join-Path $repo 'target\debug\sembazuru-daemon.exe'
 $launcher = Join-Path $repo 'target\debug\sembazuru.exe'
 $workerExe = Join-Path $repo 'target\debug\sembazuru-worker.exe'
+if ($RequireInjectionFallback) {
+    $execVfs = Join-Path $repo 'target\debug\examples\exec_vfs.exe'
+    if (-not (Test-Path -LiteralPath $execVfs -PathType Leaf)) {
+        throw "missing injection-fallback driver: $execVfs"
+    }
+}
 
 $WorkRoot = [System.IO.Path]::GetFullPath($WorkRoot)
 if (Test-Path $WorkRoot) { Remove-Item -Recurse -Force $WorkRoot }
 New-Item -ItemType Directory -Force $WorkRoot | Out-Null
+if ($RequireInjectionFallback) {
+    # Deliberately do not alter the canonical BuildDir artifacts: the worker
+    # receives this private sibling pair, then the negative case removes only
+    # the private x86 sibling.
+    $runtimeSource = Join-Path $WorkRoot 'injection-runtime'
+    New-Item -ItemType Directory -Force $runtimeSource | Out-Null
+    $runtimeDll = Join-Path $runtimeSource 'sbz_interceptor64.dll'
+    $runtimeDll32 = Join-Path $runtimeSource 'sbz_interceptor32.dll'
+    Copy-Item -LiteralPath $dll -Destination $runtimeDll -Force
+    Copy-Item -LiteralPath $dll32 -Destination $runtimeDll32 -Force
+}
 $daemonConfig = Join-Path $WorkRoot 'daemon-override.toml'
 $workerConfig = Join-Path $WorkRoot 'worker-override.toml'
 
@@ -175,37 +215,48 @@ $daemonUrl = 'npipe://Sembazuru.LocalIntake.v1'
 function Start-Daemon {
     $hadConfig = Test-Path Env:\SEMBAZURU_CONFIG
     $oldConfig = $env:SEMBAZURU_CONFIG
+    $hadClusterToken = Test-Path Env:\SEMBAZURU_CLUSTER_TOKEN
+    $oldClusterToken = $env:SEMBAZURU_CLUSTER_TOKEN
     try {
         $env:SEMBAZURU_CONFIG = $daemonConfig
         $env:SEMBAZURU_COORD = $coord; $env:SEMBAZURU_INTAKE = $daemonUrl; $env:SEMBAZURU_FILESERVER = $fs
         $env:SEMBAZURU_CACHE_ROOT = $cacheRoot; $env:SEMBAZURU_TRACE_ROOT = $traceRoot
         if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
+        else { Remove-Item Env:\SEMBAZURU_CLUSTER_TOKEN -ErrorAction SilentlyContinue }
         $p = Start-Process -FilePath $daemonExe -PassThru -WindowStyle Hidden
     } finally {
         Remove-Item Env:\SEMBAZURU_COORD, Env:\SEMBAZURU_INTAKE, Env:\SEMBAZURU_FILESERVER, `
-            Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+            Env:\SEMBAZURU_CACHE_ROOT, Env:\SEMBAZURU_TRACE_ROOT `
             -ErrorAction SilentlyContinue
         if ($hadConfig) { $env:SEMBAZURU_CONFIG = $oldConfig }
         else { Remove-Item Env:\SEMBAZURU_CONFIG -ErrorAction SilentlyContinue }
+        if ($hadClusterToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $oldClusterToken }
+        else { Remove-Item Env:\SEMBAZURU_CLUSTER_TOKEN -ErrorAction SilentlyContinue }
     }
     $p
 }
 function Start-Worker {
     $hadConfig = Test-Path Env:\SEMBAZURU_WORKER_CONFIG
     $oldConfig = $env:SEMBAZURU_WORKER_CONFIG
+    $hadClusterToken = Test-Path Env:\SEMBAZURU_CLUSTER_TOKEN
+    $oldClusterToken = $env:SEMBAZURU_CLUSTER_TOKEN
     try {
         $env:SEMBAZURU_WORKER_CONFIG = $workerConfig
         $env:SEMBAZURU_AGENT = "http://$coord"
-        $env:SEMBAZURU_LAUNCHER = $launcherExe; $env:SEMBAZURU_DLL = $dll
+        $env:SEMBAZURU_LAUNCHER = $launcherExe
+        $env:SEMBAZURU_DLL = if ($RequireInjectionFallback) { $runtimeDll } else { $dll }
         $env:SEMBAZURU_SCRATCH_ROOT = $scratchRoot; $env:SEMBAZURU_CAS_ROOT = $casRoot
         if ($AuthToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $AuthToken }
+        else { Remove-Item Env:\SEMBAZURU_CLUSTER_TOKEN -ErrorAction SilentlyContinue }
         $p = Start-Process -FilePath $workerExe -ArgumentList @($worker) -PassThru -WindowStyle Hidden
     } finally {
         Remove-Item Env:\SEMBAZURU_AGENT, Env:\SEMBAZURU_LAUNCHER, Env:\SEMBAZURU_DLL, `
-            Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT, Env:\SEMBAZURU_CLUSTER_TOKEN `
+            Env:\SEMBAZURU_SCRATCH_ROOT, Env:\SEMBAZURU_CAS_ROOT `
             -ErrorAction SilentlyContinue
         if ($hadConfig) { $env:SEMBAZURU_WORKER_CONFIG = $oldConfig }
         else { Remove-Item Env:\SEMBAZURU_WORKER_CONFIG -ErrorAction SilentlyContinue }
+        if ($hadClusterToken) { $env:SEMBAZURU_CLUSTER_TOKEN = $oldClusterToken }
+        else { Remove-Item Env:\SEMBAZURU_CLUSTER_TOKEN -ErrorAction SilentlyContinue }
     }
     $p
 }
@@ -220,6 +271,15 @@ function Invoke-Launcher {
         Remove-Item Env:\SEMBAZURU_DAEMON -ErrorAction SilentlyContinue
         return @{ exit = $code; note = $err }
     } finally { Pop-Location }
+}
+
+function Restore-ProcessEnvironment([string]$Name, [bool]$HadValue, [string]$OldValue) {
+    if ($HadValue) { Set-Item -LiteralPath "Env:$Name" -Value $OldValue }
+    else { Remove-Item -LiteralPath "Env:$Name" -ErrorAction SilentlyContinue }
+}
+
+function Get-ExactLineCount([string]$Text, [string]$Expected) {
+    return @(($Text -split '\r?\n') | Where-Object { $_ -eq $Expected }).Count
 }
 $failures = @()
 $daemon = Start-Daemon
@@ -248,6 +308,108 @@ try {
     }
     # Snapshot the distributed object for the post-fallback comparison below.
     if (Test-Path $aObj) { Copy-Item $aObj $distObj -Force }
+
+    if ($RequireInjectionFallback) {
+        # Use only Windows' signed, readable cmd.exe pair here. The restricted
+        # worker action token intentionally cannot execute a repo-local probe,
+        # so this checks injection rather than an unrelated test-fixture ACL.
+        $p0FailuresBefore = $failures.Count
+        $p0Trace = Join-Path $WorkRoot 'p0-injection-trace'
+        $p0SentinelDir = Join-Path $WorkRoot 'p0 fallback output'
+        $p0Sentinel = Join-Path $p0SentinelDir 'local-fallback.sentinel'
+        New-Item -ItemType Directory -Force $p0Trace | Out-Null
+        New-Item -ItemType Directory -Force $p0SentinelDir | Out-Null
+        # cmd.exe receives this as one argv element. The output directory has
+        # spaces so the successful local fallback proves the production quoting
+        # path; the VFS branch never touches that user-writable output path.
+        $crossBitnessCommand = 'if /I "%SEMBAZURU_MODE%"=="vfs" ("' + $sysWow64Cmd +
+            '" /d /c echo SBZ-REMOTE-UNINSTRUMENTED-CHILD) else (echo SBZ-LOCAL-FALLBACK>>"' +
+            $p0Sentinel + '")'
+        $oldNativeEap = $null
+        $hasNativeEap = Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
+        if ($hasNativeEap) {
+            $oldNativeEap = $PSNativeCommandUseErrorActionPreference
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        try {
+            # a. A private sibling pair proves the positive 64->32 VFS child
+            # injection path before the negative test takes the sibling away.
+            $positiveOutput = & $execVfs "http://$worker" $fs $proj $p0Trace -- `
+                $system32Cmd '/d' '/s' '/c' $crossBitnessCommand 2>&1 | Out-String
+            $positiveExit = $LASTEXITCODE
+            Write-Host "P0 direct positive exit=$positiveExit output=$($positiveOutput.Trim())"
+            if ($positiveExit -ne 0 -or $positiveOutput -notmatch
+                'exec_vfs:\s*states=\[\s*1\s*,\s*2\s*,\s*3\s*,\s*4\s*\]\s*exit=0') {
+                $failures += 'P0 direct positive did not complete with states=[1, 2, 3, 4], exit=0'
+            }
+            if ((Get-ExactLineCount $positiveOutput 'SBZ-REMOTE-UNINSTRUMENTED-CHILD') -ne 1) {
+                $failures += 'P0 direct positive did not emit exactly one remote child marker'
+            }
+            if (Test-Path -LiteralPath $p0Sentinel) {
+                $failures += 'P0 direct positive unexpectedly ran the local fallback sentinel path'
+                Remove-Item -LiteralPath $p0Sentinel -Force
+            }
+
+            # b. The removal is confined to the worker's isolated runtime source;
+            # canonical BuildDir artifacts remain intact for the rest of the gate.
+            Remove-Item -LiteralPath $runtimeDll32 -Force
+            $negativeOutput = & $execVfs "http://$worker" $fs $proj $p0Trace -- `
+                $system32Cmd '/d' '/s' '/c' $crossBitnessCommand 2>&1 | Out-String
+            $negativeExit = $LASTEXITCODE
+            Write-Host "P0 direct negative exit=$negativeExit output=$($negativeOutput.Trim())"
+            if ($negativeOutput -notmatch
+                'exec_vfs:\s*states=\[\s*1\s*,\s*2\s*,\s*3\s*,\s*5\s*\]\s*exit=-1') {
+                $failures += 'P0 direct negative was not a worker Failed outcome (states=[1, 2, 3, 5], exit=-1)'
+            }
+            if ((Get-ExactLineCount $negativeOutput 'SBZ-REMOTE-UNINSTRUMENTED-CHILD') -ne 0) {
+                $failures += 'P0 direct negative ran the remote child after injection failure'
+            }
+            if (Test-Path -LiteralPath $p0Sentinel) {
+                $failures += 'P0 direct negative unexpectedly ran a local fallback outside the production scheduler'
+                Remove-Item -LiteralPath $p0Sentinel -Force
+            }
+
+            # c. The daemon scheduler must translate that exact worker failure
+            # into one local execution. Non-deterministic policy prevents a cache
+            # entry from masking the failed remote action.
+            $hadDaemon = Test-Path Env:\SEMBAZURU_DAEMON
+            $oldDaemon = $env:SEMBAZURU_DAEMON
+            $hadNonDeterministic = Test-Path Env:\SEMBAZURU_NONDETERMINISTIC
+            $oldNonDeterministic = $env:SEMBAZURU_NONDETERMINISTIC
+            try {
+                $env:SEMBAZURU_DAEMON = $daemonUrl
+                $env:SEMBAZURU_NONDETERMINISTIC = '1'
+                $fallbackOutput = & $launcher $system32Cmd '/d' '/s' '/c' $crossBitnessCommand 2>&1 | Out-String
+                $fallbackExit = $LASTEXITCODE
+            } finally {
+                Restore-ProcessEnvironment 'SEMBAZURU_DAEMON' $hadDaemon $oldDaemon
+                Restore-ProcessEnvironment 'SEMBAZURU_NONDETERMINISTIC' $hadNonDeterministic $oldNonDeterministic
+            }
+            Write-Host "P0 scheduler fallback exit=$fallbackExit output=$($fallbackOutput.Trim())"
+            if ($fallbackExit -ne 0) { $failures += "P0 scheduler fallback exited $fallbackExit" }
+            if ($fallbackOutput -match 'SBZ-REMOTE-UNINSTRUMENTED-CHILD') {
+                $failures += 'P0 scheduler fallback accepted remote child execution after injection failure'
+            }
+            if (Test-RemoteSuccessNote $fallbackOutput) {
+                $failures += 'P0 scheduler fallback reported remote success after injection failure'
+            }
+            if ($fallbackOutput -match 'cache hit') {
+                $failures += 'P0 scheduler fallback was masked by an action-cache hit'
+            }
+            if ($fallbackOutput -notmatch 'sembazuru: local fallback: worker .+ did not complete the action') {
+                $failures += 'P0 scheduler fallback did not report the failed worker fallback reason'
+            }
+            if (-not (Test-Path -LiteralPath $p0Sentinel) -or
+                (Get-ExactLineCount ((Get-Content -LiteralPath $p0Sentinel -Raw)) 'SBZ-LOCAL-FALLBACK') -ne 1) {
+                $failures += 'P0 scheduler fallback did not run the local command exactly once'
+            }
+        } finally {
+            if ($hasNativeEap) { $PSNativeCommandUseErrorActionPreference = $oldNativeEap }
+        }
+        if ($failures.Count -eq $p0FailuresBefore) {
+            Write-Host 'P0 INJECTION FALLBACK PASS (positive cross-bitness remote completed; injection failure produced worker Failed; scheduler local fallback completed once)'
+        }
+    }
 } finally {
     foreach ($p in @($workerProc, $daemon)) { if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }
 }
@@ -302,4 +464,5 @@ if ($failures.Count -gt 0) {
     exit 1
 }
 $authLabel = if ($AuthToken) { 'AUTH=on (shared token)' } else { 'auth=off' }
-Write-Host "M6.1 DAEMON COMPILE GATE PASS (distributed byte-identical, local fallback, 2nd-build cache hit) compiler=$cc $authLabel"
+$injectionLabel = if ($RequireInjectionFallback) { '; P0 injection fallback' } else { '' }
+Write-Host "M6.1 DAEMON COMPILE GATE PASS (distributed byte-identical, local fallback, 2nd-build cache hit$injectionLabel) compiler=$cc $authLabel"

@@ -91,6 +91,12 @@ jobs:
           pwsh -NoProfile -File hooks/test/trace_write_batch.ps1 -CandidateDll hooks/build32/Release/sbz_interceptor32.dll
       - name: Stage 32-bit interceptor next to the 64-bit one
         run: Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
+      # P0 fail-closed contract: in VFS mode a failed child injection must not
+      # silently retry unhooked. This raw gate covers both CreateProcess variants
+      # and the observe-only compatibility control before daemon integration.
+      - name: P0 VFS child injection fails closed
+        timeout-minutes: 5
+        run: pwsh -NoProfile -File hooks/test/process_injection_failure.ps1
       - run: cargo build -p sembazuru-tracer --release
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1 (TEST-001: SHA-pinned)
       # Ninja for the M6.3 CMake/Ninja gate (the COMPILER_LAUNCHER path). GitHub's
@@ -149,7 +155,8 @@ jobs:
       # identical build HITS the action cache (compile skipped). clang-cl is the
       # byte-identity gate (the runner ships LLVM).
       - name: M6.1 daemon compile (distributed byte-identical, fallback, cache hit)
-        run: pwsh -NoProfile -File hooks/test/m6_daemon_compile.ps1 -RequireClangCl
+        timeout-minutes: 10
+        run: pwsh -NoProfile -File hooks/test/m6_daemon_compile.ps1 -RequireClangCl -RequireInjectionFallback
       # Gates M7.0 (ADR 0006): the SAME production daemon compile, but with the
       # daemon and worker running AUTHENTICATED (shared cluster token on both the
       # control plane Register and the data-plane Hello handshake). Proves the
