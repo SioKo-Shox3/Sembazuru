@@ -103,11 +103,13 @@
 - 対応commit: `d354a05` (`P1: queued actionの切断をadmission前に取消す`)。`QUEUED`送信失敗を即時終了し、`tx.closed()`とpermit待ちを`biased`に同時監視したうえで、permit取得直後にもreceiver closeを再確認する。
 - 検証証拠: `cargo test -p sembazuru-worker --test admission -- --nocapture` は `3 passed; 0 failed`。`dropping_a_queued_stream_cancels_before_admission`がpermit解放後も`served=1`、`running=0`、scratch空を維持し、取消済みactionがadmission・process/scratch/Job作成へ進まないことを固定する。
 
-### OPEN: FileClient reader taskの自己保持リーク
+### RESOLVED (2026-07-20): FileClient reader taskの自己保持リーク
 
 - 根拠: `crates/worker/src/fileclient.rs:56-80,268-278`。
 - 修正方向: readerが`Arc<Mux>`を永久保持しない所有権構造、または明示shutdown/Dropを導入し、最後のclient dropでsocketとreaderを終了させる。
 - Done: peerがEOFを返さなくても最後の`FileClient` drop後にreader taskと接続が回収され、pending waiterも解放されるテストが通る。
+- 対応commit: `9d49911` (`P1: FileClient終了時にreaderと接続を解放する`)。reader taskは`Weak<Mux>`だけを保持し、`Mux::drop`が`CancellationToken`を発火してblocked readを終了する。
+- 検証証拠: `cargo test -p sembazuru-worker dropping_last_client_releases_blocked_reader_and_pending_request -- --nocapture` は `1 passed; 0 failed`。無応答peerとpending requestがある状態でも、最後のclient drop後2秒以内にreaderがjoinし、peerはEOF、`Weak<Mux>`はupgrade不能となる。
 
 ## Performance
 
