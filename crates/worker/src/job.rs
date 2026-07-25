@@ -118,6 +118,13 @@ impl JobObject {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_kill_on_close_without_desktop_limit_for_test() -> io::Result<JobObject> {
+        Self::new_kill_on_close_with_ui_restrictions(
+            Self::STANDARD_UI_RESTRICTIONS & !JOB_OBJECT_UILIMIT_DESKTOP,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn ui_restrictions_for_test(&self) -> io::Result<u32> {
         let mut ui: JOBOBJECT_BASIC_UI_RESTRICTIONS = unsafe { std::mem::zeroed() };
         // SAFETY: this owned job handle is live and `ui` is a correctly-sized writable buffer.
@@ -193,6 +200,17 @@ impl Drop for JobObject {
 mod tests {
     use super::*;
     use std::process::Stdio;
+
+    #[test]
+    fn desktop_relaxed_test_job_differs_only_by_desktop_limit() {
+        let baseline = JobObject::new_kill_on_close().unwrap();
+        let variant = JobObject::new_kill_on_close_without_desktop_limit_for_test().unwrap();
+        let baseline_bits = baseline.ui_restrictions_for_test().unwrap();
+        let variant_bits = variant.ui_restrictions_for_test().unwrap();
+        assert_eq!(baseline_bits, 0x0000_00fe);
+        assert_eq!(variant_bits, 0x0000_00be);
+        assert_eq!(baseline_bits ^ variant_bits, JOB_OBJECT_UILIMIT_DESKTOP);
+    }
 
     /// Whether `pid` is currently a running process. Uses `tasklist` (no unsafe in
     /// the test): it prints the row only when the PID exists, and "No tasks…"

@@ -1143,6 +1143,13 @@ enum SpawnFailure {
     BeforeResume,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TestJobProfile {
+    Production,
+    DesktopRelaxed,
+}
+
 struct SuspendedGuardian(Option<OwnedHandle>);
 
 impl SuspendedGuardian {
@@ -1185,18 +1192,43 @@ impl RestrictedProcess {
             command,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            TestJobProfile::Production,
             handles,
         )
+    }
+
+    #[cfg(test)]
+    fn spawn_without_desktop_limit_for_test(
+        token: &ActionToken,
+        command: &RestrictedCommand,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(token, command, None, TestJobProfile::DesktopRelaxed, &[])
     }
 
     fn spawn_inner(
         token: &ActionToken,
         command: &RestrictedCommand,
         #[cfg(test)] failure: Option<SpawnFailure>,
+        #[cfg(test)] job_profile: TestJobProfile,
         inherited_handles: &[HANDLE],
     ) -> io::Result<Self> {
         let mut prepared = prepare_command(command)?;
-        let job = Arc::new(JobObject::new_kill_on_close()?);
+        let job = Arc::new({
+            #[cfg(test)]
+            {
+                match job_profile {
+                    TestJobProfile::Production => JobObject::new_kill_on_close()?,
+                    TestJobProfile::DesktopRelaxed => {
+                        JobObject::new_kill_on_close_without_desktop_limit_for_test()?
+                    }
+                }
+            }
+            #[cfg(not(test))]
+            {
+                JobObject::new_kill_on_close()?
+            }
+        });
         let (stdin, stdin_parent) = stdio_pipe(true)?;
         let (stdout, stdout_parent) = stdio_pipe(false)?;
         let (stderr, stderr_parent) = stdio_pipe(false)?;
@@ -1482,8 +1514,8 @@ mod tests {
     const WINDOW_STATION_SCM_SMOKE_SERVICE: &str = "SembazuruWindowStationProbeSmoke";
     const WINDOW_STATION_SCM_SMOKE_SELECTOR: &str =
         "sandbox::tests::window_station_scm_dispatcher_smoke_role";
-    const WINDOW_STATION_SCM_SMOKE_SUCCESS: u32 = 0x5342_5a31;
-    const WINDOW_STATION_SCM_SMOKE_REPRODUCED: u32 = 0x5342_5a32;
+    const WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL: u32 = 0x5342_5a31;
+    const WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT: u32 = 0x5342_5a32;
     const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5a33;
     const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
     const WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE: u32 = 0x5342_5afe;
@@ -1497,21 +1529,21 @@ mod tests {
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
     const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4432;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 2;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 3;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
     enum Session0DiagnosticOutcome {
-        Refuted = 1,
-        Reproduced = 2,
+        DesktopCausal = 1,
+        DesktopNotSufficient = 2,
         Indeterminate = 3,
     }
 
     impl Session0DiagnosticOutcome {
         fn decode(value: u8) -> Result<Self, String> {
             match value {
-                1 => Ok(Self::Refuted),
-                2 => Ok(Self::Reproduced),
+                1 => Ok(Self::DesktopCausal),
+                2 => Ok(Self::DesktopNotSufficient),
                 3 => Ok(Self::Indeterminate),
                 _ => Err("diagnostic classification".into()),
             }
@@ -1519,10 +1551,29 @@ mod tests {
 
         fn service_magic(self) -> u32 {
             match self {
-                Self::Refuted => WINDOW_STATION_SCM_SMOKE_SUCCESS,
-                Self::Reproduced => WINDOW_STATION_SCM_SMOKE_REPRODUCED,
+                Self::DesktopCausal => WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
+                Self::DesktopNotSufficient => WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT,
                 Self::Indeterminate => WINDOW_STATION_SCM_SMOKE_INDETERMINATE,
             }
+        }
+    }
+
+    fn classify_session0_diagnostic_ab(
+        baseline_spawn_succeeded: bool,
+        baseline_exit: Option<u32>,
+        desktop_relaxed_spawn_succeeded: bool,
+        desktop_relaxed_exit: Option<u32>,
+    ) -> Session0DiagnosticOutcome {
+        if !baseline_spawn_succeeded || baseline_exit != Some(0xc000_0142) {
+            return Session0DiagnosticOutcome::Indeterminate;
+        }
+        if !desktop_relaxed_spawn_succeeded {
+            return Session0DiagnosticOutcome::Indeterminate;
+        }
+        match desktop_relaxed_exit {
+            Some(0) => Session0DiagnosticOutcome::DesktopCausal,
+            Some(0xc000_0142) => Session0DiagnosticOutcome::DesktopNotSufficient,
+            _ => Session0DiagnosticOutcome::Indeterminate,
         }
     }
 
@@ -1596,7 +1647,7 @@ mod tests {
     #[test]
     fn window_station_scm_contract_rejects_aliases_and_extra_arguments() {
         assert_ne!(
-            WINDOW_STATION_SCM_SMOKE_SUCCESS,
+            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
             WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE
         );
         let valid_process: Vec<OsString> = [
@@ -1703,25 +1754,28 @@ mod tests {
             assert!(Session0DiagnosticRecord::decode(&malformed, &record.nonce).is_err());
         }
         assert!(Session0DiagnosticRecord::decode(&bytes, "0").is_err());
+        let mut inconsistent = record;
+        inconsistent.classification = Session0DiagnosticOutcome::DesktopNotSufficient;
+        assert!(inconsistent.encode().is_err());
     }
 
     #[test]
-    fn session0_diagnostic_classifies_only_the_known_signature_as_reproduced() {
+    fn session0_diagnostic_maps_only_the_ab_outcomes_to_service_magics() {
         assert_eq!(
-            Session0DiagnosticOutcome::Refuted.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_SUCCESS
+            Session0DiagnosticOutcome::DesktopCausal.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL
         );
         assert_eq!(
-            Session0DiagnosticOutcome::Reproduced.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_REPRODUCED
+            Session0DiagnosticOutcome::DesktopNotSufficient.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT
         );
         assert_eq!(
             Session0DiagnosticOutcome::Indeterminate.service_magic(),
             WINDOW_STATION_SCM_SMOKE_INDETERMINATE
         );
         for outcome in [
-            Session0DiagnosticOutcome::Refuted,
-            Session0DiagnosticOutcome::Reproduced,
+            Session0DiagnosticOutcome::DesktopCausal,
+            Session0DiagnosticOutcome::DesktopNotSufficient,
             Session0DiagnosticOutcome::Indeterminate,
         ] {
             assert_eq!(
@@ -1730,6 +1784,28 @@ mod tests {
             );
         }
         assert!(Session0DiagnosticOutcome::decode(0).is_err());
+    }
+
+    #[test]
+    fn session0_diagnostic_ab_classifier_requires_the_baseline_signature() {
+        assert_eq!(
+            classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0)),
+            Session0DiagnosticOutcome::DesktopCausal
+        );
+        assert_eq!(
+            classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0xc000_0142)),
+            Session0DiagnosticOutcome::DesktopNotSufficient
+        );
+        for variant in [None, Some(1), Some(0xc000_0142)] {
+            assert_eq!(
+                classify_session0_diagnostic_ab(true, Some(1), true, variant),
+                Session0DiagnosticOutcome::Indeterminate
+            );
+        }
+        assert_eq!(
+            classify_session0_diagnostic_ab(false, Some(0xc000_0142), true, Some(0)),
+            Session0DiagnosticOutcome::Indeterminate
+        );
     }
 
     #[test]
@@ -1756,6 +1832,10 @@ mod tests {
             "TerminateHeldProcessAndWait(",
             "OpenAclMutation(string path, bool directory)",
             "0x001301bf",
+            "0x000000fe",
+            "0x000000be",
+            "DESKTOP_CAUSAL",
+            "DESKTOP_NOT_SUFFICIENT",
             "held throwaway process reap timed out",
             "cleanup forced termination did not stop the throwaway service",
         ] {
@@ -1763,6 +1843,60 @@ mod tests {
                 script.contains(required),
                 "missing cleanup contract: {required}"
             );
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Session0DiagnosticRun {
+        job_ui_restrictions: u32,
+        spawn_succeeded: bool,
+        spawn_error: String,
+        child_exit: Option<u32>,
+        stdout: String,
+        stderr: String,
+    }
+
+    impl Session0DiagnosticRun {
+        fn empty() -> Self {
+            Self {
+                job_ui_restrictions: 0,
+                spawn_succeeded: false,
+                spawn_error: String::new(),
+                child_exit: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+
+        fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
+            payload.u32(self.job_ui_restrictions);
+            payload.bool(self.spawn_succeeded);
+            write_text(payload, &self.spawn_error)?;
+            payload.bool(self.child_exit.is_some());
+            if let Some(exit) = self.child_exit {
+                payload.u32(exit);
+            }
+            write_text(payload, &self.stdout)?;
+            write_text(payload, &self.stderr)
+        }
+
+        fn decode_from(reader: &mut Reader<'_>) -> Result<Self, String> {
+            let job_ui_restrictions = reader.u32().map_err(|_| "diagnostic run UI")?;
+            let spawn_succeeded = read_strict_bool(reader)?;
+            let spawn_error = read_text(reader)?;
+            let child_exit = if read_strict_bool(reader)? {
+                Some(reader.u32().map_err(|_| "diagnostic run exit")?)
+            } else {
+                None
+            };
+            Ok(Self {
+                job_ui_restrictions,
+                spawn_succeeded,
+                spawn_error,
+                child_exit,
+                stdout: read_text(reader)?,
+                stderr: read_text(reader)?,
+            })
         }
     }
 
@@ -1782,12 +1916,8 @@ mod tests {
         desktop_access: String,
         cwd: String,
         environment_hash: String,
-        job_ui_restrictions: u32,
-        spawn_succeeded: bool,
-        spawn_error: String,
-        child_exit: Option<u32>,
-        stdout: String,
-        stderr: String,
+        baseline: Session0DiagnosticRun,
+        desktop_relaxed: Session0DiagnosticRun,
     }
 
     impl Session0DiagnosticRecord {
@@ -1800,7 +1930,7 @@ mod tests {
             Self {
                 nonce: "0123456789abcdef0123456789abcdef".into(),
                 markers: Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED,
-                classification: Session0DiagnosticOutcome::Refuted,
+                classification: Session0DiagnosticOutcome::DesktopCausal,
                 session_id: 0,
                 broker: "user=S-1-5-80-1;integrity=8192;groups=[];privileges=[]".into(),
                 action: "user=S-1-5-80-1;integrity=8192;restricted=[];groups=[];privileges=[]"
@@ -1813,12 +1943,22 @@ mod tests {
                 desktop_access: "mask=0x000000cf;allowed=false;gle=5".into(),
                 cwd: "C:\\Sembazuru".into(),
                 environment_hash: "0".repeat(64),
-                job_ui_restrictions: 0x7f,
-                spawn_succeeded: true,
-                spawn_error: String::new(),
-                child_exit: Some(0),
-                stdout: String::new(),
-                stderr: String::new(),
+                baseline: Session0DiagnosticRun {
+                    job_ui_restrictions: 0x0000_00fe,
+                    spawn_succeeded: true,
+                    spawn_error: String::new(),
+                    child_exit: Some(0xc000_0142),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                desktop_relaxed: Session0DiagnosticRun {
+                    job_ui_restrictions: 0x0000_00be,
+                    spawn_succeeded: true,
+                    spawn_error: String::new(),
+                    child_exit: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
             }
         }
 
@@ -1835,6 +1975,17 @@ mod tests {
             {
                 return Err("environment hash".into());
             }
+            if self.markers & Self::SPAWN_RETURNED != 0
+                && self.classification
+                    != classify_session0_diagnostic_ab(
+                        self.baseline.spawn_succeeded,
+                        self.baseline.child_exit,
+                        self.desktop_relaxed.spawn_succeeded,
+                        self.desktop_relaxed.child_exit,
+                    )
+            {
+                return Err("diagnostic A/B classification".into());
+            }
             let mut payload = Writer::new();
             payload.u8(self.markers);
             payload.u8(self.classification as u8);
@@ -1850,18 +2001,11 @@ mod tests {
                 &self.desktop_access,
                 &self.cwd,
                 &self.environment_hash,
-                &self.spawn_error,
-                &self.stdout,
-                &self.stderr,
             ] {
                 write_text(&mut payload, value)?;
             }
-            payload.u32(self.job_ui_restrictions);
-            payload.bool(self.spawn_succeeded);
-            payload.bool(self.child_exit.is_some());
-            if let Some(exit) = self.child_exit {
-                payload.u32(exit);
-            }
+            self.baseline.encode_into(&mut payload)?;
+            self.desktop_relaxed.encode_into(&mut payload)?;
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
@@ -1903,16 +2047,11 @@ mod tests {
             )?;
             let session_id = reader.u32().map_err(|_| "diagnostic session")?;
             let mut fields = Vec::new();
-            for _ in 0..13 {
+            for _ in 0..10 {
                 fields.push(read_text(&mut reader)?);
             }
-            let job_ui_restrictions = reader.u32().map_err(|_| "diagnostic UI")?;
-            let spawn_succeeded = read_strict_bool(&mut reader)?;
-            let child_exit = if read_strict_bool(&mut reader)? {
-                Some(reader.u32().map_err(|_| "diagnostic exit")?)
-            } else {
-                None
-            };
+            let baseline = Session0DiagnosticRun::decode_from(&mut reader)?;
+            let desktop_relaxed = Session0DiagnosticRun::decode_from(&mut reader)?;
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -1929,12 +2068,8 @@ mod tests {
                 desktop_access: fields.remove(0),
                 cwd: fields.remove(0),
                 environment_hash: fields.remove(0),
-                spawn_error: fields.remove(0),
-                stdout: fields.remove(0),
-                stderr: fields.remove(0),
-                job_ui_restrictions,
-                spawn_succeeded,
-                child_exit,
+                baseline,
+                desktop_relaxed,
             };
             record.encode().map(|_| record)
         }
@@ -2019,7 +2154,7 @@ mod tests {
             ServiceExitCode::Win32(0),
             std::time::Duration::from_secs(10),
         )?;
-        if exit_code == WINDOW_STATION_SCM_SMOKE_SUCCESS {
+        if exit_code == WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL {
             set(
                 ServiceState::Running,
                 ServiceExitCode::Win32(0),
@@ -2285,6 +2420,82 @@ mod tests {
         post_publish_stage.map_or(Ok(record.classification), Err)
     }
 
+    fn run_session0_diagnostic_child(
+        action: &ActionToken,
+        command: &RestrictedCommand,
+        desktop_relaxed: bool,
+    ) -> Result<Session0DiagnosticRun, String> {
+        let mut record = Session0DiagnosticRun::empty();
+        let process = if desktop_relaxed {
+            RestrictedProcess::spawn_without_desktop_limit_for_test(action, command)
+        } else {
+            RestrictedProcess::spawn(action, command)
+        };
+        let mut process = match process {
+            Ok(process) => process,
+            Err(error) => {
+                record.spawn_error = format!("spawn: {error}");
+                return Ok(record);
+            }
+        };
+        record.spawn_succeeded = true;
+        record.job_ui_restrictions = process
+            .job()
+            .ui_restrictions_for_test()
+            .map_err(|error| format!("job UI query: {error}"))?;
+        let expected_ui = if desktop_relaxed {
+            0x0000_00be
+        } else {
+            0x0000_00fe
+        };
+        if record.job_ui_restrictions != expected_ui {
+            drop(process);
+            return Err(format!(
+                "job UI mismatch: expected=0x{expected_ui:08x};actual=0x{:08x}",
+                record.job_ui_restrictions
+            ));
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                drop(process);
+                return Err(format!("runtime: {error}"));
+            }
+        };
+        let result = runtime.block_on(async {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), process.wait()).await {
+                Ok(Ok(exit)) => Ok(exit),
+                Ok(Err(error)) => Err(format!("wait: {error}")),
+                Err(_) => {
+                    process.terminate();
+                    let _ = process.wait().await;
+                    Err("wait: deadline exceeded; terminated and reaped".into())
+                }
+            }
+        });
+        match result {
+            Ok(exit) => record.child_exit = Some(exit),
+            Err(error) => record.spawn_error = error,
+        }
+        if let Ok((mut stdout, mut stderr)) = process.take_output() {
+            use tokio::io::AsyncReadExt;
+            let (stdout, stderr) = runtime.block_on(async {
+                let (mut left, mut right) = (Vec::new(), Vec::new());
+                let _ = tokio::join!(
+                    stdout.read_to_end(&mut left),
+                    stderr.read_to_end(&mut right)
+                );
+                (left, right)
+            });
+            record.stdout = String::from_utf8_lossy(&stdout[..stdout.len().min(4096)]).into_owned();
+            record.stderr = String::from_utf8_lossy(&stderr[..stderr.len().min(4096)]).into_owned();
+        }
+        Ok(record)
+    }
+
     fn run_session0_diagnostic(
         config: &Session0DiagnosticConfig,
     ) -> Result<Session0DiagnosticOutcome, Session0DiagnosticFailureStage> {
@@ -2319,18 +2530,14 @@ mod tests {
             desktop_access: "unavailable:action-not-created".into(),
             cwd: config.fixture_root.display().to_string(),
             environment_hash: "0".repeat(64),
-            job_ui_restrictions: 0,
-            spawn_succeeded: false,
-            spawn_error: String::new(),
-            child_exit: None,
-            stdout: String::new(),
-            stderr: String::new(),
+            baseline: Session0DiagnosticRun::empty(),
+            desktop_relaxed: Session0DiagnosticRun::empty(),
         };
         let action = match ActionToken::create() {
             Ok(token) => token,
             Err(error) => {
                 record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-                record.spawn_error = format!("action_token: {error}");
+                record.baseline.spawn_error = format!("action_token: {error}");
                 return publish_session0_diagnostic(&record, config, None, None);
             }
         };
@@ -2350,7 +2557,7 @@ mod tests {
             Ok(scratch) => scratch,
             Err(error) => {
                 record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-                record.spawn_error = format!("private_scratch: {error}");
+                record.baseline.spawn_error = format!("private_scratch: {error}");
                 return publish_session0_diagnostic(&record, config, None, None);
             }
         };
@@ -2358,7 +2565,7 @@ mod tests {
             Ok(value) => value,
             Err(error) => {
                 record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-                record.spawn_error = format!("command: {error}");
+                record.baseline.spawn_error = format!("command: {error}");
                 return publish_session0_diagnostic(
                     &record,
                     config,
@@ -2370,71 +2577,39 @@ mod tests {
         record.cwd = scratch.path().display().to_string();
         record.environment_hash = environment_hash;
         record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-        // This deliberately calls the production plain-process path, not VFS/launcher code:
-        // the historical signature was a plain RestrictedProcess cmd child exit 0xC0000142.
-        match RestrictedProcess::spawn(&action, &command) {
-            Err(error) => record.spawn_error = format!("spawn: {error}"),
-            Ok(mut process) => {
-                record.spawn_succeeded = true;
-                record.job_ui_restrictions =
-                    process.job().ui_restrictions_for_test().unwrap_or_default();
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(error) => {
-                        record.spawn_error = format!("runtime: {error}");
-                        record.classification = Session0DiagnosticOutcome::Indeterminate;
-                        drop(process);
-                        return publish_session0_diagnostic(
-                            &record,
-                            config,
-                            Some((scratch.path(), &action)),
-                            Some(Session0DiagnosticFailureStage::Runtime),
-                        );
-                    }
-                };
-                let result = runtime.block_on(async {
-                    match tokio::time::timeout(std::time::Duration::from_secs(10), process.wait())
-                        .await
-                    {
-                        Ok(Ok(exit)) => Ok(exit),
-                        Ok(Err(error)) => Err(format!("wait: {error}")),
-                        Err(_) => {
-                            process.terminate();
-                            let _ = process.wait().await;
-                            Err("wait: deadline exceeded; terminated and reaped".into())
-                        }
-                    }
-                });
-                match result {
-                    Ok(exit) => record.child_exit = Some(exit),
-                    Err(error) => record.spawn_error = error,
-                }
-                if let Ok((mut stdout, mut stderr)) = process.take_output() {
-                    use tokio::io::AsyncReadExt;
-                    let (stdout, stderr) = runtime.block_on(async {
-                        let (mut left, mut right) = (Vec::new(), Vec::new());
-                        let _ = tokio::join!(
-                            stdout.read_to_end(&mut left),
-                            stderr.read_to_end(&mut right)
-                        );
-                        (left, right)
-                    });
-                    record.stdout =
-                        String::from_utf8_lossy(&stdout[..stdout.len().min(4096)]).into_owned();
-                    record.stderr =
-                        String::from_utf8_lossy(&stderr[..stderr.len().min(4096)]).into_owned();
-                }
+        // Both runs share the production command, CWD, BASELINE_ENV, TEMP/TMP, and action token.
+        // The test-only Job constructor is the sole variable in the A/B comparison.
+        record.baseline = match run_session0_diagnostic_child(&action, &command, false) {
+            Ok(run) => run,
+            Err(error) => {
+                record.baseline.spawn_error = error;
+                return publish_session0_diagnostic(
+                    &record,
+                    config,
+                    Some((scratch.path(), &action)),
+                    Some(Session0DiagnosticFailureStage::Runtime),
+                );
             }
-        }
-        record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
-        record.classification = match (record.spawn_succeeded, record.child_exit) {
-            (true, Some(0)) => Session0DiagnosticOutcome::Refuted,
-            (true, Some(0xc000_0142)) => Session0DiagnosticOutcome::Reproduced,
-            _ => Session0DiagnosticOutcome::Indeterminate,
         };
+        record.desktop_relaxed = match run_session0_diagnostic_child(&action, &command, true) {
+            Ok(run) => run,
+            Err(error) => {
+                record.desktop_relaxed.spawn_error = error;
+                return publish_session0_diagnostic(
+                    &record,
+                    config,
+                    Some((scratch.path(), &action)),
+                    Some(Session0DiagnosticFailureStage::Runtime),
+                );
+            }
+        };
+        record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
+        record.classification = classify_session0_diagnostic_ab(
+            record.baseline.spawn_succeeded,
+            record.baseline.child_exit,
+            record.desktop_relaxed.spawn_succeeded,
+            record.desktop_relaxed.child_exit,
+        );
         publish_session0_diagnostic(&record, config, Some((scratch.path(), &action)), None)
     }
 
@@ -5797,7 +5972,16 @@ mod tests {
                 .arg("/d")
                 .arg("/c")
                 .arg(format!("echo ran>\"{}\"", marker.display()));
-            assert!(RestrictedProcess::spawn_inner(&token, &command, Some(failure), &[]).is_err());
+            assert!(
+                RestrictedProcess::spawn_inner(
+                    &token,
+                    &command,
+                    Some(failure),
+                    TestJobProfile::Production,
+                    &[]
+                )
+                .is_err()
+            );
             assert!(
                 !marker.exists(),
                 "suspended child executed its first instruction"
