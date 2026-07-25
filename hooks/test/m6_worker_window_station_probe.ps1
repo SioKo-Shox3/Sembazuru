@@ -41,7 +41,14 @@ $workerServiceName = 'SembazuruWorker'
 $fixtureBasename = 'SbzWindowStationScmSmoke.exe'
 $selector = 'sandbox::tests::window_station_scm_dispatcher_smoke_role'
 $successMagic = [uint32]0x53425a31
+$reproducedMagic = [uint32]0x53425a32
+$indeterminateMagic = [uint32]0x53425a33
 $contractFailureMagic = [uint32]0x53425aff
+$diagnosticFailureMagic = [uint32]0x53425afe
+$brokerTokenFailureMagic = [uint32]0x53425af0
+$publishFailureMagic = [uint32]0x53425af1
+$scratchCleanupFailureMagic = [uint32]0x53425af2
+$runtimeFailureMagic = [uint32]0x53425af3
 $errorServiceSpecific = [uint32]1066
 $serviceStopped = [uint32]1
 $serviceRunning = [uint32]4
@@ -62,6 +69,12 @@ $primaryError = $null
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 $workerBefore = $null
 $workerAfter = $null
+$diagnosticNonce = [Guid]::NewGuid().ToString('N')
+$diagnosticRecordPath = $null
+$throwawayProcessId = [uint32]0
+$throwawayProcess = $null
+$diagnosticClassification = $null
+$diagnosticDetail = $null
 
 Add-Type -TypeDefinition @'
 using System;
@@ -73,6 +86,7 @@ namespace Sembazuru {
         public uint State { get; set; }
         public uint Win32ExitCode { get; set; }
         public uint ServiceSpecificExitCode { get; set; }
+        public uint ProcessId { get; set; }
     }
 
     public sealed class ProbeFileIdentity {
@@ -106,6 +120,18 @@ namespace Sembazuru {
     public sealed class HeldPath : IDisposable {
         public IntPtr Handle { get; private set; }
         internal HeldPath(IntPtr handle) { Handle = handle; }
+        public void Dispose() {
+            if (Handle != IntPtr.Zero) {
+                if (!WindowStationProbeNative.CloseHandle(Handle))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                Handle = IntPtr.Zero;
+            }
+        }
+    }
+
+    public sealed class HeldProcess : IDisposable {
+        public IntPtr Handle { get; private set; }
+        internal HeldProcess(IntPtr handle) { Handle = handle; }
         public void Dispose() {
             if (Handle != IntPtr.Zero) {
                 if (!WindowStationProbeNative.CloseHandle(Handle))
@@ -229,6 +255,10 @@ namespace Sembazuru {
             out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl,
             out IntPtr securityDescriptor);
         [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern uint SetSecurityInfo(
+            IntPtr handle, int objectType, uint securityInformation,
+            IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+        [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool GetSecurityDescriptorDacl(
             IntPtr securityDescriptor, [MarshalAs(UnmanagedType.Bool)] out bool present,
             out IntPtr dacl, [MarshalAs(UnmanagedType.Bool)] out bool defaulted);
@@ -260,6 +290,12 @@ namespace Sembazuru {
             uint bufferSize);
         [DllImport("kernel32.dll", SetLastError = true)]
         internal static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
         [DllImport("kernel32.dll")]
         private static extern IntPtr LocalFree(IntPtr memory);
         [DllImport("kernel32.dll")]
@@ -439,6 +475,27 @@ namespace Sembazuru {
             return new HeldPath(handle);
         }
 
+        public static HeldPath OpenAclMutation(string path, bool directory) {
+            const uint READ_CONTROL = 0x00020000;
+            const uint WRITE_DAC = 0x00040000;
+            const uint FILE_READ_ATTRIBUTES = 0x80;
+            const uint FILE_SHARE_READ = 0x1;
+            const uint FILE_SHARE_WRITE = 0x2;
+            const uint FILE_SHARE_DELETE = 0x4;
+            const uint OPEN_EXISTING = 3;
+            const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+            const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+            uint flags = FILE_FLAG_OPEN_REPARSE_POINT;
+            if (directory) flags |= FILE_FLAG_BACKUP_SEMANTICS;
+            IntPtr handle = CreateFileW(
+                path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero, OPEN_EXISTING, flags, IntPtr.Zero);
+            if (handle == new IntPtr(-1))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return new HeldPath(handle);
+        }
+
         public static HeldPath OpenCleanupDelete(string path) {
             const uint READ_CONTROL = 0x00020000;
             const uint DELETE = 0x00010000;
@@ -513,6 +570,35 @@ namespace Sembazuru {
                 DaclPresent = daclPresent,
                 DaclNonNull = daclNonNull
             };
+        }
+
+        public static void SetProtectedDacl(IntPtr handle, string sddl) {
+            const uint DACL_SECURITY_INFORMATION = 0x4;
+            const uint PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000;
+            IntPtr descriptor;
+            uint size;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, out descriptor, out size))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            try {
+                bool present, defaulted;
+                IntPtr dacl;
+                if (!GetSecurityDescriptorDacl(descriptor, out present, out dacl, out defaulted) ||
+                    !present || dacl == IntPtr.Zero)
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                uint result = SetSecurityInfo(
+                    handle, 1, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+                if (result != 0) throw new Win32Exception((int)result);
+            }
+            finally { LocalFree(descriptor); }
+        }
+
+        public static string ServiceAccountSid(string serviceName) {
+            System.Security.Principal.NTAccount account = new System.Security.Principal.NTAccount(
+                "NT SERVICE", serviceName);
+            return ((System.Security.Principal.SecurityIdentifier)account.Translate(
+                typeof(System.Security.Principal.SecurityIdentifier))).Value;
         }
 
         public static void MarkDelete(IntPtr handle) {
@@ -618,13 +704,14 @@ namespace Sembazuru {
             }
             finally { CloseServiceHandle(manager); }
         }
-        public static IntPtr CreateProbeService(string serviceName, string binaryPath) {
+        public static IntPtr CreateProbeService(
+            string serviceName, string binaryPath, string serviceAccount) {
             IntPtr manager = OpenManager(0x0003);
             try {
                 IntPtr service = CreateServiceW(
                     manager, serviceName, serviceName, 0x000f01ff,
                     0x00000010, 0x00000003, 0x00000001, binaryPath,
-                    null, IntPtr.Zero, null, "LocalSystem", null);
+                    null, IntPtr.Zero, null, serviceAccount, null);
                 if (service == IntPtr.Zero)
                     throw new Win32Exception(Marshal.GetLastWin32Error());
                 return service;
@@ -663,8 +750,27 @@ namespace Sembazuru {
             return new ProbeServiceStatus {
                 State = native.dwCurrentState,
                 Win32ExitCode = native.dwWin32ExitCode,
-                ServiceSpecificExitCode = native.dwServiceSpecificExitCode
+                ServiceSpecificExitCode = native.dwServiceSpecificExitCode,
+                ProcessId = native.dwProcessId
             };
+        }
+        public static HeldProcess HoldProcess(uint processId) {
+            const uint PROCESS_TERMINATE = 0x0001;
+            const uint SYNCHRONIZE = 0x00100000;
+            IntPtr process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, false, processId);
+            if (process == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            return new HeldProcess(process);
+        }
+        public static void TerminateHeldProcessAndWait(HeldProcess process, uint milliseconds) {
+            if (process == null || process.Handle == IntPtr.Zero)
+                throw new InvalidOperationException("throwaway process handle is unavailable");
+            if (!TerminateProcess(process.Handle, 1)) {
+                int error = Marshal.GetLastWin32Error();
+                if (error != 5) throw new Win32Exception(error);
+            }
+            uint wait = WaitForSingleObject(process.Handle, milliseconds);
+            if (wait == 258) throw new TimeoutException("held throwaway process reap timed out");
+            if (wait != 0) throw new Win32Exception(Marshal.GetLastWin32Error());
         }
         public static void RequestStop(IntPtr service) {
             SERVICE_STATUS status;
@@ -796,8 +902,17 @@ function Assert-RegularIdentity($Identity, [string]$ExpectedPath, [string]$Label
     }
 }
 
+function Assert-RegularDirectoryIdentity($Identity, [string]$ExpectedPath, [string]$Label) {
+    Assert-ExactPath $Identity.FinalPath $ExpectedPath $Label
+    if (($Identity.Attributes -band [uint32]0x10) -eq 0 -or
+        ($Identity.Attributes -band [uint32]0x400) -ne 0) {
+        throw "$Label is not a regular non-reparse directory"
+    }
+}
+
 function Assert-EquivalentFileIdentity(
-    $Expected, $Actual, [string]$ExpectedPath, [string]$Label
+    $Expected, $Actual, [string]$ExpectedPath, [string]$Label,
+    [switch]$AllowSecuritySddlChange
 ) {
     Assert-RegularIdentity $Actual $ExpectedPath $Label
     foreach ($property in @('FileId', 'DaclPresent', 'DaclNonNull')) {
@@ -805,12 +920,32 @@ function Assert-EquivalentFileIdentity(
             throw "$Label $property mismatch"
         }
     }
-    foreach ($property in @('FinalPath', 'SecuritySddl')) {
+    foreach ($property in @('FinalPath')) {
         if (-not [string]::Equals(
             $Expected.$property, $Actual.$property, [StringComparison]::Ordinal
         )) { throw "$Label $property mismatch" }
     }
-    Assert-ExactFileSecurity $Actual
+    if (-not $AllowSecuritySddlChange) {
+        if (-not [string]::Equals(
+            $Expected.SecuritySddl, $Actual.SecuritySddl, [StringComparison]::Ordinal
+        )) { throw "$Label SecuritySddl mismatch" }
+        Assert-ExactFileSecurity $Actual
+    }
+}
+
+function Assert-EquivalentRootIdentity(
+    $Expected, $Actual, [string]$ExpectedPath, [string]$Label,
+    [switch]$AllowSecuritySddlChange
+) {
+    Assert-RegularDirectoryIdentity $Actual $ExpectedPath $Label
+    foreach ($property in @('FileId', 'DaclPresent', 'DaclNonNull')) {
+        if (-not [object]::Equals($Expected.$property, $Actual.$property)) {
+            throw "$Label $property mismatch"
+        }
+    }
+    if (-not $AllowSecuritySddlChange -and -not [string]::Equals(
+        $Expected.SecuritySddl, $Actual.SecuritySddl, [StringComparison]::Ordinal
+    )) { throw "$Label SecuritySddl mismatch" }
 }
 
 function Get-WorkerSnapshot {
@@ -842,6 +977,81 @@ function Get-StreamSha256([IO.Stream]$Stream) {
     $sha = [Security.Cryptography.SHA256]::Create()
     try { return -join ($sha.ComputeHash($Stream) | ForEach-Object { $_.ToString('x2') }) }
     finally { $sha.Dispose() }
+}
+
+function Read-Session0U32([byte[]]$Bytes, [ref]$Offset) {
+    if ($Offset.Value -gt $Bytes.Length - 4) { throw 'Session 0 diagnostic record is truncated.' }
+    $value = [BitConverter]::ToUInt32($Bytes, $Offset.Value)
+    $Offset.Value += 4
+    return $value
+}
+
+function Read-Session0Text([byte[]]$Bytes, [ref]$Offset) {
+    $length = Read-Session0U32 $Bytes $Offset
+    if ($length -gt 32768 -or $Offset.Value -gt $Bytes.Length - [int]$length) {
+        throw 'Session 0 diagnostic text is invalid or exceeds its bound.'
+    }
+    $value = [Text.Encoding]::UTF8.GetString($Bytes, $Offset.Value, [int]$length)
+    $Offset.Value += [int]$length
+    return $value
+}
+
+function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
+    if ($Bytes.Length -lt 46 -or $Bytes.Length -gt 65580) {
+        throw 'Session 0 diagnostic record length is outside its bounded contract.'
+    }
+    if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424432 -or
+        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]2) {
+        throw 'Session 0 diagnostic record magic/version mismatch.'
+    }
+    $nonceBytes = [Text.Encoding]::ASCII.GetBytes($Nonce)
+    if ($nonceBytes.Length -ne 32) { throw 'Session 0 diagnostic nonce is malformed.' }
+    for ($index = 0; $index -lt 32; $index++) {
+        if ($Bytes[8 + $index] -ne $nonceBytes[$index]) {
+            throw 'Session 0 diagnostic record nonce mismatch.'
+        }
+    }
+    $payloadLength = [BitConverter]::ToUInt32($Bytes, 40)
+    if ($payloadLength -ne $Bytes.Length - 44) {
+        throw 'Session 0 diagnostic payload length mismatch.'
+    }
+    $offset = [ref]44
+    if ($offset.Value -ge $Bytes.Length) { throw 'Session 0 diagnostic markers are missing.' }
+    $markers = $Bytes[$offset.Value]
+    $offset.Value++
+    if ($offset.Value -ge $Bytes.Length) { throw 'Session 0 diagnostic classification is missing.' }
+    $classification = $Bytes[$offset.Value]
+    $offset.Value++
+    $sessionId = Read-Session0U32 $Bytes $offset
+    $fields = [Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt 13; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
+    $jobUi = Read-Session0U32 $Bytes $offset
+    if ($offset.Value -ge $Bytes.Length -or ($Bytes[$offset.Value] -ne 0 -and $Bytes[$offset.Value] -ne 1)) {
+        throw 'Session 0 diagnostic spawn-success flag is invalid.'
+    }
+    $spawnSucceeded = $Bytes[$offset.Value] -eq 1
+    $offset.Value++
+    if ($offset.Value -ge $Bytes.Length -or ($Bytes[$offset.Value] -ne 0 -and $Bytes[$offset.Value] -ne 1)) {
+        throw 'Session 0 diagnostic child-exit flag is invalid.'
+    }
+    $hasExit = $Bytes[$offset.Value] -eq 1
+    $offset.Value++
+    $childExit = $null
+    if ($hasExit) { $childExit = Read-Session0U32 $Bytes $offset }
+    if ($offset.Value -ne $Bytes.Length) { throw 'Session 0 diagnostic record has trailing bytes.' }
+    return [PSCustomObject]@{
+        Markers = $markers; Classification = $classification; SessionId = $sessionId
+        Station = $fields[2]; Desktop = $fields[3]; StationAccess = $fields[6]
+        DesktopAccess = $fields[7]; JobUi = $jobUi; SpawnSucceeded = $spawnSucceeded
+        SpawnError = $fields[10]; ChildExit = $childExit
+        Stdout = $fields[11]; Stderr = $fields[12]
+    }
+}
+
+function Format-BoundedDiagnosticText([string]$Value) {
+    $normalized = $Value.Replace("`r", '\\r').Replace("`n", '\\n')
+    if ($normalized.Length -gt 512) { return $normalized.Substring(0, 512) + '...[truncated]' }
+    return $normalized
 }
 
 try {
@@ -940,15 +1150,63 @@ try {
     $sourceStream.Dispose()
     $sourceStream = $null
 
+    $diagnosticRecordPath = Join-Path $root ($diagnosticNonce + '.session0.rec')
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
-        ' --nocapture --test-threads=1'
+        ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
+        $diagnosticNonce
+    $serviceAccount = 'NT SERVICE\' + $serviceName
     $serviceHandle = [Sembazuru.WindowStationProbeNative]::CreateProbeService(
-        $serviceName, $imagePath
+        $serviceName, $imagePath, $serviceAccount
     )
     $ownedService = $true
     [Sembazuru.WindowStationProbeNative]::SetUnrestrictedServiceSid($serviceHandle)
     if ([Sembazuru.WindowStationProbeNative]::QueryServiceSidType($serviceHandle) -ne 1) {
         throw 'SERVICE_SID_TYPE_UNRESTRICTED was not retained.'
+    }
+    $serviceSid = [Sembazuru.WindowStationProbeNative]::ServiceAccountSid($serviceName)
+    if ([string]::IsNullOrWhiteSpace($serviceSid)) { throw 'throwaway service SID is unavailable.' }
+    # The long-lived identity handles intentionally lack WRITE_DAC. Mutate only through
+    # short-lived handles opened with that exact right after final-path/file-ID verification.
+    $rootAclHandle = [Sembazuru.WindowStationProbeNative]::OpenAclMutation($root, $true)
+    try {
+        $rootAclIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
+            $rootAclHandle.Handle
+        )
+        Assert-EquivalentRootIdentity $rootIdentity $rootAclIdentity $root 'ACL mutation root'
+        Assert-ExactRootSecurity $rootAclIdentity
+        [Sembazuru.WindowStationProbeNative]::SetProtectedDacl(
+            $rootAclHandle.Handle,
+            ('O:SYD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x001301bf;;;{0})' -f $serviceSid)
+        )
+    }
+    finally { $rootAclHandle.Dispose() }
+    $targetAclHandle = [Sembazuru.WindowStationProbeNative]::OpenAclMutation($fixtureExe, $false)
+    try {
+        $targetAclIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
+            $targetAclHandle.Handle
+        )
+        Assert-EquivalentFileIdentity $targetIdentity $targetAclIdentity $fixtureExe `
+            'ACL mutation fixture executable'
+        [Sembazuru.WindowStationProbeNative]::SetProtectedDacl(
+            $targetAclHandle.Handle,
+            ('O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x001200a9;;;{0})' -f $serviceSid)
+        )
+    }
+    finally { $targetAclHandle.Dispose() }
+    $serviceRootIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($rootHandle.Handle)
+    $serviceExeIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($targetLease.Handle)
+    $leaseIdentity = $serviceExeIdentity
+    foreach ($check in @(
+        @($serviceRootIdentity, [uint32]0x001301bf, 'fixture root'),
+        @($serviceExeIdentity, [uint32]0x001200a9, 'fixture executable')
+    )) {
+        $ace = @((Get-RawDescriptor $check[0].SecuritySddl).DiscretionaryAcl | Where-Object {
+            $_ -is [Security.AccessControl.CommonAce] -and
+            $_.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+            $_.SecurityIdentifier.Value -eq $serviceSid -and
+            (Convert-AccessMaskToUInt32 $_.AccessMask) -eq $check[1]
+        })
+        if ($ace.Count -ne 1) { throw "$($check[2]) lacks the exact throwaway service SID right." }
     }
     try { [Sembazuru.WindowStationProbeNative]::StartWithoutArguments($serviceHandle) }
     catch {
@@ -970,18 +1228,35 @@ try {
     $sawRunning = $false
     do {
         $status = [Sembazuru.WindowStationProbeNative]::QueryStatus($serviceHandle)
+        if ($status.ProcessId -ne 0) {
+            $throwawayProcessId = $status.ProcessId
+            if ($null -eq $throwawayProcess) {
+                $throwawayProcess = [Sembazuru.WindowStationProbeNative]::HoldProcess(
+                    $throwawayProcessId
+                )
+            }
+        }
         if ($status.State -eq $serviceRunning) { $sawRunning = $true }
         if ($status.State -eq $serviceStopped) { break }
         if ([DateTime]::UtcNow -ge $deadline) { throw 'SCM smoke did not stop in 30 seconds.' }
         Start-Sleep -Milliseconds 100
     } while ($true)
     if ($status.Win32ExitCode -ne $errorServiceSpecific -or
-        $status.ServiceSpecificExitCode -ne $successMagic) {
+        ($status.ServiceSpecificExitCode -ne $successMagic -and
+         $status.ServiceSpecificExitCode -ne $reproducedMagic -and
+         $status.ServiceSpecificExitCode -ne $indeterminateMagic -and
+         $status.ServiceSpecificExitCode -ne $brokerTokenFailureMagic -and
+         $status.ServiceSpecificExitCode -ne $publishFailureMagic -and
+         $status.ServiceSpecificExitCode -ne $scratchCleanupFailureMagic -and
+         $status.ServiceSpecificExitCode -ne $runtimeFailureMagic)) {
         if ($status.Win32ExitCode -eq 1053 -or $status.Win32ExitCode -eq 1063) {
             Write-Host "REFUTED: SCM stopped with dispatcher error $($status.Win32ExitCode)."
         }
         if ($status.ServiceSpecificExitCode -eq $contractFailureMagic) {
             throw 'SCM ServiceMain argument contract rejected the launch.'
+        }
+        if ($status.ServiceSpecificExitCode -eq $diagnosticFailureMagic) {
+            throw 'Session 0 diagnostic did not publish its bounded record.'
         }
         throw ("SCM status mismatch: state={0} win32={1} service={2}" -f
             $status.State, $status.Win32ExitCode, $status.ServiceSpecificExitCode)
@@ -989,6 +1264,44 @@ try {
     if (-not $sawRunning) {
         Write-Host 'SCM status note: Running completed inside the polling interval.'
     }
+    $failureStages = @{
+        $brokerTokenFailureMagic = 'broker-token'
+        $publishFailureMagic = 'record-publish'
+        $scratchCleanupFailureMagic = 'scratch-cleanup'
+        $runtimeFailureMagic = 'runtime'
+    }
+    if ($failureStages.ContainsKey($status.ServiceSpecificExitCode)) {
+        throw ('Session 0 diagnostic harness failure stage={0} service=0x{1:x8}' -f
+            $failureStages[$status.ServiceSpecificExitCode], $status.ServiceSpecificExitCode)
+    }
+    if ($null -eq $diagnosticRecordPath -or -not [IO.File]::Exists($diagnosticRecordPath)) {
+        throw 'Session 0 diagnostic record is missing.'
+    }
+    $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
+        $diagnosticNonce
+    $classificationMap = @{
+        1 = @{ Name = 'REFUTED'; Magic = $successMagic }
+        2 = @{ Name = 'REPRODUCED'; Magic = $reproducedMagic }
+        3 = @{ Name = 'INDETERMINATE'; Magic = $indeterminateMagic }
+    }
+    if (-not $classificationMap.ContainsKey([int]$record.Classification)) {
+        throw 'Session 0 diagnostic classification is invalid.'
+    }
+    $classification = $classificationMap[[int]$record.Classification]
+    if ($status.ServiceSpecificExitCode -ne $classification.Magic) {
+        throw 'SCM diagnostic outcome magic disagrees with the bounded record.'
+    }
+    if (($record.Markers -band [byte]0x07) -ne [byte]0x07) {
+        throw 'Session 0 diagnostic markers do not prove entry/pre-spawn/spawn-returned.'
+    }
+    $diagnosticClassification = $classification.Name
+    $exitText = if ($null -eq $record.ChildExit) { 'none' } else { '0x{0:x8}' -f $record.ChildExit }
+    $diagnosticDetail = ('path=plain-production service=0x{0:x8} session={1} station={2} desktop={3} ' +
+        'stationAccess={4} desktopAccess={5} jobUi=0x{6:x8} spawnSucceeded={7} ' +
+        'spawnError={8} childExit={9} stdout={10} stderr={11}') -f $status.ServiceSpecificExitCode,
+        $record.SessionId, $record.Station, $record.Desktop, $record.StationAccess,
+        $record.DesktopAccess, $record.JobUi, $record.SpawnSucceeded, $record.SpawnError, $exitText,
+        (Format-BoundedDiagnosticText $record.Stdout), (Format-BoundedDiagnosticText $record.Stderr)
 }
 catch { $primaryError = $_.Exception }
 finally {
@@ -1005,12 +1318,33 @@ finally {
         try {
             $cleanupStatus = [Sembazuru.WindowStationProbeNative]::QueryStatus($serviceHandle)
             if ($cleanupStatus.State -ne $serviceStopped) {
-                [Sembazuru.WindowStationProbeNative]::RequestStop($serviceHandle)
+                if ($cleanupStatus.ProcessId -ne 0) { $throwawayProcessId = $cleanupStatus.ProcessId }
+                try { [Sembazuru.WindowStationProbeNative]::RequestStop($serviceHandle) }
+                catch {
+                    if ($null -eq $throwawayProcess) { throw }
+                    [Sembazuru.WindowStationProbeNative]::TerminateHeldProcessAndWait(
+                        $throwawayProcess, 15000
+                    )
+                }
                 $stopDeadline = [DateTime]::UtcNow.AddSeconds(15)
                 do {
                     $cleanupStatus = [Sembazuru.WindowStationProbeNative]::QueryStatus($serviceHandle)
                     if ($cleanupStatus.State -eq $serviceStopped) { break }
-                    if ([DateTime]::UtcNow -ge $stopDeadline) { throw 'cleanup stop timed out' }
+                    if ([DateTime]::UtcNow -ge $stopDeadline) {
+                        if ($null -eq $throwawayProcess) {
+                            throw 'cleanup stop timed out without held process handle'
+                        }
+                        [Sembazuru.WindowStationProbeNative]::TerminateHeldProcessAndWait(
+                            $throwawayProcess, 15000
+                        )
+                        $cleanupStatus = [Sembazuru.WindowStationProbeNative]::QueryStatus(
+                            $serviceHandle
+                        )
+                        if ($cleanupStatus.State -ne $serviceStopped) {
+                            throw 'cleanup forced termination did not stop the throwaway service'
+                        }
+                        break
+                    }
                     Start-Sleep -Milliseconds 100
                 } while ($true)
             }
@@ -1054,25 +1388,29 @@ finally {
                 $cleanupIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
                     $rootHandle.Handle
                 )
-                Assert-ExactPath $cleanupIdentity.FinalPath $root 'cleanup fixture root'
-                if ($cleanupIdentity.FileId -ne $rootIdentity.FileId) {
-                    throw 'fixture root file identity changed'
+                Assert-EquivalentRootIdentity $rootIdentity $cleanupIdentity $root `
+                    'cleanup fixture root' -AllowSecuritySddlChange
+                if ($null -ne $diagnosticRecordPath -and [IO.File]::Exists($diagnosticRecordPath)) {
+                    $recordCleanup = [Sembazuru.WindowStationProbeNative]::OpenCleanupDelete(
+                        $diagnosticRecordPath
+                    )
+                    try { [Sembazuru.WindowStationProbeNative]::MarkDelete($recordCleanup.Handle) }
+                    finally { $recordCleanup.Dispose() }
                 }
-                Assert-ExactRootSecurity $cleanupIdentity
                 if ($null -ne $targetLease) {
                     if ($null -eq $targetIdentity -or $null -eq $leaseIdentity) {
                         throw 'fixture executable lease identity is unavailable'
                     }
                     Assert-EquivalentFileIdentity $targetIdentity $leaseIdentity $fixtureExe `
-                        'cleanup lease'
+                        'cleanup lease' -AllowSecuritySddlChange
                     $cleanupHandle = [Sembazuru.WindowStationProbeNative]::OpenCleanupDelete(
                         $fixtureExe
                     )
                     $cleanupTargetIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
                         $cleanupHandle.Handle
                     )
-                    Assert-EquivalentFileIdentity $leaseIdentity $cleanupTargetIdentity $fixtureExe `
-                        'cleanup fixture executable'
+                    Assert-EquivalentFileIdentity $targetIdentity $cleanupTargetIdentity $fixtureExe `
+                        'cleanup fixture executable' -AllowSecuritySddlChange
                     [Sembazuru.WindowStationProbeNative]::MarkDelete($cleanupHandle.Handle)
                     $cleanupHandle.Dispose()
                     $cleanupHandle = $null
@@ -1085,7 +1423,7 @@ finally {
                             $targetHandle.Handle
                         )
                         Assert-EquivalentFileIdentity $targetIdentity $cleanupTargetIdentity `
-                            $fixtureExe 'cleanup high fixture executable'
+                            $fixtureExe 'cleanup high fixture executable' -AllowSecuritySddlChange
                     }
                     [Sembazuru.WindowStationProbeNative]::MarkDelete($targetHandle.Handle)
                     $targetHandle.Dispose()
@@ -1118,6 +1456,11 @@ finally {
         catch { $cleanupErrors.Add("fixture root handle close: $($_.Exception.Message)") }
         $rootHandle = $null
     }
+    if ($null -ne $throwawayProcess) {
+        try { $throwawayProcess.Dispose() }
+        catch { $cleanupErrors.Add("throwaway process handle close: $($_.Exception.Message)") }
+        $throwawayProcess = $null
+    }
 
     try {
         if ($null -ne $workerBefore) {
@@ -1140,5 +1483,19 @@ if ($null -ne $primaryError -or $cleanupErrors.Count -ne 0) {
     exit 1
 }
 
-Write-Host ("PASS: dispatcher=started handler=registered status=StartPending->Running->Stopped " +
-    "magic=0x{0:x8} cleanup=service+fixture-removed worker-unchanged=true" -f $successMagic)
+if ($diagnosticClassification -eq 'INDETERMINATE') {
+    [Console]::Error.WriteLine(
+        "INDETERMINATE: $diagnosticDetail; no cause is attributed; run the planned single-variable A/B."
+    )
+    exit 1
+}
+if ($diagnosticClassification -eq 'REPRODUCED') {
+    Write-Host "REPRODUCED: $diagnosticDetail; cause is not attributed; run the planned single-variable A/B."
+    exit 0
+}
+if ($diagnosticClassification -eq 'REFUTED') {
+    Write-Host "REFUTED: $diagnosticDetail; canonical worker remains unmodified; run the planned single-variable A/B."
+    exit 0
+}
+[Console]::Error.WriteLine('INDETERMINATE: no bounded diagnostic classification was published.')
+exit 1

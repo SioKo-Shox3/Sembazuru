@@ -1428,15 +1428,16 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::IntoRawHandle;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread::JoinHandle;
 
     use sembazuru_dataplane::wire::{Reader, Writer};
 
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
-        GetHandleInformation, GetLastError, INVALID_HANDLE_VALUE, LUID, LocalFree, SetLastError,
-        WAIT_TIMEOUT,
+        ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ,
+        GENERIC_WRITE, GetHandleInformation, GetLastError, INVALID_HANDLE_VALUE, LUID, LocalFree,
+        SetLastError, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -1444,12 +1445,13 @@ mod tests {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, ImpersonateLoggedOnUser, LookupPrivilegeValueW,
-        OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, RevertToSelf, SE_CHANGE_NOTIFY_NAME,
-        SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
-        TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS, TOKEN_PRIVILEGES, TOKEN_USER,
-        TokenAppContainerSid, TokenCapabilities, TokenGroups, TokenIsAppContainer, TokenPrivileges,
-        TokenRestrictedSids, TokenUser, WinCreatorOwnerRightsSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetUserObjectSecurity,
+        ImpersonateLoggedOnUser, LookupPrivilegeValueW, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, RevertToSelf, SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED,
+        SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
+        TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenGroups,
+        TokenIsAppContainer, TokenPrivileges, TokenRestrictedSids, TokenSessionId, TokenUser,
+        WinCreatorOwnerRightsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -1458,12 +1460,13 @@ mod tests {
     };
     use windows_sys::Win32::System::JobObjects::{IsProcessInJob, JOB_OBJECT_UILIMIT_HANDLES};
     use windows_sys::Win32::System::StationsAndDesktops::{
-        CloseWindowStation, CreateWindowStationW, GetProcessWindowStation,
-        GetUserObjectInformationW, OpenWindowStationW, SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+        CloseDesktop, CloseWindowStation, CreateWindowStationW, GetProcessWindowStation,
+        GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW, OpenWindowStationW,
+        SetProcessWindowStation, UOI_NAME, UOI_TYPE,
     };
     use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
     use windows_sys::Win32::System::Threading::{
-        CreateEventW, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
+        CreateEventW, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CWF_CREATE_ONLY, WINSTA_ACCESSCLIPBOARD, WINSTA_ACCESSGLOBALATOMS, WINSTA_CREATEDESKTOP,
@@ -1480,7 +1483,67 @@ mod tests {
     const WINDOW_STATION_SCM_SMOKE_SELECTOR: &str =
         "sandbox::tests::window_station_scm_dispatcher_smoke_role";
     const WINDOW_STATION_SCM_SMOKE_SUCCESS: u32 = 0x5342_5a31;
+    const WINDOW_STATION_SCM_SMOKE_REPRODUCED: u32 = 0x5342_5a32;
+    const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5a33;
     const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
+    const WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE: u32 = 0x5342_5afe;
+
+    #[derive(Clone, Debug)]
+    struct Session0DiagnosticConfig {
+        fixture_root: PathBuf,
+        record_directory: PathBuf,
+        nonce: String,
+    }
+
+    static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
+    const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4432;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 2;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    enum Session0DiagnosticOutcome {
+        Refuted = 1,
+        Reproduced = 2,
+        Indeterminate = 3,
+    }
+
+    impl Session0DiagnosticOutcome {
+        fn decode(value: u8) -> Result<Self, String> {
+            match value {
+                1 => Ok(Self::Refuted),
+                2 => Ok(Self::Reproduced),
+                3 => Ok(Self::Indeterminate),
+                _ => Err("diagnostic classification".into()),
+            }
+        }
+
+        fn service_magic(self) -> u32 {
+            match self {
+                Self::Refuted => WINDOW_STATION_SCM_SMOKE_SUCCESS,
+                Self::Reproduced => WINDOW_STATION_SCM_SMOKE_REPRODUCED,
+                Self::Indeterminate => WINDOW_STATION_SCM_SMOKE_INDETERMINATE,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Session0DiagnosticFailureStage {
+        BrokerToken,
+        Publish,
+        ScratchCleanup,
+        Runtime,
+    }
+
+    impl Session0DiagnosticFailureStage {
+        fn service_magic(self) -> u32 {
+            match self {
+                Self::BrokerToken => 0x5342_5af0,
+                Self::Publish => 0x5342_5af1,
+                Self::ScratchCleanup => 0x5342_5af2,
+                Self::Runtime => 0x5342_5af3,
+            }
+        }
+    }
 
     fn validate_window_station_scm_process_argv(argv: &[OsString]) -> Result<(), &'static str> {
         let expected = [
@@ -1490,7 +1553,7 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ];
-        if argv.len() != expected.len() + 1 {
+        if argv.len() != expected.len() + 5 {
             return Err("process argv cardinality");
         }
         if Path::new(&argv[0]).file_name() != Some(OsStr::new(WINDOW_STATION_SCM_SMOKE_BASENAME)) {
@@ -1498,11 +1561,25 @@ mod tests {
         }
         if argv[1..]
             .iter()
+            .take(expected.len())
             .zip(expected)
             .any(|(actual, expected)| actual != OsStr::new(expected))
         {
             return Err("process argv exact order/value");
         }
+        if argv[expected.len() + 1] != OsStr::new("--") {
+            return Err("process argv separator");
+        }
+        let fixture_root = PathBuf::from(&argv[expected.len() + 2]);
+        let record_directory = PathBuf::from(&argv[expected.len() + 3]);
+        let nonce = argv[expected.len() + 4]
+            .to_str()
+            .ok_or("process nonce utf8")?
+            .to_owned();
+        if !fixture_root.is_absolute() || !record_directory.is_absolute() {
+            return Err("process diagnostic paths");
+        }
+        validate_nonce(&nonce).map_err(|_| "process diagnostic nonce")?;
         Ok(())
     }
 
@@ -1529,6 +1606,10 @@ mod tests {
             WINDOW_STATION_SCM_SMOKE_SELECTOR,
             "--nocapture",
             "--test-threads=1",
+            "--",
+            "C:\\fixture",
+            "C:\\record",
+            "0123456789abcdef0123456789abcdef",
         ]
         .into_iter()
         .map(OsString::from)
@@ -1561,9 +1642,28 @@ mod tests {
         ] {
             assert!(validate_window_station_scm_process_argv(&invalid).is_err());
         }
-        for index in 1..valid_process.len() {
+        for index in 1..=5 {
             let mut invalid = valid_process.clone();
             invalid[index].push("-not-exact");
+            assert!(validate_window_station_scm_process_argv(&invalid).is_err());
+        }
+        for invalid in [
+            {
+                let mut value = valid_process.clone();
+                value[6] = OsString::from("not-a-separator");
+                value
+            },
+            {
+                let mut value = valid_process.clone();
+                value[9] = OsString::from("not-a-nonce");
+                value
+            },
+            {
+                let mut value = valid_process.clone();
+                value[7] = OsString::from("relative");
+                value
+            },
+        ] {
             assert!(validate_window_station_scm_process_argv(&invalid).is_err());
         }
         for invalid in [
@@ -1578,18 +1678,317 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session0_diagnostic_record_codec_rejects_tampering() {
+        let record = Session0DiagnosticRecord::fixture();
+        let bytes = record.encode().expect("diagnostic record encode");
+        assert_eq!(
+            Session0DiagnosticRecord::decode(&bytes, &record.nonce).expect("diagnostic decode"),
+            record
+        );
+        for malformed in [
+            Vec::new(),
+            bytes[..bytes.len() - 1].to_vec(),
+            {
+                let mut value = bytes.clone();
+                value[0] ^= 1;
+                value
+            },
+            {
+                let mut value = bytes.clone();
+                value.extend_from_slice(&[0]);
+                value
+            },
+        ] {
+            assert!(Session0DiagnosticRecord::decode(&malformed, &record.nonce).is_err());
+        }
+        assert!(Session0DiagnosticRecord::decode(&bytes, "0").is_err());
+    }
+
+    #[test]
+    fn session0_diagnostic_classifies_only_the_known_signature_as_reproduced() {
+        assert_eq!(
+            Session0DiagnosticOutcome::Refuted.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_SUCCESS
+        );
+        assert_eq!(
+            Session0DiagnosticOutcome::Reproduced.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_REPRODUCED
+        );
+        assert_eq!(
+            Session0DiagnosticOutcome::Indeterminate.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_INDETERMINATE
+        );
+        for outcome in [
+            Session0DiagnosticOutcome::Refuted,
+            Session0DiagnosticOutcome::Reproduced,
+            Session0DiagnosticOutcome::Indeterminate,
+        ] {
+            assert_eq!(
+                Session0DiagnosticOutcome::decode(outcome as u8).unwrap(),
+                outcome
+            );
+        }
+        assert!(Session0DiagnosticOutcome::decode(0).is_err());
+    }
+
+    #[test]
+    fn session0_diagnostic_failure_stages_have_distinct_service_magics() {
+        let mut magics = std::collections::BTreeSet::new();
+        for stage in [
+            Session0DiagnosticFailureStage::BrokerToken,
+            Session0DiagnosticFailureStage::Publish,
+            Session0DiagnosticFailureStage::ScratchCleanup,
+            Session0DiagnosticFailureStage::Runtime,
+        ] {
+            assert!(
+                magics.insert(stage.service_magic()),
+                "duplicate failure magic"
+            );
+        }
+    }
+
+    #[test]
+    fn session0_probe_script_keeps_the_held_process_timeout_cleanup_contract() {
+        let script = include_str!("../../../hooks/test/m6_worker_window_station_probe.ps1");
+        for required in [
+            "HoldProcess(",
+            "TerminateHeldProcessAndWait(",
+            "OpenAclMutation(string path, bool directory)",
+            "0x001301bf",
+            "held throwaway process reap timed out",
+            "cleanup forced termination did not stop the throwaway service",
+        ] {
+            assert!(
+                script.contains(required),
+                "missing cleanup contract: {required}"
+            );
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Session0DiagnosticRecord {
+        nonce: String,
+        markers: u8,
+        classification: Session0DiagnosticOutcome,
+        session_id: u32,
+        broker: String,
+        action: String,
+        station: String,
+        desktop: String,
+        station_dacl: String,
+        desktop_dacl: String,
+        station_access: String,
+        desktop_access: String,
+        cwd: String,
+        environment_hash: String,
+        job_ui_restrictions: u32,
+        spawn_succeeded: bool,
+        spawn_error: String,
+        child_exit: Option<u32>,
+        stdout: String,
+        stderr: String,
+    }
+
+    impl Session0DiagnosticRecord {
+        const MAX_BYTES: usize = 64 * 1024;
+        const ENTRY: u8 = 1;
+        const PRE_SPAWN: u8 = 2;
+        const SPAWN_RETURNED: u8 = 4;
+
+        fn fixture() -> Self {
+            Self {
+                nonce: "0123456789abcdef0123456789abcdef".into(),
+                markers: Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED,
+                classification: Session0DiagnosticOutcome::Refuted,
+                session_id: 0,
+                broker: "user=S-1-5-80-1;integrity=8192;groups=[];privileges=[]".into(),
+                action: "user=S-1-5-80-1;integrity=8192;restricted=[];groups=[];privileges=[]"
+                    .into(),
+                station: "Service-0x0-3e7$".into(),
+                desktop: "Default".into(),
+                station_dacl: "unavailable:gle=5".into(),
+                desktop_dacl: "unavailable:gle=5".into(),
+                station_access: "mask=0x0000006e;allowed=false;gle=5".into(),
+                desktop_access: "mask=0x000000cf;allowed=false;gle=5".into(),
+                cwd: "C:\\Sembazuru".into(),
+                environment_hash: "0".repeat(64),
+                job_ui_restrictions: 0x7f,
+                spawn_succeeded: true,
+                spawn_error: String::new(),
+                child_exit: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            }
+        }
+
+        fn encode(&self) -> Result<Vec<u8>, String> {
+            validate_nonce(&self.nonce)?;
+            if self.markers & !0x07 != 0 || self.markers & Self::ENTRY == 0 {
+                return Err("diagnostic markers".into());
+            }
+            if self.environment_hash.len() != 64
+                || !self
+                    .environment_hash
+                    .bytes()
+                    .all(|value| value.is_ascii_hexdigit())
+            {
+                return Err("environment hash".into());
+            }
+            let mut payload = Writer::new();
+            payload.u8(self.markers);
+            payload.u8(self.classification as u8);
+            payload.u32(self.session_id);
+            for value in [
+                &self.broker,
+                &self.action,
+                &self.station,
+                &self.desktop,
+                &self.station_dacl,
+                &self.desktop_dacl,
+                &self.station_access,
+                &self.desktop_access,
+                &self.cwd,
+                &self.environment_hash,
+                &self.spawn_error,
+                &self.stdout,
+                &self.stderr,
+            ] {
+                write_text(&mut payload, value)?;
+            }
+            payload.u32(self.job_ui_restrictions);
+            payload.bool(self.spawn_succeeded);
+            payload.bool(self.child_exit.is_some());
+            if let Some(exit) = self.child_exit {
+                payload.u32(exit);
+            }
+            let payload = payload.into_bytes();
+            if payload.len() > Self::MAX_BYTES {
+                return Err("diagnostic record too large".into());
+            }
+            let mut bytes = Vec::with_capacity(48 + payload.len());
+            bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
+            bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_VERSION.to_le_bytes());
+            bytes.extend_from_slice(self.nonce.as_bytes());
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+            Ok(bytes)
+        }
+
+        fn decode(bytes: &[u8], expected_nonce: &str) -> Result<Self, String> {
+            validate_nonce(expected_nonce)?;
+            if bytes.len() < 44 || bytes.len() > 44 + Self::MAX_BYTES {
+                return Err("diagnostic record length".into());
+            }
+            let u32_at = |offset: usize| -> u32 {
+                u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+            };
+            if u32_at(0) != SESSION0_DIAGNOSTIC_MAGIC
+                || u32_at(4) != SESSION0_DIAGNOSTIC_VERSION
+                || u32_at(40) as usize != bytes.len() - 44
+            {
+                return Err("diagnostic record header".into());
+            }
+            let nonce = std::str::from_utf8(&bytes[8..40])
+                .map_err(|_| "diagnostic nonce utf8")?
+                .to_owned();
+            validate_nonce(&nonce)?;
+            if nonce != expected_nonce {
+                return Err("diagnostic nonce".into());
+            }
+            let mut reader = Reader::new(&bytes[44..]);
+            let markers = reader.u8().map_err(|_| "diagnostic markers")?;
+            let classification = Session0DiagnosticOutcome::decode(
+                reader.u8().map_err(|_| "diagnostic classification")?,
+            )?;
+            let session_id = reader.u32().map_err(|_| "diagnostic session")?;
+            let mut fields = Vec::new();
+            for _ in 0..13 {
+                fields.push(read_text(&mut reader)?);
+            }
+            let job_ui_restrictions = reader.u32().map_err(|_| "diagnostic UI")?;
+            let spawn_succeeded = read_strict_bool(&mut reader)?;
+            let child_exit = if read_strict_bool(&mut reader)? {
+                Some(reader.u32().map_err(|_| "diagnostic exit")?)
+            } else {
+                None
+            };
+            reader.finish().map_err(|_| "diagnostic trailing")?;
+            let record = Self {
+                nonce,
+                markers,
+                classification,
+                session_id,
+                broker: fields.remove(0),
+                action: fields.remove(0),
+                station: fields.remove(0),
+                desktop: fields.remove(0),
+                station_dacl: fields.remove(0),
+                desktop_dacl: fields.remove(0),
+                station_access: fields.remove(0),
+                desktop_access: fields.remove(0),
+                cwd: fields.remove(0),
+                environment_hash: fields.remove(0),
+                spawn_error: fields.remove(0),
+                stdout: fields.remove(0),
+                stderr: fields.remove(0),
+                job_ui_restrictions,
+                spawn_succeeded,
+                child_exit,
+            };
+            record.encode().map(|_| record)
+        }
+
+        fn publish(&self, directory: &Path) -> Result<(), String> {
+            let record = directory.join(format!("{}.session0.rec", self.nonce));
+            let temporary = directory.join(format!("{}.session0.tmp", self.nonce));
+            if record.exists() || temporary.exists() {
+                return Err("diagnostic record destination exists".into());
+            }
+            let bytes = self.encode()?;
+            let mut cleanup = Some(temporary.clone());
+            let result = (|| -> io::Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                drop(file);
+                std::fs::rename(&temporary, &record)
+            })();
+            if result.is_ok() {
+                cleanup = None;
+            }
+            if let Some(path) = cleanup {
+                let _ = std::fs::remove_file(path);
+            }
+            result.map_err(|error| format!("diagnostic publish: {error}"))
+        }
+    }
+
     windows_service::define_windows_service!(
         ffi_window_station_scm_smoke_main,
         window_station_scm_smoke_main
     );
 
     fn window_station_scm_smoke_main(args: Vec<OsString>) {
-        let exit_code = if validate_window_station_scm_main_args(&args).is_ok() {
-            WINDOW_STATION_SCM_SMOKE_SUCCESS
-        } else {
-            WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE
+        let exit_code = match validate_window_station_scm_main_args(&args) {
+            Err(_) => WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE,
+            Ok(()) => match SESSION0_DIAGNOSTIC_CONFIG.get() {
+                Some(config) => match run_session0_diagnostic(config) {
+                    Ok(outcome) => outcome.service_magic(),
+                    Err(stage) => stage.service_magic(),
+                },
+                None => WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE,
+            },
         };
-        let _ = run_window_station_scm_smoke(exit_code);
+        // `ServiceMain` cannot return a Result. A registration/status failure makes this
+        // dispatcher process exit without one of the three expected service-specific codes;
+        // the outer probe treats that SCM status mismatch as a protocol failure.
+        if let Err(error) = run_window_station_scm_smoke(exit_code) {
+            eprintln!("SCM diagnostic status publication failed: {error}");
+        }
     }
 
     fn run_window_station_scm_smoke(exit_code: u32) -> windows_service::Result<()> {
@@ -1639,11 +2038,404 @@ mod tests {
     fn window_station_scm_dispatcher_smoke_role() {
         let argv: Vec<_> = std::env::args_os().collect();
         validate_window_station_scm_process_argv(&argv).expect("SCM smoke process argv contract");
+        let config = Session0DiagnosticConfig {
+            fixture_root: PathBuf::from(&argv[7]),
+            record_directory: PathBuf::from(&argv[8]),
+            nonce: argv[9]
+                .to_str()
+                .expect("SCM diagnostic nonce utf8")
+                .to_owned(),
+        };
+        SESSION0_DIAGNOSTIC_CONFIG
+            .set(config)
+            .expect("SCM diagnostic config set once");
         windows_service::service_dispatcher::start(
             WINDOW_STATION_SCM_SMOKE_SERVICE,
             ffi_window_station_scm_smoke_main,
         )
         .expect("SCM dispatcher smoke");
+    }
+
+    fn diagnostic_token_summary(
+        handle: HANDLE,
+        include_restricted: bool,
+    ) -> Result<String, String> {
+        let user = token_info(handle, TokenUser).map_err(|error| error.to_string())?;
+        // SAFETY: TokenUser returns a valid TOKEN_USER while `user` remains owned here.
+        let user = unsafe { &*(user.as_ptr().cast::<TOKEN_USER>()) };
+        let mut groups = token_sid_list(handle, TokenGroups)?;
+        groups.sort_unstable_by(|left, right| {
+            (&left.sid, left.attributes).cmp(&(&right.sid, right.attributes))
+        });
+        let mut privileges = token_privileges(handle)?;
+        privileges.sort_unstable();
+        let restricted = if include_restricted {
+            let mut values = token_sid_list(handle, TokenRestrictedSids)?;
+            values.sort_unstable_by(|left, right| {
+                (&left.sid, left.attributes).cmp(&(&right.sid, right.attributes))
+            });
+            format!(";restricted={values:?}")
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "user={};integrity={};groups={groups:?};privileges={privileges:?}{restricted}",
+            sid_string(user.User.Sid).map_err(|error| error.to_string())?,
+            integrity_rid(handle).map_err(|error| error.to_string())?,
+        ))
+    }
+
+    fn diagnostic_session_id(handle: HANDLE) -> Result<u32, String> {
+        let info = token_info(handle, TokenSessionId).map_err(|error| error.to_string())?;
+        // SAFETY: TokenSessionId returns exactly a u32 in the owned, aligned information buffer.
+        Ok(unsafe { *info.as_ptr().cast::<u32>() })
+    }
+
+    fn diagnostic_user_object_dacl(handle: HANDLE) -> String {
+        let request = DACL_SECURITY_INFORMATION;
+        let mut needed = 0;
+        // SAFETY: the sizing probe has a valid request and writable length output.
+        if unsafe { GetUserObjectSecurity(handle, &request, null_mut(), 0, &mut needed) } == 0 {
+            // SAFETY: GetLastError is read immediately after the failing sizing probe.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+                return format!("unavailable:gle={error}");
+            }
+        }
+        let mut storage = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        // SAFETY: storage has the reported byte capacity; all pointers remain live through the call.
+        if unsafe {
+            GetUserObjectSecurity(
+                handle,
+                &request,
+                storage.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        let descriptor = storage.as_mut_ptr().cast();
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: descriptor points to the returned self-relative security descriptor.
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        let (mut present, mut defaulted, mut dacl) = (0, 0, null_mut());
+        // SAFETY: descriptor remains live and the out-pointers are valid.
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
+        {
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        if present == 0 || dacl.is_null() {
+            return format!("control=0x{control:04x};dacl=absent");
+        }
+        let mut aces = Vec::new();
+        // SAFETY: the DACL is owned by the live descriptor and AceCount bounds the iteration.
+        for index in 0..unsafe { (*dacl).AceCount } as u32 {
+            let mut raw = null_mut();
+            // SAFETY: index is within AceCount and `raw` receives the descriptor-owned ACE.
+            if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+                return format!("unavailable:gle={}", unsafe { GetLastError() });
+            }
+            let ace = unsafe { &*(raw.cast::<ACCESS_ALLOWED_ACE>()) };
+            let sid = sid_string((&ace.SidStart as *const u32).cast_mut().cast())
+                .unwrap_or_else(|error| format!("sid-error={error}"));
+            aces.push(format!(
+                "type={};flags={};mask=0x{:08x};sid={sid}",
+                ace.Header.AceType, ace.Header.AceFlags, ace.Mask
+            ));
+        }
+        format!("control=0x{control:04x};aces=[{}]", aces.join(","))
+    }
+
+    fn diagnostic_open_access(
+        token: &ActionToken,
+        station: &str,
+        desktop: &str,
+    ) -> (String, String) {
+        let station_wide: Vec<u16> = OsStr::new(station).encode_wide().chain(Some(0)).collect();
+        let desktop_wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
+        token
+            .impersonated(|| {
+                // SAFETY: both names are NUL-terminated and live throughout their calls.
+                let station_handle = unsafe { OpenWindowStationW(station_wide.as_ptr(), 0, 0x6e) };
+                let station_result = if station_handle.is_null() {
+                    format!("mask=0x0000006e;allowed=false;gle={}", unsafe {
+                        GetLastError()
+                    })
+                } else {
+                    // SAFETY: OpenWindowStationW returned this owned user-object handle.
+                    unsafe { CloseWindowStation(station_handle) };
+                    "mask=0x0000006e;allowed=true;gle=0".into()
+                };
+                // SAFETY: the desktop name is valid and the current service station is unchanged.
+                let desktop_handle = unsafe { OpenDesktopW(desktop_wide.as_ptr(), 0, 0, 0x0cf) };
+                let desktop_result = if desktop_handle.is_null() {
+                    format!("mask=0x000000cf;allowed=false;gle={}", unsafe {
+                        GetLastError()
+                    })
+                } else {
+                    // SAFETY: OpenDesktopW returned this owned user-object handle.
+                    unsafe { CloseDesktop(desktop_handle) };
+                    "mask=0x000000cf;allowed=true;gle=0".into()
+                };
+                Ok((station_result, desktop_result))
+            })
+            .unwrap_or_else(|error| {
+                let value = format!("unavailable:gle={}", error.raw_os_error().unwrap_or(0));
+                (value.clone(), value)
+            })
+    }
+
+    // This is a compact, non-cryptographic FNV-derived fingerprint for correlating the exact
+    // baseline environment in one diagnostic record. It is not an integrity or secrecy claim.
+    fn diagnostic_environment_hash(values: &[(OsString, OsString)]) -> String {
+        let mut state = 0xcbf2_9ce4_8422_2325u64;
+        for (name, value) in values {
+            for unit in name
+                .encode_wide()
+                .chain(Some(b'=' as u16))
+                .chain(value.encode_wide())
+            {
+                state ^= u64::from(unit);
+                state = state.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        format!("{state:016x}").repeat(4)
+    }
+
+    fn session0_diagnostic_command(scratch: &Path) -> Result<(RestrictedCommand, String), String> {
+        let system_root = std::env::var_os("SystemRoot").ok_or("SystemRoot unavailable")?;
+        let application = PathBuf::from(&system_root).join("System32").join("cmd.exe");
+        let mut values = Vec::new();
+        for &name in crate::BASELINE_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                values.push((OsString::from(name), value));
+            }
+        }
+        values.push((OsString::from("TEMP"), scratch.as_os_str().to_owned()));
+        values.push((OsString::from("TMP"), scratch.as_os_str().to_owned()));
+        values.sort_by_key(|(name, _)| name.to_string_lossy().to_ascii_lowercase());
+        let hash = diagnostic_environment_hash(&values);
+        let mut command = RestrictedCommand::new(application, scratch)
+            .arg("/d")
+            .arg("/c")
+            .arg("exit /b 0");
+        for (name, value) in values {
+            command = command.env(name, value);
+        }
+        Ok((command, hash))
+    }
+
+    fn cleanup_session0_diagnostic_scratch(
+        scratch: &Path,
+        record_directory: &Path,
+        token: &ActionToken,
+        nonce: &str,
+    ) -> Result<(), String> {
+        use std::os::windows::fs::MetadataExt;
+
+        let expected = record_directory.join(format!("action-{nonce}"));
+        if scratch != expected {
+            return Err("diagnostic scratch path".into());
+        }
+        for (path, label) in [(record_directory, "diagnostic root"), (scratch, "scratch")] {
+            let metadata =
+                std::fs::symlink_metadata(path).map_err(|error| format!("{label}: {error}"))?;
+            if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+                return Err(format!("{label}: reparse or non-directory"));
+            }
+        }
+        let (owner, control, _) = scratch_acl(scratch).map_err(|error| error.to_string())?;
+        if owner != sid_string(token.broker_sid()).map_err(|error| error.to_string())?
+            || control & SE_DACL_PROTECTED == 0
+        {
+            return Err("diagnostic scratch ownership/DACL".into());
+        }
+        std::fs::remove_dir_all(scratch)
+            .map_err(|error| format!("diagnostic scratch remove: {error}"))?;
+        if scratch.exists() {
+            return Err("diagnostic scratch remains".into());
+        }
+        Ok(())
+    }
+
+    fn publish_session0_diagnostic(
+        record: &Session0DiagnosticRecord,
+        config: &Session0DiagnosticConfig,
+        scratch: Option<(&Path, &ActionToken)>,
+        post_publish_stage: Option<Session0DiagnosticFailureStage>,
+    ) -> Result<Session0DiagnosticOutcome, Session0DiagnosticFailureStage> {
+        record
+            .publish(&config.record_directory)
+            .map_err(|_| Session0DiagnosticFailureStage::Publish)?;
+        if let Some((scratch, token)) = scratch {
+            cleanup_session0_diagnostic_scratch(
+                scratch,
+                &config.record_directory,
+                token,
+                &config.nonce,
+            )
+            .map_err(|_| Session0DiagnosticFailureStage::ScratchCleanup)?;
+        }
+        post_publish_stage.map_or(Ok(record.classification), Err)
+    }
+
+    fn run_session0_diagnostic(
+        config: &Session0DiagnosticConfig,
+    ) -> Result<Session0DiagnosticOutcome, Session0DiagnosticFailureStage> {
+        let broker =
+            current_token(TOKEN_QUERY).map_err(|_| Session0DiagnosticFailureStage::BrokerToken)?;
+        let broker_handle = broker.as_raw_handle() as HANDLE;
+        let station_handle = unsafe { GetProcessWindowStation() };
+        let desktop_handle = unsafe { GetThreadDesktop(GetCurrentThreadId()) };
+        let station = user_object_identity(station_handle)
+            .map(|(_, name)| name)
+            .unwrap_or_else(|error| {
+                format!("unavailable:gle={}", error.raw_os_error().unwrap_or(0))
+            });
+        let desktop = user_object_identity(desktop_handle)
+            .map(|(_, name)| name)
+            .unwrap_or_else(|error| {
+                format!("unavailable:gle={}", error.raw_os_error().unwrap_or(0))
+            });
+        let mut record = Session0DiagnosticRecord {
+            nonce: config.nonce.clone(),
+            markers: Session0DiagnosticRecord::ENTRY,
+            classification: Session0DiagnosticOutcome::Indeterminate,
+            session_id: diagnostic_session_id(broker_handle).unwrap_or(u32::MAX),
+            broker: diagnostic_token_summary(broker_handle, true)
+                .unwrap_or_else(|error| format!("unavailable:{error}")),
+            action: "unavailable:not-created".into(),
+            station,
+            desktop,
+            station_dacl: diagnostic_user_object_dacl(station_handle),
+            desktop_dacl: diagnostic_user_object_dacl(desktop_handle),
+            station_access: "unavailable:action-not-created".into(),
+            desktop_access: "unavailable:action-not-created".into(),
+            cwd: config.fixture_root.display().to_string(),
+            environment_hash: "0".repeat(64),
+            job_ui_restrictions: 0,
+            spawn_succeeded: false,
+            spawn_error: String::new(),
+            child_exit: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let action = match ActionToken::create() {
+            Ok(token) => token,
+            Err(error) => {
+                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
+                record.spawn_error = format!("action_token: {error}");
+                return publish_session0_diagnostic(&record, config, None, None);
+            }
+        };
+        record.action = diagnostic_token_summary(action.handle(), true)
+            .unwrap_or_else(|error| format!("unavailable:{error}"));
+        if !record.station.starts_with("unavailable:")
+            && !record.desktop.starts_with("unavailable:")
+        {
+            (record.station_access, record.desktop_access) =
+                diagnostic_open_access(&action, &record.station, &record.desktop);
+        }
+        let scratch = match PrivateScratch::create(
+            &config.record_directory,
+            &format!("action-{}", config.nonce),
+            &action,
+        ) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
+                record.spawn_error = format!("private_scratch: {error}");
+                return publish_session0_diagnostic(&record, config, None, None);
+            }
+        };
+        let (command, environment_hash) = match session0_diagnostic_command(scratch.path()) {
+            Ok(value) => value,
+            Err(error) => {
+                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
+                record.spawn_error = format!("command: {error}");
+                return publish_session0_diagnostic(
+                    &record,
+                    config,
+                    Some((scratch.path(), &action)),
+                    None,
+                );
+            }
+        };
+        record.cwd = scratch.path().display().to_string();
+        record.environment_hash = environment_hash;
+        record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
+        // This deliberately calls the production plain-process path, not VFS/launcher code:
+        // the historical signature was a plain RestrictedProcess cmd child exit 0xC0000142.
+        match RestrictedProcess::spawn(&action, &command) {
+            Err(error) => record.spawn_error = format!("spawn: {error}"),
+            Ok(mut process) => {
+                record.spawn_succeeded = true;
+                record.job_ui_restrictions =
+                    process.job().ui_restrictions_for_test().unwrap_or_default();
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        record.spawn_error = format!("runtime: {error}");
+                        record.classification = Session0DiagnosticOutcome::Indeterminate;
+                        drop(process);
+                        return publish_session0_diagnostic(
+                            &record,
+                            config,
+                            Some((scratch.path(), &action)),
+                            Some(Session0DiagnosticFailureStage::Runtime),
+                        );
+                    }
+                };
+                let result = runtime.block_on(async {
+                    match tokio::time::timeout(std::time::Duration::from_secs(10), process.wait())
+                        .await
+                    {
+                        Ok(Ok(exit)) => Ok(exit),
+                        Ok(Err(error)) => Err(format!("wait: {error}")),
+                        Err(_) => {
+                            process.terminate();
+                            let _ = process.wait().await;
+                            Err("wait: deadline exceeded; terminated and reaped".into())
+                        }
+                    }
+                });
+                match result {
+                    Ok(exit) => record.child_exit = Some(exit),
+                    Err(error) => record.spawn_error = error,
+                }
+                if let Ok((mut stdout, mut stderr)) = process.take_output() {
+                    use tokio::io::AsyncReadExt;
+                    let (stdout, stderr) = runtime.block_on(async {
+                        let (mut left, mut right) = (Vec::new(), Vec::new());
+                        let _ = tokio::join!(
+                            stdout.read_to_end(&mut left),
+                            stderr.read_to_end(&mut right)
+                        );
+                        (left, right)
+                    });
+                    record.stdout =
+                        String::from_utf8_lossy(&stdout[..stdout.len().min(4096)]).into_owned();
+                    record.stderr =
+                        String::from_utf8_lossy(&stderr[..stderr.len().min(4096)]).into_owned();
+                }
+            }
+        }
+        record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
+        record.classification = match (record.spawn_succeeded, record.child_exit) {
+            (true, Some(0)) => Session0DiagnosticOutcome::Refuted,
+            (true, Some(0xc000_0142)) => Session0DiagnosticOutcome::Reproduced,
+            _ => Session0DiagnosticOutcome::Indeterminate,
+        };
+        publish_session0_diagnostic(&record, config, Some((scratch.path(), &action)), None)
     }
 
     #[derive(Clone, Debug)]
