@@ -87,10 +87,11 @@
 - Done: `__has_include`等のroot内absent headerはcache keyへ保持され、後の生成でresolveがmissする。場所名だけでinputを落とさず、
   run-varyingな自己生成tempだけをevent sequenceにより除外し、不明なvanished readはcache記録を拒否する。
 
-### OPEN: VFS子process注入がtrace依存かつfail-open
+### RESOLVED (2026-07-25): VFS子process注入がtrace依存かつfail-open
 
 - 根拠: `crates/agent/src/intake.rs:638-653`、`crates/worker/src/lib.rs:839-840,911-912`、`hooks/src/interceptor.cpp:1649-1703`。
-- 修正方向: `VFS mode || trace enabled`で子processへDLLを注入し、VFS中の注入失敗は未注入spawnへ再試行せずremote action失敗としてlocal fallbackへ返す。
+- 対応commit: `2aaf2a3` (`P0: VFS子プロセス注入を検証し失敗を拒否する`)。action固有のVFS attestationをlauncherからinterceptorへ渡し、子孫注入を必須化した。VFS中の注入失敗は未注入spawnへ再試行せずremote action失敗としてlocal fallbackへ返す。
+- 検証: worker lib `146 passed; 0 failed; 9 ignored`、hook CTest x64/x86、raw process injection gate、process/environment isolation、fmt、clippyが成功。attestationのDACL、payload境界、子process到達、注入失敗時のfail-closedを個別テストで固定した。
 - Done: cache無効のVFS実行でも子孫が必ずvirtualizeされ、注入失敗時にworker-local入力を使った成功結果が返らない統合テストが通る。
 
 ## P1
