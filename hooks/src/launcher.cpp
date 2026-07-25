@@ -15,8 +15,30 @@
 #include <string>
 
 #include "detours.h"
+#include "vfs_attestation.h"
 
 namespace {
+
+enum class DetourLaunchStage {
+    kNotCalled,
+    kNativeCreateFailed,
+    kNativeCreateSucceeded,
+};
+
+DetourLaunchStage g_detourLaunchStage = DetourLaunchStage::kNotCalled;
+
+BOOL WINAPI CreateProcessForDetours(
+    LPCWSTR application, LPWSTR command, LPSECURITY_ATTRIBUTES processAttributes,
+    LPSECURITY_ATTRIBUTES threadAttributes, BOOL inheritHandles, DWORD creationFlags,
+    LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup,
+    LPPROCESS_INFORMATION process) {
+    BOOL result = CreateProcessW(application, command, processAttributes, threadAttributes,
+                                 inheritHandles, creationFlags, environment, directory,
+                                 startup, process);
+    g_detourLaunchStage = result ? DetourLaunchStage::kNativeCreateSucceeded
+                                 : DetourLaunchStage::kNativeCreateFailed;
+    return result;
+}
 
 // Quotes one argv element back into command-line form (minimal CRT-style
 // quoting: sufficient for the PoC, revisited when this grows past a PoC).
@@ -73,12 +95,48 @@ int wmain(int argc, wchar_t** argv) {
     si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
 
-    if (!DetourCreateProcessWithDllExW(nullptr, cmd.data(), nullptr, nullptr,
-                                       TRUE, 0, nullptr, nullptr, &si, &pi,
-                                       dllFullA, nullptr)) {
-        fwprintf(stderr, L"error: failed to launch '%s' (GetLastError=%lu)\n",
-                 cmd.c_str(), GetLastError());
+    const bool vfs = vfs_attestation::VfsRequested();
+    if (vfs && !vfs_attestation::OpenFromBootstrapEnvironment()) {
+        fwprintf(stderr, L"error: VFS bootstrap handles unavailable gle=%lu\n",
+                 GetLastError());
         return 1;
+    }
+
+    g_detourLaunchStage = DetourLaunchStage::kNotCalled;
+    if (!DetourCreateProcessWithDllExW(nullptr, cmd.data(), nullptr, nullptr,
+                                       TRUE, vfs ? CREATE_SUSPENDED : 0, nullptr, nullptr, &si, &pi,
+                                       dllFullA, CreateProcessForDetours)) {
+        if (vfs) {
+            const wchar_t* stage =
+                g_detourLaunchStage == DetourLaunchStage::kNativeCreateFailed
+                    ? L"native-create"
+                    : L"detour-update";
+            fwprintf(stderr,
+                     L"error: failed to launch VFS target stage=%ls gle=%lu\n",
+                     stage, GetLastError());
+        } else {
+            fwprintf(stderr, L"error: failed to launch '%s' (GetLastError=%lu)\n",
+                     cmd.c_str(), GetLastError());
+        }
+        return 1;
+    }
+
+    if (vfs) {
+        // Detours has injected while the target remains suspended. Register its
+        // PID before it can execute, then resume exactly once. Any failure is
+        // conservative: reap the child so a remote VFS action cannot succeed
+        // without its loader-attestation slot.
+        if (!vfs_attestation::CopyPayloadToProcess(pi.hProcess) ||
+            !vfs_attestation::RegisterExpected(pi.dwProcessId) ||
+            ResumeThread(pi.hThread) != 1) {
+            DWORD saved = GetLastError();
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            fwprintf(stderr, L"error: VFS attestation setup failed (GetLastError=%lu)\n", saved);
+            return 1;
+        }
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);

@@ -29,19 +29,354 @@ use windows_sys::Win32::Security::{
     WinRestrictedCodeSid, WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::System::Memory::{
+    CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
+};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateSemaphoreW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
     GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    OpenSemaphoreW, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ReleaseSemaphore,
+    ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::job::JobObject;
+
+/// The named mapping ABI is intentionally only 32-bit fields, so x86 and x64
+/// interceptors share it without pointer-size or packing ambiguity.
+pub(crate) const VFS_ATTESTATION_MAGIC: u32 = 0x5342_5a41; // "SBZA"
+pub(crate) const VFS_ATTESTATION_VERSION: u32 = 1;
+pub(crate) const VFS_ATTESTATION_MAX_SLOTS: usize = 1024;
+
+#[repr(C)]
+struct VfsAttestationHeader {
+    magic: u32,
+    version: u32,
+    max_slots: u32,
+    slot_count: u32,
+    generation: u32,
+    corrupt: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VfsAttestationSlot {
+    generation: u32,
+    pid: u32,
+    attached: u32,
+}
+
+fn vfs_attestation_slots_valid(
+    generation: u32,
+    slot_count: u32,
+    corrupt: u32,
+    slots: &[VfsAttestationSlot],
+) -> bool {
+    corrupt == 0
+        && slot_count != 0
+        && usize::try_from(slot_count).is_ok_and(|count| {
+            count <= VFS_ATTESTATION_MAX_SLOTS
+                && count <= slots.len()
+                && slots[..count].iter().all(|slot| {
+                    slot.generation == generation && slot.pid != 0 && slot.attached == 1
+                })
+        })
+}
+
+/// Broker-owned, per-action attachment evidence. Names scope the broker's
+/// action-SID DACL probes; the target receives exact-right inherited handles
+/// instead of opening either object by name. A malicious target in that same
+/// action can signal a safe-side DoS, but cannot clear a failure or open
+/// another action's objects.
+pub(crate) struct VfsAttestation {
+    #[allow(
+        dead_code,
+        reason = "keeps the mapped view's kernel object alive until validation"
+    )]
+    mapping: OwnedHandle,
+    semaphore: OwnedHandle,
+    view: *mut VfsAttestationHeader,
+    mapping_name: String,
+    semaphore_name: String,
+    generation: u32,
+}
+
+pub(crate) struct VfsBootstrapHandles {
+    mapping: OwnedHandle,
+    semaphore: OwnedHandle,
+}
+
+impl VfsBootstrapHandles {
+    pub(crate) fn mapping_value(&self) -> usize {
+        self.mapping.as_raw_handle() as usize
+    }
+
+    pub(crate) fn semaphore_value(&self) -> usize {
+        self.semaphore.as_raw_handle() as usize
+    }
+
+    pub(crate) fn as_handle_list(&self) -> [HANDLE; 2] {
+        [
+            self.mapping.as_raw_handle() as HANDLE,
+            self.semaphore.as_raw_handle() as HANDLE,
+        ]
+    }
+}
+
+// SAFETY: the mapped view is owned with its mapping handle and accessed only by
+// the single worker action task after construction.
+unsafe impl Send for VfsAttestation {}
+
+impl VfsAttestation {
+    pub(crate) fn create(token: &ActionToken) -> io::Result<Self> {
+        let suffix = secure_random_hex()?;
+        let mapping_name = format!("Local\\Sembazuru.VfsAttestation.{suffix}");
+        let semaphore_name = format!("Local\\Sembazuru.VfsFailure.{suffix}");
+        let generation = u32::from_str_radix(&suffix[..8], 16)
+            .map_err(|_| io::Error::other("attestation generation unavailable"))?;
+        let mapping_sddl = format!(
+            "O:{}D:P(A;;FA;;;{})(A;;0x00000006;;;{})",
+            sid_string(token.broker_sid())?,
+            sid_string(token.broker_sid())?,
+            sid_string(token.action_sid.0)?
+        );
+        let semaphore_sddl = format!(
+            "O:{}D:P(A;;FA;;;{})(A;;0x00000002;;;{})",
+            sid_string(token.broker_sid())?,
+            sid_string(token.broker_sid())?,
+            sid_string(token.action_sid.0)?
+        );
+        let mapping_wide: Vec<u16> = mapping_name.encode_utf16().chain(Some(0)).collect();
+        let semaphore_wide: Vec<u16> = semaphore_name.encode_utf16().chain(Some(0)).collect();
+        let mapping_bytes = size_of::<VfsAttestationHeader>()
+            + VFS_ATTESTATION_MAX_SLOTS * size_of::<VfsAttestationSlot>();
+        let mapping = with_sddl_attributes(&mapping_sddl, |attributes| {
+            // SAFETY: the security descriptor and UTF-16 name live through this call.
+            let handle = unsafe {
+                CreateFileMappingW(
+                    -1isize as HANDLE,
+                    attributes,
+                    PAGE_READWRITE,
+                    0,
+                    mapping_bytes as u32,
+                    mapping_wide.as_ptr(),
+                )
+            };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: CreateFileMappingW returned an owned live handle.
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
+        })?;
+        let semaphore = with_sddl_attributes(&semaphore_sddl, |attributes| {
+            // SAFETY: the security descriptor and UTF-16 name live through this call.
+            let handle = unsafe {
+                CreateSemaphoreW(
+                    attributes,
+                    0,
+                    VFS_ATTESTATION_MAX_SLOTS as i32,
+                    semaphore_wide.as_ptr(),
+                )
+            };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: CreateSemaphoreW returned an owned live handle.
+            Ok(unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) })
+        })?;
+        // SAFETY: mapping is live, writable, and sized to the complete ABI.
+        let view = unsafe {
+            MapViewOfFile(
+                mapping.as_raw_handle() as HANDLE,
+                FILE_MAP_READ | FILE_MAP_WRITE,
+                0,
+                0,
+                mapping_bytes,
+            )
+        }
+        .Value
+        .cast::<VfsAttestationHeader>();
+        if view.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the mapping is newly created, exclusively broker-initialized, and large enough.
+        unsafe {
+            std::ptr::write_bytes(view.cast::<u8>(), 0, mapping_bytes);
+            *view = VfsAttestationHeader {
+                magic: VFS_ATTESTATION_MAGIC,
+                version: VFS_ATTESTATION_VERSION,
+                max_slots: VFS_ATTESTATION_MAX_SLOTS as u32,
+                slot_count: 0,
+                generation,
+                corrupt: 0,
+            };
+        }
+        let attestation = Self {
+            mapping,
+            semaphore,
+            view,
+            mapping_name,
+            semaphore_name,
+            generation,
+        };
+        attestation.verify_action_access(token)?;
+        Ok(attestation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mapping_name(&self) -> &str {
+        &self.mapping_name
+    }
+    #[cfg(test)]
+    pub(crate) fn semaphore_name(&self) -> &str {
+        &self.semaphore_name
+    }
+    pub(crate) fn generation(&self) -> u32 {
+        self.generation
+    }
+
+    /// Creates the only two inheritable action handles. The broker-owned
+    /// originals remain non-inheritable; these duplicates carry exactly the
+    /// rights the launcher needs to bootstrap the target payload.
+    pub(crate) fn bootstrap_handles(&self) -> io::Result<VfsBootstrapHandles> {
+        fn duplicate(source: HANDLE, access: u32) -> io::Result<OwnedHandle> {
+            let mut duplicate = null_mut();
+            // SAFETY: the source is broker-owned and live; success yields one inheritable,
+            // exact-access handle owned by this process until the launcher is spawned.
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    source,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    access,
+                    1,
+                    0,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: DuplicateHandle returned a unique owned handle.
+            Ok(unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) })
+        }
+        Ok(VfsBootstrapHandles {
+            mapping: duplicate(
+                self.mapping.as_raw_handle() as HANDLE,
+                FILE_MAP_READ | FILE_MAP_WRITE,
+            )?,
+            semaphore: duplicate(
+                self.semaphore.as_raw_handle() as HANDLE,
+                SEMAPHORE_MODIFY_STATE,
+            )?,
+        })
+    }
+
+    /// The restricted action token is checked against both ACLs before any
+    /// target starts. Restricted-token access is an intersection, so a broker
+    /// success alone would not prove the injected target can open these objects.
+    fn verify_action_access(&self, token: &ActionToken) -> io::Result<()> {
+        let mapping_name: Vec<u16> = self.mapping_name.encode_utf16().chain(Some(0)).collect();
+        let semaphore_name: Vec<u16> = self.semaphore_name.encode_utf16().chain(Some(0)).collect();
+        token.impersonated(|| {
+            // SAFETY: names are NUL-terminated and the returned handles are owned below.
+            let mapping = unsafe {
+                OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, 0, mapping_name.as_ptr())
+            };
+            if mapping.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "action cannot open VFS attestation mapping",
+                ));
+            }
+            // SAFETY: OpenFileMappingW returned a unique handle for this probe.
+            let _mapping = unsafe { OwnedHandle::from_raw_handle(mapping as RawHandle) };
+            let bytes = size_of::<VfsAttestationHeader>()
+                + VFS_ATTESTATION_MAX_SLOTS * size_of::<VfsAttestationSlot>();
+            // SAFETY: the probe owns `mapping`; the exact ABI byte count is nonzero.
+            let view = unsafe {
+                MapViewOfFile(
+                    _mapping.as_raw_handle() as HANDLE,
+                    FILE_MAP_READ | FILE_MAP_WRITE,
+                    0,
+                    0,
+                    bytes,
+                )
+            };
+            if view.Value.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "action cannot map VFS attestation mapping",
+                ));
+            }
+            // SAFETY: this successful probe mapping is immediately unmapped before closing.
+            unsafe { UnmapViewOfFile(view) };
+            // SAFETY: names are NUL-terminated and only MODIFY_STATE is requested.
+            let semaphore =
+                unsafe { OpenSemaphoreW(SEMAPHORE_MODIFY_STATE, 0, semaphore_name.as_ptr()) };
+            if semaphore.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "action cannot open VFS failure semaphore",
+                ));
+            }
+            // SAFETY: OpenSemaphoreW returned a unique handle for this probe.
+            let _semaphore = unsafe { OwnedHandle::from_raw_handle(semaphore as RawHandle) };
+            Ok(())
+        })
+    }
+
+    /// Must run after the Job tree and VFS server are stopped. A successful
+    /// `ReleaseSemaphore(+1)` with a prior positive count proves a target
+    /// reported a committed VFS failure; it cannot erase that evidence.
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        // SAFETY: view remains mapped for self's lifetime; all fields are 32-bit aligned ABI words.
+        let header = unsafe { &*self.view };
+        if header.magic != VFS_ATTESTATION_MAGIC
+            || header.version != VFS_ATTESTATION_VERSION
+            || header.max_slots != VFS_ATTESTATION_MAX_SLOTS as u32
+        {
+            return Err(io::Error::other("VFS attestation header is invalid"));
+        }
+        let slots = unsafe {
+            std::slice::from_raw_parts(
+                self.view.add(1).cast::<VfsAttestationSlot>(),
+                VFS_ATTESTATION_MAX_SLOTS,
+            )
+        };
+        if !vfs_attestation_slots_valid(self.generation, header.slot_count, header.corrupt, slots) {
+            return Err(io::Error::other("VFS attestation slots are incomplete"));
+        }
+        let mut previous = 0;
+        // SAFETY: semaphore is broker-owned and live; previous is writable.
+        if unsafe { ReleaseSemaphore(self.semaphore.as_raw_handle() as HANDLE, 1, &mut previous) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if previous != 0 {
+            return Err(io::Error::other("VFS committed failure was signaled"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for VfsAttestation {
+    fn drop(&mut self) {
+        // SAFETY: view was returned by MapViewOfFile and is unmapped exactly once here.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.view.cast(),
+            })
+        };
+    }
+}
 
 struct ActionSid(*mut c_void);
 
@@ -214,6 +549,33 @@ impl Drop for LocalAllocation {
         // SAFETY: the pointer is the outstanding LocalAlloc result.
         unsafe { LocalFree(self.0) };
     }
+}
+
+fn with_sddl_attributes<T>(
+    sddl: &str,
+    operation: impl FnOnce(*mut SECURITY_ATTRIBUTES) -> io::Result<T>,
+) -> io::Result<T> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = null_mut();
+    // SAFETY: `wide` is a valid NUL-terminated SDDL string and descriptor receives LocalAlloc memory.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    operation(&mut attributes)
 }
 
 fn sid_string(sid: *mut c_void) -> io::Result<String> {
@@ -810,11 +1172,20 @@ pub(crate) struct RestrictedProcess {
 
 impl RestrictedProcess {
     pub(crate) fn spawn(token: &ActionToken, command: &RestrictedCommand) -> io::Result<Self> {
+        Self::spawn_with_inherited(token, command, &[])
+    }
+
+    pub(crate) fn spawn_with_inherited(
+        token: &ActionToken,
+        command: &RestrictedCommand,
+        handles: &[HANDLE],
+    ) -> io::Result<Self> {
         Self::spawn_inner(
             token,
             command,
             #[cfg(test)]
             None,
+            handles,
         )
     }
 
@@ -822,6 +1193,7 @@ impl RestrictedProcess {
         token: &ActionToken,
         command: &RestrictedCommand,
         #[cfg(test)] failure: Option<SpawnFailure>,
+        inherited_handles: &[HANDLE],
     ) -> io::Result<Self> {
         let mut prepared = prepare_command(command)?;
         let job = Arc::new(JobObject::new_kill_on_close()?);
@@ -829,11 +1201,12 @@ impl RestrictedProcess {
         let (stdout, stdout_parent) = stdio_pipe(false)?;
         let (stderr, stderr_parent) = stdio_pipe(false)?;
         drop(stdin_parent); // EOF is explicit; actions cannot wait on ambient broker input.
-        let inherited = [
+        let mut inherited = vec![
             stdin.as_raw_handle() as HANDLE,
             stdout.as_raw_handle() as HANDLE,
             stderr.as_raw_handle() as HANDLE,
         ];
+        inherited.extend_from_slice(inherited_handles);
         let mut attributes = AttributeList::handles(&inherited)?;
         let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -1045,6 +1418,9 @@ impl Drop for RestrictedProcess {
         }
     }
 }
+
+#[cfg(test)]
+mod vfs_attestation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4629,7 +5005,7 @@ mod tests {
                 .arg("/d")
                 .arg("/c")
                 .arg(format!("echo ran>\"{}\"", marker.display()));
-            assert!(RestrictedProcess::spawn_inner(&token, &command, Some(failure)).is_err());
+            assert!(RestrictedProcess::spawn_inner(&token, &command, Some(failure), &[]).is_err());
             assert!(
                 !marker.exists(),
                 "suspended child executed its first instruction"

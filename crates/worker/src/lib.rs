@@ -52,7 +52,7 @@ use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
 use crate::sandbox::{
     ActionPipeSecurity, ActionToken, PrivateRuntime, PrivateScratch, RestrictedCommand,
-    RestrictedProcess, secure_random_hex,
+    RestrictedProcess, VfsAttestation, secure_random_hex,
 };
 use crate::vfs_pipe::{ActionVfsServer, start_secured_action_vfs};
 
@@ -510,6 +510,9 @@ const VFS_RESERVED_ENV: &[&str] = &[
     "SEMBAZURU_VFS_PIPE",
     "SEMBAZURU_VFS_SCRATCH",
     "SEMBAZURU_VFS_STRICT",
+    "SEMBAZURU_VFS_MAPPING_HANDLE",
+    "SEMBAZURU_VFS_SEMAPHORE_HANDLE",
+    "SEMBAZURU_VFS_ATTESTATION_GENERATION",
     "SEMBAZURU_TRACE_DIR",
 ];
 
@@ -520,6 +523,28 @@ struct VfsEnvironment<'a> {
     scratch: &'a Path,
     strict: bool,
     trace: Option<&'a Path>,
+    attestation_mapping_handle: usize,
+    failure_semaphore_handle: usize,
+    attestation_generation: u32,
+}
+
+fn utf16_fits_fixed_buffer(value: &std::ffi::OsStr, capacity: usize) -> bool {
+    value.encode_wide().count() < capacity
+}
+
+fn validate_vfs_fixed_environment(vfs: &VfsEnvironment<'_>) -> Result<(), String> {
+    let valid = utf16_fits_fixed_buffer(std::ffi::OsStr::new(vfs.root), 1024)
+        && utf16_fits_fixed_buffer(std::ffi::OsStr::new(vfs.pipe), 200)
+        && utf16_fits_fixed_buffer(vfs.scratch.as_os_str(), 1024)
+        && vfs
+            .logical_cwd
+            .is_none_or(|cwd| utf16_fits_fixed_buffer(std::ffi::OsStr::new(cwd), 1024))
+        && vfs.attestation_mapping_handle != 0
+        && vfs.failure_semaphore_handle != 0
+        && vfs.attestation_mapping_handle != vfs.failure_semaphore_handle;
+    valid
+        .then_some(())
+        .ok_or_else(|| "VFS environment exceeds interceptor fixed buffer".into())
 }
 
 fn effective_environment(
@@ -527,6 +552,9 @@ fn effective_environment(
     scratch: &Path,
     vfs: Option<VfsEnvironment<'_>>,
 ) -> Result<Vec<(OsString, OsString)>, String> {
+    if let Some(vfs) = &vfs {
+        validate_vfs_fixed_environment(vfs)?;
+    }
     let mut values: BTreeMap<String, (OsString, OsString)> = BTreeMap::new();
     if vfs.is_none() {
         for &name in BASELINE_ENV {
@@ -571,6 +599,18 @@ fn effective_environment(
             (
                 "SEMBAZURU_VFS_STRICT",
                 OsString::from(if vfs.strict { "1" } else { "0" }),
+            ),
+            (
+                "SEMBAZURU_VFS_MAPPING_HANDLE",
+                OsString::from(vfs.attestation_mapping_handle.to_string()),
+            ),
+            (
+                "SEMBAZURU_VFS_SEMAPHORE_HANDLE",
+                OsString::from(vfs.failure_semaphore_handle.to_string()),
+            ),
+            (
+                "SEMBAZURU_VFS_ATTESTATION_GENERATION",
+                OsString::from(vfs.attestation_generation.to_string()),
             ),
         ];
         if let Some(cwd) = vfs.logical_cwd {
@@ -651,6 +691,7 @@ struct BuiltChild {
     scratch: PrivateScratch,
     unvirt_marker: Option<PathBuf>,
     unsafe_output_marker: Option<PathBuf>,
+    attestation: Option<VfsAttestation>,
     trace: Option<TracePublish>,
     resolved_tool_digest: String,
 }
@@ -848,6 +889,7 @@ async fn run_action(
         scratch,
         unvirt_marker,
         unsafe_output_marker,
+        attestation,
         trace,
         resolved_tool_digest,
     } = match build_child(&cmd, vfs_plan, predicted_paths, session_id, &scratch_root).await {
@@ -913,7 +955,12 @@ async fn run_action(
 
     match finish {
         Finish::Exited(Ok(code)) => {
-            if let Some(detail) = vfs_injection_fail_closed_detail(code) {
+            if let Some(attestation) = attestation.as_ref()
+                && let Err(error) = attestation.validate()
+            {
+                let detail = setup_err("VFS attestation failed", error);
+                let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
+            } else if let Some(detail) = vfs_injection_fail_closed_detail(code) {
                 let _ = tx.send(state_event(ActionState::Failed, detail)).await;
             } else {
                 let publish = if let Some(trace) = trace {
@@ -1017,6 +1064,7 @@ async fn build_child(
                           scratch: PrivateScratch,
                           unvirt_marker: Option<PathBuf>,
                           unsafe_output_marker: Option<PathBuf>,
+                          attestation: Option<VfsAttestation>,
                           trace: Option<TracePublish>,
                           resolved_tool_digest: String| async move {
         let output = process.take_output();
@@ -1029,6 +1077,7 @@ async fn build_child(
                 scratch,
                 unvirt_marker,
                 unsafe_output_marker,
+                attestation,
                 trace,
                 resolved_tool_digest,
             }),
@@ -1066,7 +1115,17 @@ async fn build_child(
         }
         let process = RestrictedProcess::spawn(&token, &command)
             .map_err(|error| setup_err("spawn failed", error))?;
-        return finish_process(process, None, scratch, None, None, None, observed.digest).await;
+        return finish_process(
+            process,
+            None,
+            scratch,
+            None,
+            None,
+            None,
+            None,
+            observed.digest,
+        )
+        .await;
     };
 
     let agent_addr: SocketAddr = v
@@ -1075,6 +1134,11 @@ async fn build_child(
         .map_err(|e| setup_err("invalid agent fileserver address", e))?;
     let runtime = PrivateRuntime::stage(&scratch, &cfg.launcher, &cfg.dll, &token)
         .map_err(|error| setup_err("private runtime staging failed", error))?;
+    let attestation = VfsAttestation::create(&token)
+        .map_err(|error| setup_err("VFS attestation setup failed", error))?;
+    let bootstrap = attestation
+        .bootstrap_handles()
+        .map_err(|error| setup_err("VFS attestation bootstrap failed", error))?;
     let suffix = secure_random_hex().map_err(|error| setup_err("pipe identity failed", error))?;
     let pipe_name = format!("sbz-exec-{suffix}");
     let child_cwd = vfs_child_cwd(&cmd.cwd, &v.vfs_root, scratch.path(), v.allow_original_cwd);
@@ -1123,12 +1187,15 @@ async fn build_child(
             scratch: scratch.path(),
             strict: v.strict,
             trace: trace_stage,
+            attestation_mapping_handle: bootstrap.mapping_value(),
+            failure_semaphore_handle: bootstrap.semaphore_value(),
+            attestation_generation: attestation.generation(),
         }),
     ) {
         Ok(environment) => environment,
         Err(error) => {
             vfs_server.shutdown().await;
-            return Err(error);
+            return Err(setup_err("VFS environment setup failed", error));
         }
     };
     let cwd = child_cwd
@@ -1159,7 +1226,11 @@ async fn build_child(
     } else {
         None
     };
-    let process = match RestrictedProcess::spawn(&token, &command) {
+    let process_result = {
+        let bootstrap_handles = bootstrap.as_handle_list();
+        RestrictedProcess::spawn_with_inherited(&token, &command, &bootstrap_handles)
+    };
+    let process = match process_result {
         Ok(process) => process,
         Err(error) => {
             vfs_server.shutdown().await;
@@ -1172,6 +1243,7 @@ async fn build_child(
         scratch,
         unvirt_marker,
         unsafe_output_marker,
+        Some(attestation),
         trace,
         observed.digest,
     )
@@ -1313,6 +1385,7 @@ mod tests {
             Some("VFS child injection failed: re-run locally")
         );
         assert_eq!(vfs_injection_fail_closed_detail(0), None);
+        assert_eq!(vfs_injection_fail_closed_detail(0xC000_0142), None);
     }
 
     #[test]
@@ -1510,6 +1583,9 @@ mod tests {
                 scratch,
                 strict: true,
                 trace: Some(Path::new(r"C:\private\action\.trace")),
+                attestation_mapping_handle: 100,
+                failure_semaphore_handle: 104,
+                attestation_generation: 7,
             }),
         )
         .unwrap();
@@ -1518,6 +1594,19 @@ mod tests {
             Some("private-pipe")
         );
         assert_eq!(environment_value(&vfs, "SEMBAZURU_VFS_STRICT"), Some("1"));
+        assert_eq!(
+            environment_value(&vfs, "SEMBAZURU_VFS_MAPPING_HANDLE"),
+            Some("100"),
+            "launcher receives an explicit numeric mapping handle"
+        );
+        assert_eq!(
+            environment_value(&vfs, "SEMBAZURU_VFS_SEMAPHORE_HANDLE"),
+            Some("104")
+        );
+        assert_eq!(
+            environment_value(&vfs, "SEMBAZURU_VFS_ATTESTATION_GENERATION"),
+            Some("7")
+        );
         assert_eq!(environment_value(&vfs, "TEMP"), Some(r"C:\private\action"));
         assert_eq!(
             environment_value(&vfs, "NUMBER_OF_PROCESSORS"),
@@ -1539,6 +1628,9 @@ mod tests {
                 scratch,
                 strict: false,
                 trace: None,
+                attestation_mapping_handle: 100,
+                failure_semaphore_handle: 104,
+                attestation_generation: 7,
             }),
         )
         .unwrap();
@@ -1555,6 +1647,62 @@ mod tests {
             cwd: String::new(),
         };
         assert!(effective_environment(&duplicate, scratch, None).is_err());
+    }
+
+    #[test]
+    fn vfs_fixed_environment_rejects_exact_interceptor_buffer_overflow() {
+        fn vfs_environment<'a>(
+            root: &'a str,
+            pipe: &'a str,
+            scratch: &'a Path,
+        ) -> VfsEnvironment<'a> {
+            VfsEnvironment {
+                root,
+                logical_cwd: None,
+                pipe,
+                scratch,
+                strict: false,
+                trace: None,
+                attestation_mapping_handle: 100,
+                failure_semaphore_handle: 104,
+                attestation_generation: 1,
+            }
+        }
+
+        let scratch = Path::new(r"C:\private\action");
+        let command = Command {
+            argv: vec!["tool.exe".into()],
+            env: Default::default(),
+            cwd: String::new(),
+        };
+        let root_1023 = "r".repeat(1023);
+        let root_1024 = "r".repeat(1024);
+        let pipe_199 = "p".repeat(199);
+        let pipe_200 = "p".repeat(200);
+        assert!(
+            effective_environment(
+                &command,
+                scratch,
+                Some(vfs_environment(&root_1023, &pipe_199, scratch)),
+            )
+            .is_ok()
+        );
+        assert!(
+            effective_environment(
+                &command,
+                scratch,
+                Some(vfs_environment(&root_1024, &pipe_199, scratch)),
+            )
+            .is_err()
+        );
+        assert!(
+            effective_environment(
+                &command,
+                scratch,
+                Some(vfs_environment(&root_1023, &pipe_200, scratch)),
+            )
+            .is_err()
+        );
     }
 
     #[test]

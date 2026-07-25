@@ -12,6 +12,8 @@
 
 #include "common.h"
 
+#include "vfs_attestation.h"
+
 #include "detours.h"
 
 // winternl.h gives NTSTATUS / PIO_STATUS_BLOCK / FILE_INFORMATION_CLASS for the
@@ -135,6 +137,7 @@ struct FileDispositionInformationExLayout {
 // never-hooked APIs, honoring the re-entrancy contract.
 
 bool g_vfsMode = false;
+bool g_vfsRequested = false;
 wchar_t g_vfsRoot[1024];  // lowercased, no trailing backslash
 int g_vfsRootLen = 0;
 wchar_t g_vfsPipe[260];     // full \\.\pipe\<name>
@@ -190,6 +193,7 @@ void InitVfsConfig() {
     if (n == 0 || n >= 16 || _wcsicmp(mode, L"vfs") != 0) {
         return;
     }
+    g_vfsRequested = true;
     wchar_t root[1024];
     DWORD rn = GetEnvironmentVariableW(L"SEMBAZURU_VFS_ROOT", root, 1024);
     if (rn == 0 || rn >= 1024) {
@@ -909,6 +913,13 @@ bool VfsMarkUnvirtualized() {
     }
     bool marked = result > 0;
     ReleaseSRWLockExclusive(&lock);
+    // A marker is diagnostic only. The broker's monotonic semaphore remains
+    // authoritative even when strict=false lets this API call preserve its
+    // historical fallback behavior.
+    if (!vfs_attestation::SignalFailure()) {
+        TerminateProcess(GetCurrentProcess(), kVfsInjectionFailClosedExitCode);
+        ExitProcess(kVfsInjectionFailClosedExitCode);
+    }
     return marked;
 }
 
@@ -928,6 +939,10 @@ void VfsMarkUnsafeOutput() {
     static LONG written = 0;
     if (InterlockedExchange(&written, 1) != 0) {
         return;
+    }
+    if (!vfs_attestation::SignalFailure()) {
+        TerminateProcess(GetCurrentProcess(), kVfsInjectionFailClosedExitCode);
+        ExitProcess(kVfsInjectionFailClosedExitCode);
     }
     (void)VfsMarkScratchMarker(kUnsafeOutputMarker);
 }
@@ -2136,25 +2151,59 @@ BOOL WINAPI HookedRemoveDirectoryA(LPCSTR path) {
 
 // --- Process hooks -------------------------------------------------------
 
+bool VfsCopyRegisterAndResumeChild(DWORD originalFlags,
+                                   LPPROCESS_INFORMATION process) {
+    if (process == nullptr || process->hProcess == nullptr ||
+        process->hThread == nullptr ||
+        !vfs_attestation::CopyPayloadToProcess(process->hProcess) ||
+        !vfs_attestation::RegisterExpected(process->dwProcessId)) {
+        return false;
+    }
+    if ((originalFlags & CREATE_SUSPENDED) != 0) {
+        return true;
+    }
+    if (ResumeThread(process->hThread) == static_cast<DWORD>(-1)) {
+        return false;
+    }
+    return true;
+}
+
+void VfsTerminateAndReapChild(LPPROCESS_INFORMATION process) {
+    if (process == nullptr) {
+        return;
+    }
+    if (process->hProcess != nullptr) {
+        TerminateProcess(process->hProcess, 1);
+        WaitForSingleObject(process->hProcess, INFINITE);
+        CloseHandle(process->hProcess);
+        process->hProcess = nullptr;
+    }
+    if (process->hThread != nullptr) {
+        CloseHandle(process->hThread);
+        process->hThread = nullptr;
+    }
+}
+
 BOOL WINAPI HookedCreateProcessW(LPCWSTR app, LPWSTR cmd,
                                  LPSECURITY_ATTRIBUTES pa,
                                  LPSECURITY_ATTRIBUTES ta, BOOL inherit,
                                  DWORD flags, LPVOID env, LPCWSTR dir,
                                  LPSTARTUPINFOW si,
                                  LPPROCESS_INFORMATION pi) {
-    // A custom block replaces the inherited environment. Until we can prove it
-    // preserves the authoritative VFS configuration, do not create any child.
-    if (g_vfsMode && env != nullptr) {
-        VfsHandleChildInjectionFailure();
-    }
     const char* dll = trace::DllPathA();
     BOOL ok;
     DWORD saved;
     if (dll != nullptr && (g_vfsMode || trace::Enabled())) {
-        ok = DetourCreateProcessWithDllExW(app, cmd, pa, ta, inherit, flags,
+        DWORD detourFlags = g_vfsMode ? (flags | CREATE_SUSPENDED) : flags;
+        ok = DetourCreateProcessWithDllExW(app, cmd, pa, ta, inherit, detourFlags,
                                            env, dir, si, pi, dll,
                                            TrueCreateProcessW);
         saved = GetLastError();
+        if (ok && g_vfsMode && !VfsCopyRegisterAndResumeChild(flags, pi)) {
+            saved = GetLastError();
+            VfsTerminateAndReapChild(pi);
+            VfsHandleChildInjectionFailure();
+        }
         if (!ok) {
             // Injection-capable spawn failed (Detours kills the child on
             // injection failure). A VFS child cannot run uninstrumented: it
@@ -2193,19 +2242,20 @@ BOOL WINAPI HookedCreateProcessA(LPCSTR app, LPSTR cmd,
                                  DWORD flags, LPVOID env, LPCSTR dir,
                                  LPSTARTUPINFOA si,
                                  LPPROCESS_INFORMATION pi) {
-    // A custom block replaces the inherited environment. Until we can prove it
-    // preserves the authoritative VFS configuration, do not create any child.
-    if (g_vfsMode && env != nullptr) {
-        VfsHandleChildInjectionFailure();
-    }
     const char* dll = trace::DllPathA();
     BOOL ok;
     DWORD saved;
     if (dll != nullptr && (g_vfsMode || trace::Enabled())) {
-        ok = DetourCreateProcessWithDllExA(app, cmd, pa, ta, inherit, flags,
+        DWORD detourFlags = g_vfsMode ? (flags | CREATE_SUSPENDED) : flags;
+        ok = DetourCreateProcessWithDllExA(app, cmd, pa, ta, inherit, detourFlags,
                                            env, dir, si, pi, dll,
                                            TrueCreateProcessA);
         saved = GetLastError();
+        if (ok && g_vfsMode && !VfsCopyRegisterAndResumeChild(flags, pi)) {
+            saved = GetLastError();
+            VfsTerminateAndReapChild(pi);
+            VfsHandleChildInjectionFailure();
+        }
         if (!ok) {
             if (g_vfsMode) {
                 VfsHandleChildInjectionFailure();
@@ -2574,9 +2624,15 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     }
 
     if (reason == DLL_PROCESS_ATTACH) {
-        trace::Initialize(instance);
         // Read VFS config with the real env API, before any hooks are armed.
         InitVfsConfig();
+        // Exact VFS execution is fail-closed: an incomplete configuration or
+        // inaccessible per-action attestation object must leave no process that
+        // can perform untracked virtual I/O. Observe-only attach remains unchanged.
+        if (g_vfsRequested && (!g_vfsMode || !vfs_attestation::OpenFromPayload())) {
+            return FALSE;
+        }
+        trace::Initialize(instance);
         DetourRestoreAfterWith();
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
@@ -2610,6 +2666,11 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         if (err != NO_ERROR) {
             return FALSE;  // refuse to load half-instrumented
         }
+        // Detours keeps the process suspended until its parent registered this
+        // PID. The slot becomes attached only after the full transaction commits.
+        if (g_vfsMode && !vfs_attestation::MarkAttached(GetCurrentProcessId())) {
+            return FALSE;
+        }
     } else if (reason == DLL_PROCESS_DETACH) {
         if (reserved != nullptr) {
             // Process termination: threads may be frozen mid-write; let
@@ -2627,6 +2688,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         }
         DetourTransactionCommit();
         trace::Shutdown();
+        vfs_attestation::Close();
     }
     return TRUE;
 }

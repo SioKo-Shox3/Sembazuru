@@ -267,6 +267,30 @@ function Remove-RestrictionCanary {
     Remove-Item -LiteralPath $Path -Force
 }
 
+function Get-M6ListeningOwnerPids([int]$Port) {
+    @((Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess))
+}
+
+function Get-M6SafeServiceStderr([string]$Path, [string]$Service) {
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $lines = @(Get-Content -LiteralPath $Path -ErrorAction Stop |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $safe = @()
+    foreach ($line in $lines) {
+        if ($Service -eq 'worker' -and $line -like 'sembazuru-worker: VFS attestation failed:*') {
+            $safe += 'M6_SERVICE_STDERR service=worker event=attestation-failed'
+        } elseif ($Service -eq 'worker' -and $line -like 'sembazuru-worker: Execution service on *') {
+            $safe += 'M6_SERVICE_STDERR service=worker event=execution-service'
+        } elseif ($Service -eq 'worker' -and $line -like 'sembazuru-worker: VFS execution enabled*') {
+            $safe += 'M6_SERVICE_STDERR service=worker event=vfs-enabled'
+        } else {
+            $safe += "M6_SERVICE_STDERR service=$Service event=redacted"
+        }
+    }
+    @($safe | Select-Object -Unique)
+}
+
 $launcher = Join-Path $BuildDir 'launcher.exe'
 $dll = Join-Path $BuildDir 'sbz_interceptor64.dll'
 foreach ($f in @($launcher, $dll)) {
@@ -393,26 +417,53 @@ static bool SameMetadata(const WIN32_FILE_ATTRIBUTE_DATA& a,
            FileTimeValue(a.ftLastAccessTime) == FileTimeValue(b.ftLastAccessTime) &&
            FileTimeValue(a.ftLastWriteTime) == FileTimeValue(b.ftLastWriteTime);
 }
-static int CheckPresentMetadata(const wchar_t* logical, const wchar_t* backing,
+static bool ParseUnsigned64(const wchar_t* text, ULONGLONG* value) {
+    if (text == nullptr || *text == L'\0') return false;
+    ULONGLONG parsed = 0;
+    for (const wchar_t* p = text; *p != L'\0'; ++p) {
+        if (*p < L'0' || *p > L'9' ||
+            parsed > ((~static_cast<ULONGLONG>(0) - static_cast<unsigned>(*p - L'0')) / 10)) return false;
+        parsed = parsed * 10 + static_cast<unsigned>(*p - L'0');
+    }
+    *value = parsed;
+    return true;
+}
+static bool ParseMetadata(const wchar_t* attributes, const wchar_t* size,
+                          const wchar_t* creation, const wchar_t* access,
+                          const wchar_t* write, WIN32_FILE_ATTRIBUTE_DATA* metadata) {
+    ULONGLONG parsedAttributes = 0;
+    ULONGLONG parsedSize = 0;
+    ULONGLONG parsedCreation = 0;
+    ULONGLONG parsedAccess = 0;
+    ULONGLONG parsedWrite = 0;
+    if (!ParseUnsigned64(attributes, &parsedAttributes) || parsedAttributes > MAXDWORD ||
+        !ParseUnsigned64(size, &parsedSize) || !ParseUnsigned64(creation, &parsedCreation) ||
+        !ParseUnsigned64(access, &parsedAccess) || !ParseUnsigned64(write, &parsedWrite)) return false;
+    metadata->dwFileAttributes = static_cast<DWORD>(parsedAttributes);
+    metadata->nFileSizeHigh = static_cast<DWORD>(parsedSize >> 32);
+    metadata->nFileSizeLow = static_cast<DWORD>(parsedSize);
+    metadata->ftCreationTime.dwHighDateTime = static_cast<DWORD>(parsedCreation >> 32);
+    metadata->ftCreationTime.dwLowDateTime = static_cast<DWORD>(parsedCreation);
+    metadata->ftLastAccessTime.dwHighDateTime = static_cast<DWORD>(parsedAccess >> 32);
+    metadata->ftLastAccessTime.dwLowDateTime = static_cast<DWORD>(parsedAccess);
+    metadata->ftLastWriteTime.dwHighDateTime = static_cast<DWORD>(parsedWrite >> 32);
+    metadata->ftLastWriteTime.dwLowDateTime = static_cast<DWORD>(parsedWrite);
+    return true;
+}
+static int CheckPresentMetadata(const wchar_t* logical,
+                                const WIN32_FILE_ATTRIBUTE_DATA& expected,
                                 unsigned repeats, ULONGLONG* calls) {
     char logicalA[1024];
-    char backingA[1024];
-    if (!WideArgToAcp(logical, logicalA, sizeof(logicalA)) ||
-        !WideArgToAcp(backing, backingA, sizeof(backingA))) return 2;
+    if (!WideArgToAcp(logical, logicalA, sizeof(logicalA))) return 2;
     const DWORD sentinel = 0x51BADA55;
-    WIN32_FILE_ATTRIBUTE_DATA expected{};
-    SetLastError(sentinel);
-    DWORD expectedAttrs = GetFileAttributesW(backing);
-    if (expectedAttrs == INVALID_FILE_ATTRIBUTES || GetLastError() != sentinel ||
-        !GetFileAttributesExW(backing, GetFileExInfoStandard, &expected)) return 13;
     for (unsigned i = 0; i < repeats; ++i) {
         SetLastError(sentinel);
         DWORD attrsW = GetFileAttributesW(logical);
-        if (attrsW != expectedAttrs || GetLastError() != sentinel) return 14;
+        if (attrsW != expected.dwFileAttributes || GetLastError() != sentinel) return 14;
         ++*calls;
         SetLastError(sentinel);
         DWORD attrsA = GetFileAttributesA(logicalA);
-        if (attrsA != expectedAttrs || GetLastError() != sentinel) return 15;
+        if (attrsA != expected.dwFileAttributes || GetLastError() != sentinel) return 15;
         ++*calls;
         WIN32_FILE_ATTRIBUTE_DATA dataW{};
         SetLastError(sentinel);
@@ -427,25 +478,9 @@ static int CheckPresentMetadata(const wchar_t* logical, const wchar_t* backing,
     }
     return 0;
 }
-static int CheckAbsentMetadata(const wchar_t* logical, const wchar_t* backing) {
+static int CheckAbsentMetadata(const wchar_t* logical, DWORD expectedError) {
     char logicalA[1024];
-    char backingA[1024];
-    if (!WideArgToAcp(logical, logicalA, sizeof(logicalA)) ||
-        !WideArgToAcp(backing, backingA, sizeof(backingA))) return 2;
-    DWORD expectedW = GetFileAttributesW(backing);
-    DWORD expectedWError = GetLastError();
-    DWORD expectedA = GetFileAttributesA(backingA);
-    DWORD expectedAError = GetLastError();
-    if (expectedW != INVALID_FILE_ATTRIBUTES || expectedA != INVALID_FILE_ATTRIBUTES)
-        return 19;
-    BYTE expectedExW[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
-    memset(expectedExW, 0xA5, sizeof(expectedExW));
-    BOOL expectedExWOk = GetFileAttributesExW(backing, GetFileExInfoStandard, expectedExW);
-    DWORD expectedExWError = GetLastError();
-    BYTE expectedExA[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
-    memset(expectedExA, 0xA5, sizeof(expectedExA));
-    BOOL expectedExAOk = GetFileAttributesExA(backingA, GetFileExInfoStandard, expectedExA);
-    DWORD expectedExAError = GetLastError();
+    if (!WideArgToAcp(logical, logicalA, sizeof(logicalA))) return 2;
     BYTE actualExW[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
     memset(actualExW, 0xA5, sizeof(actualExW));
     DWORD actualW = GetFileAttributesW(logical);
@@ -458,12 +493,14 @@ static int CheckAbsentMetadata(const wchar_t* logical, const wchar_t* backing) {
     DWORD actualExWError = GetLastError();
     BOOL actualExAOk = GetFileAttributesExA(logicalA, GetFileExInfoStandard, actualExA);
     DWORD actualExAError = GetLastError();
-    return actualW == expectedW && actualWError == expectedWError &&
-           actualA == expectedA && actualAError == expectedAError &&
-           actualExWOk == expectedExWOk && actualExWError == expectedExWError &&
-           actualExAOk == expectedExAOk && actualExAError == expectedExAError &&
-           memcmp(actualExW, expectedExW, sizeof(actualExW)) == 0 &&
-           memcmp(actualExA, expectedExA, sizeof(actualExA)) == 0 ? 0 : 20;
+    BYTE untouched[sizeof(WIN32_FILE_ATTRIBUTE_DATA)];
+    memset(untouched, 0xA5, sizeof(untouched));
+    return actualW == INVALID_FILE_ATTRIBUTES && actualWError == expectedError &&
+           actualA == INVALID_FILE_ATTRIBUTES && actualAError == expectedError &&
+           !actualExWOk && actualExWError == expectedError &&
+           !actualExAOk && actualExAError == expectedError &&
+           memcmp(actualExW, untouched, sizeof(actualExW)) == 0 &&
+           memcmp(actualExA, untouched, sizeof(actualExA)) == 0 ? 0 : 20;
 }
 static int SpawnReadChild(const wchar_t* path, const wchar_t* expected,
                           BOOL ansi) {
@@ -1187,14 +1224,20 @@ int wmain(int argc, wchar_t** argv) {
         if (r != elen) return 3;
         return memcmp(buf, exp, elen) == 0 ? 0 : 3;
     }
-    if (argc >= 8 && wcscmp(argv[1], L"--metadata-api") == 0) {
+    if (argc >= 16 && wcscmp(argv[1], L"--metadata-api") == 0) {
         ULONGLONG started = GetTickCount64();
         ULONGLONG calls = 0;
-        int result = CheckPresentMetadata(argv[2], argv[3], 2500, &calls);
+        WIN32_FILE_ATTRIBUTE_DATA present{};
+        WIN32_FILE_ATTRIBUTE_DATA sparse{};
+        ULONGLONG missingError = 0;
+        if (!ParseMetadata(argv[3], argv[4], argv[5], argv[6], argv[7], &present) ||
+            !ParseUnsigned64(argv[9], &missingError) || missingError > MAXDWORD ||
+            !ParseMetadata(argv[11], argv[12], argv[13], argv[14], argv[15], &sparse)) return 2;
+        int result = CheckPresentMetadata(argv[2], present, 2500, &calls);
         if (result != 0) return result;
-        result = CheckAbsentMetadata(argv[4], argv[5]);
+        result = CheckAbsentMetadata(argv[8], static_cast<DWORD>(missingError));
         if (result != 0) return result;
-        result = CheckPresentMetadata(argv[6], argv[7], 1, &calls);
+        result = CheckPresentMetadata(argv[10], sparse, 1, &calls);
         if (result != 0) return result;
         wprintf(L"METADATA_NATIVE PASS calls=%llu wall_ms=%llu present=W/A/ExW/ExA absent=PASS sparse_4GiB=PASS\n",
                 calls, GetTickCount64() - started);
@@ -1366,6 +1409,52 @@ try {
 } finally { Pop-Location }
 $probe = Join-Path $WorkRoot 'probe.exe'
 
+# The compiled WorkRoot inherits the runner's private directory ACL. Make only
+# this generated executable public-equivalent: restricted actions need the same
+# BUILTIN\Users RX access as production tools such as System32\cmd.exe. This
+# is deliberately a file-only fixture ACL; the canary and all directories stay
+# private so the restriction test remains meaningful.
+function Fail-PublicProbeAcl([string]$reason) {
+    $gle = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $sddl = try { (Get-Acl -LiteralPath $probe).Sddl } catch { '<unavailable>' }
+    throw "probe public ACL assertion failed: $reason; path=$probe; gle=$gle; sddl=$sddl"
+}
+
+$BU = 'S-1-5-32-545'
+$RX_EXACT = 0x1200A9
+$FORBIDDEN = 0x2 -bor 0x4 -bor 0x10 -bor 0x100 -bor 0x40 -bor `
+    0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+& icacls.exe $probe '/grant:r' "*$BU`:(RX)" '/c' | Out-Null
+if ($LASTEXITCODE -ne 0) { Fail-PublicProbeAcl 'icacls grant:r BUILTIN Users RX failed' }
+$sd = [System.Security.AccessControl.RawSecurityDescriptor]::new(
+    (Get-Acl -LiteralPath $probe).Sddl)
+$aces = @($sd.DiscretionaryAcl | Where-Object {
+    $_ -is [System.Security.AccessControl.CommonAce] -and $_.SecurityIdentifier.Value -eq $BU
+})
+$inherited = [System.Security.AccessControl.AceFlags]::Inherited
+$explicitAllow = @($aces | Where-Object {
+    $_.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed -and
+    -not ($_.AceFlags -band $inherited)
+})
+if ($explicitAllow.Count -ne 1 -or $explicitAllow[0].AccessMask -ne $RX_EXACT) {
+    $masks = @($explicitAllow | ForEach-Object { '0x{0:X}' -f $_.AccessMask }) -join ','
+    Fail-PublicProbeAcl "BU explicit allow is not exactly RX (count=$($explicitAllow.Count), masks=$masks)"
+}
+foreach ($ace in $aces) {
+    if ($ace.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowed -and
+        ($ace.AccessMask -band $FORBIDDEN) -ne 0) {
+        Fail-PublicProbeAcl ('BU allow grants write-class bits: 0x{0:X}' -f $ace.AccessMask)
+    }
+}
+$denyTargets = @($BU, 'S-1-1-0', 'S-1-5-11', 'S-1-5-12')
+if ($sd.DiscretionaryAcl | Where-Object {
+    $_ -is [System.Security.AccessControl.CommonAce] -and
+    $_.AceType -eq [System.Security.AccessControl.AceType]::AccessDenied -and
+    $denyTargets -contains $_.SecurityIdentifier.Value
+}) {
+    Fail-PublicProbeAcl 'deny ACE targets a restricting SID'
+}
+
 # Layout: logical holds STALE bytes; backing holds CORRECT bytes the agent serves.
 $logicalRoot = Join-Path $WorkRoot 'LoGiCaL'
 $backingRoot = Join-Path $WorkRoot 'backing'
@@ -1406,13 +1495,38 @@ $sparseStream = [System.IO.File]::Open($backingSparse, [System.IO.FileMode]::Ope
     [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
 try { $sparseStream.SetLength([Int64]4294967301) } finally { $sparseStream.Dispose() }
 
+# The restricted probe must never open private backing paths. Capture the
+# known fixture metadata in the parent and pass only decimal values for the
+# logical W/A/ExW/ExA comparisons; the sparse file keeps the 4 GiB boundary.
+function Get-M6MetadataContract([string]$Path) {
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    $invariant = [Globalization.CultureInfo]::InvariantCulture
+    @(
+        ([uint64][uint32]$item.Attributes).ToString($invariant),
+        ([uint64]$item.Length).ToString($invariant),
+        ([uint64]$item.CreationTimeUtc.ToFileTimeUtc()).ToString($invariant),
+        ([uint64]$item.LastAccessTimeUtc.ToFileTimeUtc()).ToString($invariant),
+        ([uint64]$item.LastWriteTimeUtc.ToFileTimeUtc()).ToString($invariant)
+    )
+}
+$metadataExpected = Get-M6MetadataContract (Join-Path $backingRoot $rel)
+$metadataSparseExpected = Get-M6MetadataContract $backingSparse
+# The fixed absent fixture is under the supplied root but not present at either
+# endpoint, so its Win32 metadata contract is ERROR_FILE_NOT_FOUND (2).
+$metadataAbsentError = '2'
+
 $fsAddr = '127.0.0.1:50082'
 $workerPort = 50083
 $workerAddr = "127.0.0.1:$workerPort"
+$fsStderrLog = Join-Path $WorkRoot 'fs.stderr.log'
+$workerStderrLog = Join-Path $WorkRoot 'worker.stderr.log'
+$serviceStartupFailure = $null
+$safeFsStderr = @()
+$safeWorkerStderr = @()
 
 # Agent file server in REMAP mode: paths under logicalRoot are served from backingRoot.
 $fsProc = Start-Process -FilePath $fsHost -ArgumentList @($fsAddr, $logicalRoot, $backingRoot) `
-    -PassThru -WindowStyle Hidden
+    -PassThru -WindowStyle Hidden -RedirectStandardError $fsStderrLog
 
 # Worker with VFS execution enabled (install paths via env). No SEMBAZURU_AGENT:
 # it just serves Execution; exec_vfs dials it directly.
@@ -1455,28 +1569,70 @@ try {
     # canonical machine service-runtime guard used by production installations.
     $env:SEMBAZURU_WORKER_CONFIG = $workerConfig
     $workerProc = Start-Process -FilePath $workerExe -ArgumentList @($workerAddr) `
-        -PassThru -WindowStyle Hidden
+        -PassThru -WindowStyle Hidden -RedirectStandardError $workerStderrLog
 
-    # Wait for the worker's Execution port to accept connections.
-    $ready = $false
-    for ($i = 0; $i -lt 100; $i++) {
-        try {
-            $c = New-Object System.Net.Sockets.TcpClient
-            $c.Connect('127.0.0.1', $workerPort); $c.Close(); $ready = $true; break
-        } catch { Start-Sleep -Milliseconds 50 }
+    if ($fsProc.HasExited) {
+        $serviceStartupFailure = "fs-early-exit-$($fsProc.ExitCode)"
+    } elseif ($workerProc.HasExited) {
+        $serviceStartupFailure = "worker-early-exit-$($workerProc.ExitCode)"
     }
-    if (-not $ready) { throw 'worker Execution port did not come up' }
+    Write-Host "M6_SERVICE_STATE phase=post-start fs_pid=$($fsProc.Id) fs_alive=$(-not $fsProc.HasExited) worker_pid=$($workerProc.Id) worker_alive=$(-not $workerProc.HasExited)"
+
+    # Require both fixed listeners to belong to the processes this harness
+    # started; a ready worker port alone could otherwise belong to another run.
+    $ready = $false
+    if ($null -eq $serviceStartupFailure) {
+        for ($i = 0; $i -lt 100; $i++) {
+            if ($fsProc.HasExited) {
+                $serviceStartupFailure = "fs-early-exit-$($fsProc.ExitCode)"
+                break
+            }
+            if ($workerProc.HasExited) {
+                $serviceStartupFailure = "worker-early-exit-$($workerProc.ExitCode)"
+                break
+            }
+            $fsOwners = @(Get-M6ListeningOwnerPids 50082)
+            $workerOwners = @(Get-M6ListeningOwnerPids $workerPort)
+            if (($fsOwners | Where-Object { $_ -ne $fsProc.Id }).Count -ne 0 -or
+                ($workerOwners | Where-Object { $_ -ne $workerProc.Id }).Count -ne 0) {
+                $serviceStartupFailure = 'listener-owner-mismatch'
+                break
+            }
+            if ($fsOwners.Count -eq 1 -and $fsOwners[0] -eq $fsProc.Id -and
+                $workerOwners.Count -eq 1 -and $workerOwners[0] -eq $workerProc.Id) {
+                $c = $null
+                try {
+                    $c = New-Object System.Net.Sockets.TcpClient
+                    $c.Connect('127.0.0.1', $workerPort)
+                    $ready = $true
+                    break
+                } catch {
+                } finally {
+                    if ($null -ne $c) { $c.Close() }
+                }
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    $fsOwners = @(Get-M6ListeningOwnerPids 50082)
+    $workerOwners = @(Get-M6ListeningOwnerPids $workerPort)
+    Write-Host "M6_LISTENER_OWNERS fs_pid=$($fsProc.Id) owners=$($fsOwners -join ',') worker_pid=$($workerProc.Id) owners=$($workerOwners -join ',')"
+    Write-Host "M6_SERVICE_STATE phase=post-ready fs_alive=$(-not $fsProc.HasExited) worker_alive=$(-not $workerProc.HasExited)"
+    if (-not $ready -and $null -eq $serviceStartupFailure) {
+        $serviceStartupFailure = 'listener-ready-timeout'
+    }
+    if ($null -ne $serviceStartupFailure) {
+        Write-Host "M6_SERVICE_STARTUP_FAILURE category=$serviceStartupFailure"
+        exit 1
+    }
 
     Push-Location $logicalRoot
     try {
         $expectedInputPath = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot $rel))
         $verbatimInputPath = '\\?\' + $expectedInputPath
         $metadataLogicalPath = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot $rel))
-        $metadataBackingPath = [System.IO.Path]::GetFullPath((Join-Path $backingRoot $rel))
         $metadataLogicalAbsent = [System.IO.Path]::GetFullPath((Join-Path $logicalRoot $metadataAbsentRel))
-        $metadataBackingAbsent = [System.IO.Path]::GetFullPath((Join-Path $backingRoot $metadataAbsentRel))
         $metadataLogicalSparse = [System.IO.Path]::GetFullPath($logicalSparse)
-        $metadataBackingSparse = [System.IO.Path]::GetFullPath($backingSparse)
         $oldNativeEap = $null
         $hasNativeEap = Get-Variable PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue
         if ($hasNativeEap) {
@@ -1503,9 +1659,9 @@ try {
             $env:SEMBAZURU_VFS_CWD = $fakeVfsCwd
             $env:SEMBAZURU_TRACE_DIR = $smuggledTraceDir
             & $execVfs "http://$workerAddr" $fsAddr $logicalRoot $miscTraceDir -- `
-                $probe --metadata-api $metadataLogicalPath $metadataBackingPath `
-                $metadataLogicalAbsent $metadataBackingAbsent `
-                $metadataLogicalSparse $metadataBackingSparse 2>&1 |
+                $probe --metadata-api $metadataLogicalPath @metadataExpected `
+                $metadataLogicalAbsent $metadataAbsentError `
+                $metadataLogicalSparse @metadataSparseExpected 2>&1 |
                 Out-String | Write-Host
             $metadataExit = $LASTEXITCODE
 
@@ -1634,6 +1790,11 @@ try {
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
             if (-not $p.WaitForExit(5000)) { throw "process did not stop: $($p.Id)" }
         }
+    }
+    $safeFsStderr = Get-M6SafeServiceStderr $fsStderrLog 'fs'
+    $safeWorkerStderr = Get-M6SafeServiceStderr $workerStderrLog 'worker'
+    if ($null -ne $serviceStartupFailure) {
+    (@($safeFsStderr) + @($safeWorkerStderr)) | ForEach-Object { Write-Host $_ }
     }
     Remove-RestrictionCanary $restrictionCanaryPath
 }
@@ -1920,6 +2081,7 @@ if ($failures.Count -gt 0) {
     Write-Host ''
     Write-Host 'M6.1b WORKER VFS GATE FAIL:'
     $failures | ForEach-Object { Write-Host "  - $_" }
+    (@($safeFsStderr) + @($safeWorkerStderr)) | ForEach-Object { Write-Host "  - $_" }
     exit 1
 }
 Write-Host 'M6.1b WORKER VFS GATE PASS (worker Execute redirected the read to the agent-served bytes; per-action scratch cleaned up)'

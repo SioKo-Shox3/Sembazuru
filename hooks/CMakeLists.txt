@@ -39,12 +39,13 @@ else()
 endif()
 add_library(${SBZ_INTERCEPTOR} SHARED
   src/interceptor.cpp
+  src/vfs_attestation.cpp
   src/trace_writer.cpp
   src/interceptor.def
 )
 target_link_libraries(${SBZ_INTERCEPTOR} PRIVATE detours)
 
-add_executable(launcher src/launcher.cpp)
+add_executable(launcher src/launcher.cpp src/vfs_attestation.cpp)
 target_link_libraries(launcher PRIVATE detours)
 
 # Cross-bitness injection probe (M7.3). A tiny target the 32-bit build turns into
@@ -63,6 +64,14 @@ add_executable(process_injection_failure_probe
 # of test-only exports, globals, and runtime switches.
 add_executable(trace_writer_faults test/trace_writer_faults.cpp)
 add_test(NAME trace_writer_faults COMMAND trace_writer_faults)
+
+add_executable(vfs_attestation_payload_faults
+  test/vfs_attestation_payload_faults.cpp
+  src/vfs_attestation.cpp
+)
+target_link_libraries(vfs_attestation_payload_faults PRIVATE detours)
+target_include_directories(vfs_attestation_payload_faults PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME vfs_attestation_payload_faults COMMAND vfs_attestation_payload_faults)
 
 add_executable(trace_write_probe test/trace_write_probe.cpp)
 add_test(NAME trace_write_probe_help COMMAND trace_write_probe --help)
