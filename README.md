@@ -105,10 +105,13 @@ worker, launcher, hook DLLs, and the tray GUI, registers both services, adds the
 rules, and seeds `%ProgramData%\Sembazuru\{daemon,worker}.toml`. The MSI is **unsigned**, so
 SmartScreen shows an unknown-publisher prompt — **More info → Run anyway**. Updates are a
 manual reinstall, and every node in a cluster must run the same version (see the admission
-note below). Building from source stays fully supported — that path is
+note below). **v0.0.3 was cut on 2026-07-09 and `main` has moved since** — the live monitor,
+the privilege-isolation work, and the cache-correctness fixes listed below are *not* in that
+MSI. To get them today, build from source:
 [`docs/quickstart.md`](docs/quickstart.md).
 
-What works today, each backed by a CI gate (`.github/workflows/ci.yml`):
+What works today, each backed by a CI gate (`.github/workflows/ci.yml`). Everything in this
+first group is in the published v0.0.3 MSI:
 
 - **Remote execution (M3).** A hooked compiler runs under an on-demand VFS; the
   agent streams inputs as the process opens them. A distributed `clang-cl` `.obj`
@@ -126,35 +129,39 @@ What works today, each backed by a CI gate (`.github/workflows/ci.yml`):
   MSBuild/Visual Studio via a `CLToolExe` shim — no source or build-logic edits.
 - **Hardening (M7).** Authenticode sign→verify pipeline (placeholder cert in CI; real
   signing is optional and the published MSIs are unsigned), shared-token auth on both the
-  control and data planes,
-  32/64-bit cross-bitness injection, a Job-Object
-  sandbox with process-tree kill, and a Windows-version CI matrix
-  (windows-2022/2025) to catch OS-update and Detours-fork regressions.
+  control and data planes, 32/64-bit cross-bitness injection, a Job-Object sandbox with
+  process-tree kill, and a Windows-version CI matrix (windows-2022/2025) to catch OS-update
+  and Detours-fork regressions.
 - **Beyond compilation (M8).** An arbitrary non-compiler process distributes with
   **no dedicated support**: `dxc` (the HLSL shader compiler) runs through the same
   launcher→daemon→worker path, byte-identical to local and cached via trace-based
   output discovery — proof that the core is general process virtualization, not
   compilation.
 - **Packaging & residency (M9).** An MSI installs both services and a tray-resident GUI
-  that shows connected workers, cache hit rate and size, the remote/local/fallback split,
-  and starts/stops the services. Shipped as an unsigned release (v0.0.1, then v0.0.3).
+  that shows connected workers, cache hit rate / size / cap, in-flight actions, and the
+  remote/local/fallback split, and starts/stops the services. Shipped unsigned (v0.0.1,
+  then v0.0.3).
+
+**Landed on `main` after v0.0.3 — source builds only, not in the MSI:**
+
 - **Live build monitor (M15).** A Monitor tab draws each worker's execution slots on a
   rolling 60-second timeline — active / done / failed by colour *and* text, local fallback
   on its own band, a recent-activity table underneath — so "is it actually distributing
   right now?" is answerable without reading logs. Only file basenames and outcomes cross
   to the GUI; full paths, arguments, environment values, and tokens never do.
-- **Process & privilege isolation.** The daemon's local intake is a protected named pipe
+- **Process & privilege isolation.** The daemon's local intake became a protected named pipe
   (`\\.\pipe\Sembazuru.LocalIntake.v1`) with an explicit DACL, mutual SID verification, and
   daemon-side fallback that runs under the *calling* user's restricted token — production no
-  longer opens an intake TCP port. Each remote action runs under its own restricted primary
-  token in a private scratch directory, bound to a kill-on-close Job before its first
-  instruction. `%ProgramData%\Sembazuru` blocks inheritance, and the cluster token is stored
-  DPAPI-protected rather than in plaintext TOML.
+  longer opens an intake TCP port, as v0.0.3 still did. Each remote action now runs under its
+  own restricted primary token in a private scratch directory, bound to a kill-on-close Job
+  before its first instruction. `%ProgramData%\Sembazuru` blocks inheritance, and the cluster
+  token is stored DPAPI-protected rather than in plaintext TOML.
 - **Fail-closed correctness.** Non-deterministic actions never resolve, prefetch, or record
   cache entries. Absent probes inside the build root (`__has_include` and friends) stay in
   the cache key, so a later-generated header misses instead of silently hitting. A VFS child
   process that cannot be injected fails the remote action into local fallback rather than
-  running un-virtualized against worker-local files.
+  running un-virtualized against worker-local files. These are correctness fixes to behaviour
+  v0.0.3 shipped with — another reason to prefer a source build until the next release.
 
 > **clang-cl is the byte-identity target.** Native MSVC `cl` works too (the
 > interception mechanism and cache), but its bytes are best-effort — it embeds
@@ -189,7 +196,7 @@ Milestones advance by a **"Done when"** condition, not by date. This is a spare-
 | **M9** | Productization & UX | A non-developer installs from a wizard and drives the resident GUI to distribute a build | 🔧 released (v0.0.3, unsigned) · clean-machine acceptance open |
 | **M11** | GUI cluster-join | A 2nd machine joins as a worker from the GUI alone — no TOML editing | 🔧 wizard built · privileged write open |
 | **M12** | Onboarding polish | Docs, tooltips, worker-count badge, unit picker, runtime prerequisites | ✅ |
-| **M15** | Live build monitor | Per-worker activity is visible live while a build runs | 🔧 timeline shipped · speed-up meter pending |
+| **M15** | Live build monitor | Per-worker activity is visible live while a build runs | 🔧 on `main`, post-v0.0.3 · speed-up meter pending |
 | **M10** | Real two-machine LAN | Byte-identical output across physically separate machines, no latency collapse, fallback on disconnect | ⬜ next ⭐ |
 
 M0–M8 each meet their "Done when" on the **single-machine** path, gated in CI
@@ -217,7 +224,10 @@ without a text editor, then proving the whole thing on real hardware over a real
   drives it when a cert is configured), not a blocker, so every install goes through a
   SmartScreen prompt. And the **clean-machine acceptance run** — install → both services on
   AutoStart → the GUI drives a distributed build → uninstall leaves no residue — has not been
-  recorded on any machine other than this project's development box.
+  recorded on any machine other than this project's development box. A consequence of both:
+  the newest MSI is now well behind `main`, so **the next tag is the one that matters** —
+  the privilege isolation and the cache-correctness fixes above reach installed users only
+  when it is cut.
 - **GUI cluster-join (M11) — wizard built, the privileged write is not.** The GUI's Join
   tab collects the coordinator address, cluster token, `listen_addr`/`advertise`, and
   participation mode, validates them, auto-fills `advertise` from the machine's LAN IPv4,
