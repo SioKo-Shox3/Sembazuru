@@ -1145,9 +1145,19 @@ enum SpawnFailure {
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum TestJobProfile {
+enum TestCreationProfile {
     Production,
-    DesktopRelaxed,
+    NoWindow,
+}
+
+#[cfg(test)]
+impl TestCreationProfile {
+    fn creation_flags(self, production: u32) -> u32 {
+        match self {
+            Self::Production => production,
+            Self::NoWindow => production | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        }
+    }
 }
 
 struct SuspendedGuardian(Option<OwnedHandle>);
@@ -1193,42 +1203,34 @@ impl RestrictedProcess {
             #[cfg(test)]
             None,
             #[cfg(test)]
-            TestJobProfile::Production,
+            TestCreationProfile::Production,
+            #[cfg(test)]
+            None,
             handles,
         )
     }
 
     #[cfg(test)]
-    fn spawn_without_desktop_limit_for_test(
+    fn spawn_for_session0_diagnostic(
         token: &ActionToken,
         command: &RestrictedCommand,
+        profile: TestCreationProfile,
+        creation_flags: &mut u32,
     ) -> io::Result<Self> {
-        Self::spawn_inner(token, command, None, TestJobProfile::DesktopRelaxed, &[])
+        *creation_flags = 0;
+        Self::spawn_inner(token, command, None, profile, Some(creation_flags), &[])
     }
 
     fn spawn_inner(
         token: &ActionToken,
         command: &RestrictedCommand,
         #[cfg(test)] failure: Option<SpawnFailure>,
-        #[cfg(test)] job_profile: TestJobProfile,
+        #[cfg(test)] creation_profile: TestCreationProfile,
+        #[cfg(test)] observed_creation_flags: Option<&mut u32>,
         inherited_handles: &[HANDLE],
     ) -> io::Result<Self> {
         let mut prepared = prepare_command(command)?;
-        let job = Arc::new({
-            #[cfg(test)]
-            {
-                match job_profile {
-                    TestJobProfile::Production => JobObject::new_kill_on_close()?,
-                    TestJobProfile::DesktopRelaxed => {
-                        JobObject::new_kill_on_close_without_desktop_limit_for_test()?
-                    }
-                }
-            }
-            #[cfg(not(test))]
-            {
-                JobObject::new_kill_on_close()?
-            }
-        });
+        let job = Arc::new(JobObject::new_kill_on_close()?);
         let (stdin, stdin_parent) = stdio_pipe(true)?;
         let (stdout, stdout_parent) = stdio_pipe(false)?;
         let (stderr, stderr_parent) = stdio_pipe(false)?;
@@ -1248,6 +1250,14 @@ impl RestrictedProcess {
         startup.StartupInfo.hStdError = inherited[2];
         startup.lpAttributeList = attributes.ptr();
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let creation_flags =
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        #[cfg(test)]
+        let creation_flags = creation_profile.creation_flags(creation_flags);
+        #[cfg(test)]
+        if let Some(observed) = observed_creation_flags {
+            *observed = creation_flags;
+        }
         // SAFETY: all UTF-16 buffers are NUL-terminated and live; command_line is mutable;
         // only the three inheritable stdio handles in the attribute list can cross the boundary.
         if unsafe {
@@ -1258,7 +1268,7 @@ impl RestrictedProcess {
                 null(),
                 null(),
                 1,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                creation_flags,
                 prepared.environment.as_ptr().cast(),
                 prepared.cwd.as_ptr(),
                 &startup.StartupInfo,
@@ -1514,9 +1524,9 @@ mod tests {
     const WINDOW_STATION_SCM_SMOKE_SERVICE: &str = "SembazuruWindowStationProbeSmoke";
     const WINDOW_STATION_SCM_SMOKE_SELECTOR: &str =
         "sandbox::tests::window_station_scm_dispatcher_smoke_role";
-    const WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL: u32 = 0x5342_5a31;
-    const WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT: u32 = 0x5342_5a32;
-    const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5a33;
+    const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL: u32 = 0x5342_5b31;
+    const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT: u32 = 0x5342_5b32;
+    const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5b33;
     const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
     const WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE: u32 = 0x5342_5afe;
 
@@ -1528,22 +1538,22 @@ mod tests {
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
-    const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4432;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 3;
+    const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 4;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
     enum Session0DiagnosticOutcome {
-        DesktopCausal = 1,
-        DesktopNotSufficient = 2,
+        NoWindowCausal = 1,
+        NoWindowNotSufficient = 2,
         Indeterminate = 3,
     }
 
     impl Session0DiagnosticOutcome {
         fn decode(value: u8) -> Result<Self, String> {
             match value {
-                1 => Ok(Self::DesktopCausal),
-                2 => Ok(Self::DesktopNotSufficient),
+                1 => Ok(Self::NoWindowCausal),
+                2 => Ok(Self::NoWindowNotSufficient),
                 3 => Ok(Self::Indeterminate),
                 _ => Err("diagnostic classification".into()),
             }
@@ -1551,8 +1561,8 @@ mod tests {
 
         fn service_magic(self) -> u32 {
             match self {
-                Self::DesktopCausal => WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
-                Self::DesktopNotSufficient => WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT,
+                Self::NoWindowCausal => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL,
+                Self::NoWindowNotSufficient => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT,
                 Self::Indeterminate => WINDOW_STATION_SCM_SMOKE_INDETERMINATE,
             }
         }
@@ -1561,18 +1571,18 @@ mod tests {
     fn classify_session0_diagnostic_ab(
         baseline_spawn_succeeded: bool,
         baseline_exit: Option<u32>,
-        desktop_relaxed_spawn_succeeded: bool,
-        desktop_relaxed_exit: Option<u32>,
+        no_window_spawn_succeeded: bool,
+        no_window_exit: Option<u32>,
     ) -> Session0DiagnosticOutcome {
         if !baseline_spawn_succeeded || baseline_exit != Some(0xc000_0142) {
             return Session0DiagnosticOutcome::Indeterminate;
         }
-        if !desktop_relaxed_spawn_succeeded {
+        if !no_window_spawn_succeeded {
             return Session0DiagnosticOutcome::Indeterminate;
         }
-        match desktop_relaxed_exit {
-            Some(0) => Session0DiagnosticOutcome::DesktopCausal,
-            Some(0xc000_0142) => Session0DiagnosticOutcome::DesktopNotSufficient,
+        match no_window_exit {
+            Some(0) => Session0DiagnosticOutcome::NoWindowCausal,
+            Some(0xc000_0142) => Session0DiagnosticOutcome::NoWindowNotSufficient,
             _ => Session0DiagnosticOutcome::Indeterminate,
         }
     }
@@ -1647,7 +1657,7 @@ mod tests {
     #[test]
     fn window_station_scm_contract_rejects_aliases_and_extra_arguments() {
         assert_ne!(
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL,
             WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE
         );
         let valid_process: Vec<OsString> = [
@@ -1729,53 +1739,338 @@ mod tests {
         }
     }
 
+    fn diagnostic_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn diagnostic_properties(record: &Session0DiagnosticRecord) -> String {
+        let mut fields = vec![
+            diagnostic_hex(record.nonce.as_bytes()),
+            record.markers.to_string(),
+            (record.classification as u8).to_string(),
+            record.session_id.to_string(),
+        ];
+        for text in [
+            &record.broker,
+            &record.action,
+            &record.station,
+            &record.desktop,
+            &record.station_dacl,
+            &record.desktop_dacl,
+            &record.station_access,
+            &record.desktop_access,
+            &record.cwd,
+            &record.environment_hash,
+        ] {
+            fields.push(diagnostic_hex(text.as_bytes()));
+        }
+        for run in [&record.baseline, &record.no_window] {
+            fields.extend([
+                run.job_ui_restrictions.to_string(),
+                run.creation_flags.to_string(),
+                if run.spawn_succeeded { "True" } else { "False" }.into(),
+                diagnostic_hex(run.spawn_error.as_bytes()),
+                run.child_exit
+                    .map_or_else(|| "none".into(), |value| value.to_string()),
+                diagnostic_hex(run.stdout.as_bytes()),
+                diagnostic_hex(run.stderr.as_bytes()),
+            ]);
+        }
+        fields.join("\t")
+    }
+
+    struct Session0DiagnosticCase {
+        name: &'static str,
+        bytes: Vec<u8>,
+        nonce: String,
+        expected: Option<Session0DiagnosticRecord>,
+    }
+
+    fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
+        let record = Session0DiagnosticRecord::fixture();
+        let bytes = record.encode().unwrap();
+        let mut cases = Vec::new();
+        let mut accept = |name, record: Session0DiagnosticRecord| {
+            cases.push(Session0DiagnosticCase {
+                name,
+                bytes: record.encode().unwrap(),
+                nonce: record.nonce.clone(),
+                expected: Some(record),
+            });
+        };
+        accept("v4", record.clone());
+        let mut not_sufficient = record.clone();
+        not_sufficient.no_window.child_exit = Some(0xc000_0142);
+        not_sufficient.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
+        accept("no-window-not-sufficient", not_sufficient);
+        let mut partial = record.clone();
+        partial.markers = Session0DiagnosticRecord::ENTRY;
+        partial.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("partial", partial);
+        let mut outside_session0 = record.clone();
+        outside_session0.session_id = 1;
+        outside_session0.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("nonzero-session", outside_session0);
+        let mut failed = record.clone();
+        failed.no_window = Session0DiagnosticRun::empty();
+        failed.no_window.spawn_error = "unobserved".into();
+        failed.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("spawn-failed-unobserved", failed);
+        let mut bounded = record.clone();
+        bounded.broker = "b".repeat(32768);
+        let remaining =
+            Session0DiagnosticRecord::MAX_BYTES - (bounded.encode().unwrap().len() - 44);
+        bounded.action.push_str(&"a".repeat(remaining));
+        accept("payload-65536", bounded);
+
+        let mut reject = |name, bytes| {
+            cases.push(Session0DiagnosticCase {
+                name,
+                bytes,
+                nonce: record.nonce.clone(),
+                expected: None,
+            });
+        };
+        let u32_patch = |offset: usize, value: u32| {
+            let mut changed = bytes.clone();
+            changed[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            changed
+        };
+        reject("old-magic", u32_patch(0, 0x5342_4432));
+        reject("old-version", u32_patch(4, 3));
+        let mut nonce = bytes.clone();
+        nonce[8] = b'1';
+        reject("nonce-mismatch", nonce);
+        let mut nonhex = bytes.clone();
+        nonhex[8] = b'g';
+        reject("nonce-nonhex", nonhex);
+        let mut truncated = bytes[..bytes.len() - 1].to_vec();
+        let truncated_length = (truncated.len() - 44) as u32;
+        truncated[40..44].copy_from_slice(&truncated_length.to_le_bytes());
+        reject("truncated", truncated);
+        reject("payload-length", u32_patch(40, (bytes.len() - 43) as u32));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let trailing_length = (trailing.len() - 44) as u32;
+        trailing[40..44].copy_from_slice(&trailing_length.to_le_bytes());
+        reject("trailing", trailing);
+        let mut invalid_utf8 = bytes.clone();
+        invalid_utf8[54] = 0xff;
+        reject("invalid-utf8", invalid_utf8);
+        let mut baseline_offset = 50;
+        for _ in 0..10 {
+            let length = u32::from_le_bytes(
+                bytes[baseline_offset..baseline_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            baseline_offset += 4 + length as usize;
+        }
+        let mut invalid_bool = bytes.clone();
+        invalid_bool[baseline_offset + 8] = 2;
+        reject("invalid-bool", invalid_bool);
+        let mut unknown_marker = bytes.clone();
+        unknown_marker[44] |= 8;
+        reject("unknown-marker", unknown_marker);
+        let mut missing_entry = bytes.clone();
+        missing_entry[44] &= !Session0DiagnosticRecord::ENTRY;
+        reject("missing-entry", missing_entry);
+        let mut unknown_classification = bytes.clone();
+        unknown_classification[45] = 4;
+        reject("unknown-classification", unknown_classification);
+        let mut false_classification = bytes.clone();
+        false_classification[45] = 2;
+        reject("false-classification", false_classification);
+        let mut partial_causal = bytes.clone();
+        partial_causal[44] = Session0DiagnosticRecord::ENTRY;
+        reject("partial-causal", partial_causal);
+        reject("nonzero-session-causal", u32_patch(46, 1));
+        reject(
+            "extra-creation-bit",
+            u32_patch(baseline_offset + 4, 0x0008_0405),
+        );
+        reject("relaxed-job-ui", u32_patch(baseline_offset, 0xbe));
+        let mut invalid_hash = bytes.clone();
+        invalid_hash[baseline_offset - 64] = b'g';
+        reject("environment-hash-nonhex", invalid_hash);
+        cases
+            .iter_mut()
+            .find(|case| case.name == "nonce-nonhex")
+            .unwrap()
+            .nonce = "g123456789abcdef0123456789abcdef".into();
+        let mut oversized = cases
+            .iter()
+            .find(|case| case.name == "payload-65536")
+            .unwrap()
+            .bytes
+            .clone();
+        let action_offset = 54 + 32768;
+        let action_length = u32::from_le_bytes(
+            oversized[action_offset..action_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        oversized.insert(action_offset + 4, b'a');
+        oversized[action_offset..action_offset + 4]
+            .copy_from_slice(&(action_length + 1).to_le_bytes());
+        oversized[40..44].copy_from_slice(&65537u32.to_le_bytes());
+        cases.push(Session0DiagnosticCase {
+            name: "payload-65537",
+            bytes: oversized,
+            nonce: record.nonce.clone(),
+            expected: None,
+        });
+        cases
+    }
+
     #[test]
     fn session0_diagnostic_record_codec_rejects_tampering() {
-        let record = Session0DiagnosticRecord::fixture();
-        let bytes = record.encode().expect("diagnostic record encode");
-        assert_eq!(
-            Session0DiagnosticRecord::decode(&bytes, &record.nonce).expect("diagnostic decode"),
-            record
-        );
-        for malformed in [
-            Vec::new(),
-            bytes[..bytes.len() - 1].to_vec(),
-            {
-                let mut value = bytes.clone();
-                value[0] ^= 1;
-                value
-            },
-            {
-                let mut value = bytes.clone();
-                value.extend_from_slice(&[0]);
-                value
-            },
-        ] {
-            assert!(Session0DiagnosticRecord::decode(&malformed, &record.nonce).is_err());
+        for case in session0_diagnostic_corpus() {
+            let decoded = Session0DiagnosticRecord::decode(&case.bytes, &case.nonce);
+            match case.expected {
+                Some(expected) => assert_eq!(decoded.unwrap(), expected, "{}", case.name),
+                None => assert!(decoded.is_err(), "accepted {}", case.name),
+            }
         }
-        assert!(Session0DiagnosticRecord::decode(&bytes, "0").is_err());
-        let mut inconsistent = record;
-        inconsistent.classification = Session0DiagnosticOutcome::DesktopNotSufficient;
+        let mut inconsistent = Session0DiagnosticRecord::fixture();
+        inconsistent.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
         assert!(inconsistent.encode().is_err());
+    }
+
+    #[test]
+    fn session0_diagnostic_creation_flags_differ_only_by_no_window() {
+        let production =
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        let baseline = TestCreationProfile::Production.creation_flags(production);
+        let no_window = TestCreationProfile::NoWindow.creation_flags(production);
+        assert_eq!(baseline, 0x0008_0404);
+        assert_eq!(no_window, 0x0808_0404);
+        assert_eq!(
+            baseline ^ no_window,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+        );
+    }
+
+    #[test]
+    fn session0_diagnostic_record_matches_powershell_contract() {
+        use std::process::{Command, Stdio};
+
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromHexString([Console]::In.ReadLine()))
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Probe PowerShell syntax error.' }
+foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+    $definitions = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+    }, $true))
+    if ($definitions.Count -ne 1) { throw "Expected one parser function: $name" }
+    . ([ScriptBlock]::Create($definitions[0].Extent.Text))
+}
+$count = 0
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $parts = $line.Split("`t", 5)
+    $bytes = [Convert]::FromHexString($parts[2])
+    $record = $null
+    $rejected = $false
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] }
+    catch { $rejected = $true }
+    if ($parts[3] -ceq 'reject') {
+        if (-not $rejected) { throw "Accepted malformed case $($parts[0])" }
+    } else {
+        if ($rejected -or $null -eq $record) { throw "Rejected valid case $($parts[0])" }
+        if (@($record.PSObject.Properties).Count -ne 16) { throw 'Record property count mismatch.' }
+        $values = [Collections.Generic.List[string]]::new()
+        $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
+        foreach ($property in @('Markers', 'Classification', 'SessionId')) { $values.Add([string]$record.$property) }
+        foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'DesktopDacl', 'StationAccess', 'DesktopAccess', 'Cwd', 'EnvironmentHash')) {
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
+        }
+        foreach ($run in @($record.Baseline, $record.NoWindow)) {
+            if (@($run.PSObject.Properties).Count -ne 7) { throw 'Run property count mismatch.' }
+            foreach ($property in @('JobUi', 'CreationFlags', 'SpawnSucceeded')) { $values.Add([string]$run.$property) }
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.SpawnError)).ToLowerInvariant())
+            $values.Add($(if ($null -eq $run.ChildExit) { 'none' } else { [string]$run.ChildExit }))
+            foreach ($property in @('Stdout', 'Stderr')) {
+                $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.$property)).ToLowerInvariant())
+            }
+        }
+        if (($values -join "`t") -cne $parts[4]) { throw "Property mismatch: $($parts[0])" }
+    }
+    $count++
+}
+[Console]::WriteLine("PASS $count")
+"#;
+        let cases = session0_diagnostic_corpus();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hooks/test/m6_worker_window_station_probe.ps1");
+        let mut input = format!("{}\n", diagnostic_hex(path.to_str().unwrap().as_bytes()));
+        for case in &cases {
+            let expected = case.expected.as_ref().map(diagnostic_properties);
+            input.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                case.name,
+                case.nonce,
+                diagnostic_hex(&case.bytes),
+                if expected.is_some() {
+                    "accept"
+                } else {
+                    "reject"
+                },
+                expected.unwrap_or_default(),
+            ));
+        }
+        let mut child = Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pwsh is required for the record contract");
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child
+            .wait_with_output()
+            .expect("PowerShell contract process wait");
+        let written = writer.join().expect("PowerShell input writer");
+        assert!(
+            output.status.success(),
+            "PowerShell contract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        written.expect("PowerShell corpus input");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("PASS {}", cases.len())
+        );
     }
 
     #[test]
     fn session0_diagnostic_maps_only_the_ab_outcomes_to_service_magics() {
         assert_eq!(
-            Session0DiagnosticOutcome::DesktopCausal.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL
+            Session0DiagnosticOutcome::NoWindowCausal.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL
         );
         assert_eq!(
-            Session0DiagnosticOutcome::DesktopNotSufficient.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT
+            Session0DiagnosticOutcome::NoWindowNotSufficient.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT
         );
         assert_eq!(
             Session0DiagnosticOutcome::Indeterminate.service_magic(),
             WINDOW_STATION_SCM_SMOKE_INDETERMINATE
         );
         for outcome in [
-            Session0DiagnosticOutcome::DesktopCausal,
-            Session0DiagnosticOutcome::DesktopNotSufficient,
+            Session0DiagnosticOutcome::NoWindowCausal,
+            Session0DiagnosticOutcome::NoWindowNotSufficient,
             Session0DiagnosticOutcome::Indeterminate,
         ] {
             assert_eq!(
@@ -1790,11 +2085,11 @@ mod tests {
     fn session0_diagnostic_ab_classifier_requires_the_baseline_signature() {
         assert_eq!(
             classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0)),
-            Session0DiagnosticOutcome::DesktopCausal
+            Session0DiagnosticOutcome::NoWindowCausal
         );
         assert_eq!(
             classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0xc000_0142)),
-            Session0DiagnosticOutcome::DesktopNotSufficient
+            Session0DiagnosticOutcome::NoWindowNotSufficient
         );
         for variant in [None, Some(1), Some(0xc000_0142)] {
             assert_eq!(
@@ -1833,9 +2128,10 @@ mod tests {
             "OpenAclMutation(string path, bool directory)",
             "0x001301bf",
             "0x000000fe",
-            "0x000000be",
-            "DESKTOP_CAUSAL",
-            "DESKTOP_NOT_SUFFICIENT",
+            "0x00080404",
+            "0x08080404",
+            "NO_WINDOW_CAUSAL",
+            "NO_WINDOW_NOT_SUFFICIENT",
             "held throwaway process reap timed out",
             "cleanup forced termination did not stop the throwaway service",
         ] {
@@ -1846,9 +2142,10 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct Session0DiagnosticRun {
         job_ui_restrictions: u32,
+        creation_flags: u32,
         spawn_succeeded: bool,
         spawn_error: String,
         child_exit: Option<u32>,
@@ -1860,6 +2157,7 @@ mod tests {
         fn empty() -> Self {
             Self {
                 job_ui_restrictions: 0,
+                creation_flags: 0,
                 spawn_succeeded: false,
                 spawn_error: String::new(),
                 child_exit: None,
@@ -1870,6 +2168,7 @@ mod tests {
 
         fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
             payload.u32(self.job_ui_restrictions);
+            payload.u32(self.creation_flags);
             payload.bool(self.spawn_succeeded);
             write_text(payload, &self.spawn_error)?;
             payload.bool(self.child_exit.is_some());
@@ -1882,6 +2181,7 @@ mod tests {
 
         fn decode_from(reader: &mut Reader<'_>) -> Result<Self, String> {
             let job_ui_restrictions = reader.u32().map_err(|_| "diagnostic run UI")?;
+            let creation_flags = reader.u32().map_err(|_| "diagnostic creation flags")?;
             let spawn_succeeded = read_strict_bool(reader)?;
             let spawn_error = read_text(reader)?;
             let child_exit = if read_strict_bool(reader)? {
@@ -1891,6 +2191,7 @@ mod tests {
             };
             Ok(Self {
                 job_ui_restrictions,
+                creation_flags,
                 spawn_succeeded,
                 spawn_error,
                 child_exit,
@@ -1900,7 +2201,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct Session0DiagnosticRecord {
         nonce: String,
         markers: u8,
@@ -1917,7 +2218,7 @@ mod tests {
         cwd: String,
         environment_hash: String,
         baseline: Session0DiagnosticRun,
-        desktop_relaxed: Session0DiagnosticRun,
+        no_window: Session0DiagnosticRun,
     }
 
     impl Session0DiagnosticRecord {
@@ -1930,7 +2231,7 @@ mod tests {
             Self {
                 nonce: "0123456789abcdef0123456789abcdef".into(),
                 markers: Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED,
-                classification: Session0DiagnosticOutcome::DesktopCausal,
+                classification: Session0DiagnosticOutcome::NoWindowCausal,
                 session_id: 0,
                 broker: "user=S-1-5-80-1;integrity=8192;groups=[];privileges=[]".into(),
                 action: "user=S-1-5-80-1;integrity=8192;restricted=[];groups=[];privileges=[]"
@@ -1941,25 +2242,47 @@ mod tests {
                 desktop_dacl: "unavailable:gle=5".into(),
                 station_access: "mask=0x0000006e;allowed=false;gle=5".into(),
                 desktop_access: "mask=0x000000cf;allowed=false;gle=5".into(),
-                cwd: "C:\\Sembazuru".into(),
+                cwd: "C:\\Sembazuru\\診断".into(),
                 environment_hash: "0".repeat(64),
                 baseline: Session0DiagnosticRun {
                     job_ui_restrictions: 0x0000_00fe,
+                    creation_flags: 0x0008_0404,
                     spawn_succeeded: true,
-                    spawn_error: String::new(),
+                    spawn_error: "baseline-error-測定".into(),
                     child_exit: Some(0xc000_0142),
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: "baseline-stdout-診断".into(),
+                    stderr: "baseline-stderr".into(),
                 },
-                desktop_relaxed: Session0DiagnosticRun {
-                    job_ui_restrictions: 0x0000_00be,
+                no_window: Session0DiagnosticRun {
+                    job_ui_restrictions: 0x0000_00fe,
+                    creation_flags: 0x0808_0404,
                     spawn_succeeded: true,
-                    spawn_error: String::new(),
+                    spawn_error: "no-window-error".into(),
                     child_exit: Some(0),
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: "no-window-stdout".into(),
+                    stderr: "no-window-stderr-観測".into(),
                 },
             }
+        }
+
+        fn expected_classification(&self) -> Session0DiagnosticOutcome {
+            if self.markers != Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED
+                || self.session_id != 0
+                || !self.baseline.spawn_succeeded
+                || !self.no_window.spawn_succeeded
+                || self.baseline.job_ui_restrictions != 0xfe
+                || self.no_window.job_ui_restrictions != 0xfe
+                || self.baseline.creation_flags != 0x0008_0404
+                || self.no_window.creation_flags != 0x0808_0404
+            {
+                return Session0DiagnosticOutcome::Indeterminate;
+            }
+            classify_session0_diagnostic_ab(
+                self.baseline.spawn_succeeded,
+                self.baseline.child_exit,
+                self.no_window.spawn_succeeded,
+                self.no_window.child_exit,
+            )
         }
 
         fn encode(&self) -> Result<Vec<u8>, String> {
@@ -1975,15 +2298,17 @@ mod tests {
             {
                 return Err("environment hash".into());
             }
-            if self.markers & Self::SPAWN_RETURNED != 0
-                && self.classification
-                    != classify_session0_diagnostic_ab(
-                        self.baseline.spawn_succeeded,
-                        self.baseline.child_exit,
-                        self.desktop_relaxed.spawn_succeeded,
-                        self.desktop_relaxed.child_exit,
-                    )
-            {
+            for (run, expected_flags) in [
+                (&self.baseline, 0x0008_0404),
+                (&self.no_window, 0x0808_0404),
+            ] {
+                if run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe || run.creation_flags != expected_flags)
+                {
+                    return Err("diagnostic A/B flags or Job UI".into());
+                }
+            }
+            if self.classification != self.expected_classification() {
                 return Err("diagnostic A/B classification".into());
             }
             let mut payload = Writer::new();
@@ -2005,12 +2330,12 @@ mod tests {
                 write_text(&mut payload, value)?;
             }
             self.baseline.encode_into(&mut payload)?;
-            self.desktop_relaxed.encode_into(&mut payload)?;
+            self.no_window.encode_into(&mut payload)?;
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
-            let mut bytes = Vec::with_capacity(48 + payload.len());
+            let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_VERSION.to_le_bytes());
             bytes.extend_from_slice(self.nonce.as_bytes());
@@ -2051,7 +2376,7 @@ mod tests {
                 fields.push(read_text(&mut reader)?);
             }
             let baseline = Session0DiagnosticRun::decode_from(&mut reader)?;
-            let desktop_relaxed = Session0DiagnosticRun::decode_from(&mut reader)?;
+            let no_window = Session0DiagnosticRun::decode_from(&mut reader)?;
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -2069,7 +2394,7 @@ mod tests {
                 cwd: fields.remove(0),
                 environment_hash: fields.remove(0),
                 baseline,
-                desktop_relaxed,
+                no_window,
             };
             record.encode().map(|_| record)
         }
@@ -2154,7 +2479,7 @@ mod tests {
             ServiceExitCode::Win32(0),
             std::time::Duration::from_secs(10),
         )?;
-        if exit_code == WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL {
+        if exit_code == WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL {
             set(
                 ServiceState::Running,
                 ServiceExitCode::Win32(0),
@@ -2423,14 +2748,15 @@ mod tests {
     fn run_session0_diagnostic_child(
         action: &ActionToken,
         command: &RestrictedCommand,
-        desktop_relaxed: bool,
+        profile: TestCreationProfile,
     ) -> Result<Session0DiagnosticRun, String> {
         let mut record = Session0DiagnosticRun::empty();
-        let process = if desktop_relaxed {
-            RestrictedProcess::spawn_without_desktop_limit_for_test(action, command)
-        } else {
-            RestrictedProcess::spawn(action, command)
-        };
+        let process = RestrictedProcess::spawn_for_session0_diagnostic(
+            action,
+            command,
+            profile,
+            &mut record.creation_flags,
+        );
         let mut process = match process {
             Ok(process) => process,
             Err(error) => {
@@ -2443,11 +2769,7 @@ mod tests {
             .job()
             .ui_restrictions_for_test()
             .map_err(|error| format!("job UI query: {error}"))?;
-        let expected_ui = if desktop_relaxed {
-            0x0000_00be
-        } else {
-            0x0000_00fe
-        };
+        let expected_ui = 0x0000_00fe;
         if record.job_ui_restrictions != expected_ui {
             drop(process);
             return Err(format!(
@@ -2531,7 +2853,7 @@ mod tests {
             cwd: config.fixture_root.display().to_string(),
             environment_hash: "0".repeat(64),
             baseline: Session0DiagnosticRun::empty(),
-            desktop_relaxed: Session0DiagnosticRun::empty(),
+            no_window: Session0DiagnosticRun::empty(),
         };
         let action = match ActionToken::create() {
             Ok(token) => token,
@@ -2578,38 +2900,36 @@ mod tests {
         record.environment_hash = environment_hash;
         record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
         // Both runs share the production command, CWD, BASELINE_ENV, TEMP/TMP, and action token.
-        // The test-only Job constructor is the sole variable in the A/B comparison.
-        record.baseline = match run_session0_diagnostic_child(&action, &command, false) {
-            Ok(run) => run,
-            Err(error) => {
-                record.baseline.spawn_error = error;
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    Some(Session0DiagnosticFailureStage::Runtime),
-                );
-            }
-        };
-        record.desktop_relaxed = match run_session0_diagnostic_child(&action, &command, true) {
-            Ok(run) => run,
-            Err(error) => {
-                record.desktop_relaxed.spawn_error = error;
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    Some(Session0DiagnosticFailureStage::Runtime),
-                );
-            }
-        };
+        // CREATE_NO_WINDOW is the sole variable; both runs use the production Job limits.
+        record.baseline =
+            match run_session0_diagnostic_child(&action, &command, TestCreationProfile::Production)
+            {
+                Ok(run) => run,
+                Err(error) => {
+                    record.baseline.spawn_error = error;
+                    return publish_session0_diagnostic(
+                        &record,
+                        config,
+                        Some((scratch.path(), &action)),
+                        Some(Session0DiagnosticFailureStage::Runtime),
+                    );
+                }
+            };
+        record.no_window =
+            match run_session0_diagnostic_child(&action, &command, TestCreationProfile::NoWindow) {
+                Ok(run) => run,
+                Err(error) => {
+                    record.no_window.spawn_error = error;
+                    return publish_session0_diagnostic(
+                        &record,
+                        config,
+                        Some((scratch.path(), &action)),
+                        Some(Session0DiagnosticFailureStage::Runtime),
+                    );
+                }
+            };
         record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
-        record.classification = classify_session0_diagnostic_ab(
-            record.baseline.spawn_succeeded,
-            record.baseline.child_exit,
-            record.desktop_relaxed.spawn_succeeded,
-            record.desktop_relaxed.child_exit,
-        );
+        record.classification = record.expected_classification();
         publish_session0_diagnostic(&record, config, Some((scratch.path(), &action)), None)
     }
 
@@ -5977,7 +6297,8 @@ mod tests {
                     &token,
                     &command,
                     Some(failure),
-                    TestJobProfile::Production,
+                    TestCreationProfile::Production,
+                    None,
                     &[]
                 )
                 .is_err()

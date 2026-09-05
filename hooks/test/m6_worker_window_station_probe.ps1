@@ -17,11 +17,9 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # SECURITY CONTRACT: this file is a runner payload, never an elevated `-File` target. The
-# outer bootstrap (constructed by the orchestrator at execution time, not stored in this repo)
-# must open these runner bytes once with FileShare.Read, verify their final local path and
-# expected SHA-256, then invoke exactly those bytes via ScriptBlock::Create. It must elevate a
-# protected absolute pwsh.exe with -NoProfile -NonInteractive and ProcessStartInfo.ArgumentList,
-# UseShellExecute=true, Verb=runas. A ScriptBlock invocation has no PSCommandPath.
+# outer bootstrap must run in an already-elevated PowerShell, open these runner bytes once
+# with FileShare.Read, verify their final local path and expected SHA-256, then invoke exactly
+# those bytes via ScriptBlock::Create. A ScriptBlock invocation has no PSCommandPath.
 # Do not add cmdlets outside the $PSHOME startup set; native P/Invoke is required for SCM reads.
 if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
     throw 'Elevated direct -File execution is forbidden; use the verified in-memory bootstrap.'
@@ -40,9 +38,9 @@ $serviceName = 'SembazuruWindowStationProbeSmoke'
 $workerServiceName = 'SembazuruWorker'
 $fixtureBasename = 'SbzWindowStationScmSmoke.exe'
 $selector = 'sandbox::tests::window_station_scm_dispatcher_smoke_role'
-$desktopCausalMagic = [uint32]0x53425a31
-$desktopNotSufficientMagic = [uint32]0x53425a32
-$indeterminateMagic = [uint32]0x53425a33
+$noWindowCausalMagic = [uint32]0x53425b31
+$noWindowNotSufficientMagic = [uint32]0x53425b32
+$indeterminateMagic = [uint32]0x53425b33
 $contractFailureMagic = [uint32]0x53425aff
 $diagnosticFailureMagic = [uint32]0x53425afe
 $brokerTokenFailureMagic = [uint32]0x53425af0
@@ -991,13 +989,14 @@ function Read-Session0Text([byte[]]$Bytes, [ref]$Offset) {
     if ($length -gt 32768 -or $Offset.Value -gt $Bytes.Length - [int]$length) {
         throw 'Session 0 diagnostic text is invalid or exceeds its bound.'
     }
-    $value = [Text.Encoding]::UTF8.GetString($Bytes, $Offset.Value, [int]$length)
+    $value = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes, $Offset.Value, [int]$length)
     $Offset.Value += [int]$length
     return $value
 }
 
 function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
     $jobUi = Read-Session0U32 $Bytes $Offset
+    $creationFlags = Read-Session0U32 $Bytes $Offset
     if ($Offset.Value -ge $Bytes.Length -or ($Bytes[$Offset.Value] -ne 0 -and $Bytes[$Offset.Value] -ne 1)) {
         throw 'Session 0 diagnostic run spawn-success flag is invalid.'
     }
@@ -1012,20 +1011,21 @@ function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
     $childExit = $null
     if ($hasExit) { $childExit = Read-Session0U32 $Bytes $Offset }
     return [PSCustomObject]@{
-        JobUi = $jobUi; SpawnSucceeded = $spawnSucceeded; SpawnError = $spawnError
+        JobUi = $jobUi; CreationFlags = $creationFlags; SpawnSucceeded = $spawnSucceeded; SpawnError = $spawnError
         ChildExit = $childExit; Stdout = Read-Session0Text $Bytes $Offset
         Stderr = Read-Session0Text $Bytes $Offset
     }
 }
 
 function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
-    if ($Bytes.Length -lt 46 -or $Bytes.Length -gt 65580) {
+    if ($Bytes.Length -lt 44 -or $Bytes.Length -gt 65580) {
         throw 'Session 0 diagnostic record length is outside its bounded contract.'
     }
-    if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424432 -or
-        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]3) {
+    if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
+        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]4) {
         throw 'Session 0 diagnostic record magic/version mismatch.'
     }
+    if ($Nonce -cnotmatch '\A[0-9a-fA-F]{32}\z') { throw 'Session 0 diagnostic nonce is malformed.' }
     $nonceBytes = [Text.Encoding]::ASCII.GetBytes($Nonce)
     if ($nonceBytes.Length -ne 32) { throw 'Session 0 diagnostic nonce is malformed.' }
     for ($index = 0; $index -lt 32; $index++) {
@@ -1048,12 +1048,45 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     $fields = [Collections.Generic.List[string]]::new()
     for ($index = 0; $index -lt 10; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
     $baseline = Read-Session0DiagnosticRun $Bytes $offset
-    $desktopRelaxed = Read-Session0DiagnosticRun $Bytes $offset
+    $noWindow = Read-Session0DiagnosticRun $Bytes $offset
     if ($offset.Value -ne $Bytes.Length) { throw 'Session 0 diagnostic record has trailing bytes.' }
+    if (($markers -band 0xf8) -ne 0 -or ($markers -band 1) -eq 0) {
+        throw 'Session 0 diagnostic markers are invalid.'
+    }
+    if ($classification -lt 1 -or $classification -gt 3) {
+        throw 'Session 0 diagnostic classification is invalid.'
+    }
+    if ($fields[9] -cnotmatch '\A[0-9a-fA-F]{64}\z') {
+        throw 'Session 0 diagnostic environment hash is invalid.'
+    }
+    if (($baseline.SpawnSucceeded -and ($baseline.JobUi -ne [uint32]0x000000fe -or
+            $baseline.CreationFlags -ne [uint32]0x00080404)) -or
+        ($noWindow.SpawnSucceeded -and ($noWindow.JobUi -ne [uint32]0x000000fe -or
+            $noWindow.CreationFlags -ne [uint32]0x08080404))) {
+        throw 'Session 0 A/B creation flags or Job UI contract failed.'
+    }
+    $expectedClassification = 3
+    if ($markers -eq 7 -and $sessionId -eq 0 -and
+        $baseline.SpawnSucceeded -and $noWindow.SpawnSucceeded -and
+        $baseline.JobUi -eq [uint32]0x000000fe -and $noWindow.JobUi -eq [uint32]0x000000fe -and
+        $baseline.CreationFlags -eq [uint32]0x00080404 -and
+        $noWindow.CreationFlags -eq [uint32]0x08080404 -and
+        $baseline.ChildExit -eq [uint32]3221225794) { # 0xc0000142
+        if ($null -ne $noWindow.ChildExit -and $noWindow.ChildExit -eq [uint32]0) {
+            $expectedClassification = 1
+        } elseif ($noWindow.ChildExit -eq [uint32]3221225794) { # 0xc0000142
+            $expectedClassification = 2
+        }
+    }
+    if ($classification -ne $expectedClassification) {
+        throw 'Session 0 A/B classification disagrees with its bounded run records.'
+    }
     return [PSCustomObject]@{
-        Markers = $markers; Classification = $classification; SessionId = $sessionId
-        Station = $fields[2]; Desktop = $fields[3]; StationAccess = $fields[6]
-        DesktopAccess = $fields[7]; Baseline = $baseline; DesktopRelaxed = $desktopRelaxed
+        Nonce = $Nonce; Markers = $markers; Classification = $classification; SessionId = $sessionId
+        Broker = $fields[0]; Action = $fields[1]; Station = $fields[2]; Desktop = $fields[3]
+        StationDacl = $fields[4]; DesktopDacl = $fields[5]; StationAccess = $fields[6]
+        DesktopAccess = $fields[7]; Cwd = $fields[8]; EnvironmentHash = $fields[9]
+        Baseline = $baseline; NoWindow = $noWindow
     }
 }
 
@@ -1251,8 +1284,8 @@ try {
         Start-Sleep -Milliseconds 100
     } while ($true)
     if ($status.Win32ExitCode -ne $errorServiceSpecific -or
-        ($status.ServiceSpecificExitCode -ne $desktopCausalMagic -and
-         $status.ServiceSpecificExitCode -ne $desktopNotSufficientMagic -and
+        ($status.ServiceSpecificExitCode -ne $noWindowCausalMagic -and
+         $status.ServiceSpecificExitCode -ne $noWindowNotSufficientMagic -and
          $status.ServiceSpecificExitCode -ne $indeterminateMagic -and
          $status.ServiceSpecificExitCode -ne $brokerTokenFailureMagic -and
          $status.ServiceSpecificExitCode -ne $publishFailureMagic -and
@@ -1289,8 +1322,8 @@ try {
     $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
         $diagnosticNonce
     $classificationMap = @{
-        1 = @{ Name = 'DESKTOP_CAUSAL'; Magic = $desktopCausalMagic }
-        2 = @{ Name = 'DESKTOP_NOT_SUFFICIENT'; Magic = $desktopNotSufficientMagic }
+        1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
+        2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
         3 = @{ Name = 'INDETERMINATE'; Magic = $indeterminateMagic }
     }
     if (-not $classificationMap.ContainsKey([int]$record.Classification)) {
@@ -1300,44 +1333,27 @@ try {
     if ($status.ServiceSpecificExitCode -ne $classification.Magic) {
         throw 'SCM diagnostic outcome magic disagrees with the bounded record.'
     }
-    if (($record.Markers -band [byte]0x07) -ne [byte]0x07) {
-        throw 'Session 0 diagnostic markers do not prove entry/pre-spawn/spawn-returned.'
-    }
-    if ($record.Baseline.JobUi -ne [uint32]0x000000fe -or
-        $record.DesktopRelaxed.JobUi -ne [uint32]0x000000be -or
-        (($record.Baseline.JobUi -bxor $record.DesktopRelaxed.JobUi) -ne [uint32]0x00000040)) {
-        throw ('Session 0 A/B Job UI contract failed: baseline=0x{0:x8} variant=0x{1:x8}' -f
-            $record.Baseline.JobUi, $record.DesktopRelaxed.JobUi)
-    }
-    $expectedClassification = 3
-    if ($record.Baseline.SpawnSucceeded -and $record.Baseline.ChildExit -eq [uint32]3221225794 -and # 0xc0000142
-        $record.DesktopRelaxed.SpawnSucceeded) {
-        if ($record.DesktopRelaxed.ChildExit -eq [uint32]0) { $expectedClassification = 1 }
-        elseif ($record.DesktopRelaxed.ChildExit -eq [uint32]3221225794) { $expectedClassification = 2 } # 0xc0000142
-    }
-    if ($record.Classification -ne $expectedClassification) {
-        throw 'Session 0 A/B classification disagrees with its bounded run records.'
-    }
     $diagnosticClassification = $classification.Name
-    $baselineExitText = if ($null -eq $record.Baseline.ChildExit) {
-        'none'
-    } else { '0x{0:x8}' -f $record.Baseline.ChildExit }
-    $variantExitText = if ($null -eq $record.DesktopRelaxed.ChildExit) {
-        'none'
-    } else { '0x{0:x8}' -f $record.DesktopRelaxed.ChildExit }
-    $diagnosticDetail = ('path=plain-production service=0x{0:x8} session={1} station={2} desktop={3} ' +
-        'stationAccess={4} desktopAccess={5} baselineJobUi=0x{6:x8} baselineSpawnSucceeded={7} ' +
-        'baselineSpawnError={8} baselineChildExit={9} baselineStdout={10} baselineStderr={11} ' +
-        'variantJobUi=0x{12:x8} variantSpawnSucceeded={13} variantSpawnError={14} ' +
-        'variantChildExit={15} variantStdout={16} variantStderr={17}') -f $status.ServiceSpecificExitCode,
-        $record.SessionId, $record.Station, $record.Desktop, $record.StationAccess,
-        $record.DesktopAccess, $record.Baseline.JobUi, $record.Baseline.SpawnSucceeded,
-        $record.Baseline.SpawnError, $baselineExitText,
-        (Format-BoundedDiagnosticText $record.Baseline.Stdout),
-        (Format-BoundedDiagnosticText $record.Baseline.Stderr), $record.DesktopRelaxed.JobUi,
-        $record.DesktopRelaxed.SpawnSucceeded, $record.DesktopRelaxed.SpawnError, $variantExitText,
-        (Format-BoundedDiagnosticText $record.DesktopRelaxed.Stdout),
-        (Format-BoundedDiagnosticText $record.DesktopRelaxed.Stderr)
+    $detail = [Collections.Generic.List[string]]::new()
+    $detail.Add(('service=0x{0:x8} session={1} markers=0x{2:x2}' -f
+        $status.ServiceSpecificExitCode, $record.SessionId, $record.Markers))
+    foreach ($property in @(
+        'Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'DesktopDacl',
+        'StationAccess', 'DesktopAccess', 'Cwd', 'EnvironmentHash'
+    )) {
+        $detail.Add(('{0}={1}' -f $property, (Format-BoundedDiagnosticText $record.$property)))
+    }
+    foreach ($name in @('Baseline', 'NoWindow')) {
+        $run = $record.$name
+        $exitText = if ($null -eq $run.ChildExit) { 'none' } else { '0x{0:x8}' -f $run.ChildExit }
+        $detail.Add(('{0}JobUi=0x{1:x8} {0}CreationFlags=0x{2:x8} {0}SpawnSucceeded={3} {0}ChildExit={4}' -f
+            $name, $run.JobUi, $run.CreationFlags, $run.SpawnSucceeded, $exitText))
+        foreach ($property in @('SpawnError', 'Stdout', 'Stderr')) {
+            $detail.Add(('{0}{1}={2}' -f $name, $property, (Format-BoundedDiagnosticText $run.$property)))
+        }
+    }
+    $diagnosticDetail = $detail -join ' '
+
 }
 catch { $primaryError = $_.Exception }
 finally {
@@ -1521,16 +1537,16 @@ if ($null -ne $primaryError -or $cleanupErrors.Count -ne 0) {
 
 if ($diagnosticClassification -eq 'INDETERMINATE') {
     [Console]::Error.WriteLine(
-        "INDETERMINATE: $diagnosticDetail; no cause is attributed; run the planned single-variable A/B."
+        "INDETERMINATE: $diagnosticDetail; the measurement did not determine whether CREATE_NO_WINDOW is causal."
     )
     exit 1
 }
-if ($diagnosticClassification -eq 'DESKTOP_CAUSAL') {
-    Write-Host "DESKTOP_CAUSAL: $diagnosticDetail; only this Job desktop-limit A/B is attributed."
+if ($diagnosticClassification -eq 'NO_WINDOW_CAUSAL') {
+    Write-Host "NO_WINDOW_CAUSAL: $diagnosticDetail; CREATE_NO_WINDOW changed the baseline 0xc0000142 exit to zero."
     exit 0
 }
-if ($diagnosticClassification -eq 'DESKTOP_NOT_SUFFICIENT') {
-    Write-Host "DESKTOP_NOT_SUFFICIENT: $diagnosticDetail; no alternative cause is attributed."
+if ($diagnosticClassification -eq 'NO_WINDOW_NOT_SUFFICIENT') {
+    Write-Host "NO_WINDOW_NOT_SUFFICIENT: $diagnosticDetail; the child still exited with 0xc0000142."
     exit 0
 }
 [Console]::Error.WriteLine('INDETERMINATE: no bounded diagnostic classification was published.')

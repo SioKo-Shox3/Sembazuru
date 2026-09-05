@@ -1,0 +1,94 @@
+name: Session 0 creation flags diagnostic
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  session0:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Measure CREATE_NO_WINDOW in Session 0
+        shell: pwsh -NoProfile -NonInteractive -Command ". '{0}'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $env:PSModulePath = "$PSHOME\Modules"
+          $principal = [Security.Principal.WindowsPrincipal]::new(
+              [Security.Principal.WindowsIdentity]::GetCurrent()
+          )
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+              throw 'The diagnostic requires an already-elevated runner.'
+          }
+          Write-Host ('commit={0} runner_os={1} os_build={2}' -f
+              $env:GITHUB_SHA, $env:RUNNER_OS, [Environment]::OSVersion.Version)
+          $probePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/m6_worker_window_station_probe.ps1')
+          )
+          $expectedProbeSha256 = (Get-FileHash -LiteralPath $probePath -Algorithm SHA256).Hash
+          & rustup toolchain install 1.97.0 --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed.' }
+          $artifacts = @(& cargo +1.97.0 test -p sembazuru-worker --lib --locked --no-run --message-format=json)
+          if ($LASTEXITCODE -ne 0) { throw 'Worker diagnostic fixture build failed.' }
+          $executables = @($artifacts | ForEach-Object {
+              $artifact = $_ | ConvertFrom-Json
+              if ($artifact.reason -eq 'compiler-artifact' -and $artifact.profile.test -eq $true -and
+                  $artifact.target.name -eq 'sembazuru_worker' -and
+                  $artifact.target.kind.Count -eq 1 -and $artifact.target.kind[0] -eq 'lib' -and
+                  $null -ne $artifact.executable) {
+                  $artifact.executable
+              }
+          })
+          if ($executables.Count -ne 1) { throw 'Expected exactly one worker library test executable.' }
+          $artifactPath = [IO.Path]::GetFullPath($executables[0])
+          $expectedArtifactSha256 = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          using System.Text;
+          public static class Session0BootstrapNative {
+              [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+              public static extern uint GetFinalPathNameByHandleW(
+                  IntPtr handle, StringBuilder path, uint length, uint flags);
+          }
+          '@
+          $probeStream = [IO.FileStream]::new(
+              $probePath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
+          )
+          try {
+              $finalPath = [Text.StringBuilder]::new(32768)
+              $length = [Session0BootstrapNative]::GetFinalPathNameByHandleW(
+                  $probeStream.SafeFileHandle.DangerousGetHandle(), $finalPath, $finalPath.Capacity, 0
+              )
+              if ($length -eq 0 -or $length -ge $finalPath.Capacity) {
+                  throw 'Diagnostic runner final path query failed.'
+              }
+              $actualPath = $finalPath.ToString()
+              if (-not $actualPath.StartsWith('\\?\') -or $actualPath.StartsWith('\\?\UNC\')) {
+                  throw 'Diagnostic runner must have a final local path.'
+              }
+              if (-not [string]::Equals(
+                  $actualPath.Substring(4), $probePath, [StringComparison]::OrdinalIgnoreCase
+              )) { throw 'Diagnostic runner final path mismatch.' }
+              $memory = [IO.MemoryStream]::new()
+              try {
+                  $probeStream.CopyTo($memory)
+                  $probeBytes = $memory.ToArray()
+              } finally { $memory.Dispose() }
+              $actualSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($probeBytes))
+              if (-not [string]::Equals(
+                  $actualSha256, $expectedProbeSha256, [StringComparison]::OrdinalIgnoreCase
+              )) { throw 'Diagnostic runner SHA-256 mismatch.' }
+              Write-Host ('verified_script_sha256={0} expected_executable_sha256={1}' -f
+                  $actualSha256, $expectedArtifactSha256)
+              $probeText = [Text.UTF8Encoding]::new($false, $true).GetString($probeBytes)
+              & ([ScriptBlock]::Create($probeText)) -ArtifactPath $artifactPath `
+                  -ExpectedSha256 $expectedArtifactSha256
+              if ($LASTEXITCODE -ne 0) { throw 'Session 0 diagnostic failed.' }
+          } finally { $probeStream.Dispose() }
