@@ -10,7 +10,9 @@
 use std::time::{Duration, Instant};
 
 use sembazuru_agent::Execution;
-use sembazuru_agent::coordination::{DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination};
+use sembazuru_agent::coordination::{
+    DEFAULT_DEAD_TIMEOUT, WorkerTable, serve_coordination_with_token,
+};
 use sembazuru_agent::scheduler::{BuildAction, Scheduler};
 use sembazuru_proto::v0::Command;
 
@@ -28,14 +30,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .cloned()
         .ok_or("usage: scale_harness <addr> <workers> <n> <burn_exe> <iters>")?;
     let iters = args.get(4).cloned().unwrap_or_else(|| "20000000".into());
+    let coord_addr = coord_addr.parse::<std::net::SocketAddr>()?;
+    let token = sembazuru_proto::auth::cluster_token_from_env();
+    if !coord_addr.ip().is_loopback() && token.is_none() {
+        return Err("SEMBAZURU_CLUSTER_TOKEN is required for non-loopback coordination".into());
+    }
 
     let table = WorkerTable::new(DEFAULT_DEAD_TIMEOUT);
-    let listener = tokio::net::TcpListener::bind(&coord_addr).await?;
+    let listener = tokio::net::TcpListener::bind(coord_addr).await?;
     eprintln!("scale_harness: Coordination on {}", listener.local_addr()?);
     {
         let t = table.clone();
+        let coordination_token = token.clone();
         tokio::spawn(async move {
-            let _ = serve_coordination(listener, t).await;
+            let _ = serve_coordination_with_token(listener, t, coordination_token).await;
         });
     }
 
@@ -69,7 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .collect();
 
     let start = Instant::now();
-    let outcomes = Scheduler::new(table).run_build(actions).await;
+    let outcomes = Scheduler::with_cluster_token(table, token)
+        .run_build(actions)
+        .await;
     let makespan = start.elapsed();
 
     let remote = outcomes
@@ -77,10 +87,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .filter(|o| matches!(o, Execution::Remote(_)))
         .count();
     let local = outcomes.len() - remote;
-    let ok = outcomes.iter().all(|o| match o {
-        Execution::Remote(r) => r.exit_code == Some(0),
-        Execution::LocalFallback { exit_code, .. } => *exit_code == 0,
-    });
+    let ok = n > 0
+        && expected > 0
+        && outcomes.len() == n
+        && local == 0
+        && outcomes.iter().all(|o| match o {
+            Execution::Remote(r) => r.exit_code == Some(0),
+            Execution::LocalFallback { .. } => false,
+        });
 
     // Machine-readable result line for the ps1 to parse.
     println!(
