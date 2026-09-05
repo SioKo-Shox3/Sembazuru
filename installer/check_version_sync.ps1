@@ -18,8 +18,9 @@ $ErrorActionPreference = 'Stop'
 $root    = Split-Path -Parent $PSScriptRoot
 $cargo   = Join-Path $root 'Cargo.toml'
 $wixproj = Join-Path $PSScriptRoot 'Package.wixproj'
+$bundle  = Join-Path $PSScriptRoot 'Bundle.wixproj'
 
-foreach ($f in @($cargo, $wixproj)) {
+foreach ($f in @($cargo, $wixproj, $bundle)) {
     if (-not (Test-Path $f)) { throw "missing file: $f" }
 }
 
@@ -33,12 +34,17 @@ $wixMatch = Select-String -Path $wixproj -Pattern '<SbzVersion[^>]*>([^<]+)</Sbz
 if (-not $wixMatch) { throw "could not find SbzVersion in $wixproj" }
 $wixVersion = $wixMatch.Matches.Groups[1].Value
 
+$bundleMatch = Select-String -Path $bundle -Pattern '<SbzVersion[^>]*>([^<]+)</SbzVersion>' | Select-Object -First 1
+if (-not $bundleMatch) { throw "could not find SbzVersion in $bundle" }
+$bundleVersion = $bundleMatch.Matches.Groups[1].Value
+
 Write-Host "Cargo workspace version : $cargoVersion"
 Write-Host "WiX default SbzVersion   : $wixVersion"
+Write-Host "Bundle default SbzVersion: $bundleVersion"
 
-if ($cargoVersion -ne $wixVersion) {
-    Write-Error ("VERSION MISMATCH: Cargo '$cargoVersion' != WiX SbzVersion '$wixVersion'. " +
-        "Update installer/Package.wixproj's <SbzVersion> default (or pass -p:SbzVersion=$cargoVersion) " +
+if ($cargoVersion -ne $wixVersion -or $cargoVersion -ne $bundleVersion) {
+    Write-Error ("VERSION MISMATCH: Cargo '$cargoVersion', MSI WiX '$wixVersion', Bundle WiX '$bundleVersion'. " +
+        "Update both installer project <SbzVersion> defaults (or pass -p:SbzVersion=$cargoVersion) " +
         "so the MSI ProductVersion and the binaries' reported version (version-gated admission, ADR 0011) agree.")
     exit 1
 }

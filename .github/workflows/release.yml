@@ -1,18 +1,17 @@
 # Release pipeline (M9.6, ADR 0008). Manual-distribution publisher: there is no
-# in-app self-update (ADR 0009 was withdrawn); this just makes a versioned MSI that
-# users download and install by hand from the GitHub Releases page.
+# in-app self-update (ADR 0009 was withdrawn); this makes versioned Windows installers
+# that users download and install by hand from the GitHub Releases page.
 #
 # Push a tag `vX.Y.Z` to cut a release: this builds the shipped binaries + C++ hooks,
-# packages the versioned MSI, signs everything with the real release certificate (if
-# one is configured), and publishes a GitHub Release with the MSI attached for manual
-# download.
+# packages the versioned MSI and Burn Bundle, signs everything with the real release
+# certificate (if one is configured), and publishes both installers for manual download.
 #
 # Signing is conditional and non-gating (ADR 0009 withdrawal): the cluster gates on
 # version (ADR 0011), not on signature. When the signing secrets are set, the MSI is
 # signed and the release is published normally. When they are NOT set (the default
 # until the OV certificate is provisioned, ADR 0006), signing is skipped and the
-# release is published as a DRAFT — so a maintainer must deliberately publish an
-# UNSIGNED MSI rather than it auto-surfacing as the public "latest" download.
+# release is published as a DRAFT — so a maintainer must deliberately publish the
+# UNSIGNED installers rather than they auto-surface as the public "latest" download.
 # Configure these repository secrets to enable signing:
 #   SBZ_SIGNING_PFX_BASE64  — base64 of the release code-signing PFX
 #   SBZ_SIGNING_PASSWORD    — the PFX password
@@ -25,7 +24,7 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  # Manual dry run: builds + signs (if configured) and uploads the MSI as an
+  # Manual dry run: builds + signs (if configured) and uploads both installers as an
   # artifact, but does NOT create a release (there is no tag to release).
   workflow_dispatch:
 
@@ -34,7 +33,7 @@ permissions:
 
 jobs:
   release:
-    name: Build, sign, and publish the MSI
+    name: Build, sign, and publish the Windows installers
     runs-on: windows-latest
     env:
       # 'true' only when a signing PFX secret is configured. Drives the conditional
@@ -82,9 +81,8 @@ jobs:
             throw "tag version '${{ steps.ver.outputs.version }}' != Cargo version '$cargo' — the release tag must match the crate version"
           }
 
-      # The four shipped Rust binaries (release): sembazuru-agent yields
-      # sembazuru-daemon + sembazuru(launcher), plus worker and gui.
-      - run: cargo build --release -p sembazuru-agent -p sembazuru-worker -p sembazuru-gui
+      # The shipped Rust binaries plus the machine-store helper embedded by the MSI.
+      - run: cargo build --release -p sembazuru-agent -p sembazuru-worker -p sembazuru-gui -p sembazuru-config-store
       # The C++ hooks, both bitnesses, staged together (mirrors the CI installer job).
       - run: cmake -S hooks -B hooks/build -A x64
       - run: cmake --build hooks/build --config Release
@@ -108,6 +106,7 @@ jobs:
             'target/release/sembazuru-worker.exe',
             'target/release/sembazuru.exe',
             'target/release/sembazuru-gui.exe',
+            'target/release/sembazuru-storectl.exe',
             'hooks/build/Release/launcher.exe',
             'hooks/build/Release/sbz_interceptor64.dll',
             'hooks/build/Release/sbz_interceptor32.dll'
@@ -129,10 +128,34 @@ jobs:
           TSA: ${{ secrets.SBZ_TIMESTAMP_URL }}
         run: ./installer/sign_release.ps1 -Files 'installer/bin/x64/Release/Sembazuru.msi' -PfxBase64 $env:PFX -Password $env:PFX_PW -TimestampServer $env:TSA
 
-      # Name the asset with the version so manual downloaders can tell releases apart.
+      # Prepare and verify the official VC++ payloads before binding them into Burn.
+      - name: Prepare VC++ redistributables
+        shell: pwsh
+        run: pwsh -NoProfile -File installer/prepare_redist.ps1
+
+      # WiX's standard Bundle signing pipeline signs the detached Burn engine and
+      # then the reattached outer bundle. The unsigned path remains the default.
+      - name: Build Bundle (signed)
+        if: env.HAS_SIGNING_CERT == 'true'
+        shell: pwsh
+        env:
+          SBZ_SIGNING_PFX_BASE64: ${{ secrets.SBZ_SIGNING_PFX_BASE64 }}
+          SBZ_SIGNING_PASSWORD: ${{ secrets.SBZ_SIGNING_PASSWORD }}
+          SBZ_TIMESTAMP_URL: ${{ secrets.SBZ_TIMESTAMP_URL }}
+        run: dotnet build installer/Bundle.wixproj -c Release -p:Platform=x64 -p:SbzVersion=${{ steps.ver.outputs.version }} -p:SbzMsi=installer/bin/x64/Release/Sembazuru.msi -p:SignOutput=true
+
+      - name: Build Bundle (unsigned)
+        if: env.HAS_SIGNING_CERT != 'true'
+        run: dotnet build installer/Bundle.wixproj -c Release -p:Platform=x64 -p:SbzVersion=${{ steps.ver.outputs.version }} -p:SbzMsi=installer/bin/x64/Release/Sembazuru.msi
+
+      # Name the assets with the version so manual downloaders can tell releases apart.
       - name: Name the MSI asset
         shell: pwsh
         run: Copy-Item installer/bin/x64/Release/Sembazuru.msi "Sembazuru-${{ steps.ver.outputs.version }}-x64.msi" -Force
+
+      - name: Name the Bundle asset
+        shell: pwsh
+        run: Copy-Item installer/bin/x64/Release/Sembazuru-Setup.exe "Sembazuru-${{ steps.ver.outputs.version }}-x64-Setup.exe" -Force
 
       - name: Upload MSI artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
@@ -140,9 +163,15 @@ jobs:
           name: Sembazuru-${{ steps.ver.outputs.version }}-msi
           path: Sembazuru-${{ steps.ver.outputs.version }}-x64.msi
 
-      # Publish the GitHub Release with the MSI attached for manual download (tag pushes
+      - name: Upload Bundle artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
+        with:
+          name: Sembazuru-${{ steps.ver.outputs.version }}-bundle
+          path: Sembazuru-${{ steps.ver.outputs.version }}-x64-Setup.exe
+
+      # Publish the GitHub Release with both installers attached for manual download (tag pushes
       # only). Unsigned builds are published as a DRAFT, so a maintainer must explicitly
-      # publish an unsigned MSI rather than it auto-surfacing as the public "latest".
+      # publish the unsigned installers rather than they auto-surface as the public "latest".
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -151,12 +180,13 @@ jobs:
         run: |
           $signed = "${{ env.HAS_SIGNING_CERT }}" -eq 'true'
           $msi = "Sembazuru-${{ steps.ver.outputs.version }}-x64.msi"
+          $bundle = "Sembazuru-${{ steps.ver.outputs.version }}-x64-Setup.exe"
           $common = @(
-            "${{ steps.ver.outputs.tag }}", $msi,
+            "${{ steps.ver.outputs.tag }}", $msi, $bundle,
             '--title', "Sembazuru ${{ steps.ver.outputs.version }}"
           )
           if ($signed) {
-            gh release create @common --notes 'Signed release. The MSI is Authenticode-signed; download and install it manually. Updating is a manual reinstall (no in-app self-update).'
+            gh release create @common --notes 'Signed release. Download and run the Burn Setup.exe to install the VC++ runtimes and Sembazuru. The MSI is also attached for manual MSI-only installation after uninstalling an existing MSI. Updating is a manual reinstall (no in-app self-update).'
           } else {
-            gh release create @common --draft --notes 'UNSIGNED build (no release certificate configured). Published as a DRAFT for manual download; installing it triggers SmartScreen (unknown publisher). Configure SBZ_SIGNING_* secrets to sign.'
+            gh release create @common --draft --notes 'UNSIGNED build (no release certificate configured). This DRAFT is for manual download; run the Burn Setup.exe to install the VC++ runtimes and Sembazuru, and expect SmartScreen (unknown publisher). Configure SBZ_SIGNING_* secrets to sign.'
           }
