@@ -3,7 +3,7 @@ param(
     [ValidateSet('Check', 'Worker', 'Coordinator', 'Token')]
     [string] $Mode = 'Check',
 
-    [string] $BundleRoot = $PSScriptRoot,
+    [string] $BundleRoot,
     [string] $LocalAddress,
     [string] $CoordinatorAddress,
     [string] $WorkerProgram,
@@ -12,6 +12,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
+
+if ([string]::IsNullOrWhiteSpace($BundleRoot)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
+        throw 'Unable to determine the script path for the default BundleRoot.'
+    }
+    $BundleRoot = Split-Path -Parent ([System.IO.Path]::GetFullPath($scriptPath))
+}
 
 $CoordinationPort = 50170
 $WorkerPort = 50161
