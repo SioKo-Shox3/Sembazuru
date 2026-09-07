@@ -3,7 +3,7 @@
 ## Done
 - 8444fbd: VC++ x64/x86 を同梱する Burn Setup.exe と Release ワークフローを追加。ローカルで MSI/Bundle の内容と SHA を検証済み。公開は未実施。
 - 2156d47: CREATE_NO_WINDOW の test 限定 A/B 診断を追加。製品の起動 flags は未変更。独立評価と契約検査済み、SCM 実測は未実施。
-- T-001: h2 0.4.16 と webbrowser 1.2.2 へ最小更新。cargo-deny、fmt、clippy、workspace test の保存済み証拠を確認し、独立評価 PASS。配布全体の合格とは区別する。
+- T-001: h2 0.4.16 と webbrowser 1.2.2 へ最小更新。cargo-deny、fmt、clippy、workspace test の保存済み証拠を確認し、独立評価1周目の指摘を記録・再確認した2周目 PASS。配布全体の合格とは区別する。
 - 2026-09-08 開始検査: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked` → `7 passed; 0 failed; 156 filtered out`。fmt --all --check と clippy --all-targets --locked -- -D warnings も exit 0。
 - GitHub の chore/two-pc-preparation は 2156d47 と一致、main は 8b91020。開始時の作業ツリーは clean。
 
@@ -21,5 +21,5 @@
 - main CI の installed worker は exit=-1073741502 (0xC0000142)。install/repair/ACL/uninstall は通過。Job UI の緩和では解決しなかった。
 - ローカル worker/SCM 起動は前セッションの自動承認審査で拒否された。別 CLI、子、ループからも迂回実行しない。通常の cargo 単体・契約テストと静的なパッケージ展開は可。
 - 公開版は v0.0.3 のまま。現在の dry run も 0.0.3 だが、既存 Release を上書きしない。次版は修正とゲート完了後に用意する。
-- T-001 の検証ログは `.harness/runs/20260908-082159/verify-T-001-1.txt` から `verify-T-001-4.txt` に保存。workspace test のログにある `sandbox_probe_record_child` の FAILED は親テストが意図的に起動した子プロセスの診断出力で、cargo test 全体は exit 0。
+- T-001 の検証ログは `.harness/runs/20260908-082159/verify-T-001-5.txt` から `verify-T-001-8.txt` に保存し、再現性確認を `verify-T-001-9.txt` に保存。workspace test のログにある `sandbox_probe_record_child` の FAILED は親テストが意図的に起動した子プロセスの診断出力で、cargo test 全体は exit 0。独立評価は `evaluation-T-001-1.txt` が NEEDS_WORK、対応後の `evaluation-T-001-2.txt` が PASS。
 - このターンで新たな git push の指示はない。新規変更は作業ブランチへのコミットまで。
