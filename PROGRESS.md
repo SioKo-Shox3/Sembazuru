@@ -7,19 +7,21 @@
 - 2026-09-08 開始検査: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked` → `7 passed; 0 failed; 156 filtered out`。fmt --all --check と clippy --all-targets --locked -- -D warnings も exit 0。
 - GitHub の chore/two-pc-preparation は 2156d47 と一致、main は 8b91020。開始時の作業ツリーは clean。
 - T-002: GitHub の Release と PR CI の実ログを取得して確認。結果は docs/verification/2026-09-08-release-preparation.md。PR CI では MSI/Bundle の生成が成功、installed worker は 0xC0000142。Release は診断テストで失敗し、どちらの run も artifact 0 件。公開準備の完了ではない。
+- T-004: 診断レコードの親比較を process security 専用収集へ分離し、子の環境全体収集・codec 検証・厳密比較を維持。cmd、PowerShell、fmt、worker clippy の反復1検証と独立安全性評価を確認して完了。
 
 ## In progress
-- T-004/T-005: 2026-09-08 の続行指示を受け、診断テストと Rust 1.98.1 の CI lint 修正に着手。開始時の Session 0 契約検査は `7 passed; 0 failed`。
+- T-005: Rust 1.98.1 の CI lint 修正が次の対象。開始時の Session 0 契約検査は `7 passed; 0 failed`。
 - T-001: cmd 経由の診断レコード往復テストで environment text が再現。依存更新を保持し、詳細と再開条件を blocked/T-001.md へ記録した。
 - T-003: 診断 workflow の default branch 登録待ち。blocked/T-003.md。GitHub 上での実測は未実施。
 
 ## Next
-- T-004 で診断レコードの環境依存を修正し、T-005 で現行 CI の lint を解消する。
+- T-005 で現行 CI の lint を解消する。
 - Session 0 診断 workflow の default branch 登録後に実測する。現在 dispatch は HTTP 404。
 - Rust 1.98.1 の tracer lint と、Release を止めた private_station_unnamed_create_rejects_connected_logon_station の想定を修正・検証する。
 - C++ の P0 cross-bitness negative control が Windows 2022/2025 の両方で 5 分 timeout。M2 は CI で未到達。ローカル M2 は cl の起動失敗で比較前に終了した。
 - GUI Join は StubConfigWriter のまま。保存する token と machine store の境界、昇格方法の設計を固めてから実装する。
 - 全体の完了にはインストール、参加設定、installed worker 実行、C++/M2、公開ダウンロードの検証が必要。
+- T-004 の証拠は `.harness/runs/20260908-092538/verify-T-004-1.txt`〜`verify-T-004-4.txt`。各ファイルを開いて cmd/PowerShell のテスト結果、不正環境名拒否、fmt、clippy の exit 0 を確認した。
 
 ## Notes
 - 最新 main CI: https://github.com/SioKo-Shox3/Sembazuru/actions/runs/34032907718 。ログは target/release-preparation/ci-34032907718-failed.log を取得して確認済み。

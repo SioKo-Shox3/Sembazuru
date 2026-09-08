@@ -28,7 +28,7 @@
 - notes: 2026-09-08 の dispatch は default branch に workflow がないため HTTP 404。main は 8b91020、作業ブランチだけ 2156d47。default branch への登録が必要。git push、API による同等の直接反映、PR の無断マージをしない。登録待ちは blocked にして測定成功としない。上記 verify は診断の契約検査だけで、実測ログなしに done にしない。ローカル SCM 診断は禁止。
 
 ## T-004: 診断レコードの比較を親の環境変数から独立させる
-- status: todo
+- status: done
 - done-when: 親の権限と Job の比較に不要な環境変数を読まず、子の環境全体の収集・厳密な codec 検証・期待値比較を維持する。往復テストが cmd と PowerShell の両方で成功し、不正な環境名の拒否も成功する。test モジュールだけの差分で安全性評価を通す。
 - verify: `cmd.exe /d /c "rustup run 1.97.0 cargo test -p sembazuru-worker --lib sandbox::tests::sandbox_probe_record_round_trip_uses_file_not_stdout --locked -- --exact"`
 - verify: `pwsh -NoProfile -Command "rustup run 1.97.0 cargo test -p sembazuru-worker --lib sandbox_probe_record_ --locked; exit $LASTEXITCODE"`
@@ -36,6 +36,7 @@
 - verify: `rustup run 1.97.0 cargo clippy -p sembazuru-worker --all-targets --locked -- -D warnings`
 - paths: crates/worker/src/sandbox.rs, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, blocked/T-001.md, blocked/T-004.md, .harness/**
 - notes: メインが collect_process_security を切り出して実装する。collect はその後 normalized_environment を収集する従来の完全レコード経路として保持。往復テストの親は collect_process_security、子は collect のまま。環境検査を緩めたり process environment を書き換えない。製品の token/Job/flags/ACL/codec 変更、ローカル SCM/製品 worker 起動、push/merge/publication は対象外。既存の Cargo.lock 差分の再評価は不要。この新しい worker test 差分だけを評価する。
+- execution: メインがソース変更を実装済み。上記4検査の出力は .harness/T-004-cmd.log、T-004-pwsh.log、T-004-fmt.log、T-004-clippy.log。独立した安全性評価は .harness/T-004-review.txt に保存済みで実際に開いて確認すること。評価後はコメント2行の明確化だけ。反復ではソースを追加変更せず、指定検査と証拠確認、T-004 の記録更新、明示列挙によるコミットを行う。他タスクへ進まず、新たな評価者を呼ばない。失敗時はソースを変更せず blocked にして具体的な出力を記録する。反復1の再検証は .harness/runs/20260908-092538/verify-T-004-1.txt〜verify-T-004-4.txt に保存し、4件すべて exit_code=0 を開いて確認した。
 
 ## T-005: Rust 1.98.1 の CI lint に対応する
 - status: todo

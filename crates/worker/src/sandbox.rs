@@ -4640,6 +4640,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         let mut duplicate_env = SandboxProbeRecord::fixture();
         duplicate_env.environment = vec![("Path".into(), "a".into()), ("PATH".into(), "b".into())];
         assert!(duplicate_env.encode().is_err());
+        let mut invalid_env_name = SandboxProbeRecord::fixture();
+        invalid_env_name.environment = vec![("=C:".into(), "C:\\fixture".into())];
+        assert!(invalid_env_name.encode().is_err());
         let mut unsorted_sids = SandboxProbeRecord::fixture();
         unsorted_sids.groups = vec![
             ProbeSid {
@@ -4826,6 +4829,14 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         }
 
         fn collect(nonce: String) -> Result<Self, String> {
+            let mut record = Self::collect_process_security(nonce)?;
+            record.environment = normalized_environment()?;
+            Ok(record)
+        }
+
+        // Parent comparisons use security fields only, so they must not collect inherited
+        // environment entries such as cmd.exe's hidden drive variables.
+        fn collect_process_security(nonce: String) -> Result<Self, String> {
             validate_nonce(&nonce)?;
             let token = current_token(TOKEN_QUERY).map_err(|error| error.to_string())?;
             let handle = token.as_raw_handle() as HANDLE;
@@ -4857,7 +4868,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 capabilities: token_sid_list(handle, TokenCapabilities)?,
                 integrity_rid: integrity_rid(handle).map_err(|error| error.to_string())?,
                 privileges: token_privileges(handle)?,
-                environment: normalized_environment()?,
+                environment: Vec::new(),
                 in_job: in_job != 0,
             };
             // The record is a canonical comparison surface, so Windows group duplication is
@@ -4875,9 +4886,6 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 });
             }
             record.privileges.sort_unstable();
-            record
-                .environment
-                .sort_by_key(|(name, _)| name.to_ascii_lowercase());
             Ok(record)
         }
     }
@@ -5058,7 +5066,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             "status={status}"
         );
         let record = SandboxProbeRecord::decode(&std::fs::read(&path).unwrap(), &nonce).unwrap();
-        let expected = SandboxProbeRecord::collect(nonce.clone()).unwrap();
+        let expected = SandboxProbeRecord::collect_process_security(nonce.clone()).unwrap();
         assert_eq!(record.is_appcontainer, expected.is_appcontainer);
         assert_eq!(record.appcontainer_sid, expected.appcontainer_sid);
         assert_eq!(record.restricted_sids, expected.restricted_sids);
