@@ -5,7 +5,7 @@
 - 2156d47: CREATE_NO_WINDOW の test 限定 A/B 診断を追加。製品の起動 flags は未変更。独立評価と契約検査済み、SCM 実測は未実施。
 - e463b93 / T-001: h2 0.4.16 と webbrowser 1.2.2 へ最小更新。cargo-deny、Rust 1.97.0 の fmt/clippy と独立評価は成功。T-004 後に cmd 経由の workspace 全体テストも exit 0 となり、検証未完を解消。証拠は .harness/T-001-workspace-after-T004.log。
 - 2026-09-08 開始検査: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked` → `7 passed; 0 failed; 156 filtered out`。fmt --all --check と clippy --all-targets --locked -- -D warnings も exit 0。
-- GitHub の chore/two-pc-preparation は 2156d47 と一致、main は 8b91020。開始時の作業ツリーは clean。
+- 開始確認時の GitHub chore/two-pc-preparation は 2156d47、main は 8b91020。開始時の作業ツリーは clean。今回の修正は未 push。
 - T-002: GitHub の Release と PR CI の実ログを取得して確認。結果は docs/verification/2026-09-08-release-preparation.md。PR CI では MSI/Bundle の生成が成功、installed worker は 0xC0000142。Release は診断テストで失敗し、どちらの run も artifact 0 件。公開準備の完了ではない。
 - T-004: 診断レコードの親比較を process security 専用収集へ分離し、子の環境全体収集・codec 検証・厳密比較を維持。cmd、PowerShell、fmt、worker clippy の反復1検証と独立安全性評価を確認して完了。
 - T-005: Rust 1.98.1 の fmt と workspace Clippy が exit 0。tracer/config-store/CAS の結合テストは 288 passed、0 failed、1 ignored。変更前後および同一入力二回の出力比較はハッシュ 1,030 ケース・trace 446 ケースで一致。安全性・決定性の独立評価 PASS。証拠は .harness/T-005-clippy-2.log、T-005-tests.log、T-005-output-equivalence.log、T-005-review.txt。C++/M2 全体の未合格は残る。
@@ -13,15 +13,15 @@
 - c16ba9c 時点の最終 Rust 全体検証: `cmd.exe /d /c "rustup run 1.98.1 cargo test --workspace --locked"` が exit 0。worker は `154 passed; 0 failed; 9 ignored`。証拠は .harness/final-rust-workspace.log。
 
 ## In progress
-- T-007: Release の手動実行から同じコミットの診断を呼び出す経路を整える。
-- T-003: 診断 workflow の default branch 登録待ち。blocked/T-003.md。GitHub 上での実測は未実施。
+- T-007: Release のブランチ指定の手動実行から同じコミットの診断を呼び出す定義を追加。actionlint と初回の独立評価は PASS。タグ指定の手動実行を除外する条件と記録を最終確認する。
+- T-003: 修正の push と GitHub 上での実測待ち。blocked/T-003.md。T-007 により診断専用 workflow の main 登録は先行条件ではなくなる。
 
 ## Next
 - T-007 の検証を終え、push 後に GitHub の実測へ進む。
-- Session 0 診断 workflow の default branch 登録後に実測する。現在 dispatch は HTTP 404。
+- push 後に `gh workflow run release.yml --ref chore/two-pc-preparation` を実行し、同じ SHA の診断 job の結果を確認する。診断専用名への直接 dispatch は使わない。
 - `private_station_unnamed_create_cannot_allocate_per_action_station` の初回成功分岐を GitHub runner で確認する。
 - C++ の P0 cross-bitness negative control が Windows 2022/2025 の両方で 5 分 timeout。M2 は CI で未到達。ローカル M2 は cl の起動失敗で比較前に終了した。
-- GUI Join は StubConfigWriter のまま。保存する token と machine store の境界、昇格方法の設計を固めてから実装する。
+- GUI Join は StubConfigWriter のまま。MachineTokenUpdate は machine token/daemon設定/worker設定を同じ journal で扱えるが、storectl の7固定動詞には Join 保存がなく、GUI ConfigWriter も token を表現しない。既存の固定パスと認可を維持する Join 専用経路が必要。
 - 全体の完了にはインストール、参加設定、installed worker 実行、C++/M2、公開ダウンロードの検証が必要。
 - T-004 の証拠は `.harness/runs/20260908-092538/verify-T-004-1.txt`〜`verify-T-004-4.txt`。各ファイルを開いて cmd/PowerShell のテスト結果、不正環境名拒否、fmt、clippy の exit 0 を確認した。
 

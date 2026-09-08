@@ -34,7 +34,7 @@ permissions:
 jobs:
   session0-diagnostic:
     name: Measure worker creation flags in Session 0
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref_type == 'branch'
     permissions:
       contents: read
     uses: ./.github/workflows/session0-diagnostic.yml

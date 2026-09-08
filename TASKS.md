@@ -25,7 +25,7 @@
 - done-when: 2156d47 の診断を GitHub hosted runner で実測し、A/B の flags、Job UI、分類、cleanup、worker 前後一致を実ログで確認する。
 - verify: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked`
 - paths: docs/verification/2026-09-08-session0.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, blocked/T-003.md, .harness/runs/**, target/release-preparation/**
-- notes: 2026-09-08 の dispatch は default branch に workflow がないため HTTP 404。main は 8b91020、作業ブランチだけ 2156d47。default branch への登録が必要。git push、API による同等の直接反映、PR の無断マージをしない。登録待ちは blocked にして測定成功としない。上記 verify は診断の契約検査だけで、実測ログなしに done にしない。ローカル SCM 診断は禁止。
+- notes: 診断名への直接 dispatch は default branch 未登録により HTTP 404。T-007 で登録済み Release から同じコミットを呼べる定義を追加し、main 登録の前提を外した。残りは修正の push と、gh workflow run release.yml --ref chore/two-pc-preparation による実測。git push、API による同等の直接反映、PR の無断マージをしない。上記 verify は診断の契約検査だけで、実測ログなしに done にしない。ローカル SCM 診断は禁止。
 
 ## T-004: 診断レコードの比較を親の環境変数から独立させる
 - status: done
@@ -64,3 +64,4 @@
 - verify: `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/release.yml .github/workflows/session0-diagnostic.yml`
 - paths: .github/workflows/release.yml, .github/workflows/session0-diagnostic.yml, docs/verification/2026-09-08-release-preparation.md, blocked/T-003.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
 - notes: GitHub の同一リポジトリ内 ./ 参照は呼び出し元と同じコミットの workflow を使う。session0-diagnostic.yml に workflow_call を追加し、Release 側に手動時限定・contents: read の呼び出し job を追加する。needs を置かず、パッケージ検査が失敗しても診断を実行できる構造とする。スクリプト本体、署名、公開条件は変更しない。権限拡大・secrets 継承が必要なら止める。main 登録を要求する記録を修正し、未 push 差分の実行成功とは報告しない。
+- refinement: Release の既存の公開条件は refs/tags/ で、タグ指定の手動実行も含む。診断を github.ref_type == branch で限定し、タグ指定の手動実行も公開経路として維持する。
