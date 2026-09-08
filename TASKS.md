@@ -59,7 +59,7 @@
 - notes: Microsoft CreateWindowStationW の NULL 名は呼び出しプロセスのログオンセッション ID から命名される。初回に current と違う station を作れても action 専用性を示さない。初回の既存環境での 183/5 は従来どおり unsupported、初回成功後の二回目は 183 の衝突だけを確定し、その他は indeterminate とする。製品の station/token/Job/ACL 変更、SCM 起動は禁止。GitHub 特有の初回成功分岐の実測は次回 CI まで未確認と明示する。
 
 ## T-007: Release の手動実行から同じコミットの診断を呼び出す
-- status: todo
+- status: doing
 - done-when: 既存 Release の workflow_dispatch から同じコミットの Session 0 診断を独立 job で呼び出せる定義にする。診断 job の contents: read、secret 非継承、checkout の SHA 固定・資格情報非保持を維持する。タグの公開経路では診断を実行しない。actionlint と独立安全性評価を通す。SCM 実測の合格は T-003 で別途判定する。
 - verify: `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/release.yml .github/workflows/session0-diagnostic.yml`
 - paths: .github/workflows/release.yml, .github/workflows/session0-diagnostic.yml, docs/verification/2026-09-08-release-preparation.md, blocked/T-003.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**

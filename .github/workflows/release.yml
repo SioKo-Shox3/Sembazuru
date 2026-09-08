@@ -32,6 +32,13 @@ permissions:
   contents: write # create the GitHub Release
 
 jobs:
+  session0-diagnostic:
+    name: Measure worker creation flags in Session 0
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/session0-diagnostic.yml
+
   release:
     name: Build, sign, and publish the Windows installers
     runs-on: windows-latest
