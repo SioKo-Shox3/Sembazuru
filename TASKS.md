@@ -1,7 +1,7 @@
 # TASKS — Sembazuru
 
 目的: GitHub Releases から Windows 11 x64 の新しい PC に導入し、LAN 上の実行に参加できる状態にする。
-現在は診断テストの環境依存、CI lint、Session 0 の診断を進める。公開、未測定の起動条件の製品適用、GUI 保存方式の決定は未完。
+診断テストと CI lint の修正、GitHub 診断の呼び出し定義を検証済み。現在は修正の push と Session 0 の実測待ち。公開、未測定の起動条件の製品適用、GUI 保存方式の決定は未完。
 
 ## T-001: 依存関係の脆弱性検査エラーを修正する
 - status: done
@@ -22,7 +22,7 @@
 
 ## T-003: GitHub runner で Session 0 の起動フラグを測定する
 - status: blocked
-- done-when: 2156d47 の診断を GitHub hosted runner で実測し、A/B の flags、Job UI、分類、cleanup、worker 前後一致を実ログで確認する。
+- done-when: T-007 を含む作業ブランチの SHA を実行前に記録し、GitHub run と診断 job の対象 SHA の一致を確認する。その診断を hosted runner で実測し、A/B の flags、Job UI、分類、cleanup、worker 前後一致を実ログで確認する。
 - verify: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked`
 - paths: docs/verification/2026-09-08-session0.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, blocked/T-003.md, .harness/runs/**, target/release-preparation/**
 - notes: 診断名への直接 dispatch は default branch 未登録により HTTP 404。T-007 で登録済み Release から同じコミットを呼べる定義を追加し、main 登録の前提を外した。残りは修正の push と、gh workflow run release.yml --ref chore/two-pc-preparation による実測。git push、API による同等の直接反映、PR の無断マージをしない。上記 verify は診断の契約検査だけで、実測ログなしに done にしない。ローカル SCM 診断は禁止。
@@ -59,7 +59,7 @@
 - notes: Microsoft CreateWindowStationW の NULL 名は呼び出しプロセスのログオンセッション ID から命名される。初回に current と違う station を作れても action 専用性を示さない。初回の既存環境での 183/5 は従来どおり unsupported、初回成功後の二回目は 183 の衝突だけを確定し、その他は indeterminate とする。製品の station/token/Job/ACL 変更、SCM 起動は禁止。GitHub 特有の初回成功分岐の実測は次回 CI まで未確認と明示する。
 
 ## T-007: Release の手動実行から同じコミットの診断を呼び出す
-- status: doing
+- status: done
 - done-when: 既存 Release の workflow_dispatch から同じコミットの Session 0 診断を独立 job で呼び出せる定義にする。診断 job の contents: read、secret 非継承、checkout の SHA 固定・資格情報非保持を維持する。タグの公開経路では診断を実行しない。actionlint と独立安全性評価を通す。SCM 実測の合格は T-003 で別途判定する。
 - verify: `go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 .github/workflows/release.yml .github/workflows/session0-diagnostic.yml`
 - paths: .github/workflows/release.yml, .github/workflows/session0-diagnostic.yml, docs/verification/2026-09-08-release-preparation.md, blocked/T-003.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**

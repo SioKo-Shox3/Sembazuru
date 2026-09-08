@@ -11,13 +11,12 @@
 - T-005: Rust 1.98.1 の fmt と workspace Clippy が exit 0。tracer/config-store/CAS の結合テストは 288 passed、0 failed、1 ignored。変更前後および同一入力二回の出力比較はハッシュ 1,030 ケース・trace 446 ケースで一致。安全性・決定性の独立評価 PASS。証拠は .harness/T-005-clippy-2.log、T-005-tests.log、T-005-output-equivalence.log、T-005-review.txt。C++/M2 全体の未合格は残る。
 - c16ba9c / T-006: unnamed station の初回成功時にハンドルを維持して二回目の生成衝突を検査する形へ修正。対象テスト、fmt、Clippy は exit 0。独立安全性評価は本文 PASS、blocking なし（回答の先頭は Markdown 見出し）。ローカルは初回183の分岐だけを実測し、初回成功時の分岐は次回 GitHub CI で確認する。証拠は .harness/T-006-test.log、T-006-fmt.log、T-006-clippy.log、T-006-review.txt。
 - c16ba9c 時点の最終 Rust 全体検証: `cmd.exe /d /c "rustup run 1.98.1 cargo test --workspace --locked"` が exit 0。worker は `154 passed; 0 failed; 9 ignored`。証拠は .harness/final-rust-workspace.log。
+- e5385d6 / cf26037 / T-007: Release のブランチ指定の手動実行から、同じコミットの Session 0 診断を独立 job として呼ぶ定義を追加。contents: read・secret 非継承を維持し、タグ指定の手動実行も除外。actionlint と独立安全性評価が PASS。証拠は .harness/T-007-actionlint-final.log、T-007-review.txt、T-007-review-2.txt。main 登録を要求する記録を更新済み。
 
 ## In progress
-- T-007: Release のブランチ指定の手動実行から同じコミットの診断を呼び出す定義を追加。actionlint と初回の独立評価は PASS。タグ指定の手動実行を除外する条件と記録を最終確認する。
 - T-003: 修正の push と GitHub 上での実測待ち。blocked/T-003.md。T-007 により診断専用 workflow の main 登録は先行条件ではなくなる。
 
 ## Next
-- T-007 の検証を終え、push 後に GitHub の実測へ進む。
 - push 後に `gh workflow run release.yml --ref chore/two-pc-preparation` を実行し、同じ SHA の診断 job の結果を確認する。診断専用名への直接 dispatch は使わない。
 - `private_station_unnamed_create_cannot_allocate_per_action_station` の初回成功分岐を GitHub runner で確認する。
 - C++ の P0 cross-bitness negative control が Windows 2022/2025 の両方で 5 分 timeout。M2 は CI で未到達。ローカル M2 は cl の起動失敗で比較前に終了した。
@@ -26,6 +25,7 @@
 - T-004 の証拠は `.harness/runs/20260908-092538/verify-T-004-1.txt`〜`verify-T-004-4.txt`。各ファイルを開いて cmd/PowerShell のテスト結果、不正環境名拒否、fmt、clippy の exit 0 を確認した。
 
 ## Notes
+- T-007 の残る実測条件: 最初に GitHub run へ診断 job が現れることと SHA を確認する。Release のパッケージ job も同時に動き、署名 secret が設定されていれば既存の署名処理も走る。ブランチ ref では公開ステップを実行しない。
 - T-006 の非阻害指摘: 既存の test 専用 AuditWindowStation::close は失敗時に Drop から再試行する。今回の成功時は所有権を消去して一度だけ閉じる。未知の二回目エラーは fail にし、Windows の全環境で183になることは未保証。全体の復元/close に関する既存ヘルパーの改善は別件として残す。
 - 独立評価 CLI の終了フックが未コミットの T-005 を f14deaa として自動保存した。変更は依頼差分と一致し、評価 PASS 後に結果記録と件名を整えて 7daf3d8 とした。以降は検証済みソースをコミットしてから、その明示範囲を評価する。展開フックは変更しない。
 - T-005 の非阻害指摘: config-store のディレクトリ列挙パーサは CAS と同じ合成破損バッファの直接検査がない。実ファイルシステム経由の検査は成功し、今回の byte-copy・境界検査は不変。将来パーサを変更する際に補う。以降の検証ログにはコマンドと終了コードも保存する。

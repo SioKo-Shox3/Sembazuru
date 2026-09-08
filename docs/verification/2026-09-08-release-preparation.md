@@ -1,7 +1,7 @@
 # GitHub での配布パッケージ検証（2026-09-08）
 
 GitHub 上で MSI と Setup.exe のビルドは成功した。ただしインストール後の worker 実行が失敗しており、新しい PC で利用できる公開版には達していない。
-Rust 検査の失敗はローカルで修正・検証済み。修正版の GitHub 実測は未実施。
+診断レコードの環境依存と Rust 1.98.1 の lint はローカルで修正・検証済み。修正版の GitHub 実測は未実施。
 
 ## 対象
 
@@ -59,4 +59,4 @@ Rust の成功は C++/M2 や installed worker の起動成功を代替しない�
 ブランチ指定の手動実行だけが対象で、診断 job は `contents: read`、secret 非継承、SHA 固定 checkout を使う。
 パッケージ job の結果を待たずに診断を実行できる。[同一リポジトリの相対パス参照は呼び出し元と同じコミットを使う](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows)。
 実行後は対象 SHA、A/B の flags、Job UI、分類、cleanup、既存 worker の前後一致をログで確認する。
-この定義の構文検査は `actionlint v1.7.12` で成功した。GitHub 上の実行成功はまだ確認していない。
+この定義の構文検査は `actionlint v1.7.12` で成功し、独立安全性評価も通過した。GitHub 上の実行成功はまだ確認していない。
