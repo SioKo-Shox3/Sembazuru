@@ -9,11 +9,12 @@
 - T-002: GitHub の Release と PR CI の実ログを取得して確認。結果は docs/verification/2026-09-08-release-preparation.md。PR CI では MSI/Bundle の生成が成功、installed worker は 0xC0000142。Release は診断テストで失敗し、どちらの run も artifact 0 件。公開準備の完了ではない。
 
 ## In progress
+- T-004/T-005: 2026-09-08 の続行指示を受け、診断テストと Rust 1.98.1 の CI lint 修正に着手。開始時の Session 0 契約検査は `7 passed; 0 failed`。
 - T-001: cmd 経由の診断レコード往復テストで environment text が再現。依存更新を保持し、詳細と再開条件を blocked/T-001.md へ記録した。
 - T-003: 診断 workflow の default branch 登録待ち。blocked/T-003.md。GitHub 上での実測は未実施。
 
 ## Next
-- M1 で blocked 項目を解消する修正範囲を決める。現在の一覧は T-001/T-003 が blocked、T-002 の結果確認が done。新規 todo を作るまで同じ一覧を再実行しない。
+- T-004 で診断レコードの環境依存を修正し、T-005 で現行 CI の lint を解消する。
 - Session 0 診断 workflow の default branch 登録後に実測する。現在 dispatch は HTTP 404。
 - Rust 1.98.1 の tracer lint と、Release を止めた private_station_unnamed_create_rejects_connected_logon_station の想定を修正・検証する。
 - C++ の P0 cross-bitness negative control が Windows 2022/2025 の両方で 5 分 timeout。M2 は CI で未到達。ローカル M2 は cl の起動失敗で比較前に終了した。

@@ -1,7 +1,7 @@
 # TASKS — Sembazuru
 
 目的: GitHub Releases から Windows 11 x64 の新しい PC に導入し、LAN 上の実行に参加できる状態にする。
-現在の承認範囲は配布パッケージの検証と Session 0 診断。公開、未測定の起動条件の製品適用、GUI 保存方式の決定は未完。
+現在は診断テストの環境依存、CI lint、Session 0 の診断を進める。公開、未測定の起動条件の製品適用、GUI 保存方式の決定は未完。
 
 ## T-001: 依存関係の脆弱性検査エラーを修正する
 - status: blocked
@@ -26,3 +26,22 @@
 - verify: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked`
 - paths: docs/verification/2026-09-08-session0.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, blocked/T-003.md, .harness/runs/**, target/release-preparation/**
 - notes: 2026-09-08 の dispatch は default branch に workflow がないため HTTP 404。main は 8b91020、作業ブランチだけ 2156d47。default branch への登録が必要。git push、API による同等の直接反映、PR の無断マージをしない。登録待ちは blocked にして測定成功としない。上記 verify は診断の契約検査だけで、実測ログなしに done にしない。ローカル SCM 診断は禁止。
+
+## T-004: 診断レコードの比較を親の環境変数から独立させる
+- status: todo
+- done-when: 親の権限と Job の比較に不要な環境変数を読まず、子の環境全体の収集・厳密な codec 検証・期待値比較を維持する。往復テストが cmd と PowerShell の両方で成功し、不正な環境名の拒否も成功する。test モジュールだけの差分で安全性評価を通す。
+- verify: `cmd.exe /d /c "rustup run 1.97.0 cargo test -p sembazuru-worker --lib sandbox::tests::sandbox_probe_record_round_trip_uses_file_not_stdout --locked -- --exact"`
+- verify: `pwsh -NoProfile -Command "rustup run 1.97.0 cargo test -p sembazuru-worker --lib sandbox_probe_record_ --locked; exit $LASTEXITCODE"`
+- verify: `rustup run 1.97.0 cargo fmt --all --check`
+- verify: `rustup run 1.97.0 cargo clippy -p sembazuru-worker --all-targets --locked -- -D warnings`
+- paths: crates/worker/src/sandbox.rs, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, blocked/T-001.md, blocked/T-004.md, .harness/**
+- notes: メインが collect_process_security を切り出して実装する。collect はその後 normalized_environment を収集する従来の完全レコード経路として保持。往復テストの親は collect_process_security、子は collect のまま。環境検査を緩めたり process environment を書き換えない。製品の token/Job/flags/ACL/codec 変更、ローカル SCM/製品 worker 起動、push/merge/publication は対象外。既存の Cargo.lock 差分の再評価は不要。この新しい worker test 差分だけを評価する。
+
+## T-005: Rust 1.98.1 の CI lint に対応する
+- status: todo
+- done-when: 定数サイズの chunks_exact を as_chunks に置き換え、SHA-256 の既知ベクトルと trace decode の境界検査を維持する。Rust 1.98.1 の fmt/clippy と tracer テストが成功する。ハッシュ・文字列の出力が変わらないことを評価する。
+- verify: `rustup run 1.98.1 cargo fmt --all --check`
+- verify: `rustup run 1.98.1 cargo clippy --all-targets --locked -- -D warnings`
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-tracer --locked`
+- paths: crates/tracer/src/determinism.rs, crates/tracer/src/format.rs, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, blocked/T-005.md, .harness/**
+- notes: メインが先に実装する。警告の allow や toolchain の downgrade で検査を回避しない。Rust 1.98.1 はローカルにも用意する。新たな lint が他のファイルに見つかったら記録し、内容を確認して範囲を更新する。C++/M2 の既知の不合格を tracer の単体テストで代替したと報告しない。
