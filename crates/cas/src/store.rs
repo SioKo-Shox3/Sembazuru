@@ -1166,7 +1166,9 @@ fn parse_file_id_extd_directory_buffer(
         // Byte-copy every field and UTF-16 unit: no struct/u16 reference is
         // formed, so i686 never depends on FILE_ID_EXTD_DIR_INFO alignment.
         let wide = buffer[header_end..name_end]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| u16::from_ne_bytes([b[0], b[1]]))
             .collect::<Vec<_>>();
         let name = OsString::from_wide(&wide);
