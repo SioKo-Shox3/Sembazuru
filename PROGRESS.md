@@ -3,7 +3,7 @@
 ## Done
 - 8444fbd: VC++ x64/x86 を同梱する Burn Setup.exe と Release ワークフローを追加。ローカルで MSI/Bundle の内容と SHA を検証済み。公開は未実施。
 - 2156d47: CREATE_NO_WINDOW の test 限定 A/B 診断を追加。製品の起動 flags は未変更。独立評価と契約検査済み、SCM 実測は未実施。
-- e463b93: h2 0.4.16 と webbrowser 1.2.2 へ最小更新。cargo-deny、Rust 1.97.0 の fmt/clippy は成功。T-001 全体は下記の再検証失敗で blocked。
+- e463b93 / T-001: h2 0.4.16 と webbrowser 1.2.2 へ最小更新。cargo-deny、Rust 1.97.0 の fmt/clippy と独立評価は成功。T-004 後に cmd 経由の workspace 全体テストも exit 0 となり、検証未完を解消。証拠は .harness/T-001-workspace-after-T004.log。
 - 2026-09-08 開始検査: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked` → `7 passed; 0 failed; 156 filtered out`。fmt --all --check と clippy --all-targets --locked -- -D warnings も exit 0。
 - GitHub の chore/two-pc-preparation は 2156d47 と一致、main は 8b91020。開始時の作業ツリーは clean。
 - T-002: GitHub の Release と PR CI の実ログを取得して確認。結果は docs/verification/2026-09-08-release-preparation.md。PR CI では MSI/Bundle の生成が成功、installed worker は 0xC0000142。Release は診断テストで失敗し、どちらの run も artifact 0 件。公開準備の完了ではない。
@@ -12,7 +12,6 @@
 
 ## In progress
 - T-006/T-007: unnamed station の診断契約と、Release の手動実行から同じコミットの診断を呼び出す経路を整える。
-- T-001: cmd 経由の診断レコード往復テストで environment text が再現。依存更新を保持し、詳細と再開条件を blocked/T-001.md へ記録した。
 - T-003: 診断 workflow の default branch 登録待ち。blocked/T-003.md。GitHub 上での実測は未実施。
 
 ## Next
@@ -25,6 +24,7 @@
 - T-004 の証拠は `.harness/runs/20260908-092538/verify-T-004-1.txt`〜`verify-T-004-4.txt`。各ファイルを開いて cmd/PowerShell のテスト結果、不正環境名拒否、fmt、clippy の exit 0 を確認した。
 
 ## Notes
+- 独立評価 CLI の終了フックが未コミットの T-005 を f14deaa として自動保存した。変更は依頼差分と一致し、評価 PASS 後に結果記録と件名を整えて 7daf3d8 とした。以降は検証済みソースをコミットしてから、その明示範囲を評価する。展開フックは変更しない。
 - T-005 の非阻害指摘: config-store のディレクトリ列挙パーサは CAS と同じ合成破損バッファの直接検査がない。実ファイルシステム経由の検査は成功し、今回の byte-copy・境界検査は不変。将来パーサを変更する際に補う。以降の検証ログにはコマンドと終了コードも保存する。
 - 最新 main CI: https://github.com/SioKo-Shox3/Sembazuru/actions/runs/34032907718 。ログは target/release-preparation/ci-34032907718-failed.log を取得して確認済み。
 - main CI の installed worker は exit=-1073741502 (0xC0000142)。install/repair/ACL/uninstall は通過。Job UI の緩和では解決しなかった。

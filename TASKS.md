@@ -4,7 +4,7 @@
 現在は診断テストの環境依存、CI lint、Session 0 の診断を進める。公開、未測定の起動条件の製品適用、GUI 保存方式の決定は未完。
 
 ## T-001: 依存関係の脆弱性検査エラーを修正する
-- status: blocked
+- status: done
 - done-when: h2 と webbrowser を修正版へ最小更新し、cargo-deny、fmt、clippy、workspace テストの実出力を確認する。差分の独立評価を通す。配布全体の合格とは区別する。
 - verify: `cargo deny check advisories bans licenses sources`
 - verify: `rustup run 1.97.0 cargo fmt --all --check`
