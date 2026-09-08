@@ -4436,28 +4436,30 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
 
     #[test]
-    fn private_station_unnamed_create_rejects_connected_logon_station() {
+    fn private_station_unnamed_create_cannot_allocate_per_action_station() {
         let token = ActionToken::create().expect("action token");
         let broker = sid_string(token.broker_sid()).expect("broker SID");
         let current = unsafe { GetProcessWindowStation() };
         let before = user_object_identity(current).expect("current identity before create");
         let sddl = format!("O:{broker}D:P(D;;WD;;;OW)(A;;0x00020002;;;{broker})");
-        let created = ActionPipeSecurity(sddl).with_attributes(|attributes| {
-            // SAFETY: attributes points to the live protected descriptor for this synchronous call.
-            let handle = unsafe {
-                CreateWindowStationW(
-                    null(),
-                    CWF_CREATE_ONLY,
-                    READ_CONTROL | WINSTA_READATTRIBUTES as u32,
-                    attributes.cast(),
-                )
-            };
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(AuditWindowStation(Some(handle)))
-        });
-        match created {
+        let create = || {
+            ActionPipeSecurity(sddl.clone()).with_attributes(|attributes| {
+                // SAFETY: attributes points to the live protected descriptor for this synchronous call.
+                let handle = unsafe {
+                    CreateWindowStationW(
+                        null(),
+                        CWF_CREATE_ONLY,
+                        READ_CONTROL | WINSTA_READATTRIBUTES as u32,
+                        attributes.cast(),
+                    )
+                };
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(AuditWindowStation(Some(handle)))
+            })
+        };
+        match create() {
             Err(error) => {
                 let after = user_object_identity(unsafe { GetProcessWindowStation() })
                     .expect("current identity after failed create");
@@ -4475,15 +4477,20 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 }
             }
             Ok(station) => {
+                // A NULL name uses the process logon session, not an action identity.
+                // Keep the first station alive so a second CREATE_ONLY must collide.
+                let second = create();
+                let second_error = second.as_ref().err().and_then(io::Error::raw_os_error);
                 // SAFETY: current is the original live process window-station handle.
                 let restore_ok = unsafe { SetProcessWindowStation(current) } != 0;
                 let restore_error = (!restore_ok).then(io::Error::last_os_error);
                 let restored =
                     restore_ok.then(|| user_object_identity(unsafe { GetProcessWindowStation() }));
                 let identity = user_object_identity(station.handle());
+                let second_close = second.ok().map(AuditWindowStation::close);
                 let close = station.close();
                 eprintln!(
-                    "unnamed station cleanup: restore_ok={restore_ok} restore_error={:?} close_error={:?}",
+                    "unnamed station cleanup: restore_ok={restore_ok} restore_error={:?} second_create_error={second_error:?} second_close={second_close:?} close_error={:?}",
                     restore_error.as_ref().and_then(io::Error::raw_os_error),
                     close.as_ref().err().and_then(io::Error::raw_os_error),
                 );
@@ -4498,10 +4505,19 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 );
                 let identity = identity.expect("created identity");
                 assert!(close.is_ok(), "created station close failed: {close:?}");
-                if identity != before {
-                    panic!("fresh unnamed station supported; design review required: {identity:?}");
+                if let Some(second_close) = second_close {
+                    assert!(
+                        second_close.is_ok(),
+                        "second station close failed: {second_close:?}"
+                    );
+                    panic!("second unnamed CREATE_ONLY unexpectedly succeeded: {identity:?}");
                 }
-                eprintln!("unsupported unnamed station aliases current: {identity:?}");
+                assert_eq!(
+                    second_error,
+                    Some(183),
+                    "indeterminate second unnamed create: {identity:?}"
+                );
+                eprintln!("unnamed station is logon-bound, not action-private: {identity:?}");
             }
         }
     }

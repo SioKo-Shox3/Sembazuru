@@ -50,7 +50,7 @@
 - scope: 同じ定数サイズの変換が config-store/CAS のディレクトリ列挙にもある。偶数長・境界・整列に関する検査と byte-copy を保持し、as_chunks への置換だけを行う。config-store の test モジュール内の重複 import も削除する。攻撃面とメモリ安全性を独立評価に含める。出力比較用 .harness/T-005-output-equivalence.rs は変更前後のハッシュと trace decode を比較し、同じ入力で二回の出力一致も検査する。製品の ACL や codec 仕様、ハッシュ方式の変更が必要なら止めて別タスクとする。
 
 ## T-006: unnamed station の診断をログオン単位の生成契約へ修正する
-- status: todo
+- status: doing
 - done-when: 最初の NULL 名による生成が失敗する環境と、ログオン用 station を初回生成できる環境を区別する。初回成功時はそのハンドルを保持して二回目の CWF_CREATE_ONLY を試し、二回目の成功を拒否する。元の process station の復元と全生成ハンドルの close を検査する。未知の失敗を衝突成功としない。test モジュールだけの変更を安全性評価する。
 - verify: `rustup run 1.98.1 cargo test -p sembazuru-worker --lib private_station_unnamed_create_ --locked -- --nocapture`
 - verify: `rustup run 1.98.1 cargo fmt --all --check`
