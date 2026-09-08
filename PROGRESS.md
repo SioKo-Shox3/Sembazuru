@@ -6,13 +6,16 @@
 - e463b93: h2 0.4.16 と webbrowser 1.2.2 へ最小更新。cargo-deny、Rust 1.97.0 の fmt/clippy は成功。T-001 全体は下記の再検証失敗で blocked。
 - 2026-09-08 開始検査: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked` → `7 passed; 0 failed; 156 filtered out`。fmt --all --check と clippy --all-targets --locked -- -D warnings も exit 0。
 - GitHub の chore/two-pc-preparation は 2156d47 と一致、main は 8b91020。開始時の作業ツリーは clean。
+- T-002: GitHub の Release と PR CI の実ログを取得して確認。結果は docs/verification/2026-09-08-release-preparation.md。PR CI では MSI/Bundle の生成が成功、installed worker は 0xC0000142。Release は診断テストで失敗し、どちらの run も artifact 0 件。公開準備の完了ではない。
 
 ## In progress
-- T-002: Release の dry run 34169478977 を 2156d47 で開始済み。
 - T-001: cmd 経由の診断レコード往復テストで environment text が再現。依存更新を保持し、詳細と再開条件を blocked/T-001.md へ記録した。
+- T-003: 診断 workflow の default branch 登録待ち。blocked/T-003.md。GitHub 上での実測は未実施。
 
 ## Next
-- T-003: Session 0 診断 workflow の default branch 登録後に実測する。現在 dispatch は HTTP 404。
+- M1 で blocked 項目を解消する修正範囲を決める。現在の一覧は T-001/T-003 が blocked、T-002 の結果確認が done。新規 todo を作るまで同じ一覧を再実行しない。
+- Session 0 診断 workflow の default branch 登録後に実測する。現在 dispatch は HTTP 404。
+- Rust 1.98.1 の tracer lint と、Release を止めた private_station_unnamed_create_rejects_connected_logon_station の想定を修正・検証する。
 - C++ の P0 cross-bitness negative control が Windows 2022/2025 の両方で 5 分 timeout。M2 は CI で未到達。ローカル M2 は cl の起動失敗で比較前に終了した。
 - GUI Join は StubConfigWriter のまま。保存する token と machine store の境界、昇格方法の設計を固めてから実装する。
 - 全体の完了にはインストール、参加設定、installed worker 実行、C++/M2、公開ダウンロードの検証が必要。
