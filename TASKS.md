@@ -85,4 +85,7 @@
 - done-when: `hooks/test/vfs_redirect.ps1` の launcher が `VFS bootstrap handles unavailable gle=13` を出さず、redirect がエージェントのバイト列を返す。gle=13 (ERROR_INVALID_DATA) の発生源を実出力で特定し、ローカル環境固有か製品欠陥かを区別して記録する。
 - verify: `pwsh -NoProfile -File hooks/test/vfs_redirect.ps1`
 - paths: hooks/src/vfs_attestation.cpp, hooks/src/launcher.cpp, hooks/test/vfs_redirect.ps1, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
-- notes: T-008 の検証中に発見。失敗は launcher が Detours を呼ぶ前の `OpenFromBootstrapEnvironment` で起きるため T-008 の差分とは経路が交わらない。シェルの入れ子の有無で挙動は変わらず、vcvars 環境でも同じ。最新 CI では P0 のタイムアウトで M2 以降が skipped になっており、この gate の CI 上の現状は未確認。先に CI での状態を確かめてからローカル固有と断定する。
+- notes: T-008 の検証中に発見。失敗は launcher が Detours を呼ぶ前の `OpenFromBootstrapEnvironment` で起きるため T-008 の差分とは経路が交わらない。シェルの入れ子の有無で挙動は変わらず、vcvars 環境でも同じ。
+- diagnosis: ローカル固有ではない。`fb02b72`「P0: VFS子プロセス注入を検証し失敗を拒否する」(2026-07-25) が `vfs_attestation` を導入し、launcher の VFS 経路に bootstrap ハンドルを必須化した。`hooks/test/vfs_redirect.ps1` の最終更新は `8096c2e` (2026-07-07) でそれより前であり、attestation オブジェクトを一切用意しない。`SEMBAZURU_VFS_MAPPING_HANDLE` を設定しているテストは `process_injection_failure.ps1` だけで、`vfs_redirect.ps1`・`vfs_compile.ps1`・`vfs_bench.ps1` の3件は `SEMBAZURU_MODE=vfs` を設定しながら用意していない。`m6_worker_vfs_redirect.ps1` は worker 経由なので影響を受けない。
+- impact: CI の C++ job は P0 (ci.yml:97) が vfs_redirect (ci.yml:128) より前にあり、P0 のタイムアウトでこの3件は skipped になっていた。T-008 で P0 が通ると、この3件が新たに失敗として現れる。次回 CI で C++ job が緑になると期待しないこと。
+- scope: 修正対象は3スクリプト側か、launcher の VFS 経路の要件かを先に決める。製品の fail-closed の意味づけ（attestation なしの VFS 子を走らせない）を緩める方向の修正はしない。
