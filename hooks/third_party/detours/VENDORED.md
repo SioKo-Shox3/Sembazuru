@@ -33,17 +33,30 @@ and back), then wait for it with `WaitForSingleObject(..., INFINITE)`.
 When the sibling DLL is absent, `rundll32` cannot load it and puts up a modal
 error box instead of exiting. Nothing dismisses that box on a build machine, so
 the caller waits forever: a 64-bit parent spawning a 32-bit child never returns
-from `CreateProcess`. Two changes make that case terminate:
+from `CreateProcess`. Three changes make that case terminate, and terminate
+without leaving a helper behind:
 
-- `HelperDllsArePresent` checks the rewritten DLL names before any helper is
-  spawned and fails with `ERROR_MOD_NOT_FOUND`. Names without a path separator
-  are not checked, because the helper's loader search order cannot be
-  reproduced from a process of the other bitness.
-- `WaitForHelperProcess` bounds the wait at `DETOUR_HELPER_TIMEOUT_MS`
-  (30 s) and terminates a helper that overruns it, reporting `ERROR_TIMEOUT`.
-  Injecting into an already-suspended process is sub-second work, so this only
-  fires on a wedged helper.
+- `WaitForHelperProcess` bounds the wait at `DETOUR_HELPER_TIMEOUT_MS` (30 s).
+  This is a policy bound, not a claim that a slower helper is necessarily
+  wedged. It distinguishes the helper exiting on its own (`ERROR_TIMEOUT` is
+  not reported, the exit code is) from the caller giving up (`ERROR_TIMEOUT`)
+  from the wait itself failing (`ERROR_PROCESS_ABORTED`), because only the
+  first yields a meaningful exit code.
+- `CreateHelperJob` puts the helper in a job with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before it is resumed, so cleanup does
+  not depend on `TerminateProcess` succeeding or on the helper responding to
+  it. The job handle is closed on every exit path. If no such job can be set
+  up, no helper is spawned: an injection that cannot be cleaned up after is
+  reported as a failure rather than started.
+- `AnyHelperDllIsProvablyMissing` skips the helper entirely when a rewritten
+  DLL name cannot possibly load, which keeps the common failure fast rather
+  than paying the timeout. "Provably" is narrow on purpose, because absence
+  for this process is not absence for the helper: relative names (resolved by
+  the helper's own loader search order) and anything under `%WINDIR%` (subject
+  to WOW64 redirection, so `System32\x32.dll` may resolve to `SysWOW64` in the
+  helper) are never judged, and only `ERROR_FILE_NOT_FOUND`-class results
+  count. Everything else falls through to the bounded wait.
 
-Both turn an unbounded wait into a `FALSE` return, which is what the callers
-already treat as an injection failure. The duplicated `ResumeThread` call in
-the wide variant is upstream's and is left as-is.
+All three turn an unbounded wait into a `FALSE` return, which is what the
+callers already treat as an injection failure. The duplicated `ResumeThread`
+call in the wide variant is upstream's and is left as-is.

@@ -1134,75 +1134,192 @@ VOID WINAPI FreeExeHelper(PDETOUR_EXE_HELPER *pHelper)
     }
 }
 
-// SEMBAZURU LOCAL PATCH (see VENDORED.md): upper bound on how long the
-// cross-bitness rundll32 helper may run before it is treated as a failure.
-// Injection into an already-suspended process is sub-second work; anything
-// beyond this is a stuck helper, not slow progress.
+// SEMBAZURU LOCAL PATCH (see VENDORED.md): how long the cross-bitness
+// rundll32 helper may run before the caller stops waiting for it. This is a
+// policy bound, not a claim that a slower helper is necessarily wedged:
+// injecting into an already-suspended process is sub-second work, so waiting
+// longer buys nothing the caller's fail-closed path does not already handle.
 #define DETOUR_HELPER_TIMEOUT_MS 30000
 
-// SEMBAZURU LOCAL PATCH (see VENDORED.md): rundll32 blocks on a modal error
-// box when it cannot load the DLL named on its command line, so a missing
-// sibling DLL would otherwise hang the caller forever. AllocExeHelper has
-// already rewritten "64." to "32." (or back), so these are the names the
-// helper will really load. Only names that carry a path are checked: a bare
-// file name is resolved by the helper's own loader search order, which this
-// process cannot reproduce across bitness.
+// How long to confirm the helper is gone after asking it to terminate.
+// TerminateProcess is asynchronous, so the kill is only observed here.
+#define DETOUR_HELPER_KILL_TIMEOUT_MS 5000
+
+// SEMBAZURU LOCAL PATCH (see VENDORED.md): the helper is killed when the job
+// handle closes, so cleanup does not depend on TerminateProcess succeeding or
+// on the process responding. Returns NULL when no such job can be set up.
 static
-BOOL WINAPI HelperDllsArePresent(_In_ PDETOUR_EXE_HELPER pHelper)
+HANDLE WINAPI CreateHelperJob(VOID)
 {
-    PCHAR pszDll = &pHelper->rDlls[0];
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (hJob == NULL) {
+        DETOUR_TRACE(("CreateJobObject failed: %d\n", GetLastError()));
+        return NULL;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+    ZeroMemory(&jeli, sizeof(jeli));
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                 &jeli, sizeof(jeli))) {
+        DETOUR_TRACE(("SetInformationJobObject failed: %d\n", GetLastError()));
+        CloseHandle(hJob);
+        return NULL;
+    }
+
+    return hJob;
+}
+
+// SEMBAZURU LOCAL PATCH (see VENDORED.md): rundll32 blocks on a modal error
+// box when it cannot load the DLL named on its command line, so spawning a
+// helper that is certain to fail only costs the caller the timeout below.
+// AllocExeHelper has already rewritten "64." to "32." (or back), so these are
+// the names the helper will really load.
+//
+// Only absence that holds for the HELPER counts, which is narrower than
+// absence for this process:
+//   - relative names are resolved by the helper's loader search order, which
+//     this process cannot reproduce, so they are never judged;
+//   - paths under the Windows directory are subject to WOW64 file system
+//     redirection, so a name this process cannot see may still resolve in the
+//     helper (System32 -> SysWOW64), and they are never judged either;
+//   - any error other than "not found" (sharing, access, offline) says
+//     nothing about whether the helper can load the file.
+// Everything else is a plain absolute path outside the redirected tree, where
+// "not found" here means "not found there".
+static
+BOOL WINAPI HelperDllIsProvablyMissing(_In_reads_(cchDll) PCSTR pszDll,
+                                       _In_ size_t cchDll)
+{
+    BOOL bAbsolute = FALSE;
+    if (cchDll >= 3 && pszDll[1] == ':' &&
+        (pszDll[2] == '\\' || pszDll[2] == '/')) {
+        bAbsolute = TRUE;                       // X:\... or X:/...
+    }
+    else if (cchDll >= 2 && pszDll[0] == '\\' && pszDll[1] == '\\') {
+        bAbsolute = TRUE;                       // \\server\share\...
+    }
+    if (!bAbsolute) {
+        return FALSE;
+    }
+
+    CHAR szWindows[MAX_PATH];
+    DWORD nLen = GetEnvironmentVariableA("WINDIR", szWindows, ARRAYSIZE(szWindows));
+    if (nLen == 0 || nLen >= ARRAYSIZE(szWindows)) {
+        return FALSE;                           // cannot rule redirection out
+    }
+    if ((size_t)nLen <= cchDll) {
+        BOOL bUnderWindows = TRUE;
+        for (DWORD c = 0; c < nLen; c++) {
+            CHAR a = szWindows[c];
+            CHAR b = pszDll[c];
+            if (a >= 'a' && a <= 'z') { a = (CHAR)(a - 'a' + 'A'); }
+            if (b >= 'a' && b <= 'z') { b = (CHAR)(b - 'a' + 'A'); }
+            if (a == '/') { a = '\\'; }
+            if (b == '/') { b = '\\'; }
+            if (a != b) {
+                bUnderWindows = FALSE;
+                break;
+            }
+        }
+        if (bUnderWindows) {
+            return FALSE;                       // WOW64 may still resolve it
+        }
+    }
+
+    if (GetFileAttributesA(pszDll) != INVALID_FILE_ATTRIBUTES) {
+        return FALSE;
+    }
+
+    DWORD dwError = GetLastError();
+    if (dwError != ERROR_FILE_NOT_FOUND && dwError != ERROR_PATH_NOT_FOUND &&
+        dwError != ERROR_INVALID_NAME) {
+
+        return FALSE;                           // absence not established
+    }
+
+    DETOUR_TRACE(("Helper DLL provably missing: %hs\n", pszDll));
+    return TRUE;
+}
+
+// Walks the packed DLL names the same way DetourFinishHelperProcess does, so
+// the two agree on where each name ends. cb bounds the walk: AllocExeHelper
+// sized the block, and a name that runs past it is treated as malformed.
+static
+BOOL WINAPI AnyHelperDllIsProvablyMissing(_In_ PDETOUR_EXE_HELPER pHelper)
+{
+    if (pHelper->cb < sizeof(DETOUR_EXE_HELPER)) {
+        return FALSE;
+    }
+
+    DWORD cbRemaining = pHelper->cb - sizeof(DETOUR_EXE_HELPER);
+    PCSTR pszDll = &pHelper->rDlls[0];
 
     for (DWORD n = 0; n < pHelper->nDlls; n++) {
         size_t cchDll = 0;
 
-        if (!SUCCEEDED(StringCchLengthA(pszDll, 4096, &cchDll))) {
-            return FALSE;
+        if (cbRemaining == 0 ||
+            !SUCCEEDED(StringCchLengthA(pszDll, cbRemaining, &cchDll))) {
+
+            return FALSE;                       // malformed; let the wait bound it
         }
-
-        BOOL bHasPath = FALSE;
-        for (size_t c = 0; c < cchDll; c++) {
-            if (pszDll[c] == '\\' || pszDll[c] == '/' || pszDll[c] == ':') {
-                bHasPath = TRUE;
-                break;
-            }
-        }
-
-        if (bHasPath) {
-            DWORD dwAttributes = GetFileAttributesA(pszDll);
-            if (dwAttributes == INVALID_FILE_ATTRIBUTES ||
-                (dwAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
-
-                DETOUR_TRACE(("Helper DLL not present: %hs\n", pszDll));
-                return FALSE;
-            }
+        if (HelperDllIsProvablyMissing(pszDll, cchDll)) {
+            return TRUE;
         }
 
         pszDll += cchDll + 1;
+        cbRemaining -= (DWORD)cchDll + 1;
     }
 
-    return TRUE;
+    return FALSE;
 }
 
 // SEMBAZURU LOCAL PATCH (see VENDORED.md): upstream waits INFINITE on the
 // helper. A helper that never exits (blocked on a message box, or wedged for
 // any other reason) must surface as an injection failure so the caller's
-// fail-closed path runs, not as a hang. Returns FALSE when the helper had to
-// be terminated.
+// fail-closed path runs, not as a hang.
+//
+// Reports which of three things happened, because they are not the same:
+// the helper exited on its own, the caller stopped waiting, or the wait
+// itself failed. Only the first yields a meaningful exit code. Cleanup does
+// not depend on the answer: the caller's job object kills whatever is left.
+enum DETOUR_HELPER_WAIT {
+    DETOUR_HELPER_EXITED,
+    DETOUR_HELPER_TIMED_OUT,
+    DETOUR_HELPER_WAIT_FAILED,
+};
+
 static
-BOOL WINAPI WaitForHelperProcess(_In_ HANDLE hProcess, _Out_ PDWORD pdwResult)
+DETOUR_HELPER_WAIT WINAPI WaitForHelperProcess(_In_ HANDLE hProcess,
+                                               _Out_ PDWORD pdwResult)
 {
     *pdwResult = 500;
 
-    if (WaitForSingleObject(hProcess, DETOUR_HELPER_TIMEOUT_MS) != WAIT_OBJECT_0) {
-        DETOUR_TRACE(("Rundll32.exe did not exit within %d ms\n",
-                      DETOUR_HELPER_TIMEOUT_MS));
-        TerminateProcess(hProcess, ~0u);
-        WaitForSingleObject(hProcess, DETOUR_HELPER_TIMEOUT_MS);
-        return FALSE;
+    DWORD dwWait = WaitForSingleObject(hProcess, DETOUR_HELPER_TIMEOUT_MS);
+    if (dwWait == WAIT_OBJECT_0) {
+        GetExitCodeProcess(hProcess, pdwResult);
+        return DETOUR_HELPER_EXITED;
+    }
+    if (dwWait != WAIT_TIMEOUT) {
+        DETOUR_TRACE(("Waiting on rundll32.exe failed: %d\n", GetLastError()));
+        return DETOUR_HELPER_WAIT_FAILED;
     }
 
-    GetExitCodeProcess(hProcess, pdwResult);
-    return TRUE;
+    DETOUR_TRACE(("Rundll32.exe did not exit within %d ms\n",
+                  DETOUR_HELPER_TIMEOUT_MS));
+
+    // Ask nicely first so the common case is reaped here rather than at job
+    // close, but do not depend on it: TerminateProcess can fail outright and
+    // is asynchronous when it does not.
+    if (TerminateProcess(hProcess, ~0u)) {
+        WaitForSingleObject(hProcess, DETOUR_HELPER_KILL_TIMEOUT_MS);
+    }
+    else {
+        DETOUR_TRACE(("TerminateProcess(rundll32.exe) failed: %d\n",
+                      GetLastError()));
+    }
+    return DETOUR_HELPER_TIMED_OUT;
 }
 
 BOOL WINAPI DetourProcessViaHelperA(_In_ DWORD dwTargetPid,
@@ -1224,6 +1341,7 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
     CHAR szExe[MAX_PATH];
     CHAR szCommand[MAX_PATH];
     PDETOUR_EXE_HELPER helper = NULL;
+    HANDLE hJob = NULL;
     HRESULT hr;
 
     DETOUR_TRACE(("DetourProcessViaHelperDlls(pid=%d,dlls=%d)\n", dwTargetPid, nDlls));
@@ -1234,8 +1352,12 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
     if (!AllocExeHelper(&helper, dwTargetPid, nDlls, rlpDlls)) {
         goto Cleanup;
     }
-    if (!HelperDllsArePresent(helper)) {
+    if (AnyHelperDllIsProvablyMissing(helper)) {
         SetLastError(ERROR_MOD_NOT_FOUND);
+        goto Cleanup;
+    }
+    hJob = CreateHelperJob();
+    if (hJob == NULL) {
         goto Cleanup;
     }
 
@@ -1281,16 +1403,25 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
             goto Cleanup;
         }
 
+        if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+            DETOUR_TRACE(("AssignProcessToJobObject failed: %d\n", GetLastError()));
+            TerminateProcess(pi.hProcess, ~0u);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            goto Cleanup;
+        }
+
         ResumeThread(pi.hThread);
 
         DWORD dwResult = 500;
-        BOOL bExited = WaitForHelperProcess(pi.hProcess, &dwResult);
+        DETOUR_HELPER_WAIT wait = WaitForHelperProcess(pi.hProcess, &dwResult);
 
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        if (!bExited) {
-            SetLastError(ERROR_TIMEOUT);
+        if (wait != DETOUR_HELPER_EXITED) {
+            SetLastError(wait == DETOUR_HELPER_TIMED_OUT ? ERROR_TIMEOUT
+                                                         : ERROR_PROCESS_ABORTED);
             goto Cleanup;
         }
         if (dwResult != 0) {
@@ -1305,6 +1436,12 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
     }
 
   Cleanup:
+    // Closing the job kills any helper still alive, whether or not
+    // TerminateProcess above was able to.
+    if (hJob != NULL) {
+        CloseHandle(hJob);
+        hJob = NULL;
+    }
     FreeExeHelper(&helper);
     return Result;
 }
@@ -1327,6 +1464,7 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
     WCHAR szExe[MAX_PATH];
     WCHAR szCommand[MAX_PATH];
     PDETOUR_EXE_HELPER helper = NULL;
+    HANDLE hJob = NULL;
     HRESULT hr;
 
     DETOUR_TRACE(("DetourProcessViaHelperDlls(pid=%d,dlls=%d)\n", dwTargetPid, nDlls));
@@ -1337,8 +1475,12 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
     if (!AllocExeHelper(&helper, dwTargetPid, nDlls, rlpDlls)) {
         goto Cleanup;
     }
-    if (!HelperDllsArePresent(helper)) {
+    if (AnyHelperDllIsProvablyMissing(helper)) {
         SetLastError(ERROR_MOD_NOT_FOUND);
+        goto Cleanup;
+    }
+    hJob = CreateHelperJob();
+    if (hJob == NULL) {
         goto Cleanup;
     }
 
@@ -1384,18 +1526,27 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
             goto Cleanup;
         }
 
+        if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+            DETOUR_TRACE(("AssignProcessToJobObject failed: %d\n", GetLastError()));
+            TerminateProcess(pi.hProcess, ~0u);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+            goto Cleanup;
+        }
+
         ResumeThread(pi.hThread);
 
         ResumeThread(pi.hThread);
 
         DWORD dwResult = 500;
-        BOOL bExited = WaitForHelperProcess(pi.hProcess, &dwResult);
+        DETOUR_HELPER_WAIT wait = WaitForHelperProcess(pi.hProcess, &dwResult);
 
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
-        if (!bExited) {
-            SetLastError(ERROR_TIMEOUT);
+        if (wait != DETOUR_HELPER_EXITED) {
+            SetLastError(wait == DETOUR_HELPER_TIMED_OUT ? ERROR_TIMEOUT
+                                                         : ERROR_PROCESS_ABORTED);
             goto Cleanup;
         }
         if (dwResult != 0) {
@@ -1410,6 +1561,12 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
     }
 
   Cleanup:
+    // Closing the job kills any helper still alive, whether or not
+    // TerminateProcess above was able to.
+    if (hJob != NULL) {
+        CloseHandle(hJob);
+        hJob = NULL;
+    }
     FreeExeHelper(&helper);
     return Result;
 }
