@@ -16,14 +16,16 @@
 - T-008: Detours の cross-bitness helper が `WaitForSingleObject(..., INFINITE)` で rundll32 を待つため、sibling DLL が無い場合に永久に止まっていた。15 秒の有界待ちと、KILL_ON_JOB_CLOSE のジョブによるベストエフォートの後始末を vendored Detours に入れ、無期限待ちを既存の fail-closed が扱える FALSE に変換した。P0 ゲートはローカルで 5 分 timeout から 91.4 秒の PASS になり、rundll32 と probe の残留はゼロ。M7.3 cross-bitness 成功経路、trace_write_batch の x64/x86、nt_rename、hooks の ctest 3 件も PASS。証拠は .harness/T-008-p0-injection.log、T-008-m7-inject32.log、T-008-regression-gates.log。
 - T-008 で捨てた案: 不在の事前判定は WOW64 リダイレクトと相対名の探索順のせいで、このプロセスからは確定できず、誤ると正常な注入を拒否する。後始末のジョブを必須にすると、UI 制限付きで breakaway を許さない製品ワーカーのジョブ内で注入が失敗しうる。rundll32 のエラーダイアログはプロセスのエラーモードでは抑止できない（実測）。
 
+- T-009: `fb02b72` が launcher の VFS 経路に attestation を必須化した一方、vfs_redirect・vfs_compile・vfs_bench がそれを用意しておらず、注入の前に落ちていた。生成と破棄を hooks/test/vfs_attestation_bootstrap.ps1 に集約し、4ゲートが同じ契約を共有するようにした。各ゲートの判定条件と製品コードは変更していない。3件とも PASS。証拠は .harness/T-009-gates.log。
+- **M2 決定性ハーネスがローカルで PASS した**。`DETERMINISM OK: 2 output(s) reproduce`、`GATE PASS msvc: corpus reproduces byte-for-byte`。以前「cl の起動失敗で比較前に終了」と記録していたのは、下の Notes にある古い modules.obj と同じビルドツリー汚染が原因。clang-cl は不在のため SKIP で、CI 側の担当。証拠は .harness/T-009-determinism.log。
+
 ## In progress
 - T-003: GitHub 上での実測待ち。blocked/T-003.md。T-007 により診断専用 workflow の main 登録は先行条件ではなくなった。push は完了済みで、残るのは Release のブランチ指定の手動実行。
 
 ## Next
 - `gh workflow run release.yml --ref chore/two-pc-preparation` を実行し、同じ SHA の診断 job の結果を確認する。診断専用名への直接 dispatch は使わない。2026-09-17 の試行は自動承認の分類器が Create Public Surface として拒否したため、ユーザーの明示指示が要る。
 - `private_station_unnamed_create_cannot_allocate_per_action_station` の初回成功分岐を GitHub runner で確認する。
-- T-009: vfs_redirect の launcher が `VFS bootstrap handles unavailable gle=13` で失敗する。T-008 の差分とは経路が交わらない別件。最新 CI では P0 の timeout で M2 以降が skipped のため、この gate の CI 上の現状は未確認。
-- ローカル M2 は cl の起動失敗で比較前に終了した状態のまま。
+- 次に CI を回すとき、C++ job で新たに見えるようになるのは M2 以降の段。ローカルでは M2・smoke・VFS 3件が通るが、clang-cl を要する段はローカルで未実行なので CI が初出になる。
 - GUI Join は StubConfigWriter のまま。MachineTokenUpdate は machine token/daemon設定/worker設定を同じ journal で扱えるが、storectl の7固定動詞には Join 保存がなく、GUI ConfigWriter も token を表現しない。既存の固定パスと認可を維持する Join 専用経路が必要。
 - 全体の完了にはインストール、参加設定、installed worker 実行、C++/M2、公開ダウンロードの検証が必要。
 - T-004 の証拠は `.harness/runs/20260908-092538/verify-T-004-1.txt`〜`verify-T-004-4.txt`。各ファイルを開いて cmd/PowerShell のテスト結果、不正環境名拒否、fmt、clippy の exit 0 を確認した。

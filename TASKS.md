@@ -82,7 +82,7 @@
 - measured: P0 は 91.4 秒で PASS（cross-bitness 6 ケース × 15 秒）。CI の 5 分予算の約 30%。m7_inject32 0.6 秒 PASS、trace_write_batch x64/x86 PASS、nt_rename PASS、ctest 3/3 PASS、rundll32 と probe の残留 0。GitHub CI 上での確認は未実施。
 
 ## T-009: VFS bootstrap ハンドルの受け渡しが失敗する
-- status: todo
+- status: done
 - done-when: `hooks/test/vfs_redirect.ps1` の launcher が `VFS bootstrap handles unavailable gle=13` を出さず、redirect がエージェントのバイト列を返す。gle=13 (ERROR_INVALID_DATA) の発生源を実出力で特定し、ローカル環境固有か製品欠陥かを区別して記録する。
 - verify: `pwsh -NoProfile -File hooks/test/vfs_redirect.ps1`
 - paths: hooks/src/vfs_attestation.cpp, hooks/src/launcher.cpp, hooks/test/vfs_redirect.ps1, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
@@ -90,3 +90,5 @@
 - diagnosis: ローカル固有ではない。`fb02b72`「P0: VFS子プロセス注入を検証し失敗を拒否する」(2026-07-25) が `vfs_attestation` を導入し、launcher の VFS 経路に bootstrap ハンドルを必須化した。`hooks/test/vfs_redirect.ps1` の最終更新は `8096c2e` (2026-07-07) でそれより前であり、attestation オブジェクトを一切用意しない。`SEMBAZURU_VFS_MAPPING_HANDLE` を設定しているテストは `process_injection_failure.ps1` だけで、`vfs_redirect.ps1`・`vfs_compile.ps1`・`vfs_bench.ps1` の3件は `SEMBAZURU_MODE=vfs` を設定しながら用意していない。`m6_worker_vfs_redirect.ps1` は worker 経由なので影響を受けない。
 - impact: CI の C++ job は P0 (ci.yml:97) が vfs_redirect (ci.yml:128) より前にあり、P0 のタイムアウトでこの3件は skipped になっていた。T-008 で P0 が通ると、この3件が新たに失敗として現れる。次回 CI で C++ job が緑になると期待しないこと。
 - scope: 修正対象は3スクリプト側か、launcher の VFS 経路の要件かを先に決める。製品の fail-closed の意味づけ（attestation なしの VFS 子を走らせない）を緩める方向の修正はしない。
+- resolution: 生成と破棄を hooks/test/vfs_attestation_bootstrap.ps1 に集約し、vfs_redirect・vfs_compile・vfs_bench が launcher を起動する各箇所で用意するようにした。既に動いていた process_injection_failure も同じヘルパへ寄せ、重複を残していない。各ゲートの合否判定は変更していない。製品コードは変更していない。
+- measured: process_injection_failure PASS 91.3秒、vfs_redirect PASS 1.7秒、vfs_compile PASS 1.9秒、vfs_bench PASS 9.9秒、m7_inject32 PASS 0.6秒、nt_rename PASS 0.7秒、ctest 3/3 PASS、smoke PASS、determinism (M2) PASS。clang-cl はローカル不在で各ゲート SKIP。証拠は .harness/T-009-gates.log、T-009-determinism.log。GitHub CI 上での確認は未実施。
