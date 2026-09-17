@@ -1137,17 +1137,24 @@ VOID WINAPI FreeExeHelper(PDETOUR_EXE_HELPER *pHelper)
 // SEMBAZURU LOCAL PATCH (see VENDORED.md): how long the cross-bitness
 // rundll32 helper may run before the caller stops waiting for it. This is a
 // policy bound, not a claim that a slower helper is necessarily wedged:
-// injecting into an already-suspended process is sub-second work, so waiting
-// longer buys nothing the caller's fail-closed path does not already handle.
-#define DETOUR_HELPER_TIMEOUT_MS 30000
+// injecting into an already-suspended process is sub-second work, and a
+// caller that gives up early only loses the injection, which every caller
+// already handles as a failure.
+#define DETOUR_HELPER_TIMEOUT_MS 15000
 
 // How long to confirm the helper is gone after asking it to terminate.
 // TerminateProcess is asynchronous, so the kill is only observed here.
 #define DETOUR_HELPER_KILL_TIMEOUT_MS 5000
 
-// SEMBAZURU LOCAL PATCH (see VENDORED.md): the helper is killed when the job
-// handle closes, so cleanup does not depend on TerminateProcess succeeding or
-// on the process responding. Returns NULL when no such job can be set up.
+// SEMBAZURU LOCAL PATCH (see VENDORED.md): a job whose closure kills whatever
+// is left in it, so cleanup does not depend on TerminateProcess succeeding or
+// on the helper responding to it.
+//
+// Best effort on purpose. The caller may already run inside a job that does
+// not permit what this one needs (the Sembazuru worker sandboxes actions in a
+// UI-restricted job with no breakaway), and losing a cleanup backstop is not
+// a reason to refuse an injection that would otherwise succeed. Callers treat
+// NULL as "no job" and carry on.
 static
 HANDLE WINAPI CreateHelperJob(VOID)
 {
@@ -1171,119 +1178,31 @@ HANDLE WINAPI CreateHelperJob(VOID)
     return hJob;
 }
 
-// SEMBAZURU LOCAL PATCH (see VENDORED.md): rundll32 blocks on a modal error
-// box when it cannot load the DLL named on its command line, so spawning a
-// helper that is certain to fail only costs the caller the timeout below.
-// AllocExeHelper has already rewritten "64." to "32." (or back), so these are
-// the names the helper will really load.
-//
-// Only absence that holds for the HELPER counts, which is narrower than
-// absence for this process:
-//   - relative names are resolved by the helper's loader search order, which
-//     this process cannot reproduce, so they are never judged;
-//   - paths under the Windows directory are subject to WOW64 file system
-//     redirection, so a name this process cannot see may still resolve in the
-//     helper (System32 -> SysWOW64), and they are never judged either;
-//   - any error other than "not found" (sharing, access, offline) says
-//     nothing about whether the helper can load the file.
-// Everything else is a plain absolute path outside the redirected tree, where
-// "not found" here means "not found there".
+// Puts the (still suspended) helper in the job if there is one. Failing to
+// assign it is not fatal: the helper is then bounded only by the wait below,
+// which is still strictly better than the unbounded wait this patch replaces.
 static
-BOOL WINAPI HelperDllIsProvablyMissing(_In_reads_(cchDll) PCSTR pszDll,
-                                       _In_ size_t cchDll)
+VOID WINAPI TryAssignHelperToJob(_Inout_ HANDLE *phJob, _In_ HANDLE hProcess)
 {
-    BOOL bAbsolute = FALSE;
-    if (cchDll >= 3 && pszDll[1] == ':' &&
-        (pszDll[2] == '\\' || pszDll[2] == '/')) {
-        bAbsolute = TRUE;                       // X:\... or X:/...
+    if (*phJob == NULL) {
+        return;
     }
-    else if (cchDll >= 2 && pszDll[0] == '\\' && pszDll[1] == '\\') {
-        bAbsolute = TRUE;                       // \\server\share\...
+    if (!AssignProcessToJobObject(*phJob, hProcess)) {
+        DETOUR_TRACE(("AssignProcessToJobObject failed: %d\n", GetLastError()));
+        CloseHandle(*phJob);
+        *phJob = NULL;
     }
-    if (!bAbsolute) {
-        return FALSE;
-    }
-
-    CHAR szWindows[MAX_PATH];
-    DWORD nLen = GetEnvironmentVariableA("WINDIR", szWindows, ARRAYSIZE(szWindows));
-    if (nLen == 0 || nLen >= ARRAYSIZE(szWindows)) {
-        return FALSE;                           // cannot rule redirection out
-    }
-    if ((size_t)nLen <= cchDll) {
-        BOOL bUnderWindows = TRUE;
-        for (DWORD c = 0; c < nLen; c++) {
-            CHAR a = szWindows[c];
-            CHAR b = pszDll[c];
-            if (a >= 'a' && a <= 'z') { a = (CHAR)(a - 'a' + 'A'); }
-            if (b >= 'a' && b <= 'z') { b = (CHAR)(b - 'a' + 'A'); }
-            if (a == '/') { a = '\\'; }
-            if (b == '/') { b = '\\'; }
-            if (a != b) {
-                bUnderWindows = FALSE;
-                break;
-            }
-        }
-        if (bUnderWindows) {
-            return FALSE;                       // WOW64 may still resolve it
-        }
-    }
-
-    if (GetFileAttributesA(pszDll) != INVALID_FILE_ATTRIBUTES) {
-        return FALSE;
-    }
-
-    DWORD dwError = GetLastError();
-    if (dwError != ERROR_FILE_NOT_FOUND && dwError != ERROR_PATH_NOT_FOUND &&
-        dwError != ERROR_INVALID_NAME) {
-
-        return FALSE;                           // absence not established
-    }
-
-    DETOUR_TRACE(("Helper DLL provably missing: %hs\n", pszDll));
-    return TRUE;
-}
-
-// Walks the packed DLL names the same way DetourFinishHelperProcess does, so
-// the two agree on where each name ends. cb bounds the walk: AllocExeHelper
-// sized the block, and a name that runs past it is treated as malformed.
-static
-BOOL WINAPI AnyHelperDllIsProvablyMissing(_In_ PDETOUR_EXE_HELPER pHelper)
-{
-    if (pHelper->cb < sizeof(DETOUR_EXE_HELPER)) {
-        return FALSE;
-    }
-
-    DWORD cbRemaining = pHelper->cb - sizeof(DETOUR_EXE_HELPER);
-    PCSTR pszDll = &pHelper->rDlls[0];
-
-    for (DWORD n = 0; n < pHelper->nDlls; n++) {
-        size_t cchDll = 0;
-
-        if (cbRemaining == 0 ||
-            !SUCCEEDED(StringCchLengthA(pszDll, cbRemaining, &cchDll))) {
-
-            return FALSE;                       // malformed; let the wait bound it
-        }
-        if (HelperDllIsProvablyMissing(pszDll, cchDll)) {
-            return TRUE;
-        }
-
-        pszDll += cchDll + 1;
-        cbRemaining -= (DWORD)cchDll + 1;
-    }
-
-    return FALSE;
 }
 
 // SEMBAZURU LOCAL PATCH (see VENDORED.md): upstream waits INFINITE on the
-// helper. A helper that never exits (blocked on a message box, or wedged for
-// any other reason) must surface as an injection failure so the caller's
-// fail-closed path runs, not as a hang.
+// helper. rundll32 puts up a modal error box when it cannot load the DLL named
+// on its command line, and nothing dismisses that box on a build machine, so
+// the wait never ends. A helper that does not exit must surface as an
+// injection failure so the caller's fail-closed path runs, not as a hang.
 //
-// Reports which of three things happened, because they are not the same:
-// the helper exited on its own, the caller stopped waiting, or the wait
-// itself failed. Only the first yields a meaningful exit code. Cleanup does
-// not depend on the answer: the caller's job object kills whatever is left.
+// Reports which of three things happened, because they are not the same: the
+// helper exited on its own, the caller stopped waiting, or the wait itself
+// failed. Only the first yields a meaningful exit code.
 enum DETOUR_HELPER_WAIT {
     DETOUR_HELPER_EXITED,
     DETOUR_HELPER_TIMED_OUT,
@@ -1309,9 +1228,9 @@ DETOUR_HELPER_WAIT WINAPI WaitForHelperProcess(_In_ HANDLE hProcess,
     DETOUR_TRACE(("Rundll32.exe did not exit within %d ms\n",
                   DETOUR_HELPER_TIMEOUT_MS));
 
-    // Ask nicely first so the common case is reaped here rather than at job
-    // close, but do not depend on it: TerminateProcess can fail outright and
-    // is asynchronous when it does not.
+    // Ask first so the common case is reaped here rather than at job close,
+    // but do not depend on it: TerminateProcess can fail outright, and is
+    // asynchronous when it does not.
     if (TerminateProcess(hProcess, ~0u)) {
         WaitForSingleObject(hProcess, DETOUR_HELPER_KILL_TIMEOUT_MS);
     }
@@ -1352,14 +1271,7 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
     if (!AllocExeHelper(&helper, dwTargetPid, nDlls, rlpDlls)) {
         goto Cleanup;
     }
-    if (AnyHelperDllIsProvablyMissing(helper)) {
-        SetLastError(ERROR_MOD_NOT_FOUND);
-        goto Cleanup;
-    }
     hJob = CreateHelperJob();
-    if (hJob == NULL) {
-        goto Cleanup;
-    }
 
     DWORD nLen = GetEnvironmentVariableA("WINDIR", szExe, ARRAYSIZE(szExe));
     if (nLen == 0 || nLen >= ARRAYSIZE(szExe)) {
@@ -1403,13 +1315,7 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
             goto Cleanup;
         }
 
-        if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
-            DETOUR_TRACE(("AssignProcessToJobObject failed: %d\n", GetLastError()));
-            TerminateProcess(pi.hProcess, ~0u);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            goto Cleanup;
-        }
+        TryAssignHelperToJob(&hJob, pi.hProcess);
 
         ResumeThread(pi.hThread);
 
@@ -1475,14 +1381,7 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
     if (!AllocExeHelper(&helper, dwTargetPid, nDlls, rlpDlls)) {
         goto Cleanup;
     }
-    if (AnyHelperDllIsProvablyMissing(helper)) {
-        SetLastError(ERROR_MOD_NOT_FOUND);
-        goto Cleanup;
-    }
     hJob = CreateHelperJob();
-    if (hJob == NULL) {
-        goto Cleanup;
-    }
 
     DWORD nLen = GetEnvironmentVariableW(L"WINDIR", szExe, ARRAYSIZE(szExe));
     if (nLen == 0 || nLen >= ARRAYSIZE(szExe)) {
@@ -1526,13 +1425,7 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
             goto Cleanup;
         }
 
-        if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
-            DETOUR_TRACE(("AssignProcessToJobObject failed: %d\n", GetLastError()));
-            TerminateProcess(pi.hProcess, ~0u);
-            CloseHandle(pi.hProcess);
-            CloseHandle(pi.hThread);
-            goto Cleanup;
-        }
+        TryAssignHelperToJob(&hJob, pi.hProcess);
 
         ResumeThread(pi.hThread);
 
