@@ -23,6 +23,7 @@ param(
     [switch]$ConnectionReuseOnly
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'vfs_attestation_bootstrap.ps1')
 
 $launcher = Join-Path $BuildDir 'launcher.exe'
 $dll = Join-Path $BuildDir 'sbz_interceptor64.dll'
@@ -187,10 +188,12 @@ function Invoke-ReuseScenario {
         $env:SEMBAZURU_MODE = 'vfs'; $env:SEMBAZURU_VFS_ROOT = $logical
         $env:SEMBAZURU_VFS_PIPE = $name; $env:SEMBAZURU_VFS_SCRATCH = $scratch
         if ($Strict) { $env:SEMBAZURU_VFS_STRICT = '1' }
+        $attestation = New-SbzVfsAttestation 'vfs-bench-reuse'
         try {
             $out = & $launcher $dll $reuseProbe $logical $Threads $Rounds 2>&1 | Out-String
             $exit = $LASTEXITCODE
         } finally {
+            Remove-SbzVfsAttestation $attestation
             Remove-Item Env:\SEMBAZURU_MODE, Env:\SEMBAZURU_VFS_ROOT, Env:\SEMBAZURU_VFS_PIPE, `
                 Env:\SEMBAZURU_VFS_SCRATCH, Env:\SEMBAZURU_VFS_STRICT -ErrorAction SilentlyContinue
         }
@@ -215,10 +218,12 @@ function Invoke-HostGoneStrictScenario {
     $env:SEMBAZURU_MODE = 'vfs'; $env:SEMBAZURU_VFS_ROOT = $logical
     $env:SEMBAZURU_VFS_PIPE = "gone-$PID-" + [System.IO.Path]::GetRandomFileName().Substring(0, 8)
     $env:SEMBAZURU_VFS_SCRATCH = $scratch; $env:SEMBAZURU_VFS_STRICT = '1'
+    $attestation = New-SbzVfsAttestation 'vfs-bench-gone'
     try {
         $out = & $launcher $dll $reuseProbe $logical 1 1 2>&1 | Out-String
         return @{ Output = $out; Exit = $LASTEXITCODE; Scratch = $scratch }
     } finally {
+        Remove-SbzVfsAttestation $attestation
         Remove-Item Env:\SEMBAZURU_MODE, Env:\SEMBAZURU_VFS_ROOT, Env:\SEMBAZURU_VFS_PIPE, `
             Env:\SEMBAZURU_VFS_SCRATCH, Env:\SEMBAZURU_VFS_STRICT -ErrorAction SilentlyContinue
     }
@@ -323,6 +328,7 @@ function Time-Vfs {
         for ($i = 0; $i -lt 100; $i++) { if (Test-Path $full) { break }; Start-Sleep -Milliseconds 50 }
         $env:SEMBAZURU_MODE = 'vfs'; $env:SEMBAZURU_VFS_ROOT = $agentSrc
         $env:SEMBAZURU_VFS_PIPE = $pipe; $env:SEMBAZURU_VFS_SCRATCH = $scratch
+        $attestation = New-SbzVfsAttestation 'vfs-bench-rtt'
         try {
             $ms = (Measure-Command {
                     Push-Location $workdir
@@ -338,6 +344,7 @@ function Time-Vfs {
                 throw "VFS not exercised: scratch empty (rtt=$RttUs us) -> measuring a local compile"
             }
         } finally {
+            Remove-SbzVfsAttestation $attestation
             Remove-Item Env:\SEMBAZURU_MODE, Env:\SEMBAZURU_VFS_ROOT, Env:\SEMBAZURU_VFS_PIPE, Env:\SEMBAZURU_VFS_SCRATCH -ErrorAction SilentlyContinue
         }
     } finally {
