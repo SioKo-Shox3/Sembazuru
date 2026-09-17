@@ -22,7 +22,7 @@
 - notes: 対象は既に push された 2156d473e934483c85257aa081cb6cfcf3a6a3fa。T-001 の未 push 差分を含む成果物ではない。workflow_dispatch は公開 Release を作らない。既に run は開始済みなので重複 dispatch しない。Setup.exe/MSI は実行しない。WiX extract/decompile は可。少なくとも VC++ x64/x86 と MSI、製品の x64/x86 DLL と storectl の同梱を静的に確認する。失敗の調査記録が完了しても公開準備完了ではない。
 
 ## T-003: GitHub runner で Session 0 の起動フラグを測定する
-- status: blocked
+- status: done
 - done-when: T-007 を含む作業ブランチの SHA を実行前に記録し、GitHub run と診断 job の対象 SHA の一致を確認する。その診断を hosted runner で実測し、A/B の flags、Job UI、分類、cleanup、worker 前後一致を実ログで確認する。
 - verify: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked`
 - paths: docs/verification/2026-09-08-session0.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, blocked/T-003.md, .harness/runs/**, target/release-preparation/**
@@ -106,3 +106,14 @@
 - 調査済み: storectl は現在 MSI 埋め込みの CA 用で、インストールされない (installer/sembazuru.wxs:21)。helper 化には配置と署名対象の追加が要る。
 - 調査済み: `worker_toml.rs` が平文 cluster_token を書く形は実系と不整合。実系は DPAPI の machine secret を使うので、Join ではトークンを設定ファイルに書かず join payload で別に渡す。
 - **未決の分岐（着手前に決める）**: 昇格した子へ秘密をどう渡すか。`read_rotate_token` (storectl:164) は1行のトークン専用で CR/LF/NUL を拒否するため TOML を運べない。かつ `ShellExecuteEx` の runas 昇格では stdin をリダイレクトできず、ハンドル継承も期待できない。候補は (a) 制限 ACL の一時ファイルを argv で渡す（秘密がディスクに残る）、(b) GUI が DACL を絞った名前付きパイプを立て、昇格した storectl が接続して読む、(c) GUI 自身を昇格して起動し直す。秘密の受け渡し設計は本プロジェクトの取り決めにより GPT 側へ回す。
+
+## T-011: アクションがウィンドウステーションとデスクトップを開けるようにする
+- status: todo (設計未決)
+- done-when: Session 0 のサービス配下で、制限付き・Medium 整合性のアクショントークンが起動したプロセスが 0xC0000142 にならず動く。ステーションとデスクトップの許可範囲を、アクションが必要とする最小に保つ。`m9_installer_acl.ps1` の ACL 検証と worker sandbox の既存の隔離（UI 制限ジョブ、breakaway 不可、制限トークン）を緩めない。
+- verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`
+- verify: Session 0 診断を再実行し、`StationAccess`/`DesktopAccess` が allowed=true になること
+- paths: crates/worker/src/sandbox.rs, hooks/test/m6_worker_window_station_probe.ps1, docs/verification/**, TASKS.md, PROGRESS.md
+- measured: 2026-09-17 の実測 (docs/verification/2026-09-17-session0.md)。アクション = Medium 整合性 8192 (sandbox.rs:510 の lower_to_medium_if_needed)、ブローカー = 12288。Station=Service-0x0-27fb60$ / Desktop=Default の DACL はサービス SID と S-1-5-32-544 にしか許可がなく、StationAccess も DesktopAccess も allowed=false gle=5。
+- 前提の訂正: 起動フラグでは直らない。CREATE_NO_WINDOW は実測で NO_WINDOW_NOT_SUFFICIENT。製品の起動フラグは変更しない。
+- 関連: T-006 のログオン単位ウィンドウステーション生成の調査は、アクション専用ステーションを用意する案の側にある。
+- **未決**: 解の方向を決める。(a) アクション専用のステーションとデスクトップを生成して割り当てる、(b) 既存のサービスステーションとデスクトップに、アクショントークンが使える最小の許可を足す、(c) 整合性の下げ方を見直す。いずれも特権境界の設計なので、本プロジェクトの取り決めにより GPT 側へ回す。

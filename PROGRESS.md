@@ -19,13 +19,16 @@
 - T-009: `fb02b72` が launcher の VFS 経路に attestation を必須化した一方、vfs_redirect・vfs_compile・vfs_bench がそれを用意しておらず、注入の前に落ちていた。生成と破棄を hooks/test/vfs_attestation_bootstrap.ps1 に集約し、4ゲートが同じ契約を共有するようにした。各ゲートの判定条件と製品コードは変更していない。3件とも PASS。証拠は .harness/T-009-gates.log。
 - **M2 決定性ハーネスがローカルで PASS した**。`DETERMINISM OK: 2 output(s) reproduce`、`GATE PASS msvc: corpus reproduces byte-for-byte`。以前「cl の起動失敗で比較前に終了」と記録していたのは、下の Notes にある古い modules.obj と同じビルドツリー汚染が原因。clang-cl は不在のため SKIP で、CI 側の担当。証拠は .harness/T-009-determinism.log。
 
-## In progress
-- T-003: GitHub 上での実測待ち。blocked/T-003.md。T-007 により診断専用 workflow の main 登録は先行条件ではなくなった。push は完了済みで、残るのは Release のブランチ指定の手動実行。
+- T-003 完了: run 35208068643 で Session 0 の A/B を初めて実測した。対象 SHA・診断 job の存在・flags・Job UI・分類・cleanup・worker 前後一致をすべて実ログで確認。結果は **NO_WINDOW_NOT_SUFFICIENT** で、両アームとも 0xc0000142。**CREATE_NO_WINDOW は製品に適用しない。** 記録は docs/verification/2026-09-17-session0.md。
+- 同じ実測から真因が判明した。アクションは Medium 整合性 (8192、sandbox.rs:510) で、サービスのウィンドウステーションとデスクトップの DACL はサービス SID と Administrators にしか許可がない。StationAccess も DesktopAccess も allowed=false gle=5。開けないプロセスは初期化に失敗して 0xC0000142 になる。起動フラグでは直らない。T-011 として起票。
 
-- installed worker の 0xC0000142 は T-003 と同一の問題だと確認した。失敗するのは `--no-vfs` の plain control で、フック DLL は注入されていない。ワーカーの本番起動フラグ (sandbox.rs:1253) が診断の baseline と一致し、lpDesktop も未設定。**A/B の実測が出るまでこの件は着手できない。** 詳細は blocked/T-003.md。
+## In progress
+
+- T-011: installed worker の 0xC0000142 は T-003 と同一の問題で、失敗するのは `--no-vfs` の plain control（フック DLL は関与しない）。実測で真因はウィンドウステーションとデスクトップへのアクセス拒否と判明した。解の方向が未決で、特権境界の設計なので GPT 側へ回す。
+- T-010: GUI Join。方式は storectl の helper 化に決定済み。取引機構 (MachineTokenUpdate) と認可 (storectl の authorize) は実装済みで、足りないのは join 動詞と配置と GUI 側 writer。昇格した子への秘密の受け渡しだけが未決。
 
 ## Next
-- `gh workflow run release.yml --ref chore/two-pc-preparation` を実行し、同じ SHA の診断 job の結果を確認する。診断専用名への直接 dispatch は使わない。2026-09-17 の試行は自動承認の分類器が Create Public Surface として拒否したため、ユーザーの明示指示が要る。
+- T-011 と T-010 の未決分岐を GPT 側で詰める。どちらも特権境界の設計。
 - `private_station_unnamed_create_cannot_allocate_per_action_station` の初回成功分岐を GitHub runner で確認する。
 - 次に CI を回すとき、C++ job で新たに見えるようになるのは M2 以降の段。ローカルでは M2・smoke・VFS 3件が通るが、clang-cl を要する段はローカルで未実行なので CI が初出になる。
 - GUI Join は StubConfigWriter のまま。MachineTokenUpdate は machine token/daemon設定/worker設定を同じ journal で扱えるが、storectl の7固定動詞には Join 保存がなく、GUI ConfigWriter も token を表現しない。既存の固定パスと認可を維持する Join 専用経路が必要。
