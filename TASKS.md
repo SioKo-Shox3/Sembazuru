@@ -113,7 +113,8 @@
 - verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`
 - verify: Session 0 診断を再実行し、`StationAccess`/`DesktopAccess` が allowed=true になること
 - paths: crates/worker/src/sandbox.rs, hooks/test/m6_worker_window_station_probe.ps1, docs/verification/**, TASKS.md, PROGRESS.md
-- measured: 2026-09-17 の実測 (docs/verification/2026-09-17-session0.md)。アクション = Medium 整合性 8192 (sandbox.rs:510 の lower_to_medium_if_needed)、ブローカー = 12288。Station=Service-0x0-27fb60$ / Desktop=Default の DACL はサービス SID と S-1-5-32-544 にしか許可がなく、StationAccess も DesktopAccess も allowed=false gle=5。
+- measured: 2026-09-17 の実測 (docs/verification/2026-09-17-session0.md)。Station=Service-0x0-27fb60$ / Desktop=Default の DACL はサービス SID と S-1-5-32-544 にしか許可がなく、StationAccess も DesktopAccess も allowed=false gle=5。
+- mechanism: 原因は整合性ではなく制限付きトークンの二重アクセスチェック。制限 SID は sandbox.rs:469-487 で [action_sid(乱数), Everyone, Authenticated Users, Users, RESTRICTED]。DACL に制限 SID 側と一致する ACE が1つもないため、通常側が通っても制限側で落ちる。整合性を上げても解決しない（Medium 以上が作ったオブジェクトは無ラベル=Medium 扱いで no-write-up が効かない）。
 - 前提の訂正: 起動フラグでは直らない。CREATE_NO_WINDOW は実測で NO_WINDOW_NOT_SUFFICIENT。製品の起動フラグは変更しない。
 - 関連: T-006 のログオン単位ウィンドウステーション生成の調査は、アクション専用ステーションを用意する案の側にある。
 - **未決**: 解の方向を決める。(a) アクション専用のステーションとデスクトップを生成して割り当てる、(b) 既存のサービスステーションとデスクトップに、アクショントークンが使える最小の許可を足す、(c) 整合性の下げ方を見直す。いずれも特権境界の設計なので、本プロジェクトの取り決めにより GPT 側へ回す。
