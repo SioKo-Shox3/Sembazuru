@@ -93,3 +93,16 @@
 - resolution: 生成と破棄を hooks/test/vfs_attestation_bootstrap.ps1 に集約し、vfs_redirect・vfs_compile・vfs_bench が launcher を起動する各箇所で用意するようにした。既に動いていた process_injection_failure も同じヘルパへ寄せ、重複を残していない。各ゲートの合否判定は変更していない。製品コードは変更していない。
 - measured: process_injection_failure PASS 91.3秒、vfs_redirect PASS 1.7秒、vfs_compile PASS 1.9秒、vfs_bench PASS 9.9秒、m7_inject32 PASS 0.6秒、nt_rename PASS 0.7秒、ctest 3/3 PASS、smoke PASS、determinism (M2) PASS。clang-cl はローカル不在で各ゲート SKIP。証拠は .harness/T-009-gates.log、T-009-determinism.log。GitHub CI 上での確認は未実施。
 - review: 独立評価 PASS、blocking なし。ゲートの合否判定と製品の fail-closed 要件を弱める変更はないと確認された。非阻害の指摘2件（生成が途中で失敗したときの解放漏れ、置き換え時の二重解放）は 0dfbfd6 で解消し、4ゲートを再実行して PASS。証拠は .harness/T-009-review.txt。
+
+## T-010: GUI の Join を storectl 経由の特権書き込みにする
+- status: todo (設計未決の分岐あり)
+- done-when: GUI の Join が machine token・daemon 設定・worker 設定を原子的に永続化し、ProgramData の ACL と status_admin の default-deny を緩めない。秘密が argv とディスクに残らない。Join 後にサービスが新しい設定で動く。
+- verify: `cargo test -p sembazuru-config-store --locked`
+- verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`（ACL 保護が不変であること）
+- paths: crates/config-store/src/bin/sembazuru_storectl.rs, crates/gui/src/join/**, installer/sembazuru.wxs, TASKS.md, PROGRESS.md
+- decided: 方式は「storectl を install 済み helper にし join 動詞を追加」。ユーザー決定 2026-09-17。status_admin の有効化とインストーラによる ACL 緩和は退けた。
+- 調査済み: 取引機構は実装済み。`MachineTokenUpdate` (config-store/src/lib.rs:182) が cluster_token・daemon_config・worker_config の3つを保持し、`prepare_machine_cluster_token_update` と `apply_or_resume_machine_cluster_token_update` が journal で原子的に適用する。Join に必要な書き込みはこれで表現できる。
+- 調査済み: 認可も実装済み。`authorize` (storectl:271) は LocalSystem、または token-maintenance 動詞かつ Administrators かつ elevated を要求する。join を token-maintenance に分類すれば昇格した管理者だけが通る。
+- 調査済み: storectl は現在 MSI 埋め込みの CA 用で、インストールされない (installer/sembazuru.wxs:21)。helper 化には配置と署名対象の追加が要る。
+- 調査済み: `worker_toml.rs` が平文 cluster_token を書く形は実系と不整合。実系は DPAPI の machine secret を使うので、Join ではトークンを設定ファイルに書かず join payload で別に渡す。
+- **未決の分岐（着手前に決める）**: 昇格した子へ秘密をどう渡すか。`read_rotate_token` (storectl:164) は1行のトークン専用で CR/LF/NUL を拒否するため TOML を運べない。かつ `ShellExecuteEx` の runas 昇格では stdin をリダイレクトできず、ハンドル継承も期待できない。候補は (a) 制限 ACL の一時ファイルを argv で渡す（秘密がディスクに残る）、(b) GUI が DACL を絞った名前付きパイプを立て、昇格した storectl が接続して読む、(c) GUI 自身を昇格して起動し直す。秘密の受け渡し設計は本プロジェクトの取り決めにより GPT 側へ回す。
