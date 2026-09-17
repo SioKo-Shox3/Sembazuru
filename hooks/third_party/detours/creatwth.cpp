@@ -1220,25 +1220,35 @@ DETOUR_HELPER_WAIT WINAPI WaitForHelperProcess(_In_ HANDLE hProcess,
         GetExitCodeProcess(hProcess, pdwResult);
         return DETOUR_HELPER_EXITED;
     }
-    if (dwWait != WAIT_TIMEOUT) {
-        DETOUR_TRACE(("Waiting on rundll32.exe failed: %d\n", GetLastError()));
-        return DETOUR_HELPER_WAIT_FAILED;
-    }
 
-    DETOUR_TRACE(("Rundll32.exe did not exit within %d ms\n",
-                  DETOUR_HELPER_TIMEOUT_MS));
-
-    // Ask first so the common case is reaped here rather than at job close,
-    // but do not depend on it: TerminateProcess can fail outright, and is
-    // asynchronous when it does not.
-    if (TerminateProcess(hProcess, ~0u)) {
-        WaitForSingleObject(hProcess, DETOUR_HELPER_KILL_TIMEOUT_MS);
+    DETOUR_HELPER_WAIT result = DETOUR_HELPER_TIMED_OUT;
+    if (dwWait == WAIT_TIMEOUT) {
+        DETOUR_TRACE(("Rundll32.exe did not exit within %d ms\n",
+                      DETOUR_HELPER_TIMEOUT_MS));
     }
     else {
+        DETOUR_TRACE(("Waiting on rundll32.exe failed: %d\n", GetLastError()));
+        result = DETOUR_HELPER_WAIT_FAILED;
+    }
+
+    // Reap regardless of why the wait ended. A helper this function stops
+    // waiting for must not be left running because the wait API failed, and
+    // the caller is about to drop the only handle to it.
+    if (!TerminateProcess(hProcess, ~0u)) {
         DETOUR_TRACE(("TerminateProcess(rundll32.exe) failed: %d\n",
                       GetLastError()));
     }
-    return DETOUR_HELPER_TIMED_OUT;
+    else if (WaitForSingleObject(hProcess, DETOUR_HELPER_KILL_TIMEOUT_MS)
+             == WAIT_OBJECT_0) {
+        return result;
+    }
+
+    // Termination was refused, or is still pending past the confirmation
+    // window. Whatever is left is the job's to reap; without one it outlives
+    // this call. That is the one case this patch does not close, and it is
+    // recorded in VENDORED.md rather than papered over.
+    DETOUR_TRACE(("Rundll32.exe termination unconfirmed\n"));
+    return result;
 }
 
 BOOL WINAPI DetourProcessViaHelperA(_In_ DWORD dwTargetPid,

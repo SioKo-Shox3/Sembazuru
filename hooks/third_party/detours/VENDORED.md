@@ -57,6 +57,22 @@ Both turn an unbounded wait into a `FALSE` return, which is what the callers
 already treat as an injection failure. The duplicated `ResumeThread` call in
 the wide variant is upstream's and is left as-is.
 
+### What this does not guarantee
+
+Upstream never leaks a helper, because it never stops waiting for one — it
+trades the leak for the hang this patch removes. Giving up on the wait brings
+the leak back in one case: the helper is still alive, `TerminateProcess` is
+refused or has not taken effect within the confirmation window, and there is
+no job to reap it. Termination is attempted however the wait ended, including
+when the wait API itself failed, so what remains is a refused or still-pending
+kill with no job — which needs `CreateJobObject`, `SetInformationJobObject`, or
+`AssignProcessToJobObject` to have failed first.
+
+Inside the Sembazuru worker that last condition is covered from outside: an
+action already runs in a `KILL_ON_JOB_CLOSE` job it cannot break away from, so
+a helper it spawns is reaped when the action ends, whether or not the job added
+here could be created.
+
 An earlier revision also skipped the helper when the rewritten DLL name looked
 absent, to avoid paying the timeout for a failure that is certain. It was
 removed: absence for this process is not absence for the helper (WOW64
