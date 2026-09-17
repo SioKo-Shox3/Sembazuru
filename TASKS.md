@@ -1,7 +1,8 @@
 # TASKS — Sembazuru
 
 目的: GitHub Releases から Windows 11 x64 の新しい PC に導入し、LAN 上の実行に参加できる状態にする。
-診断テストと CI lint の修正、GitHub 診断の呼び出し定義を検証済み。現在は修正の push と Session 0 の実測待ち。公開、未測定の起動条件の製品適用、GUI 保存方式の決定は未完。
+診断テストと CI lint の修正、GitHub 診断の呼び出し定義を検証済みで、作業ブランチは push 済み。
+現在は Session 0 の実測待ち。公開、未測定の起動条件の製品適用、GUI 保存方式の決定は未完。
 
 ## T-001: 依存関係の脆弱性検査エラーを修正する
 - status: done
@@ -65,3 +66,21 @@
 - paths: .github/workflows/release.yml, .github/workflows/session0-diagnostic.yml, docs/verification/2026-09-08-release-preparation.md, blocked/T-003.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
 - notes: GitHub の同一リポジトリ内 ./ 参照は呼び出し元と同じコミットの workflow を使う。session0-diagnostic.yml に workflow_call を追加し、Release 側に手動時限定・contents: read の呼び出し job を追加する。needs を置かず、パッケージ検査が失敗しても診断を実行できる構造とする。スクリプト本体、署名、公開条件は変更しない。権限拡大・secrets 継承が必要なら止める。main 登録を要求する記録を修正し、未 push 差分の実行成功とは報告しない。
 - refinement: Release の既存の公開条件は refs/tags/ で、タグ指定の手動実行も含む。診断を github.ref_type == branch で限定し、タグ指定の手動実行も公開経路として維持する。
+
+## T-008: cross-bitness injection の helper 待ちを有界にする
+- status: done
+- done-when: 別 bitness の子へ注入できないとき、呼び出し元が無期限に待たずに注入失敗として戻る。sibling DLL が存在する正規の helper 経路は従来どおり成功する。P0 ゲートが CI の 5 分予算内で終わり、rundll32 と probe の残留プロセスがない。vendored の変更を VENDORED.md に記録する。独立評価を通す。
+- verify: `pwsh -NoProfile -File hooks/test/process_injection_failure.ps1`
+- verify: `pwsh -NoProfile -File hooks/test/m7_inject32.ps1`
+- verify: `pwsh -NoProfile -File hooks/test/trace_write_batch.ps1 -CandidateDll hooks/build/Release/sbz_interceptor64.dll`
+- verify: `pwsh -NoProfile -File hooks/test/nt_rename.ps1`
+- verify: `ctest --test-dir hooks/build -C Release --output-on-failure`
+- paths: hooks/third_party/detours/creatwth.cpp, hooks/third_party/detours/VENDORED.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
+- notes: 原因は Detours の `DetourProcessViaHelperDllsA/W` が `WaitForSingleObject(..., INFINITE)` で helper を待つこと。sibling DLL が無いと 32-bit rundll32 がモーダルのエラーダイアログで止まり、誰も閉じないため永久に待つ。spawn 前の存在検査と有界待ちの二段で、無期限待ちを既存の fail-closed 経路が扱える FALSE に変換する。製品の注入方針・fail-closed の意味づけ・署名・公開条件は変更しない。
+
+## T-009: VFS bootstrap ハンドルの受け渡しが失敗する
+- status: todo
+- done-when: `hooks/test/vfs_redirect.ps1` の launcher が `VFS bootstrap handles unavailable gle=13` を出さず、redirect がエージェントのバイト列を返す。gle=13 (ERROR_INVALID_DATA) の発生源を実出力で特定し、ローカル環境固有か製品欠陥かを区別して記録する。
+- verify: `pwsh -NoProfile -File hooks/test/vfs_redirect.ps1`
+- paths: hooks/src/vfs_attestation.cpp, hooks/src/launcher.cpp, hooks/test/vfs_redirect.ps1, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
+- notes: T-008 の検証中に発見。失敗は launcher が Detours を呼ぶ前の `OpenFromBootstrapEnvironment` で起きるため T-008 の差分とは経路が交わらない。シェルの入れ子の有無で挙動は変わらず、vcvars 環境でも同じ。最新 CI では P0 のタイムアウトで M2 以降が skipped になっており、この gate の CI 上の現状は未確認。先に CI での状態を確かめてからローカル固有と断定する。
