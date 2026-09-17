@@ -105,7 +105,9 @@
 - 調査済み: 認可も実装済み。`authorize` (storectl:271) は LocalSystem、または token-maintenance 動詞かつ Administrators かつ elevated を要求する。join を token-maintenance に分類すれば昇格した管理者だけが通る。
 - 調査済み: storectl は現在 MSI 埋め込みの CA 用で、インストールされない (installer/sembazuru.wxs:21)。helper 化には配置と署名対象の追加が要る。
 - 調査済み: `worker_toml.rs` が平文 cluster_token を書く形は実系と不整合。実系は DPAPI の machine secret を使うので、Join ではトークンを設定ファイルに書かず join payload で別に渡す。
-- **未決の分岐（着手前に決める）**: 昇格した子へ秘密をどう渡すか。`read_rotate_token` (storectl:164) は1行のトークン専用で CR/LF/NUL を拒否するため TOML を運べない。かつ `ShellExecuteEx` の runas 昇格では stdin をリダイレクトできず、ハンドル継承も期待できない。候補は (a) 制限 ACL の一時ファイルを argv で渡す（秘密がディスクに残る）、(b) GUI が DACL を絞った名前付きパイプを立て、昇格した storectl が接続して読む、(c) GUI 自身を昇格して起動し直す。秘密の受け渡し設計は本プロジェクトの取り決めにより GPT 側へ回す。
+- decided: 受け渡しは (b) GUI が立てた一回限りの名前付きパイプ。GPT と Fable の双方が (b) を推し、一時ファイルと GUI 全体の昇格を退けた。payload は 1 本のバージョン付き長さ前置の封筒で、MachineTokenUpdate の3フィールドに 1:1 対応。詳細と到達点の限界は docs/decisions/0018-action-desktop-and-join-transport.md。
+- 残る未決: パイプの DACL を Administrators のみにするか logon SID に絞るかで助言が割れた。標準ユーザーの GUI から別の管理者アカウントで同意したときに通るかを実測して決める。
+- 未定義: Join 後に誰がサービスを再起動して設定を反映するか。
 
 ## T-011: アクションがウィンドウステーションとデスクトップを開けるようにする
 - status: todo (設計未決)
@@ -117,4 +119,14 @@
 - mechanism: 原因は整合性ではなく制限付きトークンの二重アクセスチェック。制限 SID は sandbox.rs:469-487 で [action_sid(乱数), Everyone, Authenticated Users, Users, RESTRICTED]。DACL に制限 SID 側と一致する ACE が1つもないため、通常側が通っても制限側で落ちる。整合性を上げても解決しない（Medium 以上が作ったオブジェクトは無ラベル=Medium 扱いで no-write-up が効かない）。
 - 前提の訂正: 起動フラグでは直らない。CREATE_NO_WINDOW は実測で NO_WINDOW_NOT_SUFFICIENT。製品の起動フラグは変更しない。
 - 関連: T-006 のログオン単位ウィンドウステーション生成の調査は、アクション専用ステーションを用意する案の側にある。
-- **未決**: 解の方向を決める。(a) アクション専用のステーションとデスクトップを生成して割り当てる、(b) 既存のサービスステーションとデスクトップに、アクショントークンが使える最小の許可を足す、(c) 整合性の下げ方を見直す。いずれも特権境界の設計なので、本プロジェクトの取り決めにより GPT 側へ回す。
+- decided: 方向は (a) アクション専用のステーションとデスクトップ。GPT と Fable の双方が (a) を推し、(b) と (c) を退けた。根拠と罠は docs/decisions/0018-action-desktop-and-join-transport.md。
+- blocked-on: 設計に入る前に診断を広げる。GPT が「SACL 未測定なので DACL だけが原因とは断定できない、MIC は DACL より先に評価される」と留保した。T-012 で測る。
+
+## T-012: Session 0 診断に整合性ラベルと制限 SID を足す
+- status: todo
+- done-when: 診断レコードが、ウィンドウステーションとデスクトップの SACL（整合性 SID と mandatory mask）、アクショントークンの `TokenRestrictedSids` と通常 SID と `TokenMandatoryPolicy`、`JOB_OBJECT_UILIMIT_*` の展開結果を含む。GitHub runner で実測し、0xC0000142 の拒否が DACL 由来か MIC 由来かを区別できる。
+- verify: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked`
+- verify: `gh workflow run release.yml --ref chore/two-pc-preparation` の診断 job 実ログ
+- paths: crates/worker/src/sandbox.rs, hooks/test/m6_worker_window_station_probe.ps1, docs/verification/**, TASKS.md, PROGRESS.md
+- notes: T-011 の設計に入る前の前提確認。GPT の留保「SACL 未測定なので DACL だけが原因とは断定できない。MIC は DACL より先に評価される」に答える。診断は test 限定で、製品の起動条件は変更しない。
+- notes: 最小権限は現在「プローブした値」であって実測値ではない。mask を1ビットずつ削って境界を出す作業は、この診断が揃ってから別タスクにする。
