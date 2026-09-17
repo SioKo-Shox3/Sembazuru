@@ -28,7 +28,10 @@ foreach ($name in @('SEMBAZURU_MODE', 'SEMBAZURU_VFS_ROOT', 'SEMBAZURU_VFS_PIPE'
 
 $script:attestation = $null
 function Set-VfsAttestation([string]$tag) {
+    # Drop the reference before creating the replacement: if creation throws,
+    # the finally at the end must not release the previous one a second time.
     Remove-SbzVfsAttestation $script:attestation
+    $script:attestation = $null
     $script:attestation = New-SbzVfsAttestation $tag
 }
 

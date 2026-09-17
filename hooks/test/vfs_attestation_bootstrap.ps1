@@ -59,38 +59,50 @@ function New-SbzVfsAttestation {
     $mappingName = "Local\Sembazuru.VfsAttestation.$suffix"
     $semaphoreName = "Local\Sembazuru.VfsFailure.$suffix"
 
-    $mapping = [SbzAttestationNative]::CreateFileMapping(
-        [IntPtr](-1), [IntPtr]::Zero, 0x04, 0, $script:SbzAttestationBytes, $mappingName)
-    $view = [SbzAttestationNative]::MapViewOfFile(
-        $mapping, 0x06, 0, 0, [UIntPtr]::new([uint64]$script:SbzAttestationBytes))
-    $semaphore = [SbzAttestationNative]::CreateSemaphore([IntPtr]::Zero, 0, $script:SbzAttestationMaxSlots, $semaphoreName)
-    if ($mapping -eq [IntPtr]::Zero -or $view -eq [IntPtr]::Zero -or $semaphore -eq [IntPtr]::Zero) {
-        throw "cannot create $Tag VFS attestation objects"
-    }
+    $mapping = [IntPtr]::Zero
+    $view = [IntPtr]::Zero
+    $semaphore = [IntPtr]::Zero
+    try {
+        $mapping = [SbzAttestationNative]::CreateFileMapping(
+            [IntPtr](-1), [IntPtr]::Zero, 0x04, 0, $script:SbzAttestationBytes, $mappingName)
+        $view = [SbzAttestationNative]::MapViewOfFile(
+            $mapping, 0x06, 0, 0, [UIntPtr]::new([uint64]$script:SbzAttestationBytes))
+        $semaphore = [SbzAttestationNative]::CreateSemaphore([IntPtr]::Zero, 0, $script:SbzAttestationMaxSlots, $semaphoreName)
+        if ($mapping -eq [IntPtr]::Zero -or $view -eq [IntPtr]::Zero -or $semaphore -eq [IntPtr]::Zero) {
+            throw "cannot create $Tag VFS attestation objects"
+        }
 
-    # The launcher opens these by value out of the environment, so the child
-    # must inherit them.
-    if (-not [SbzAttestationNative]::SetHandleInformation($mapping, 1, 1) -or
-        -not [SbzAttestationNative]::SetHandleInformation($semaphore, 1, 1)) {
-        throw "cannot make $Tag VFS bootstrap handles inheritable"
-    }
+        # The launcher opens these by value out of the environment, so the child
+        # must inherit them.
+        if (-not [SbzAttestationNative]::SetHandleInformation($mapping, 1, 1) -or
+            -not [SbzAttestationNative]::SetHandleInformation($semaphore, 1, 1)) {
+            throw "cannot make $Tag VFS bootstrap handles inheritable"
+        }
 
-    $generation = Get-Random -Minimum 1 -Maximum 2147483647
-    [Runtime.InteropServices.Marshal]::WriteInt32($view, 0, $script:SbzAttestationMagic)
-    [Runtime.InteropServices.Marshal]::WriteInt32($view, 4, $script:SbzAttestationVersion)
-    [Runtime.InteropServices.Marshal]::WriteInt32($view, 8, $script:SbzAttestationMaxSlots)
-    [Runtime.InteropServices.Marshal]::WriteInt32($view, 16, $generation)
+        $generation = Get-Random -Minimum 1 -Maximum 2147483647
+        [Runtime.InteropServices.Marshal]::WriteInt32($view, 0, $script:SbzAttestationMagic)
+        [Runtime.InteropServices.Marshal]::WriteInt32($view, 4, $script:SbzAttestationVersion)
+        [Runtime.InteropServices.Marshal]::WriteInt32($view, 8, $script:SbzAttestationMaxSlots)
+        [Runtime.InteropServices.Marshal]::WriteInt32($view, 16, $generation)
 
-    $env:SEMBAZURU_VFS_MAPPING_HANDLE = "$($mapping.ToInt64())"
-    $env:SEMBAZURU_VFS_SEMAPHORE_HANDLE = "$($semaphore.ToInt64())"
-    $env:SEMBAZURU_VFS_ATTESTATION_GENERATION = "$generation"
+        $env:SEMBAZURU_VFS_MAPPING_HANDLE = "$($mapping.ToInt64())"
+        $env:SEMBAZURU_VFS_SEMAPHORE_HANDLE = "$($semaphore.ToInt64())"
+        $env:SEMBAZURU_VFS_ATTESTATION_GENERATION = "$generation"
 
-    return [pscustomobject]@{
-        Tag        = $Tag
-        Mapping    = $mapping
-        View       = $view
-        Semaphore  = $semaphore
-        Generation = $generation
+        return [pscustomobject]@{
+            Tag        = $Tag
+            Mapping    = $mapping
+            View       = $view
+            Semaphore  = $semaphore
+            Generation = $generation
+        }
+    } catch {
+        # Nothing was handed back, so the caller has no cleanup block covering
+        # these yet. Release whatever was acquired before re-throwing.
+        if ($view -ne [IntPtr]::Zero) { [SbzAttestationNative]::UnmapViewOfFile($view) | Out-Null }
+        if ($mapping -ne [IntPtr]::Zero) { [SbzAttestationNative]::CloseHandle($mapping) | Out-Null }
+        if ($semaphore -ne [IntPtr]::Zero) { [SbzAttestationNative]::CloseHandle($semaphore) | Out-Null }
+        throw
     }
 }
 
