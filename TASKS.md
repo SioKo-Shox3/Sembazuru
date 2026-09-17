@@ -77,7 +77,8 @@
 - verify: `ctest --test-dir hooks/build -C Release --output-on-failure`
 - paths: hooks/third_party/detours/creatwth.cpp, hooks/third_party/detours/VENDORED.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
 - notes: 原因は Detours の `DetourProcessViaHelperDllsA/W` が `WaitForSingleObject(..., INFINITE)` で helper を待つこと。sibling DLL が無いと 32-bit rundll32 がモーダルのエラーダイアログで止まり、誰も閉じないため永久に待つ。プロセスのエラーモードでは抑止できないことを実測で確認した。待機を 15 秒で打ち切り、KILL_ON_JOB_CLOSE のジョブをベストエフォートで併用する。製品の注入方針・fail-closed の意味づけ・署名・公開条件は変更しない。
-- review: 独立評価を2周実施。1周目は存在検査の WOW64 誤判定と終了未確認時の後始末を blocking で指摘。2周目は %WINDIR% 前方一致の取りこぼし、ジョブ必須化が製品の UI 制限ジョブ (crates/worker/src/job.rs:63) と衝突すること、割り当て失敗時の残留を blocking で指摘。3件とも 60ea6bf で解消したが、その差分自体は未評価（規約の2周上限）。証拠は .harness/T-008-review.txt、T-008-review-2.txt。
+- review: 独立評価を3周実施（3周目はユーザー承認の例外）。1周目は存在検査の WOW64 誤判定と終了未確認時の後始末、2周目は %WINDIR% 前方一致の取りこぼし・ジョブ必須化が製品の UI 制限ジョブ (crates/worker/src/job.rs:63) と衝突すること・割り当て失敗時の残留、3周目は待機 API 失敗時に終了要求を出していないことを blocking で指摘。いずれも解消済み (60ea6bf, d3da8ce)。証拠は .harness/T-008-review.txt、T-008-review-2.txt、T-008-review-3.txt。3周目の1回目は撤去済み関数を根拠にした無効な回答で、依頼文から過去レビューの参照を外して再実行した。
+- residual: 終了要求が拒否される、または確認窓内に効かず、かつジョブが無い場合はヘルパーがこの呼び出しより長く残る。上流は待ち続けることで漏れを避けており、待機を打ち切る以上この差は残る。ワーカー内では既存の action ジョブが外側から回収する。条件は VENDORED.md に記載。d3da8ce 自体は未評価。
 - measured: P0 は 91.4 秒で PASS（cross-bitness 6 ケース × 15 秒）。CI の 5 分予算の約 30%。m7_inject32 0.6 秒 PASS、trace_write_batch x64/x86 PASS、nt_rename PASS、ctest 3/3 PASS、rundll32 と probe の残留 0。GitHub CI 上での確認は未実施。
 
 ## T-009: VFS bootstrap ハンドルの受け渡しが失敗する
