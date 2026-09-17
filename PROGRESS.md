@@ -22,6 +22,8 @@
 ## In progress
 - T-003: GitHub 上での実測待ち。blocked/T-003.md。T-007 により診断専用 workflow の main 登録は先行条件ではなくなった。push は完了済みで、残るのは Release のブランチ指定の手動実行。
 
+- installed worker の 0xC0000142 は T-003 と同一の問題だと確認した。失敗するのは `--no-vfs` の plain control で、フック DLL は注入されていない。ワーカーの本番起動フラグ (sandbox.rs:1253) が診断の baseline と一致し、lpDesktop も未設定。**A/B の実測が出るまでこの件は着手できない。** 詳細は blocked/T-003.md。
+
 ## Next
 - `gh workflow run release.yml --ref chore/two-pc-preparation` を実行し、同じ SHA の診断 job の結果を確認する。診断専用名への直接 dispatch は使わない。2026-09-17 の試行は自動承認の分類器が Create Public Surface として拒否したため、ユーザーの明示指示が要る。
 - `private_station_unnamed_create_cannot_allocate_per_action_station` の初回成功分岐を GitHub runner で確認する。
