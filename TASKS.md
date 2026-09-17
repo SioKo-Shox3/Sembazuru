@@ -76,7 +76,9 @@
 - verify: `pwsh -NoProfile -File hooks/test/nt_rename.ps1`
 - verify: `ctest --test-dir hooks/build -C Release --output-on-failure`
 - paths: hooks/third_party/detours/creatwth.cpp, hooks/third_party/detours/VENDORED.md, TASKS.md, PROGRESS.md, NEXT_FINDINGS.md, .harness/**
-- notes: 原因は Detours の `DetourProcessViaHelperDllsA/W` が `WaitForSingleObject(..., INFINITE)` で helper を待つこと。sibling DLL が無いと 32-bit rundll32 がモーダルのエラーダイアログで止まり、誰も閉じないため永久に待つ。spawn 前の存在検査と有界待ちの二段で、無期限待ちを既存の fail-closed 経路が扱える FALSE に変換する。製品の注入方針・fail-closed の意味づけ・署名・公開条件は変更しない。
+- notes: 原因は Detours の `DetourProcessViaHelperDllsA/W` が `WaitForSingleObject(..., INFINITE)` で helper を待つこと。sibling DLL が無いと 32-bit rundll32 がモーダルのエラーダイアログで止まり、誰も閉じないため永久に待つ。プロセスのエラーモードでは抑止できないことを実測で確認した。待機を 15 秒で打ち切り、KILL_ON_JOB_CLOSE のジョブをベストエフォートで併用する。製品の注入方針・fail-closed の意味づけ・署名・公開条件は変更しない。
+- review: 独立評価を2周実施。1周目は存在検査の WOW64 誤判定と終了未確認時の後始末を blocking で指摘。2周目は %WINDIR% 前方一致の取りこぼし、ジョブ必須化が製品の UI 制限ジョブ (crates/worker/src/job.rs:63) と衝突すること、割り当て失敗時の残留を blocking で指摘。3件とも 60ea6bf で解消したが、その差分自体は未評価（規約の2周上限）。証拠は .harness/T-008-review.txt、T-008-review-2.txt。
+- measured: P0 は 91.4 秒で PASS（cross-bitness 6 ケース × 15 秒）。CI の 5 分予算の約 30%。m7_inject32 0.6 秒 PASS、trace_write_batch x64/x86 PASS、nt_rename PASS、ctest 3/3 PASS、rundll32 と probe の残留 0。GitHub CI 上での確認は未実施。
 
 ## T-009: VFS bootstrap ハンドルの受け渡しが失敗する
 - status: todo

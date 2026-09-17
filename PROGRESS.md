@@ -13,7 +13,8 @@
 - c16ba9c 時点の最終 Rust 全体検証: `cmd.exe /d /c "rustup run 1.98.1 cargo test --workspace --locked"` が exit 0。worker は `154 passed; 0 failed; 9 ignored`。証拠は .harness/final-rust-workspace.log。
 - e5385d6 / cf26037 / T-007: Release のブランチ指定の手動実行から、同じコミットの Session 0 診断を独立 job として呼ぶ定義を追加。contents: read・secret 非継承を維持し、タグ指定の手動実行も除外。actionlint と独立安全性評価が PASS。証拠は .harness/T-007-actionlint-final.log、T-007-review.txt、T-007-review-2.txt。main 登録を要求する記録を更新済み。
 
-- T-008: Detours の cross-bitness helper が `WaitForSingleObject(..., INFINITE)` で rundll32 を待つため、sibling DLL が無い場合に永久に止まっていた。spawn 前の存在検査と 30 秒の有界待ちを vendored Detours に入れ、無期限待ちを既存の fail-closed が扱える FALSE に変換した。P0 ゲートはローカルで 5 分 timeout から 1.2 秒の PASS になり、rundll32 と probe の残留はゼロ。M7.3 cross-bitness 成功経路、trace_write_batch の x64/x86、nt_rename、hooks の ctest 3 件も PASS。証拠は .harness/T-008-p0-injection.log、T-008-m7-inject32.log、T-008-regression-gates.log。
+- T-008: Detours の cross-bitness helper が `WaitForSingleObject(..., INFINITE)` で rundll32 を待つため、sibling DLL が無い場合に永久に止まっていた。15 秒の有界待ちと、KILL_ON_JOB_CLOSE のジョブによるベストエフォートの後始末を vendored Detours に入れ、無期限待ちを既存の fail-closed が扱える FALSE に変換した。P0 ゲートはローカルで 5 分 timeout から 91.4 秒の PASS になり、rundll32 と probe の残留はゼロ。M7.3 cross-bitness 成功経路、trace_write_batch の x64/x86、nt_rename、hooks の ctest 3 件も PASS。証拠は .harness/T-008-p0-injection.log、T-008-m7-inject32.log、T-008-regression-gates.log。
+- T-008 で捨てた案: 不在の事前判定は WOW64 リダイレクトと相対名の探索順のせいで、このプロセスからは確定できず、誤ると正常な注入を拒否する。後始末のジョブを必須にすると、UI 制限付きで breakaway を許さない製品ワーカーのジョブ内で注入が失敗しうる。rundll32 のエラーダイアログはプロセスのエラーモードでは抑止できない（実測）。
 
 ## In progress
 - T-003: GitHub 上での実測待ち。blocked/T-003.md。T-007 により診断専用 workflow の main 登録は先行条件ではなくなった。push は完了済みで、残るのは Release のブランチ指定の手動実行。
