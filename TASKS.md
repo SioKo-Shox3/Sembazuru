@@ -92,3 +92,4 @@
 - scope: 修正対象は3スクリプト側か、launcher の VFS 経路の要件かを先に決める。製品の fail-closed の意味づけ（attestation なしの VFS 子を走らせない）を緩める方向の修正はしない。
 - resolution: 生成と破棄を hooks/test/vfs_attestation_bootstrap.ps1 に集約し、vfs_redirect・vfs_compile・vfs_bench が launcher を起動する各箇所で用意するようにした。既に動いていた process_injection_failure も同じヘルパへ寄せ、重複を残していない。各ゲートの合否判定は変更していない。製品コードは変更していない。
 - measured: process_injection_failure PASS 91.3秒、vfs_redirect PASS 1.7秒、vfs_compile PASS 1.9秒、vfs_bench PASS 9.9秒、m7_inject32 PASS 0.6秒、nt_rename PASS 0.7秒、ctest 3/3 PASS、smoke PASS、determinism (M2) PASS。clang-cl はローカル不在で各ゲート SKIP。証拠は .harness/T-009-gates.log、T-009-determinism.log。GitHub CI 上での確認は未実施。
+- review: 独立評価 PASS、blocking なし。ゲートの合否判定と製品の fail-closed 要件を弱める変更はないと確認された。非阻害の指摘2件（生成が途中で失敗したときの解放漏れ、置き換え時の二重解放）は 0dfbfd6 で解消し、4ゲートを再実行して PASS。証拠は .harness/T-009-review.txt。
