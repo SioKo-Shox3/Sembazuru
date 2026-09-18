@@ -2,7 +2,7 @@
 <!--
   Sembazuru MSI — binary placement (M9.5a, ADR 0008 §1).
 
-  This authors only the file layout: the four Rust executables, the C++ hook
+  This authors only the file layout: the five Rust executables, the C++ hook
   launcher + both-bitness interceptor DLLs, and the MSBuild integration targets,
   installed under Program Files (a standard-user non-writable location, required
   by the GUI's self-elevation image-integrity assumption — ADR 0008 §3), plus a
@@ -18,7 +18,8 @@
     $(var.RustTarget)   release dir holding the Rust .exe set
     $(var.Hooks)        Release dir holding launcher.exe + sbz_interceptor{64,32}.dll
     $(var.Integration)  dir holding Directory.Build.targets
-    $(var.StoreCtl)     release sembazuru-storectl.exe embedded for machine-store CAs
+    $(var.StoreCtl)     release sembazuru-storectl.exe, embedded for machine-store CAs
+                        (the same file is also installed, from $(var.RustTarget))
     $(var.ProductVersion)
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
@@ -68,8 +69,12 @@
       <ComponentRef Id="GuiAutostartShortcut" />
     </Feature>
 
-    <!-- The helper is an embedded Binary stream only: it never enters Program Files.
-         All lifecycle actions run as LocalSystem and fail the transaction closed. -->
+    <!-- The lifecycle actions use an embedded Binary stream, so provisioning does not depend on
+         anything already being on disk. All of them run as LocalSystem and fail the transaction
+         closed. The same executable is ALSO installed under Program Files (see the Binaries group),
+         because the GUI's join needs an elevated helper to write the machine store (ADR 0018); the
+         install location is what makes "elevate this exact image" meaningful, since standard users
+         cannot write there. -->
     <Binary Id="MachineStoreCtlBinary" SourceFile="$(var.StoreCtl)" />
     <CustomAction Id="RollbackMachineStoreProvision" BinaryRef="MachineStoreCtlBinary"
                   ExeCommand="rollback-provision" Execute="rollback"
@@ -161,6 +166,12 @@
       </Component>
       <Component Id="GuiExe">
         <File Id="GuiExeFile" Source="$(var.RustTarget)\sembazuru-gui.exe" KeyPath="yes" />
+      </Component>
+      <!-- The machine-store helper. The GUI launches it elevated, by its full path next to the
+           GUI's own image, to hand over a join (ADR 0018). It is not on PATH and has no shortcut:
+           nothing but the GUI and the MSI's own actions are meant to invoke it. -->
+      <Component Id="StoreCtlExe">
+        <File Id="StoreCtlExeFile" Source="$(var.RustTarget)\sembazuru-storectl.exe" KeyPath="yes" />
       </Component>
       <Component Id="HookLauncherExe">
         <File Id="HookLauncherExeFile" Source="$(var.Hooks)\launcher.exe" KeyPath="yes" />
