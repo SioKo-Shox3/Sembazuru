@@ -428,6 +428,82 @@ mod tests {
         }
     }
 
+    /// Frames `fields` with a header whose declared length is correct, so a refusal can only come
+    /// from parsing the fields themselves and not from the outer length check.
+    fn envelope(fields: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(HEADER_BYTES + fields.len());
+        bytes.extend_from_slice(&JOIN_PAYLOAD_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&JOIN_PAYLOAD_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(fields);
+        bytes
+    }
+
+    #[test]
+    fn the_field_parser_refuses_on_its_own_terms() {
+        // Every case below declares its true payload length, so the outer check passes and the
+        // field parser is what has to reject it.
+        for (name, fields, expected) in [
+            ("two fields", vec![0u8, 0], JoinPayloadError::Field),
+            ("four fields", vec![0u8, 0, 0, 0], JoinPayloadError::Length),
+            (
+                "a replacement that runs past the envelope",
+                {
+                    let mut fields = vec![1u8];
+                    fields.extend_from_slice(&9u32.to_le_bytes());
+                    fields.extend_from_slice(b"abc");
+                    fields
+                },
+                JoinPayloadError::Field,
+            ),
+            (
+                "an empty token replacement",
+                {
+                    let mut fields = vec![1u8];
+                    fields.extend_from_slice(&0u32.to_le_bytes());
+                    fields.extend_from_slice(&[0, 0]);
+                    fields
+                },
+                JoinPayloadError::Token,
+            ),
+            (
+                "a token that is not UTF-8",
+                {
+                    let mut fields = vec![1u8];
+                    fields.extend_from_slice(&2u32.to_le_bytes());
+                    fields.extend_from_slice(&[0xff, 0xfe, 0, 0]);
+                    fields
+                },
+                JoinPayloadError::Token,
+            ),
+            (
+                "an empty configuration replacement",
+                {
+                    let mut fields = vec![0u8, 1];
+                    fields.extend_from_slice(&0u32.to_le_bytes());
+                    fields.push(0);
+                    fields
+                },
+                JoinPayloadError::Config,
+            ),
+        ] {
+            assert_eq!(
+                JoinPayload::decode(&envelope(&fields))
+                    .map(|_| ())
+                    .unwrap_err(),
+                expected,
+                "{name}"
+            );
+        }
+
+        // The same framing, correctly filled, still decodes: the helper above is not simply broken.
+        let mut valid = vec![1u8];
+        valid.extend_from_slice(&5u32.to_le_bytes());
+        valid.extend_from_slice(b"token");
+        valid.extend_from_slice(&[0, 2]);
+        assert!(JoinPayload::decode(&envelope(&valid)).is_ok());
+    }
+
     #[test]
     fn the_token_keeps_its_single_line_contract() {
         for invalid in [
