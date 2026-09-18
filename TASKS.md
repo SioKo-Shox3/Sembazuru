@@ -276,3 +276,45 @@
   トークンは payload の `cluster_token` として渡し、設定ファイルには書かない。
 - notes: 昇格を伴う実測（Medium の GUI がパイプを作り、昇格 helper が接続して PID 照合後に
   payload を受け取る）は人が UAC を押す必要がある。結線が済んでから1回行う。
+
+## T-020: Join の接続と送信に期限を持たせる
+- status: todo
+- done-when: GUI 側の `ConnectNamedPipe` と書き込みが、helper が接続せずに終了した場合や応答しない
+  場合に有界時間で戻る。helper のプロセスハンドルと期限の両方を待機の対象にする。成功経路の
+  受け渡しは従来どおり成立する。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-gui --locked`
+- paths: crates/gui/src/join/transport.rs, TASKS.md, PROGRESS.md
+- notes: 独立評価の blocking。同期の `ConnectNamedPipe` は待ち続ける。現在の 120 秒は
+  `hand_over` が終わったあとの `wait_for_helper` にしか効かない。`FILE_FLAG_OVERLAPPED` で
+  パイプを作り、接続・書き込みを overlapped にして、イベントと helper のプロセスハンドルを
+  一緒に待つ形にする。同期のまま短い待ちを繰り返す形は、取りこぼしと競合を増やすので避ける。
+
+## T-021: サービスの反映を一瞬の Running で判定しない
+- status: todo
+- done-when: `join` がサービスの起動を「初期化まで到達した」ことで判定する。`Running` を報告した
+  直後に失敗して停止する場合を失敗として扱う。判定の根拠を1つに決めて記録する。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-config-store --locked`
+- paths: crates/config-store/src/bin/sembazuru_storectl.rs, TASKS.md, PROGRESS.md
+- notes: 独立評価の blocking。worker は `crates/worker/src/service.rs:198` で `Running` を報告した
+  あと `crates/worker/src/run.rs:53` で listener を bind する。daemon も
+  `crates/agent/src/service.rs:188` で実行ループ開始前に `Running` を報告する。ポート競合などで
+  直後に落ちても、その間の `Running` を観測すると `join-applied` を返してしまう。
+  ADR 0018 の「SCM の `Running` 一回を動作確認の代用にしない」を満たしていない。
+- notes: 判定の候補は (a) 一定時間 `Running` が継続することの確認、(b) Status プレーンへの問い合わせ、
+  (c) サービス側が初期化完了を報告する仕組みの追加。(b) は ADR 0016 の境界に触れるので、
+  選ぶ前に影響を確認する。
+
+## T-022: storectl の配置を MSI 検査の期待値と一致させる
+- status: todo (ユーザーの判断待ち)
+- done-when: `hooks/test/m9_installer_acl.ps1` が、storectl の埋め込み Binary ストリームと
+  lifecycle CustomAction を従来どおり検証しつつ、INSTALLFOLDER への配置を許可して検証する。
+  ProgramData の ACL と `status_admin` の default-deny の検査は緩めない。
+- verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`
+- paths: hooks/test/m9_installer_acl.ps1, installer/sembazuru.wxs, TASKS.md, PROGRESS.md
+- notes: 独立評価の blocking。`m9_installer_acl.ps1:145` は
+  「storectl must remain an embedded Binary stream, not an installed File」として `File` 要素を拒否し、
+  375行目は `StoreCtlExeFile` を名指しで拒否、387行目は File テーブルに `storectl` が現れることを拒否する。
+  **T-018 (57e5d8e) はこの必須ゲートに落ちる。**
+- notes: このゲートは「ディスクに置かない」という不変条件を強制している。ADR 0018 の決定
+  （storectl を install 済み helper にする、ユーザー決定 2026-09-17）はそれを上書きするが、
+  強制されている不変条件の向きを変える変更なので、ゲートを直すか T-018 を戻すかはユーザーの判断とする。
