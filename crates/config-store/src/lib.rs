@@ -266,6 +266,12 @@ pub fn apply_machine_join_payload(
     guard: &mut MachineTokenUpdateGuard,
     payload: &JoinPayload,
 ) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    // A join that died between preparing and applying leaves a journal behind. The store then
+    // refuses both a new preparation and a service start, so the pending transaction is finished
+    // first; resuming it is what the journal exists for.
+    if machine_cluster_token_update_pending(guard)? {
+        apply_or_resume_machine_cluster_token_update(guard)?;
+    }
     match prepare_machine_cluster_token_update(guard, payload.update())? {
         MachineTokenUpdatePreparation::NoChange => Ok(MachineTokenMaintenanceResult::Unchanged),
         MachineTokenUpdatePreparation::JournalReady => {

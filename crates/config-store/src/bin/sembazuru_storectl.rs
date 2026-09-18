@@ -622,20 +622,17 @@ fn join_under_exclusion<A: StoreActions>(
     payload: &JoinPayload,
     actions: &mut A,
 ) -> Result<Option<&'static str>, CliError> {
-    actions
-        .stop_services()
-        .map_err(CliError::TokenMaintenance)?;
-    let saved = {
-        let mut update = actions.begin_update().map_err(CliError::TokenMaintenance)?;
-        actions
-            .join(&mut update, payload)
-            .map_err(CliError::TokenMaintenance)
-        // The update guard is released here, before anything is started.
-    };
-    let saved = match saved {
+    // A stop that fails partway has already taken something down, so it joins the recovery path.
+    if let Err(error) = actions.stop_services() {
+        let _ = actions.start_services();
+        return Err(CliError::TokenMaintenance(error));
+    }
+    let saved = match save_while_stopped(payload, actions) {
         Ok(saved) => saved,
         Err(error) => {
-            // Nothing was written, so leave the machine running as it was found.
+            // Every failure from here back to the stop leaves the machine as it was found. Taking
+            // the update lease can fail on its own — a service that has just reported Stopped may
+            // still be releasing its own lease — and that must not leave the machine down.
             let _ = actions.start_services();
             return Err(error);
         }
@@ -644,6 +641,18 @@ fn join_under_exclusion<A: StoreActions>(
         .start_services()
         .map_err(|_| CliError::JoinNotApplied)?;
     Ok(token_success(Verb::Join, saved))
+}
+
+/// Takes the update lease, writes, and releases the lease again, all while the services are down.
+fn save_while_stopped<A: StoreActions>(
+    payload: &JoinPayload,
+    actions: &mut A,
+) -> Result<MachineTokenMaintenanceResult, CliError> {
+    let mut update = actions.begin_update().map_err(CliError::TokenMaintenance)?;
+    actions
+        .join(&mut update, payload)
+        .map_err(CliError::TokenMaintenance)
+    // The update guard is released here, before the caller starts anything.
 }
 
 fn execute_authorized<A, F, G>(
@@ -1276,6 +1285,8 @@ mod tests {
     #[derive(Default)]
     struct SequenceActions {
         log: SequenceLog,
+        stop_fails: bool,
+        begin_fails: bool,
         join_fails: bool,
         start_fails: bool,
     }
@@ -1289,6 +1300,9 @@ mod tests {
 
         fn begin_update(&mut self) -> StoreResult<SequenceGuard> {
             self.log.push("begin");
+            if self.begin_fails {
+                return Err(MachineStoreErrorClass::Busy);
+            }
             Ok(SequenceGuard(self.log.clone()))
         }
 
@@ -1327,6 +1341,9 @@ mod tests {
 
         fn stop_services(&mut self) -> StoreResult<()> {
             self.log.push("stop");
+            if self.stop_fails {
+                return Err(MachineStoreErrorClass::Busy);
+            }
             Ok(())
         }
 
@@ -1393,6 +1410,37 @@ mod tests {
                 "release-exclusion"
             ]
         );
+    }
+
+    #[test]
+    fn every_failure_after_the_stop_puts_the_services_back() {
+        // Taking the update lease can fail on its own: a service that has just reported Stopped may
+        // still be releasing its own lease. Failing there must not leave the machine down.
+        for (actions, expected) in [
+            (
+                SequenceActions {
+                    begin_fails: true,
+                    ..SequenceActions::default()
+                },
+                // No guard was taken, so there is none to release.
+                vec!["exclude", "stop", "begin", "start", "release-exclusion"],
+            ),
+            (
+                SequenceActions {
+                    stop_fails: true,
+                    ..SequenceActions::default()
+                },
+                vec!["exclude", "stop", "start", "release-exclusion"],
+            ),
+        ] {
+            let mut actions = actions;
+            let log = actions.log.clone();
+            assert_eq!(
+                join_sequence(&sequence_payload(), &mut actions),
+                Err(CliError::TokenMaintenance(MachineStoreErrorClass::Busy))
+            );
+            assert_eq!(log.steps(), expected);
+        }
     }
 
     #[test]

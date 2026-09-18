@@ -112,7 +112,7 @@ mod imp {
         FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, PIPE_ACCESS_OUTBOUND, WriteFile,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
@@ -240,8 +240,12 @@ mod imp {
         }
 
         /// Waits for the helper to connect, proves it is the launched process, and only then writes.
+        ///
+        /// Takes the pipe by value: the helper reads to end of file, and only the server handle
+        /// closing gives it one. `DisconnectNamedPipe` would tear the connection down instead, and
+        /// the helper's next read would fail rather than end, losing a payload it already has.
         fn hand_over(
-            &self,
+            self,
             launched: &OwnedHandle,
             payload: &JoinPayload,
         ) -> Result<(), TransportError> {
@@ -265,8 +269,8 @@ mod imp {
             let expected = unsafe { GetProcessId(launched.as_raw_handle() as _) };
             let expected = (expected != 0).then_some(expected);
             if !peer_is_the_launched_helper(client, expected) {
-                // SAFETY: the server handle is live; disconnecting drops the unproven client.
-                unsafe { DisconnectNamedPipe(server) };
+                // Nothing has been written, and dropping this pipe closes the handle, which drops
+                // the unproven client with it.
                 return Err(TransportError::Peer(
                     "the connected client was not the launched helper".to_owned(),
                 ));
@@ -297,11 +301,11 @@ mod imp {
                 }
                 written_total += written as usize;
             }
+            // Blocks until the helper has consumed the bytes, so closing below cannot cut the
+            // payload short.
             // SAFETY: the server handle is live and connected.
             unsafe { FlushFileBuffers(server) };
-            // The helper reads to end of file, so the write side has to close before it can decode.
-            // SAFETY: the server handle is live.
-            unsafe { DisconnectNamedPipe(server) };
+            // Dropping `self` closes the server handle, and that close is the helper's end of file.
             Ok(())
         }
     }
