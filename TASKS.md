@@ -208,7 +208,7 @@
   どの API でも外せないまま残っている。新しく作られることは無くなった。
 
 ## T-014: Join payload の封筒を定義する
-- status: todo
+- status: done
 - done-when: バージョン付き・長さ前置の1本の封筒を encode/decode でき、論理フィールド
   `cluster_token` / `daemon_config` / `worker_config` が `MachineTokenUpdate` に 1:1 で対応する。
   未知バージョン、全体長の超過、各フィールド長の超過、切り詰め、末尾余剰、フィールド数違いを拒否する。
@@ -216,12 +216,13 @@
 - verify: `rustup run 1.98.1 cargo test -p sembazuru-config-store --locked`
 - verify: `rustup run 1.98.1 cargo clippy -p sembazuru-config-store --all-targets --locked -- -D warnings`
 - paths: crates/config-store/src/join.rs, crates/config-store/src/lib.rs, TASKS.md, PROGRESS.md
+- measured: b13994e。lib 89 passed / 0 failed、fmt と clippy は exit 0。
 - notes: ADR 0018「payload の形」。3対象を1取引として扱う理由は `prepare_machine_cluster_token_update`
   が1取引で受けること。分割メッセージにすると解析・再試行・順序付けの失敗状態が増える。
   トークンの既存の一行制約 (`MAX_MACHINE_CLUSTER_TOKEN_BYTES`、CR/LF/NUL 禁止) はフィールド内部で維持する。
 
 ## T-015: storectl に join 動詞を足す
-- status: todo
+- status: done
 - done-when: `sembazuru-storectl join --pipe <name>` が token-maintenance として既存の `authorize` を通り
   (LocalSystem、または Administrators かつ昇格)、名前付きパイプへ
   `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` で接続して封筒を読み、`MachineTokenUpdate` として
@@ -232,7 +233,7 @@
   パイプ名は argv で受けるが、秘密ではない。名前の検証（`\.\pipe\` 配下、長さ、文字種）を入れる。
 
 ## T-016: GUI 側の一回限りのパイプを作る
-- status: todo
+- status: done
 - done-when: GUI が `FILE_FLAG_FIRST_PIPE_INSTANCE`・`PIPE_REJECT_REMOTE_CLIENTS`・インスタンス数 1・
   明示のセキュリティ記述子 `D:P(A;;GR;;;BA)` でパイプを作る。`SEE_MASK_NOCLOSEPROCESS` で得た
   プロセスハンドルを保持したまま `GetNamedPipeClientProcessId` と突き合わせ、一致するまで payload を
@@ -244,7 +245,7 @@
   サーバーハンドルを閉じて同名で作り直す経路を作らない。
 
 ## T-017: Join 後のサービス反映を storectl join に持たせる
-- status: todo
+- status: done
 - done-when: `join` が 停止 → 更新ガード取得 → journal 適用 → **ガード解放後に**起動 の順で実行する。
   設定保存の完了とサービス反映の完了を別の結果として返し、起動に失敗したときは Join 成功にしない。
   再起動までの Join 全体を直列化する。SCM 操作は対象名と操作を固定し、停止・開始・状態照会の権限だけを要求する。
@@ -256,9 +257,22 @@
   動作確認の代用にしない。
 
 ## T-018: storectl をインストール対象に入れる
-- status: todo
+- status: done
 - done-when: `storectl` が MSI 埋め込みの CA 専用から、インストールされる helper になる。配置先と署名対象に
   入り、既存の ProgramData の ACL と `status_admin` の default-deny を緩めない。
 - verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`
 - paths: installer/sembazuru.wxs, TASKS.md, PROGRESS.md
 - notes: 現状 `installer/sembazuru.wxs:21` の CA 用でインストールされない。配置と署名対象の追加が要る。
+
+## T-019: GUI のウィザードを Join の経路へつなぐ
+- status: todo
+- done-when: 参加ウィザードの入力が `JoinPayload` になり、`join::transport::deliver` を通って
+  保存される。`StubConfigWriter` の `MechanismUnconfigured` がこの経路から消える。
+  昇格の辞退、helper の不在、`join-saved-not-applied` が、利用者に区別できる形で表示される。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-gui --locked`
+- paths: crates/gui/src/app/join_panel.rs, crates/gui/src/join/**, TASKS.md, PROGRESS.md
+- notes: T-014〜T-018 で経路の両端は揃ったが、**ウィザードからの呼び出しがまだ無い**。
+  `worker_toml.rs` は平文の cluster_token を worker.toml に書く形なので、実系に合わせて
+  トークンは payload の `cluster_token` として渡し、設定ファイルには書かない。
+- notes: 昇格を伴う実測（Medium の GUI がパイプを作り、昇格 helper が接続して PID 照合後に
+  payload を受け取る）は人が UAC を押す必要がある。結線が済んでから1回行う。

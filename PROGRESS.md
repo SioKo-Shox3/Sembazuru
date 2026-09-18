@@ -24,21 +24,21 @@
 
 ## In progress
 
-- T-012: Session 0 診断の拡張は実装と契約検査まで完了 (3162525、a3caf65)。整合性ラベル・
-  `TokenMandatoryPolicy`・Job UI 制限の全ビット展開・順序付き open 6 段を version 5 のレコードに入れた。
-  独立評価 PASS。残るのは GitHub runner での実測で、push とワークフロー実行はユーザーの明示指示待ち。
+- T-010 の実装: 経路の両端が揃った。封筒 (b13994e)、storectl の join 動詞 (1d47100)、
+  GUI 側の一回限りのパイプ (ba77081)、停止→更新→起動の順序 (dff8e35)、storectl のインストール配置
+  (57e5d8e)。**残るのはウィザードからの結線 (T-019) と、人が UAC を押す昇格ありの実測。**
 
 - T-011: installed worker の 0xC0000142 は T-003 と同一の問題で、失敗するのは `--no-vfs` の plain control（フック DLL は関与しない）。実測で真因はウィンドウステーションとデスクトップへのアクセス拒否と判明した。解の方向が未決で、特権境界の設計なので GPT 側へ回す。
-- T-010: GUI Join。設計の未決は 2026-09-18 にすべて埋まった。受け渡しは GUI が立てる一回限りの名前付きパイプ、
+- T-010: GUI Join。設計の未決は 2026-09-18 に埋まり、実装は T-014〜T-018 で完了した。受け渡しは GUI が立てる一回限りの名前付きパイプ、
   その DACL は Administrators のみ、Join 後のサービス反映は昇格した `storectl join` が担当する
   （停止 → 更新ガード取得 → journal 適用 → ガード解放後に起動）。残るのは実装で、join 動詞・storectl の配置・
   GUI 側 writer・Join 全体の直列化。決定と罠は docs/decisions/0018-action-desktop-and-join-transport.md。
 
 ## Next
-- T-012 の実測。push 後に Release をブランチ ref で手動実行し、診断 job のレコードから
-  `StationSacl`/`DesktopSacl`/`UiProbe`/`JobUiLimits` と `mandatory_policy` を読む。これで
-  0xC0000142 の拒否が DACL 由来か MIC 由来か Job UI 由来かを切り分ける。
-- T-011 と T-010 の未決分岐を GPT 側で詰める。どちらも特権境界の設計。
+- T-019: GUI のウィザードを Join の経路へつなぐ。両端は揃っているが呼び出しが無い。
+- T-011: 拒否が DACL 由来と確定したので、アクション専用のステーションとデスクトップに
+  制限側を満たす `action_sid` の ACE を置く設計に入れる。`CreateProcessAsUser` が要求する
+  full access との折り合いが未検証。
 - `private_station_unnamed_create_cannot_allocate_per_action_station` の初回成功分岐を GitHub runner で確認する。
 - 次に CI を回すとき、C++ job で新たに見えるようになるのは M2 以降の段。ローカルでは M2・smoke・VFS 3件が通るが、clang-cl を要する段はローカルで未実行なので CI が初出になる。
 - GUI Join は StubConfigWriter のまま。MachineTokenUpdate は machine token/daemon設定/worker設定を同じ journal で扱えるが、storectl の7固定動詞には Join 保存がなく、GUI ConfigWriter も token を表現しない。既存の固定パスと認可を維持する Join 専用経路が必要。
@@ -62,3 +62,6 @@
 - T-001 の PowerShell での成功ログは `.harness/runs/20260908-082159/verify-T-001-1.txt`〜`verify-T-001-9.txt`。一方、cmd を使う runner の recheck は 2 回 exit 101。親の collect が特殊な環境変数の名前を拒否することを単独テストで再現した。成功ログだけでは完了条件を満たさない。
 - 20260908-082159 の自動反復は、コード変更なしの再検証が 2 回失敗したため所有プロセスを確認して停止した。実行中の反復は残していない。根拠は .harness/loop-state.json と各 recheck ログ。記録上の done を blocked に訂正した。
 - このターンで新たな git push の指示はない。新規変更は作業ブランチへのコミットまで。
+- 2026-09-18 の push は `3fbed87` まで。以後 `57e5d8e` までの 7 コミットは未 push。
+- 診断の実測に使った run: https://github.com/SioKo-Shox3/Sembazuru/actions/runs/35347944739
+  （session0 job は success。パッケージ job の結果はこのセッションでは確認していない。）
