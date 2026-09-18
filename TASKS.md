@@ -129,10 +129,18 @@
 - 前提の訂正: 起動フラグでは直らない。CREATE_NO_WINDOW は実測で NO_WINDOW_NOT_SUFFICIENT。製品の起動フラグは変更しない。
 - 関連: T-006 のログオン単位ウィンドウステーション生成の調査は、アクション専用ステーションを用意する案の側にある。
 - decided: 方向は (a) アクション専用のステーションとデスクトップ。GPT と Fable の双方が (a) を推し、(b) と (c) を退けた。根拠と罠は docs/decisions/0018-action-desktop-and-join-transport.md。
-- blocked-on: 設計に入る前に診断を広げる。GPT が「SACL 未測定なので DACL だけが原因とは断定できない、MIC は DACL より先に評価される」と留保した。T-012 で測る。
+- measured: 2026-09-18 の run 35347944739 で留保に決着。ステーションもデスクトップも
+  `label=absent`（= Medium 扱い）なので **MIC では説明できない**。制限 SID 列
+  `[action_sid, Everyone, Authenticated Users, Users, RESTRICTED]` に一致する ACE が DACL に1つも無く、
+  `MAXIMUM_ALLOWED` すら gle=5 で落ちる。原因は DACL の制限側で確定した。
+  記録は docs/verification/2026-09-18-session0-label-and-restricted-sids.md。
+- scope: 与えるべきは「もっと狭い mask」ではなく、制限側を満たす `action_sid` の ACE そのもの。
+  許可が皆無なので、mask を1ビットずつ削って境界を出す作業には意味が無い。
+- 残る未検証: `CreateProcessAsUser` が対象ステーション/デスクトップへの full access を要求する点と、
+  最小権限だけを与える構成との折り合い。
 
 ## T-012: Session 0 診断に整合性ラベルと制限 SID を足す
-- status: todo (実装と契約検査は完了、GitHub runner の実測だけ残り)
+- status: done
 - done-when: 診断レコードが、ウィンドウステーションとデスクトップの SACL（整合性 SID と mandatory mask）、アクショントークンの `TokenRestrictedSids` と通常 SID と `TokenMandatoryPolicy`、`JOB_OBJECT_UILIMIT_*` の展開結果を含む。GitHub runner で実測し、0xC0000142 の拒否が DACL 由来か MIC 由来かを区別できる。
 - verify: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked`
 - verify: `gh workflow run release.yml --ref chore/two-pc-preparation` の診断 job 実ログ
@@ -160,8 +168,14 @@
 - review: 独立評価 PASS、blocking なし。非阻害2件（`relaxed-job-ui` が名称検査で先に落ちる、ラベル不在の
   コメントが DACL を唯一の容疑者と読ませる）は a3caf65 で解消し、4 検査を再実行した。a3caf65 自体は未評価。
   証拠は .harness/T-012-review.txt、依頼文は .harness/T-012-review-brief.md。
-- blocked-on: 残るのは GitHub runner での実測だけ。`git push` と
-  `gh workflow run release.yml --ref chore/two-pc-preparation` はユーザーがそのターンで明示したときだけ行う。
+- measured: run 35347944739 (SHA 3fbed87、job は completed/success) で実測完了。
+  `StationSacl` / `DesktopSacl` はどちらも `label=absent;implied_integrity=8192`、
+  `UiProbe` は 6 段すべて `allowed=false;gle=5`（`MAXIMUM_ALLOWED` を含む）、
+  `JobUiLimits` は `handles=0` で残り 7 ビットが 1。記録は
+  docs/verification/2026-09-18-session0-label-and-restricted-sids.md。
+- 結論: 拒否は **MIC ではなく DACL**。ラベルが無いオブジェクトは Medium 扱いで、Medium のアクションに
+  no-write-up は働かない。version 5 のレコードは hosted runner の PowerShell 解析器を通り、
+  Rust と PowerShell の契約が実環境でも一致することも確認できた。
 
 ## T-013: junction を含む一時ツリーの後始末が失敗する
 - status: todo
