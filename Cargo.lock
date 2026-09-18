@@ -3943,6 +3943,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml_edit 0.20.2",
+ "windows-service",
  "windows-sys 0.59.0",
  "zeroize",
 ]

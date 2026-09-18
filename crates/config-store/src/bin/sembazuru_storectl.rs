@@ -85,6 +85,8 @@ enum CliError {
     Unsupported,
     Lifecycle(MachineStoreErrorClass),
     TokenMaintenance(MachineStoreErrorClass),
+    /// The join was written, but the services did not come back on the new configuration.
+    JoinNotApplied,
 }
 
 impl CliError {
@@ -115,6 +117,7 @@ impl CliError {
             Self::TokenMaintenance(MachineStoreErrorClass::Busy) => "token-update-busy",
             Self::TokenMaintenance(MachineStoreErrorClass::InvalidInput) => "invalid-token-input",
             Self::TokenMaintenance(MachineStoreErrorClass::Io) => "token-io-failed",
+            Self::JoinNotApplied => "join-saved-not-applied",
         }
     }
 
@@ -127,6 +130,7 @@ impl CliError {
             Self::Unsupported => 5,
             Self::Lifecycle(_) => 10,
             Self::TokenMaintenance(_) => 11,
+            Self::JoinNotApplied => 12,
         }
     }
 }
@@ -234,6 +238,14 @@ trait StoreActions {
     fn rotate_token(&mut self, update: &mut Self::Update, secret: &SecretInput) -> TokenResult;
     fn clear_token(&mut self, update: &mut Self::Update) -> TokenResult;
     fn join(&mut self, update: &mut Self::Update, payload: &JoinPayload) -> TokenResult;
+    /// Takes the machine-wide exclusion that covers one whole stop-update-start sequence.
+    ///
+    /// The update lease alone cannot do this: it is released before the services are started, and
+    /// two joins interleaving their stops and starts would otherwise be free to cross.
+    fn begin_join_exclusion(&mut self) -> StoreResult<()>;
+    fn end_join_exclusion(&mut self);
+    fn stop_services(&mut self) -> StoreResult<()>;
+    fn start_services(&mut self) -> StoreResult<()>;
 }
 
 type StoreResult<T> = Result<T, MachineStoreErrorClass>;
@@ -261,7 +273,195 @@ fn classify_backend_error(
     error.classification()
 }
 
-struct MachineStoreLifecycle;
+/// The machine-wide exclusion that covers one whole join sequence.
+#[cfg(windows)]
+mod join_exclusion {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{
+        GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    /// One name for the whole machine: joins from different sessions have to exclude each other.
+    const NAME: &str = r"Global\SembazuruJoinSequence";
+
+    /// A join stops services, writes, and starts them again; this only bounds a true hang.
+    const TIMEOUT_MS: u32 = 120_000;
+
+    /// One held join exclusion. Dropping the handle without releasing would leave the mutex
+    /// abandoned, so the release is explicit and the handle is closed after it.
+    pub(super) struct Exclusion(OwnedHandle);
+
+    pub(super) fn acquire(slot: &mut Option<Exclusion>) -> StoreResult<()> {
+        if slot.is_some() {
+            // A second acquire in one process would deadlock on a non-recursive wait.
+            return Err(MachineStoreErrorClass::Busy);
+        }
+        let name: Vec<u16> = NAME.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: the name is NUL-terminated and live for the call; ownership is taken below.
+        let handle = unsafe { CreateMutexW(null_mut(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            let _ = unsafe { GetLastError() };
+            return Err(MachineStoreErrorClass::Io);
+        }
+        // SAFETY: CreateMutexW returned one owned kernel handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        // SAFETY: the handle is a live mutex handle.
+        match unsafe { WaitForSingleObject(handle.as_raw_handle() as _, TIMEOUT_MS) } {
+            // An abandoned mutex means a previous join died holding it. Its own transaction is
+            // either journalled or absent, so this join may proceed and the store decides.
+            WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                *slot = Some(Exclusion(handle));
+                Ok(())
+            }
+            WAIT_TIMEOUT => Err(MachineStoreErrorClass::Busy),
+            _ => Err(MachineStoreErrorClass::Io),
+        }
+    }
+
+    pub(super) fn release(slot: &mut Option<Exclusion>) {
+        if let Some(exclusion) = slot.take() {
+            // SAFETY: this process owns the mutex; releasing before the handle closes keeps the
+            // next join from seeing it abandoned.
+            unsafe { ReleaseMutex(exclusion.0.as_raw_handle() as _) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod join_exclusion {
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    pub(super) struct Exclusion;
+
+    pub(super) fn acquire(_slot: &mut Option<Exclusion>) -> StoreResult<()> {
+        Err(MachineStoreErrorClass::Unsupported)
+    }
+
+    pub(super) fn release(_slot: &mut Option<Exclusion>) {}
+}
+
+/// Stopping and starting exactly the two Sembazuru services, in the order their leases allow.
+#[cfg(windows)]
+mod service_control {
+    use std::ffi::OsStr;
+    use std::time::{Duration, Instant};
+
+    use windows_service::service::{Service, ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    /// The two fixed names, nothing free-form. The worker runs the actions the daemon hands it, so
+    /// it stops first and starts last.
+    const STOP_ORDER: [&str; 2] = ["SembazuruWorker", "SembazuruDaemon"];
+    const START_ORDER: [&str; 2] = ["SembazuruDaemon", "SembazuruWorker"];
+
+    /// A service settles well inside this; the bound only keeps a stuck service from hanging a join.
+    const SETTLE: Duration = Duration::from_secs(30);
+
+    fn manager() -> StoreResult<ServiceManager> {
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(|_| MachineStoreErrorClass::Io)
+    }
+
+    /// Opens one service, or reports that it is not installed on this machine.
+    fn open(name: &str, access: ServiceAccess) -> StoreResult<Option<Service>> {
+        match manager()?.open_service(name, access) {
+            Ok(service) => Ok(Some(service)),
+            // A machine that never installed this service has nothing to stop or start, which is
+            // not a join failure. Every other open failure is.
+            Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
+                Ok(None)
+            }
+            Err(_) => Err(MachineStoreErrorClass::Io),
+        }
+    }
+
+    fn settle(service: &Service, done: impl Fn(ServiceState) -> bool) -> StoreResult<()> {
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            let state = service
+                .query_status()
+                .map_err(|_| MachineStoreErrorClass::Io)?
+                .current_state;
+            if done(state) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                // An unsettled service is reported, never assumed: the whole point of stopping is
+                // that nothing keeps running on the configuration being replaced.
+                return Err(MachineStoreErrorClass::Busy);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    pub(super) fn stop_all() -> StoreResult<()> {
+        for name in STOP_ORDER {
+            let Some(service) = open(name, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?
+            else {
+                continue;
+            };
+            if service
+                .query_status()
+                .map_err(|_| MachineStoreErrorClass::Io)?
+                .current_state
+                != ServiceState::Stopped
+            {
+                service.stop().map_err(|_| MachineStoreErrorClass::Io)?;
+            }
+            settle(&service, |state| state == ServiceState::Stopped)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn start_all() -> StoreResult<()> {
+        for name in START_ORDER {
+            let Some(service) = open(name, ServiceAccess::START | ServiceAccess::QUERY_STATUS)?
+            else {
+                continue;
+            };
+            if service
+                .query_status()
+                .map_err(|_| MachineStoreErrorClass::Io)?
+                .current_state
+                == ServiceState::Stopped
+            {
+                service
+                    .start(&[] as &[&OsStr])
+                    .map_err(|_| MachineStoreErrorClass::Io)?;
+            }
+            // Running is where the SCM's report ends; whether the daemon is serving is a separate
+            // question this sequence does not claim to have answered.
+            settle(&service, |state| state == ServiceState::Running)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+mod service_control {
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    pub(super) fn stop_all() -> StoreResult<()> {
+        Err(MachineStoreErrorClass::Unsupported)
+    }
+
+    pub(super) fn start_all() -> StoreResult<()> {
+        Err(MachineStoreErrorClass::Unsupported)
+    }
+}
+
+#[derive(Default)]
+struct MachineStoreLifecycle {
+    exclusion: Option<join_exclusion::Exclusion>,
+}
 
 impl StoreActions for MachineStoreLifecycle {
     type Update = MachineTokenUpdateGuard;
@@ -300,6 +500,22 @@ impl StoreActions for MachineStoreLifecycle {
     fn join(&mut self, update: &mut Self::Update, payload: &JoinPayload) -> TokenResult {
         apply_machine_join_payload(update, payload)
             .map_err(|error| classify_backend_error("join", error))
+    }
+
+    fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+        join_exclusion::acquire(&mut self.exclusion)
+    }
+
+    fn end_join_exclusion(&mut self) {
+        join_exclusion::release(&mut self.exclusion);
+    }
+
+    fn stop_services(&mut self) -> StoreResult<()> {
+        service_control::stop_all()
+    }
+
+    fn start_services(&mut self) -> StoreResult<()> {
+        service_control::start_all()
     }
 }
 
@@ -364,16 +580,70 @@ fn dispatch<A: StoreActions>(
     if !input.matches(verb) {
         return Err(CliError::InvalidArguments);
     }
+    if let (Verb::Join, VerbInput::Join(payload)) = (verb, &input) {
+        return join_sequence(payload, actions);
+    }
     let mut update = actions.begin_update().map_err(CliError::TokenMaintenance)?;
     let result = match (verb, input) {
         (Verb::MigrateToken, _) => actions.migrate_token(&mut update),
         (Verb::RotateToken, VerbInput::Secret(secret)) => actions.rotate_token(&mut update, secret),
         (Verb::ClearToken, _) => actions.clear_token(&mut update),
-        (Verb::Join, VerbInput::Join(payload)) => actions.join(&mut update, payload),
+        (Verb::Join, VerbInput::Join(_)) => {
+            unreachable!("join runs its own stop-update-start sequence")
+        }
         _ => unreachable!("lifecycle verb was handled above"),
     }
     .map_err(CliError::TokenMaintenance)?;
     Ok(token_success(verb, result))
+}
+
+/// Runs one join as stop, update, release, start.
+///
+/// The order is forced by the store: a running service holds its own lease on the root, and the
+/// update takes an exclusive one, so the write cannot happen while the services run. The reverse is
+/// equally forced — the services cannot take their lease while the update guard is still held — so
+/// the guard has to be dropped before anything is started.
+///
+/// Writing the configuration and running on it are reported separately. A join whose services did
+/// not come back is not a successful join, even though the bytes are safely stored.
+fn join_sequence<A: StoreActions>(
+    payload: &JoinPayload,
+    actions: &mut A,
+) -> Result<Option<&'static str>, CliError> {
+    actions
+        .begin_join_exclusion()
+        .map_err(CliError::TokenMaintenance)?;
+    let outcome = join_under_exclusion(payload, actions);
+    actions.end_join_exclusion();
+    outcome
+}
+
+fn join_under_exclusion<A: StoreActions>(
+    payload: &JoinPayload,
+    actions: &mut A,
+) -> Result<Option<&'static str>, CliError> {
+    actions
+        .stop_services()
+        .map_err(CliError::TokenMaintenance)?;
+    let saved = {
+        let mut update = actions.begin_update().map_err(CliError::TokenMaintenance)?;
+        actions
+            .join(&mut update, payload)
+            .map_err(CliError::TokenMaintenance)
+        // The update guard is released here, before anything is started.
+    };
+    let saved = match saved {
+        Ok(saved) => saved,
+        Err(error) => {
+            // Nothing was written, so leave the machine running as it was found.
+            let _ = actions.start_services();
+            return Err(error);
+        }
+    };
+    actions
+        .start_services()
+        .map_err(|_| CliError::JoinNotApplied)?;
+    Ok(token_success(Verb::Join, saved))
 }
 
 fn execute_authorized<A, F, G>(
@@ -672,7 +942,7 @@ fn run() -> Result<Option<&'static str>, CliError> {
             let pipe = pipe.as_ref().ok_or(CliError::InvalidArguments)?;
             read_join_payload(pipe)
         },
-        &mut MachineStoreLifecycle,
+        &mut MachineStoreLifecycle::default(),
     )
 }
 
@@ -735,6 +1005,21 @@ mod tests {
         fn join(&mut self, update: &mut u8, _payload: &JoinPayload) -> TokenResult {
             self.calls.push(Call("join", *update));
             Ok(MachineTokenMaintenanceResult::Changed)
+        }
+        fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+            self.calls.push(Call("exclude", 0));
+            Ok(())
+        }
+        fn end_join_exclusion(&mut self) {
+            self.calls.push(Call("release-exclusion", 0));
+        }
+        fn stop_services(&mut self) -> StoreResult<()> {
+            self.calls.push(Call("stop", 0));
+            Ok(())
+        }
+        fn start_services(&mut self) -> StoreResult<()> {
+            self.calls.push(Call("start", 0));
+            Ok(())
         }
     }
 
@@ -965,6 +1250,217 @@ mod tests {
         assert_eq!(bounded.1, MAX_MACHINE_CLUSTER_TOKEN_BYTES + 3);
     }
 
+    /// A fake whose update guard records its own release, so the order of the join sequence is
+    /// observable rather than assumed.
+    #[derive(Clone, Default)]
+    struct SequenceLog(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+
+    impl SequenceLog {
+        fn push(&self, step: &'static str) {
+            self.0.borrow_mut().push(step);
+        }
+
+        fn steps(&self) -> Vec<&'static str> {
+            self.0.borrow().clone()
+        }
+    }
+
+    struct SequenceGuard(SequenceLog);
+
+    impl Drop for SequenceGuard {
+        fn drop(&mut self) {
+            self.0.push("guard-released");
+        }
+    }
+
+    #[derive(Default)]
+    struct SequenceActions {
+        log: SequenceLog,
+        join_fails: bool,
+        start_fails: bool,
+    }
+
+    impl StoreActions for SequenceActions {
+        type Update = SequenceGuard;
+
+        fn lifecycle(&mut self, _verb: Verb) -> StoreResult<()> {
+            unreachable!("the join sequence never reaches a lifecycle verb")
+        }
+
+        fn begin_update(&mut self) -> StoreResult<SequenceGuard> {
+            self.log.push("begin");
+            Ok(SequenceGuard(self.log.clone()))
+        }
+
+        fn migrate_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+            unreachable!("not part of the join sequence")
+        }
+
+        fn rotate_token(
+            &mut self,
+            _update: &mut SequenceGuard,
+            _secret: &SecretInput,
+        ) -> TokenResult {
+            unreachable!("not part of the join sequence")
+        }
+
+        fn clear_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+            unreachable!("not part of the join sequence")
+        }
+
+        fn join(&mut self, _update: &mut SequenceGuard, _payload: &JoinPayload) -> TokenResult {
+            self.log.push("join");
+            if self.join_fails {
+                return Err(MachineStoreErrorClass::Io);
+            }
+            Ok(MachineTokenMaintenanceResult::Changed)
+        }
+
+        fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+            self.log.push("exclude");
+            Ok(())
+        }
+
+        fn end_join_exclusion(&mut self) {
+            self.log.push("release-exclusion");
+        }
+
+        fn stop_services(&mut self) -> StoreResult<()> {
+            self.log.push("stop");
+            Ok(())
+        }
+
+        fn start_services(&mut self) -> StoreResult<()> {
+            self.log.push("start");
+            if self.start_fails {
+                return Err(MachineStoreErrorClass::Io);
+            }
+            Ok(())
+        }
+    }
+
+    fn sequence_payload() -> JoinPayload {
+        JoinPayload::new(
+            JoinField::replace(b"cluster-token"),
+            JoinField::Preserve,
+            JoinField::Preserve,
+        )
+        .expect("fixture payload")
+    }
+
+    #[test]
+    fn a_join_releases_its_update_guard_before_anything_is_started() {
+        let mut actions = SequenceActions::default();
+        let log = actions.log.clone();
+        let result = join_sequence(&sequence_payload(), &mut actions);
+        assert_eq!(result, Ok(Some("join-applied")));
+        assert_eq!(
+            log.steps(),
+            vec![
+                "exclude",
+                "stop",
+                "begin",
+                "join",
+                "guard-released",
+                "start",
+                "release-exclusion"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_machine_running_as_it_was_found() {
+        let mut actions = SequenceActions {
+            join_fails: true,
+            ..SequenceActions::default()
+        };
+        let log = actions.log.clone();
+        let result = join_sequence(&sequence_payload(), &mut actions);
+        assert_eq!(
+            result,
+            Err(CliError::TokenMaintenance(MachineStoreErrorClass::Io))
+        );
+        // The services are started again, and the exclusion is still given back.
+        assert_eq!(
+            log.steps(),
+            vec![
+                "exclude",
+                "stop",
+                "begin",
+                "join",
+                "guard-released",
+                "start",
+                "release-exclusion"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_saved_join_whose_services_stay_down_is_not_a_successful_join() {
+        let mut actions = SequenceActions {
+            start_fails: true,
+            ..SequenceActions::default()
+        };
+        let log = actions.log.clone();
+        let result = join_sequence(&sequence_payload(), &mut actions);
+        assert_eq!(result, Err(CliError::JoinNotApplied));
+        assert_eq!(CliError::JoinNotApplied.code(), "join-saved-not-applied");
+        assert_ne!(CliError::JoinNotApplied.exit_code(), 0);
+        assert_eq!(*log.steps().last().expect("a step"), "release-exclusion");
+    }
+
+    #[test]
+    fn a_join_that_cannot_take_the_exclusion_touches_nothing() {
+        struct RefusingActions(SequenceLog);
+
+        impl StoreActions for RefusingActions {
+            type Update = SequenceGuard;
+            fn lifecycle(&mut self, _verb: Verb) -> StoreResult<()> {
+                unreachable!("nothing runs")
+            }
+            fn begin_update(&mut self) -> StoreResult<SequenceGuard> {
+                unreachable!("nothing runs")
+            }
+            fn migrate_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn rotate_token(
+                &mut self,
+                _update: &mut SequenceGuard,
+                _secret: &SecretInput,
+            ) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn clear_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn join(&mut self, _update: &mut SequenceGuard, _payload: &JoinPayload) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+                self.0.push("exclude-refused");
+                Err(MachineStoreErrorClass::Busy)
+            }
+            fn end_join_exclusion(&mut self) {
+                unreachable!("an exclusion that was never taken is not given back")
+            }
+            fn stop_services(&mut self) -> StoreResult<()> {
+                unreachable!("nothing runs")
+            }
+            fn start_services(&mut self) -> StoreResult<()> {
+                unreachable!("nothing runs")
+            }
+        }
+
+        let log = SequenceLog::default();
+        let mut actions = RefusingActions(log.clone());
+        assert_eq!(
+            join_sequence(&sequence_payload(), &mut actions),
+            Err(CliError::TokenMaintenance(MachineStoreErrorClass::Busy))
+        );
+        assert_eq!(log.steps(), vec!["exclude-refused"]);
+    }
+
     #[test]
     fn authorization_precedes_input_and_exact_backend_dispatch() {
         for identity in [
@@ -1007,7 +1503,17 @@ mod tests {
                 vec![Call("begin", 0), Call("rotate", 73)],
             ),
             (Verb::ClearToken, vec![Call("begin", 0), Call("clear", 73)]),
-            (Verb::Join, vec![Call("begin", 0), Call("join", 73)]),
+            (
+                Verb::Join,
+                vec![
+                    Call("exclude", 0),
+                    Call("stop", 0),
+                    Call("begin", 0),
+                    Call("join", 73),
+                    Call("start", 0),
+                    Call("release-exclusion", 0),
+                ],
+            ),
         ] {
             let (mut reads, mut joins, mut actions) = (0, 0, RecordingActions::default());
             execute_authorized(
