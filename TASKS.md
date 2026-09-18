@@ -178,3 +178,59 @@
 - notes: c16ba9c 時点の `.harness/final-rust-workspace.log` では workspace 全体が exit 0 だった。
   その後にこのマシン側で変わったもの（junction の削除権限、常駐ソフトのハンドル保持）を先に疑う。
   CI で同じ失敗が出るかを確認してから、製品コードとテストのどちらを直すかを決める。
+
+## T-014: Join payload の封筒を定義する
+- status: todo
+- done-when: バージョン付き・長さ前置の1本の封筒を encode/decode でき、論理フィールド
+  `cluster_token` / `daemon_config` / `worker_config` が `MachineTokenUpdate` に 1:1 で対応する。
+  未知バージョン、全体長の超過、各フィールド長の超過、切り詰め、末尾余剰、フィールド数違いを拒否する。
+  秘密は `Zeroizing` に載り、`Debug` に出ない。I/O を含まない純粋な層にする。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-config-store --locked`
+- verify: `rustup run 1.98.1 cargo clippy -p sembazuru-config-store --all-targets --locked -- -D warnings`
+- paths: crates/config-store/src/join.rs, crates/config-store/src/lib.rs, TASKS.md, PROGRESS.md
+- notes: ADR 0018「payload の形」。3対象を1取引として扱う理由は `prepare_machine_cluster_token_update`
+  が1取引で受けること。分割メッセージにすると解析・再試行・順序付けの失敗状態が増える。
+  トークンの既存の一行制約 (`MAX_MACHINE_CLUSTER_TOKEN_BYTES`、CR/LF/NUL 禁止) はフィールド内部で維持する。
+
+## T-015: storectl に join 動詞を足す
+- status: todo
+- done-when: `sembazuru-storectl join --pipe <name>` が token-maintenance として既存の `authorize` を通り
+  (LocalSystem、または Administrators かつ昇格)、名前付きパイプへ
+  `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` で接続して封筒を読み、`MachineTokenUpdate` として
+  原子的に適用する。秘密を argv に載せず、ディスクに書かない。既存7動詞の argv・認可・出力コードは不変。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-config-store --locked`
+- paths: crates/config-store/src/bin/sembazuru_storectl.rs, TASKS.md, PROGRESS.md
+- notes: `authorize` の条件式は変えず、`is_token_maintenance` に join を足すだけにする。
+  パイプ名は argv で受けるが、秘密ではない。名前の検証（`\.\pipe\` 配下、長さ、文字種）を入れる。
+
+## T-016: GUI 側の一回限りのパイプを作る
+- status: todo
+- done-when: GUI が `FILE_FLAG_FIRST_PIPE_INSTANCE`・`PIPE_REJECT_REMOTE_CLIENTS`・インスタンス数 1・
+  明示のセキュリティ記述子 `D:P(A;;GR;;;BA)` でパイプを作る。`SEE_MASK_NOCLOSEPROCESS` で得た
+  プロセスハンドルを保持したまま `GetNamedPipeClientProcessId` と突き合わせ、一致するまで payload を
+  1バイトも書かない。ハンドル取得の失敗と照合の失敗はどちらも中止にする。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-gui --locked`
+- paths: crates/gui/src/join/**, TASKS.md, PROGRESS.md
+- notes: ADR 0018「実装時の罠」。`GENERIC_WRITE` は `FILE_CREATE_PIPE_INSTANCE` を含むので一方向なら
+  `PIPE_ACCESS_OUTBOUND` と `GR` だけにする。first-instance は作成時の競合検出であって名前の予約ではないので、
+  サーバーハンドルを閉じて同名で作り直す経路を作らない。
+
+## T-017: Join 後のサービス反映を storectl join に持たせる
+- status: todo
+- done-when: `join` が 停止 → 更新ガード取得 → journal 適用 → **ガード解放後に**起動 の順で実行する。
+  設定保存の完了とサービス反映の完了を別の結果として返し、起動に失敗したときは Join 成功にしない。
+  再起動までの Join 全体を直列化する。SCM 操作は対象名と操作を固定し、停止・開始・状態照会の権限だけを要求する。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-config-store --locked`
+- paths: crates/config-store/src/bin/sembazuru_storectl.rs, TASKS.md, PROGRESS.md
+- notes: 順序は既存の lease から強制される (`enter_service_runtime_at` crates/config-store/src/windows.rs:573、
+  `acquire_committed_root_lease` の共有モード 0 と Busy crates/config-store/src/windows.rs:1105)。
+  `crates/agent/src/service.rs:188` は実行ループ開始前に `Running` を報告するので、SCM の `Running` 一回を
+  動作確認の代用にしない。
+
+## T-018: storectl をインストール対象に入れる
+- status: todo
+- done-when: `storectl` が MSI 埋め込みの CA 専用から、インストールされる helper になる。配置先と署名対象に
+  入り、既存の ProgramData の ACL と `status_admin` の default-deny を緩めない。
+- verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`
+- paths: installer/sembazuru.wxs, TASKS.md, PROGRESS.md
+- notes: 現状 `installer/sembazuru.wxs:21` の CA 用でインストールされない。配置と署名対象の追加が要る。
