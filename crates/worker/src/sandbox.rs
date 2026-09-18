@@ -1913,7 +1913,15 @@ mod tests {
             "extra-creation-bit",
             u32_patch(baseline_flags_offset, 0x0008_0405),
         );
-        reject("relaxed-job-ui", u32_patch(baseline_offset, 0xbe));
+        let mut relaxed_job_ui = u32_patch(baseline_offset, 0xbe);
+        let relaxed_names = describe_job_ui_limits(0xbe);
+        // Every name is fixed width, so the record stays internally consistent and the rejection
+        // still has to come from the A/B Job UI constraint rather than from the names check.
+        assert_eq!(relaxed_names.len(), baseline_names_length);
+        relaxed_job_ui
+            [baseline_names_offset + 4..baseline_names_offset + 4 + baseline_names_length]
+            .copy_from_slice(relaxed_names.as_bytes());
+        reject("relaxed-job-ui", relaxed_job_ui);
         let mut invalid_hash = bytes.clone();
         invalid_hash[baseline_offset - 64] = b'g';
         reject("environment-hash-nonhex", invalid_hash);
@@ -2785,8 +2793,9 @@ privileges={privileges:?}{restricted}",
             return format!("unavailable:gle={}", unsafe { GetLastError() });
         }
         if present == 0 || sacl.is_null() {
-            // No label ACE. Windows then treats the object as Medium, so no-write-up cannot be
-            // what refuses a Medium action; the denial has to come from the DACL.
+            // No label ACE. Windows then treats the object as Medium, so a refusal of a Medium
+            // action cannot be explained by no-write-up. That does not leave the DACL as the only
+            // candidate: the Job UI restrictions refuse in a layer of their own.
             return format!("label=absent;implied_integrity={SECURITY_MANDATORY_MEDIUM_RID}");
         }
         let mut aces = Vec::new();
