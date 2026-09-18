@@ -8,6 +8,16 @@ use zeroize::Zeroizing;
 /// Maximum UTF-8 byte length accepted for a fixed machine cluster token.
 pub const MAX_MACHINE_CLUSTER_TOKEN_BYTES: usize = 64 * 1024;
 
+/// Maximum byte length accepted for one fixed machine configuration body.
+pub const MAX_MACHINE_CONFIG_BYTES: usize = 1024 * 1024;
+
+mod join;
+
+pub use join::{
+    JOIN_PAYLOAD_MAGIC, JOIN_PAYLOAD_VERSION, JoinField, JoinPayload, JoinPayloadError,
+    MAX_JOIN_PAYLOAD_BYTES,
+};
+
 #[cfg(windows)]
 mod windows;
 
