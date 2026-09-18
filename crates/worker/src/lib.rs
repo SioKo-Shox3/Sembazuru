@@ -1751,6 +1751,10 @@ mod tests {
 
         assert!(publish_trace_directory(&source, &destination).is_err());
         assert!(!destination.exists());
+        // The junction has to go as a link, and before the tree it points at. `remove_dir_all`
+        // walks `real` first, and the junction it leaves behind then reads as already gone, so the
+        // root stays non-empty. Removing the link never touches its target.
+        std::fs::remove_dir(&source).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

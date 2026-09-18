@@ -178,7 +178,7 @@
   Rust と PowerShell の契約が実環境でも一致することも確認できた。
 
 ## T-013: junction を含む一時ツリーの後始末が失敗する
-- status: todo
+- status: done
 - done-when: `tests::trace_publish_rejects_reparse_source_directory` がローカルで成功する。失敗の原因が
   このマシンの環境なのか `remove_dir_all` の扱いなのかを区別して記録し、環境依存なら検査側で扱う。
 - verify: `rustup run 1.98.1 cargo test -p sembazuru-worker --lib trace_publish_rejects_reparse_source_directory --locked`
@@ -189,9 +189,23 @@
   （junction を拒否し destination を作らない）は成功しており、失敗するのは後始末だけ。
 - measured: T-012 の差分を stash した HEAD でも同じく失敗する。1.97.0 と 1.98.1 の両方で失敗する。
   ツールチェーンの退行でも T-012 の差分由来でもない。
-- notes: c16ba9c 時点の `.harness/final-rust-workspace.log` では workspace 全体が exit 0 だった。
-  その後にこのマシン側で変わったもの（junction の削除権限、常駐ソフトのハンドル保持）を先に疑う。
-  CI で同じ失敗が出るかを確認してから、製品コードとテストのどちらを直すかを決める。
+- diagnosed: 失敗後に残る一時ツリーを開いて確認した。`real/` は消えており、**宙に浮いた
+  `source-junction` だけが残る**。`remove_dir_all` は名前順に `real` を先に消し、その時点で
+  dangling になった junction を「既に無い」として読み飛ばし、親が非空のまま残る。
+  常駐ソフトのハンドル保持でも権限でもない。
+- diagnosed: dangling になった junction は、対象を解決してから開く API では外せない。
+  .NET の `Directory.Delete`、`cmd` の `rmdir`、`fsutil reparsepoint delete` のいずれも失敗する
+  （それぞれ path not found / ERROR_INVALID_NAME / 145）。したがって後始末は
+  **dangling になる前にリンクとして外す**しかない。
+- resolution: `crates/worker/src/lib.rs` の fixture が、木を消す前に `remove_dir(&source)` で
+  junction をリンクとして外すようにした。`remove_dir` は reparse point だけを外し、対象には触れない。
+  製品コード (`publish_trace_directory`) は変更していない。元々この関数の判定は正しく、
+  失敗していたのは後始末だけだった。
+- measured: `rustup run 1.98.1 cargo test -p sembazuru-worker --lib --locked` が exit 0、
+  `157 passed; 0 failed; 9 ignored`。証拠は .harness/T-013-worker-after.log。
+  修正前の全体像は .harness/T-013-workspace-before.log。
+- notes: 過去の失敗で `%TEMP%` に残った `sembazuru-worker-trace-reparse-*` は、上記のとおり
+  どの API でも外せないまま残っている。新しく作られることは無くなった。
 
 ## T-014: Join payload の封筒を定義する
 - status: todo
