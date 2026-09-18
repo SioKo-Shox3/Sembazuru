@@ -258,6 +258,23 @@ pub fn apply_or_resume_machine_cluster_token_update(
     platform::apply_token_update(&mut guard.inner)
 }
 
+/// Applies one complete join transaction as a single machine cluster-token update.
+///
+/// The three targets travel together because the journal accepts them as one transaction; a join
+/// that changed only some of them would leave the machine in a state no single authorization covers.
+pub fn apply_machine_join_payload(
+    guard: &mut MachineTokenUpdateGuard,
+    payload: &JoinPayload,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    match prepare_machine_cluster_token_update(guard, payload.update())? {
+        MachineTokenUpdatePreparation::NoChange => Ok(MachineTokenMaintenanceResult::Unchanged),
+        MachineTokenUpdatePreparation::JournalReady => {
+            apply_or_resume_machine_cluster_token_update(guard)?;
+            Ok(MachineTokenMaintenanceResult::Changed)
+        }
+    }
+}
+
 /// Outcome of one fixed machine cluster-token maintenance operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MachineTokenMaintenanceResult {

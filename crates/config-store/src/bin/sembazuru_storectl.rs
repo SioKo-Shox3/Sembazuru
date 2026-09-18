@@ -3,8 +3,9 @@ use std::fmt;
 use std::io::{self, IsTerminal, Read};
 
 use sembazuru_config_store::{
-    MAX_MACHINE_CLUSTER_TOKEN_BYTES, MachineStoreError, MachineStoreErrorClass,
-    MachineTokenMaintenanceResult, MachineTokenUpdateGuard, begin_machine_token_update,
+    JoinPayload, JoinPayloadError, MAX_JOIN_PAYLOAD_BYTES, MAX_MACHINE_CLUSTER_TOKEN_BYTES,
+    MachineStoreError, MachineStoreErrorClass, MachineTokenMaintenanceResult,
+    MachineTokenUpdateGuard, apply_machine_join_payload, begin_machine_token_update,
     clear_machine_cluster_token_storage, commit_machine_store_provision,
     migrate_machine_cluster_token_storage, provision_fresh_machine_store,
     rollback_machine_store_provision, rotate_machine_cluster_token_storage,
@@ -21,6 +22,7 @@ enum Verb {
     MigrateToken,
     RotateToken,
     ClearToken,
+    Join,
 }
 
 impl Verb {
@@ -33,13 +35,14 @@ impl Verb {
             Self::MigrateToken => "migrate-token",
             Self::RotateToken => "rotate-token",
             Self::ClearToken => "clear-token",
+            Self::Join => "join",
         }
     }
 
     const fn is_token_maintenance(self) -> bool {
         matches!(
             self,
-            Self::MigrateToken | Self::RotateToken | Self::ClearToken
+            Self::MigrateToken | Self::RotateToken | Self::ClearToken | Self::Join
         )
     }
 }
@@ -134,7 +137,56 @@ const fn token_success(verb: Verb, result: MachineTokenMaintenanceResult) -> Opt
         (Verb::MigrateToken, MachineTokenMaintenanceResult::Changed) => Some("token-migrated"),
         (Verb::RotateToken, MachineTokenMaintenanceResult::Changed) => Some("token-rotated"),
         (Verb::ClearToken, MachineTokenMaintenanceResult::Changed) => Some("token-cleared"),
+        (Verb::Join, MachineTokenMaintenanceResult::Changed) => Some("join-applied"),
         _ => None,
+    }
+}
+
+/// The name of the one-shot pipe the join payload arrives on. It is not a secret: the transport's
+/// protection is the pipe's own security descriptor and the peer check, never the name's obscurity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PipeName(String);
+
+impl PipeName {
+    const PREFIX: &'static str = r"\\.\pipe\";
+    const MAX_COMPONENT_BYTES: usize = 200;
+
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, CliError> {
+        let value = value.to_str().ok_or(CliError::InvalidArguments)?;
+        let component = value
+            .strip_prefix(Self::PREFIX)
+            .ok_or(CliError::InvalidArguments)?;
+        // One component of the local pipe namespace, so a name can never redirect this read at a
+        // remote server or at another kind of object.
+        if component.is_empty()
+            || component.len() > Self::MAX_COMPONENT_BYTES
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(CliError::InvalidArguments);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The one input a verb may carry. A verb never accepts the other kind.
+enum VerbInput<'a> {
+    None,
+    Secret(&'a SecretInput),
+    Join(&'a JoinPayload),
+}
+
+impl VerbInput<'_> {
+    const fn matches(&self, verb: Verb) -> bool {
+        matches!(
+            (verb, self),
+            (Verb::RotateToken, Self::Secret(_)) | (Verb::Join, Self::Join(_))
+        ) || (!matches!(verb, Verb::RotateToken | Verb::Join) && matches!(self, Self::None))
     }
 }
 
@@ -181,6 +233,7 @@ trait StoreActions {
     fn migrate_token(&mut self, update: &mut Self::Update) -> TokenResult;
     fn rotate_token(&mut self, update: &mut Self::Update, secret: &SecretInput) -> TokenResult;
     fn clear_token(&mut self, update: &mut Self::Update) -> TokenResult;
+    fn join(&mut self, update: &mut Self::Update, payload: &JoinPayload) -> TokenResult;
 }
 
 type StoreResult<T> = Result<T, MachineStoreErrorClass>;
@@ -243,29 +296,48 @@ impl StoreActions for MachineStoreLifecycle {
         clear_machine_cluster_token_storage(update)
             .map_err(|error| classify_backend_error("clear-token", error))
     }
+
+    fn join(&mut self, update: &mut Self::Update, payload: &JoinPayload) -> TokenResult {
+        apply_machine_join_payload(update, payload)
+            .map_err(|error| classify_backend_error("join", error))
+    }
 }
 
-fn parse_args<I>(args: I) -> Result<Verb, CliError>
+fn parse_args<I>(args: I) -> Result<(Verb, Option<PipeName>), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
     let mut args = args.into_iter();
     args.next().ok_or(CliError::InvalidArguments)?;
     let verb = args.next().ok_or(CliError::InvalidArguments)?;
+
+    let verb = match verb.to_str() {
+        Some("provision") => Verb::Provision,
+        Some("rollback-provision") => Verb::RollbackProvision,
+        Some("commit-provision") => Verb::CommitProvision,
+        Some("uninstall") => Verb::Uninstall,
+        Some("migrate-token") => Verb::MigrateToken,
+        Some("rotate-token") => Verb::RotateToken,
+        Some("clear-token") => Verb::ClearToken,
+        Some("join") => Verb::Join,
+        _ => return Err(CliError::InvalidArguments),
+    };
+
+    let pipe = if verb == Verb::Join {
+        let flag = args.next().ok_or(CliError::InvalidArguments)?;
+        if flag.to_str() != Some("--pipe") {
+            return Err(CliError::InvalidArguments);
+        }
+        Some(PipeName::parse(
+            &args.next().ok_or(CliError::InvalidArguments)?,
+        )?)
+    } else {
+        None
+    };
     if args.next().is_some() {
         return Err(CliError::InvalidArguments);
     }
-
-    match verb.to_str() {
-        Some("provision") => Ok(Verb::Provision),
-        Some("rollback-provision") => Ok(Verb::RollbackProvision),
-        Some("commit-provision") => Ok(Verb::CommitProvision),
-        Some("uninstall") => Ok(Verb::Uninstall),
-        Some("migrate-token") => Ok(Verb::MigrateToken),
-        Some("rotate-token") => Ok(Verb::RotateToken),
-        Some("clear-token") => Ok(Verb::ClearToken),
-        _ => Err(CliError::InvalidArguments),
-    }
+    Ok((verb, pipe))
 }
 
 fn authorize(verb: Verb, identity: IdentityFacts) -> Result<(), CliError> {
@@ -280,7 +352,7 @@ fn authorize(verb: Verb, identity: IdentityFacts) -> Result<(), CliError> {
 
 fn dispatch<A: StoreActions>(
     verb: Verb,
-    secret: Option<&SecretInput>,
+    input: VerbInput<'_>,
     actions: &mut A,
 ) -> Result<Option<&'static str>, CliError> {
     if !verb.is_token_maintenance() {
@@ -289,37 +361,47 @@ fn dispatch<A: StoreActions>(
             .map(|()| None)
             .map_err(CliError::Lifecycle);
     }
-    if (verb == Verb::RotateToken) != secret.is_some() {
+    if !input.matches(verb) {
         return Err(CliError::InvalidArguments);
     }
     let mut update = actions.begin_update().map_err(CliError::TokenMaintenance)?;
-    let result = match verb {
-        Verb::MigrateToken => actions.migrate_token(&mut update),
-        Verb::RotateToken => actions.rotate_token(&mut update, secret.unwrap()),
-        Verb::ClearToken => actions.clear_token(&mut update),
+    let result = match (verb, input) {
+        (Verb::MigrateToken, _) => actions.migrate_token(&mut update),
+        (Verb::RotateToken, VerbInput::Secret(secret)) => actions.rotate_token(&mut update, secret),
+        (Verb::ClearToken, _) => actions.clear_token(&mut update),
+        (Verb::Join, VerbInput::Join(payload)) => actions.join(&mut update, payload),
         _ => unreachable!("lifecycle verb was handled above"),
     }
     .map_err(CliError::TokenMaintenance)?;
     Ok(token_success(verb, result))
 }
 
-fn execute_authorized<A, F>(
+fn execute_authorized<A, F, G>(
     verb: Verb,
     identity: IdentityFacts,
     mut read_rotate: F,
+    mut read_join: G,
     actions: &mut A,
 ) -> Result<Option<&'static str>, CliError>
 where
     A: StoreActions,
     F: FnMut() -> Result<SecretInput, CliError>,
+    G: FnMut() -> Result<JoinPayload, CliError>,
 {
+    // Authorization precedes every read, so an unauthorized caller never makes this process touch
+    // the pipe or the terminal.
     authorize(verb, identity)?;
-    let secret = if verb == Verb::RotateToken {
-        Some(read_rotate()?)
-    } else {
-        None
-    };
-    dispatch(verb, secret.as_ref(), actions)
+    match verb {
+        Verb::RotateToken => {
+            let secret = read_rotate()?;
+            dispatch(verb, VerbInput::Secret(&secret), actions)
+        }
+        Verb::Join => {
+            let payload = read_join()?;
+            dispatch(verb, VerbInput::Join(&payload), actions)
+        }
+        _ => dispatch(verb, VerbInput::None, actions),
+    }
 }
 
 #[cfg(windows)]
@@ -510,8 +592,74 @@ fn effective_identity(_verb: Verb) -> Result<IdentityFacts, CliError> {
     Err(CliError::Unsupported)
 }
 
+fn invalid_join_input(reason: &'static str) -> CliError {
+    eprintln!("sembazuru-storectl: join envelope refused; reason={reason}");
+    CliError::TokenMaintenance(MachineStoreErrorClass::InvalidInput)
+}
+
+/// Reads one whole envelope from the one-shot pipe the caller named.
+///
+/// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` caps what a server may do with this elevated
+/// token to identification, so a process that took the name first cannot impersonate this one.
+#[cfg(windows)]
+fn read_join_payload(pipe: &PipeName) -> Result<JoinPayload, CliError> {
+    use std::fs::File;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(pipe.as_str())
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: the name is NUL-terminated and live for the call; no attributes are inherited.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            0,
+            null_mut(),
+            OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(CliError::TokenMaintenance(MachineStoreErrorClass::Io));
+    }
+    // SAFETY: CreateFileW returned one owned kernel handle.
+    let file = File::from(unsafe { OwnedHandle::from_raw_handle(handle.cast()) });
+    read_join_envelope(file)
+}
+
+#[cfg(not(windows))]
+fn read_join_payload(_pipe: &PipeName) -> Result<JoinPayload, CliError> {
+    Err(CliError::Unsupported)
+}
+
+/// Decodes one envelope from a reader that is expected to end after exactly one.
+fn read_join_envelope<R: Read>(reader: R) -> Result<JoinPayload, CliError> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    // One byte past the bound is enough to tell "at the limit" from "over it" without ever holding
+    // an unbounded amount of a peer's output.
+    reader
+        .take((MAX_JOIN_PAYLOAD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CliError::TokenMaintenance(MachineStoreErrorClass::Io))?;
+    if bytes.len() > MAX_JOIN_PAYLOAD_BYTES {
+        return Err(invalid_join_input(JoinPayloadError::Length.reason()));
+    }
+    JoinPayload::decode(&bytes).map_err(|error| invalid_join_input(error.reason()))
+}
+
 fn run() -> Result<Option<&'static str>, CliError> {
-    let verb = parse_args(std::env::args_os())?;
+    let (verb, pipe) = parse_args(std::env::args_os())?;
     let identity = effective_identity(verb)?;
     execute_authorized(
         verb,
@@ -519,6 +667,10 @@ fn run() -> Result<Option<&'static str>, CliError> {
         || {
             let stdin = io::stdin();
             read_rotate_token(stdin.is_terminal(), stdin.lock())
+        },
+        || {
+            let pipe = pipe.as_ref().ok_or(CliError::InvalidArguments)?;
+            read_join_payload(pipe)
         },
         &mut MachineStoreLifecycle,
     )
@@ -542,6 +694,8 @@ fn main() {
 mod tests {
     use std::ffi::OsString;
     use std::io::{Cursor, Read};
+
+    use sembazuru_config_store::JoinField;
 
     use super::*;
 
@@ -578,6 +732,10 @@ mod tests {
             Ok(MachineTokenMaintenanceResult::Changed)
         }
         token_action!(clear_token, "clear");
+        fn join(&mut self, update: &mut u8, _payload: &JoinPayload) -> TokenResult {
+            self.calls.push(Call("join", *update));
+            Ok(MachineTokenMaintenanceResult::Changed)
+        }
     }
 
     struct Counter(Cursor<Vec<u8>>, usize);
@@ -598,7 +756,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_only_the_seven_fixed_verbs() {
+    fn parser_accepts_only_the_eight_fixed_verbs() {
         for (text, expected) in [
             ("provision", Verb::Provision),
             ("rollback-provision", Verb::RollbackProvision),
@@ -610,9 +768,117 @@ mod tests {
         ] {
             assert_eq!(
                 parse_args(args(&["sembazuru-storectl", text])),
-                Ok(expected)
+                Ok((expected, None))
             );
         }
+        assert_eq!(
+            parse_args(args(&[
+                "sembazuru-storectl",
+                "join",
+                "--pipe",
+                r"\\.\pipe\sembazuru-join-0123456789abcdef"
+            ])),
+            Ok((
+                Verb::Join,
+                Some(PipeName(
+                    r"\\.\pipe\sembazuru-join-0123456789abcdef".to_owned()
+                ))
+            ))
+        );
+    }
+
+    #[test]
+    fn the_join_pipe_name_stays_one_local_pipe_component() {
+        for rejected in [
+            "join",
+            r"\\.\pipe\",
+            r"\\server\pipe\sembazuru-join",
+            r"\\.\pipe\nested\name",
+            r"\\.\pipe\sembazuru join",
+            r"\\.\PIPE\sembazuru-join",
+            r"C:\pipe\sembazuru-join",
+            r"\\.\pipe\..\elsewhere",
+        ] {
+            assert_eq!(
+                PipeName::parse(std::ffi::OsStr::new(rejected)),
+                Err(CliError::InvalidArguments),
+                "accepted {rejected}"
+            );
+        }
+        let oversized = format!(
+            r"\\.\pipe\{}",
+            "n".repeat(PipeName::MAX_COMPONENT_BYTES + 1)
+        );
+        assert_eq!(
+            PipeName::parse(std::ffi::OsStr::new(&oversized)),
+            Err(CliError::InvalidArguments)
+        );
+        let longest = format!(r"\\.\pipe\{}", "n".repeat(PipeName::MAX_COMPONENT_BYTES));
+        assert!(PipeName::parse(std::ffi::OsStr::new(&longest)).is_ok());
+    }
+
+    #[test]
+    fn the_join_verb_requires_its_pipe_and_nothing_else() {
+        for rejected in [
+            vec!["sembazuru-storectl", "join"],
+            vec!["sembazuru-storectl", "join", "--pipe"],
+            vec!["sembazuru-storectl", "join", r"\\.\pipe\sembazuru-join"],
+            vec![
+                "sembazuru-storectl",
+                "join",
+                "--file",
+                r"\\.\pipe\sembazuru-join",
+            ],
+            vec![
+                "sembazuru-storectl",
+                "join",
+                "--pipe",
+                r"\\.\pipe\sembazuru-join",
+                "extra",
+            ],
+            vec![
+                "sembazuru-storectl",
+                "rotate-token",
+                "--pipe",
+                r"\\.\pipe\sembazuru-join",
+            ],
+        ] {
+            assert_eq!(
+                parse_args(args(&rejected)),
+                Err(CliError::InvalidArguments),
+                "accepted {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_join_envelope_reader_is_bounded_and_refuses_anything_else() {
+        let payload = JoinPayload::new(
+            JoinField::replace(b"cluster-token"),
+            JoinField::Preserve,
+            JoinField::Remove,
+        )
+        .expect("fixture payload");
+        let bytes = payload.encode().expect("encode");
+        assert!(read_join_envelope(Cursor::new(bytes.to_vec())).is_ok());
+
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        for refused in [Vec::new(), vec![0u8; 8], trailing] {
+            assert_eq!(
+                read_join_envelope(Cursor::new(refused))
+                    .map(|_| ())
+                    .unwrap_err(),
+                invalid_token_input()
+            );
+        }
+
+        let mut bounded = Counter(Cursor::new(vec![b'x'; MAX_JOIN_PAYLOAD_BYTES + 99]), 0);
+        assert_eq!(
+            read_join_envelope(&mut bounded).map(|_| ()).unwrap_err(),
+            invalid_token_input()
+        );
+        assert_eq!(bounded.1, MAX_JOIN_PAYLOAD_BYTES + 1);
     }
 
     #[test]
@@ -656,7 +922,12 @@ mod tests {
             ] {
                 assert_eq!(authorize(verb, identity).is_ok(), lifecycle);
             }
-            for verb in [Verb::MigrateToken, Verb::RotateToken, Verb::ClearToken] {
+            for verb in [
+                Verb::MigrateToken,
+                Verb::RotateToken,
+                Verb::ClearToken,
+                Verb::Join,
+            ] {
                 assert_eq!(authorize(verb, identity).is_ok(), token);
             }
         }
@@ -700,20 +971,27 @@ mod tests {
             IdentityFacts::user(true, false),
             IdentityFacts::user(false, false),
         ] {
-            let (mut reads, mut actions) = (0, RecordingActions::default());
-            let result = execute_authorized(
-                Verb::RotateToken,
-                identity,
-                || {
-                    reads += 1;
-                    Ok(SecretInput::new("unreachable".to_owned()))
-                },
-                &mut actions,
-            );
-            assert_eq!(
-                (result, reads, actions.calls.len()),
-                (Err(CliError::Unauthorized), 0, 0)
-            );
+            for verb in [Verb::RotateToken, Verb::Join] {
+                let (mut reads, mut joins) = (0, 0);
+                let mut actions = RecordingActions::default();
+                let result = execute_authorized(
+                    verb,
+                    identity,
+                    || {
+                        reads += 1;
+                        Ok(SecretInput::new("unreachable".to_owned()))
+                    },
+                    || {
+                        joins += 1;
+                        unreachable!("an unauthorized join must not touch the pipe")
+                    },
+                    &mut actions,
+                );
+                assert_eq!(
+                    (result, reads, joins, actions.calls.len()),
+                    (Err(CliError::Unauthorized), 0, 0, 0)
+                );
+            }
         }
         for (verb, expected) in [
             (Verb::Provision, vec![Call("lifecycle", 0)]),
@@ -729,8 +1007,9 @@ mod tests {
                 vec![Call("begin", 0), Call("rotate", 73)],
             ),
             (Verb::ClearToken, vec![Call("begin", 0), Call("clear", 73)]),
+            (Verb::Join, vec![Call("begin", 0), Call("join", 73)]),
         ] {
-            let (mut reads, mut actions) = (0, RecordingActions::default());
+            let (mut reads, mut joins, mut actions) = (0, 0, RecordingActions::default());
             execute_authorized(
                 verb,
                 IdentityFacts::SYSTEM,
@@ -738,12 +1017,25 @@ mod tests {
                     reads += 1;
                     Ok(SecretInput::new("test-input".to_owned()))
                 },
+                || {
+                    joins += 1;
+                    JoinPayload::new(
+                        JoinField::replace(b"cluster-token"),
+                        JoinField::Preserve,
+                        JoinField::Preserve,
+                    )
+                    .map_err(|error| invalid_join_input(error.reason()))
+                },
                 &mut actions,
             )
             .unwrap();
             assert_eq!(
-                (reads, actions.calls),
-                (usize::from(verb == Verb::RotateToken), expected)
+                (reads, joins, actions.calls),
+                (
+                    usize::from(verb == Verb::RotateToken),
+                    usize::from(verb == Verb::Join),
+                    expected
+                )
             );
         }
     }
@@ -754,22 +1046,50 @@ mod tests {
 
         let secret = SecretInput::new("cli-secret-sentinel-91827".to_owned());
         let mut actions = RecordingActions::default();
-        let error = dispatch(Verb::RotateToken, None, &mut actions).unwrap_err();
-        assert_eq!(error, CliError::InvalidArguments);
-        dispatch(Verb::RotateToken, Some(&secret), &mut actions).unwrap();
+        let payload = JoinPayload::new(
+            JoinField::replace(b"cluster-token"),
+            JoinField::Preserve,
+            JoinField::Preserve,
+        )
+        .expect("fixture payload");
+        // A verb never accepts the other verb's input, and never runs without its own.
+        for (verb, input) in [
+            (Verb::RotateToken, VerbInput::None),
+            (Verb::RotateToken, VerbInput::Join(&payload)),
+            (Verb::Join, VerbInput::None),
+            (Verb::Join, VerbInput::Secret(&secret)),
+            (Verb::MigrateToken, VerbInput::Secret(&secret)),
+            (Verb::ClearToken, VerbInput::Join(&payload)),
+        ] {
+            assert_eq!(
+                dispatch(verb, input, &mut actions).unwrap_err(),
+                CliError::InvalidArguments
+            );
+        }
+        dispatch(Verb::RotateToken, VerbInput::Secret(&secret), &mut actions).unwrap();
+        dispatch(Verb::Join, VerbInput::Join(&payload), &mut actions).unwrap();
+        assert!(!format!("{payload:?}").contains("cluster-token"));
         assert!(!format!("{secret:?}{:?}", actions.calls).contains(secret.expose()));
         for (verb, changed) in [
             (Verb::MigrateToken, "token-migrated"),
             (Verb::RotateToken, "token-rotated"),
             (Verb::ClearToken, "token-cleared"),
+            (Verb::Join, "join-applied"),
         ] {
             assert_eq!(token_success(verb, Changed), Some(changed));
         }
         assert_eq!(
+            token_success(Verb::Join, Unchanged).unwrap(),
+            "token-unchanged"
+        );
+        assert_eq!(
             token_success(Verb::MigrateToken, Unchanged).unwrap(),
             "token-unchanged"
         );
-        assert_eq!(dispatch(Verb::Provision, None, &mut actions), Ok(None));
+        assert_eq!(
+            dispatch(Verb::Provision, VerbInput::None, &mut actions),
+            Ok(None)
+        );
     }
 
     #[test]
