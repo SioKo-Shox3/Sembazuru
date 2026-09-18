@@ -15,6 +15,9 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 sembazuru-proto = { path = "../proto" }
+# The join envelope's codec. The GUI and the elevated helper have to agree on it byte for byte,
+# so both build the one definition in the config store rather than each keeping a copy.
+sembazuru-config-store = { path = "../config-store" }
 tonic = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
 # Zeroize the cluster token's GUI-side copy on drop so the plaintext credential
@@ -40,6 +43,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     # Not for registry access: the SHELLEXECUTEINFOW struct (used by the runas
     # self-elevation) is feature-gated on this because it carries an HKEY field.
