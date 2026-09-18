@@ -29,7 +29,10 @@
   独立評価 PASS。残るのは GitHub runner での実測で、push とワークフロー実行はユーザーの明示指示待ち。
 
 - T-011: installed worker の 0xC0000142 は T-003 と同一の問題で、失敗するのは `--no-vfs` の plain control（フック DLL は関与しない）。実測で真因はウィンドウステーションとデスクトップへのアクセス拒否と判明した。解の方向が未決で、特権境界の設計なので GPT 側へ回す。
-- T-010: GUI Join。方式は storectl の helper 化に決定済み。取引機構 (MachineTokenUpdate) と認可 (storectl の authorize) は実装済みで、足りないのは join 動詞と配置と GUI 側 writer。昇格した子への秘密の受け渡しだけが未決。
+- T-010: GUI Join。設計の未決は 2026-09-18 にすべて埋まった。受け渡しは GUI が立てる一回限りの名前付きパイプ、
+  その DACL は Administrators のみ、Join 後のサービス反映は昇格した `storectl join` が担当する
+  （停止 → 更新ガード取得 → journal 適用 → ガード解放後に起動）。残るのは実装で、join 動詞・storectl の配置・
+  GUI 側 writer・Join 全体の直列化。決定と罠は docs/decisions/0018-action-desktop-and-join-transport.md。
 
 ## Next
 - T-012 の実測。push 後に Release をブランチ ref で手動実行し、診断 job のレコードから
