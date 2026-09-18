@@ -24,10 +24,17 @@
 
 ## In progress
 
+- T-012: Session 0 診断の拡張は実装と契約検査まで完了 (3162525、a3caf65)。整合性ラベル・
+  `TokenMandatoryPolicy`・Job UI 制限の全ビット展開・順序付き open 6 段を version 5 のレコードに入れた。
+  独立評価 PASS。残るのは GitHub runner での実測で、push とワークフロー実行はユーザーの明示指示待ち。
+
 - T-011: installed worker の 0xC0000142 は T-003 と同一の問題で、失敗するのは `--no-vfs` の plain control（フック DLL は関与しない）。実測で真因はウィンドウステーションとデスクトップへのアクセス拒否と判明した。解の方向が未決で、特権境界の設計なので GPT 側へ回す。
 - T-010: GUI Join。方式は storectl の helper 化に決定済み。取引機構 (MachineTokenUpdate) と認可 (storectl の authorize) は実装済みで、足りないのは join 動詞と配置と GUI 側 writer。昇格した子への秘密の受け渡しだけが未決。
 
 ## Next
+- T-012 の実測。push 後に Release をブランチ ref で手動実行し、診断 job のレコードから
+  `StationSacl`/`DesktopSacl`/`UiProbe`/`JobUiLimits` と `mandatory_policy` を読む。これで
+  0xC0000142 の拒否が DACL 由来か MIC 由来か Job UI 由来かを切り分ける。
 - T-011 と T-010 の未決分岐を GPT 側で詰める。どちらも特権境界の設計。
 - `private_station_unnamed_create_cannot_allocate_per_action_station` の初回成功分岐を GitHub runner で確認する。
 - 次に CI を回すとき、C++ job で新たに見えるようになるのは M2 以降の段。ローカルでは M2・smoke・VFS 3件が通るが、clang-cl を要する段はローカルで未実行なので CI が初出になる。
@@ -36,6 +43,10 @@
 - T-004 の証拠は `.harness/runs/20260908-092538/verify-T-004-1.txt`〜`verify-T-004-4.txt`。各ファイルを開いて cmd/PowerShell のテスト結果、不正環境名拒否、fmt、clippy の exit 0 を確認した。
 
 ## Notes
+- T-013 として起票: `tests::trace_publish_rejects_reparse_source_directory` が
+  `crates/worker/src/lib.rs:1754` の `remove_dir_all` で `DirectoryNotEmpty` になる。T-012 の差分を
+  stash した HEAD でも、1.97.0 と 1.98.1 の両方でも再現するので今回の差分由来ではない。
+  c16ba9c 時点の workspace 全体は exit 0 だったので、マシン側で変わったものを先に疑う。
 - ローカルの `hooks/build/` には旧ツールチェーンが生成した `modules.obj` が残っており、`DetourFindPayloadEx` の本体が 1 バイトの nop だけになっていた。modules.cpp が変わらないため MSBuild が再利用し続け、注入された子プロセスが `DllMain` の先頭で int 3 を踏んで 0xC0000142 で落ちていた。`/t:Rebuild` で解消。ソース側の欠陥ではないので、CI の installed worker の 0xC0000142 と同一視しない。ローカルの hooks ゲートが原因不明で落ちるときは、まず強制リビルドで切り分ける。
 - T-007 の残る実測条件: 最初に GitHub run へ診断 job が現れることと SHA を確認する。Release のパッケージ job も同時に動き、署名 secret が設定されていれば既存の署名処理も走る。ブランチ ref では公開ステップを実行しない。
 - T-006 の非阻害指摘: 既存の test 専用 AuditWindowStation::close は失敗時に Drop から再試行する。今回の成功時は所有権を消去して一度だけ閉じる。未知の二回目エラーは fail にし、Windows の全環境で183になることは未保証。全体の復元/close に関する既存ヘルパーの改善は別件として残す。

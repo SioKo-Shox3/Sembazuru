@@ -123,13 +123,36 @@
 - blocked-on: 設計に入る前に診断を広げる。GPT が「SACL 未測定なので DACL だけが原因とは断定できない、MIC は DACL より先に評価される」と留保した。T-012 で測る。
 
 ## T-012: Session 0 診断に整合性ラベルと制限 SID を足す
-- status: todo
+- status: todo (実装と契約検査は完了、GitHub runner の実測だけ残り)
 - done-when: 診断レコードが、ウィンドウステーションとデスクトップの SACL（整合性 SID と mandatory mask）、アクショントークンの `TokenRestrictedSids` と通常 SID と `TokenMandatoryPolicy`、`JOB_OBJECT_UILIMIT_*` の展開結果を含む。GitHub runner で実測し、0xC0000142 の拒否が DACL 由来か MIC 由来かを区別できる。
 - verify: `rustup run 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked`
 - verify: `gh workflow run release.yml --ref chore/two-pc-preparation` の診断 job 実ログ
 - paths: crates/worker/src/sandbox.rs, hooks/test/m6_worker_window_station_probe.ps1, docs/verification/**, TASKS.md, PROGRESS.md
 - notes: T-011 の設計に入る前の前提確認。GPT の留保「SACL 未測定なので DACL だけが原因とは断定できない。MIC は DACL より先に評価される」に答える。診断は test 限定で、製品の起動条件は変更しない。
 - notes: 最小権限は現在「プローブした値」であって実測値ではない。mask を1ビットずつ削って境界を出す作業は、この診断が揃ってから別タスクにする。
+- implemented: 3162525 と a3caf65。レコードは version 5。追加した項目は (1) ステーションとデスクトップの
+  mandatory label を `LABEL_SECURITY_INFORMATION` で読んだラベル ACE の型・フラグ・mask・SID
+  (`SE_SECURITY_NAME` を要求しない)、(2) トークン要約の `TokenMandatoryPolicy`、(3) Job の UI 制限マスクの
+  `JOB_OBJECT_UILIMIT_*` 全ビット展開、(4) アクショントークンでの順序付き open 6 段と最初の拒否。
+  いずれも `#[cfg(test)]` 限定で、製品の起動条件・トークン・Job・ACL は変更していない。
+- implemented: (3) は測定ではなくマスクの復号表なので、`encode_into` がマスクとの一致を検査し、
+  PowerShell 側 `Expand-Session0JobUi` がビット定義を独立に持って突き合わせる。改竄は新しい拒否ケース
+  `job-ui-limit-names` が受け持ち、`relaxed-job-ui` は名称もマスクに合わせて従来どおり A/B 制約で拒否させる。
+- limitation: (4) は「最初に失敗する USER32/GDI32 呼び出し」の代替観測にすぎない。子は `user32` の初期化中に
+  死ぬため in-child のトレースは取れない。記録文字列に `scope=broker-impersonated` を持たせて限界を明示した。
+- measured: ローカル (session 1、対話デスクトップ)。ステーションのラベルは
+  `label_aces=[type=17;flags=0;mask=0x00000001;sid=S-1-16-4096]`(Low)。制限付きアクショントークンでも
+  6 段すべて `allowed=true`。Session 0 の拒否が「制限トークンそのもの」では説明できないことを示す。
+- measured: `rustup run 1.98.1 / 1.97.0 cargo test -p sembazuru-worker --lib session0_ --locked` が
+  どちらも 10 passed / 0 failed。`cargo fmt --all --check` と
+  `cargo clippy -p sembazuru-worker --all-targets --locked -- -D warnings` は exit 0。証拠は
+  .harness/T-012-session0-tests.log、T-012-session0-tests-1.97.log、T-012-fmt.log、T-012-clippy.log、
+  T-012-gates-after-review.log。
+- review: 独立評価 PASS、blocking なし。非阻害2件（`relaxed-job-ui` が名称検査で先に落ちる、ラベル不在の
+  コメントが DACL を唯一の容疑者と読ませる）は a3caf65 で解消し、4 検査を再実行した。a3caf65 自体は未評価。
+  証拠は .harness/T-012-review.txt、依頼文は .harness/T-012-review-brief.md。
+- blocked-on: 残るのは GitHub runner での実測だけ。`git push` と
+  `gh workflow run release.yml --ref chore/two-pc-preparation` はユーザーがそのターンで明示したときだけ行う。
 
 ## T-013: junction を含む一時ツリーの後始末が失敗する
 - status: todo
