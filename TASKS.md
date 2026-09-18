@@ -305,7 +305,7 @@
   選ぶ前に影響を確認する。
 
 ## T-022: storectl の配置を MSI 検査の期待値と一致させる
-- status: todo (ユーザーの判断待ち)
+- status: done
 - done-when: `hooks/test/m9_installer_acl.ps1` が、storectl の埋め込み Binary ストリームと
   lifecycle CustomAction を従来どおり検証しつつ、INSTALLFOLDER への配置を許可して検証する。
   ProgramData の ACL と `status_admin` の default-deny の検査は緩めない。
@@ -315,6 +315,14 @@
   「storectl must remain an embedded Binary stream, not an installed File」として `File` 要素を拒否し、
   375行目は `StoreCtlExeFile` を名指しで拒否、387行目は File テーブルに `storectl` が現れることを拒否する。
   **T-018 (57e5d8e) はこの必須ゲートに落ちる。**
-- notes: このゲートは「ディスクに置かない」という不変条件を強制している。ADR 0018 の決定
-  （storectl を install 済み helper にする、ユーザー決定 2026-09-17）はそれを上書きするが、
-  強制されている不変条件の向きを変える変更なので、ゲートを直すか T-018 を戻すかはユーザーの判断とする。
+- decided: ユーザー判断 2026-09-18。ゲートを ADR 0018 の決定に合わせる。「ディスクに置かない」という
+  不変条件は正式に手放し、代わりに「置き場所と形が正確に1つであること」を検証する。
+- resolution: 拒否を肯定的な検証へ反転した。storectl の `File` はちょうど1つで、`StoreCtlExeFile` として
+  `$(var.RustTarget)` から KeyPath で入り、`Binaries` グループの INSTALLFOLDER 配下にあり、PATH エントリも
+  ショートカットも持たないこと。埋め込み Binary ストリームが残っていることも別途要求する。
+  MSI の File テーブル側も同様に「storectl の行はちょうど1つで、それは `StoreCtlExeFile`」とした。
+  ProgramData の ACL と status_admin の default-deny の検査は触っていない。
+- measured: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 -Static` が exit 0（4 つの PASS)。
+  検査が素通りでないことは、`StoreCtlExe` コンポーネントを一時的に外すと
+  `storectl must be installed exactly once as a File (found 0)` で落ち、戻すと PASS に戻ることで確認した。
+  証拠は .harness/T-022-static.log。MSI テーブル側の検査は MSI が要るので CI が初出。
