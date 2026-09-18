@@ -994,8 +994,29 @@ function Read-Session0Text([byte[]]$Bytes, [ref]$Offset) {
     return $value
 }
 
+function Expand-Session0JobUi([uint32]$Mask) {
+    $named = @(
+        @([uint32]1, 'handles'), @([uint32]2, 'readclipboard'), @([uint32]4, 'writeclipboard'),
+        @([uint32]8, 'systemparameters'), @([uint32]16, 'displaysettings'),
+        @([uint32]32, 'globalatoms'), @([uint32]64, 'desktop'), @([uint32]128, 'exitwindows')
+    )
+    $parts = [Collections.Generic.List[string]]::new()
+    $covered = [uint32]0
+    foreach ($entry in $named) {
+        $bit = [uint32]$entry[0]
+        $covered = [uint32]($covered -bor $bit)
+        $parts.Add(('{0}={1}' -f $entry[1], $(if (($Mask -band $bit) -ne 0) { 1 } else { 0 })))
+    }
+    $parts.Add(('unknown=0x{0:x8}' -f [uint32]($Mask -bxor ($Mask -band $covered))))
+    return $parts -join ';'
+}
+
 function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
     $jobUi = Read-Session0U32 $Bytes $Offset
+    $jobUiLimits = Read-Session0Text $Bytes $Offset
+    if ($jobUiLimits -cne (Expand-Session0JobUi $jobUi)) {
+        throw 'Session 0 diagnostic run UI limit names disagree with their own mask.'
+    }
     $creationFlags = Read-Session0U32 $Bytes $Offset
     if ($Offset.Value -ge $Bytes.Length -or ($Bytes[$Offset.Value] -ne 0 -and $Bytes[$Offset.Value] -ne 1)) {
         throw 'Session 0 diagnostic run spawn-success flag is invalid.'
@@ -1011,7 +1032,8 @@ function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
     $childExit = $null
     if ($hasExit) { $childExit = Read-Session0U32 $Bytes $Offset }
     return [PSCustomObject]@{
-        JobUi = $jobUi; CreationFlags = $creationFlags; SpawnSucceeded = $spawnSucceeded; SpawnError = $spawnError
+        JobUi = $jobUi; JobUiLimits = $jobUiLimits; CreationFlags = $creationFlags
+        SpawnSucceeded = $spawnSucceeded; SpawnError = $spawnError
         ChildExit = $childExit; Stdout = Read-Session0Text $Bytes $Offset
         Stderr = Read-Session0Text $Bytes $Offset
     }
@@ -1022,7 +1044,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
         throw 'Session 0 diagnostic record length is outside its bounded contract.'
     }
     if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
-        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]4) {
+        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]5) {
         throw 'Session 0 diagnostic record magic/version mismatch.'
     }
     if ($Nonce -cnotmatch '\A[0-9a-fA-F]{32}\z') { throw 'Session 0 diagnostic nonce is malformed.' }
@@ -1046,7 +1068,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     $offset.Value++
     $sessionId = Read-Session0U32 $Bytes $offset
     $fields = [Collections.Generic.List[string]]::new()
-    for ($index = 0; $index -lt 10; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
+    for ($index = 0; $index -lt 13; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
     $baseline = Read-Session0DiagnosticRun $Bytes $offset
     $noWindow = Read-Session0DiagnosticRun $Bytes $offset
     if ($offset.Value -ne $Bytes.Length) { throw 'Session 0 diagnostic record has trailing bytes.' }
@@ -1056,7 +1078,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     if ($classification -lt 1 -or $classification -gt 3) {
         throw 'Session 0 diagnostic classification is invalid.'
     }
-    if ($fields[9] -cnotmatch '\A[0-9a-fA-F]{64}\z') {
+    if ($fields[12] -cnotmatch '\A[0-9a-fA-F]{64}\z') {
         throw 'Session 0 diagnostic environment hash is invalid.'
     }
     if (($baseline.SpawnSucceeded -and ($baseline.JobUi -ne [uint32]0x000000fe -or
@@ -1084,8 +1106,9 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     return [PSCustomObject]@{
         Nonce = $Nonce; Markers = $markers; Classification = $classification; SessionId = $sessionId
         Broker = $fields[0]; Action = $fields[1]; Station = $fields[2]; Desktop = $fields[3]
-        StationDacl = $fields[4]; DesktopDacl = $fields[5]; StationAccess = $fields[6]
-        DesktopAccess = $fields[7]; Cwd = $fields[8]; EnvironmentHash = $fields[9]
+        StationDacl = $fields[4]; StationSacl = $fields[5]; DesktopDacl = $fields[6]
+        DesktopSacl = $fields[7]; StationAccess = $fields[8]; DesktopAccess = $fields[9]
+        UiProbe = $fields[10]; Cwd = $fields[11]; EnvironmentHash = $fields[12]
         Baseline = $baseline; NoWindow = $noWindow
     }
 }
@@ -1338,8 +1361,9 @@ try {
     $detail.Add(('service=0x{0:x8} session={1} markers=0x{2:x2}' -f
         $status.ServiceSpecificExitCode, $record.SessionId, $record.Markers))
     foreach ($property in @(
-        'Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'DesktopDacl',
-        'StationAccess', 'DesktopAccess', 'Cwd', 'EnvironmentHash'
+        'Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl',
+        'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe',
+        'Cwd', 'EnvironmentHash'
     )) {
         $detail.Add(('{0}={1}' -f $property, (Format-BoundedDiagnosticText $record.$property)))
     }
@@ -1348,6 +1372,7 @@ try {
         $exitText = if ($null -eq $run.ChildExit) { 'none' } else { '0x{0:x8}' -f $run.ChildExit }
         $detail.Add(('{0}JobUi=0x{1:x8} {0}CreationFlags=0x{2:x8} {0}SpawnSucceeded={3} {0}ChildExit={4}' -f
             $name, $run.JobUi, $run.CreationFlags, $run.SpawnSucceeded, $exitText))
+        $detail.Add(('{0}JobUiLimits={1}' -f $name, (Format-BoundedDiagnosticText $run.JobUiLimits)))
         foreach ($property in @('SpawnError', 'Stdout', 'Stderr')) {
             $detail.Add(('{0}{1}={2}' -f $name, $property, (Format-BoundedDiagnosticText $run.$property)))
         }

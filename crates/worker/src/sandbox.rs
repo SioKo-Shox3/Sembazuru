@@ -1487,26 +1487,34 @@ mod tests {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetUserObjectSecurity,
-        ImpersonateLoggedOnUser, LookupPrivilegeValueW, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, RevertToSelf, SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED,
-        SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
-        TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenGroups,
-        TokenIsAppContainer, TokenPrivileges, TokenRestrictedSids, TokenSessionId, TokenUser,
-        WinCreatorOwnerRightsSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl,
+        GetUserObjectSecurity, ImpersonateLoggedOnUser, LABEL_SECURITY_INFORMATION,
+        LookupPrivilegeValueW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, RevertToSelf,
+        SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
+        SYSTEM_MANDATORY_LABEL_ACE, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
+        TOKEN_MANDATORY_POLICY, TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid,
+        TokenCapabilities, TokenGroups, TokenIsAppContainer, TokenMandatoryPolicy, TokenPrivileges,
+        TokenRestrictedSids, TokenSessionId, TokenUser, WinCreatorOwnerRightsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
-    use windows_sys::Win32::System::JobObjects::{IsProcessInJob, JOB_OBJECT_UILIMIT_HANDLES};
-    use windows_sys::Win32::System::StationsAndDesktops::{
-        CloseDesktop, CloseWindowStation, CreateWindowStationW, GetProcessWindowStation,
-        GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW, OpenWindowStationW,
-        SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
+        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
+        JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     };
-    use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseDesktop, CloseWindowStation, CreateWindowStationW, DESKTOP_READOBJECTS,
+        GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW,
+        OpenWindowStationW, SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    };
     use windows_sys::Win32::System::Threading::{
         CreateEventW, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
     };
@@ -1539,7 +1547,7 @@ mod tests {
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
     const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 4;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 5;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
@@ -1756,9 +1764,12 @@ mod tests {
             &record.station,
             &record.desktop,
             &record.station_dacl,
+            &record.station_sacl,
             &record.desktop_dacl,
+            &record.desktop_sacl,
             &record.station_access,
             &record.desktop_access,
+            &record.ui_probe,
             &record.cwd,
             &record.environment_hash,
         ] {
@@ -1767,6 +1778,7 @@ mod tests {
         for run in [&record.baseline, &record.no_window] {
             fields.extend([
                 run.job_ui_restrictions.to_string(),
+                diagnostic_hex(run.job_ui_limits.as_bytes()),
                 run.creation_flags.to_string(),
                 if run.spawn_succeeded { "True" } else { "False" }.into(),
                 diagnostic_hex(run.spawn_error.as_bytes()),
@@ -1798,7 +1810,7 @@ mod tests {
                 expected: Some(record),
             });
         };
-        accept("v4", record.clone());
+        accept("v5", record.clone());
         let mut not_sufficient = record.clone();
         not_sufficient.no_window.child_exit = Some(0xc000_0142);
         not_sufficient.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
@@ -1858,7 +1870,7 @@ mod tests {
         invalid_utf8[54] = 0xff;
         reject("invalid-utf8", invalid_utf8);
         let mut baseline_offset = 50;
-        for _ in 0..10 {
+        for _ in 0..13 {
             let length = u32::from_le_bytes(
                 bytes[baseline_offset..baseline_offset + 4]
                     .try_into()
@@ -1866,9 +1878,21 @@ mod tests {
             );
             baseline_offset += 4 + length as usize;
         }
+        // The baseline run is the UI mask, the names of that mask, the creation flags, and then
+        // the spawn-succeeded flag; the names are variable length, so the rest is measured here.
+        let baseline_names_offset = baseline_offset + 4;
+        let baseline_names_length = u32::from_le_bytes(
+            bytes[baseline_names_offset..baseline_names_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let baseline_flags_offset = baseline_names_offset + 4 + baseline_names_length;
         let mut invalid_bool = bytes.clone();
-        invalid_bool[baseline_offset + 8] = 2;
+        invalid_bool[baseline_flags_offset + 4] = 2;
         reject("invalid-bool", invalid_bool);
+        let mut renamed_job_ui = bytes.clone();
+        renamed_job_ui[baseline_names_offset + 4] = b'X';
+        reject("job-ui-limit-names", renamed_job_ui);
         let mut unknown_marker = bytes.clone();
         unknown_marker[44] |= 8;
         reject("unknown-marker", unknown_marker);
@@ -1887,7 +1911,7 @@ mod tests {
         reject("nonzero-session-causal", u32_patch(46, 1));
         reject(
             "extra-creation-bit",
-            u32_patch(baseline_offset + 4, 0x0008_0405),
+            u32_patch(baseline_flags_offset, 0x0008_0405),
         );
         reject("relaxed-job-ui", u32_patch(baseline_offset, 0xbe));
         let mut invalid_hash = bytes.clone();
@@ -1963,7 +1987,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw 'Probe PowerShell syntax error.' }
-foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -1982,16 +2006,18 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         if (-not $rejected) { throw "Accepted malformed case $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "Rejected valid case $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne 16) { throw 'Record property count mismatch.' }
+        if (@($record.PSObject.Properties).Count -ne 19) { throw 'Record property count mismatch.' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId')) { $values.Add([string]$record.$property) }
-        foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'DesktopDacl', 'StationAccess', 'DesktopAccess', 'Cwd', 'EnvironmentHash')) {
+        foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
         foreach ($run in @($record.Baseline, $record.NoWindow)) {
-            if (@($run.PSObject.Properties).Count -ne 7) { throw 'Run property count mismatch.' }
-            foreach ($property in @('JobUi', 'CreationFlags', 'SpawnSucceeded')) { $values.Add([string]$run.$property) }
+            if (@($run.PSObject.Properties).Count -ne 8) { throw 'Run property count mismatch.' }
+            $values.Add([string]$run.JobUi)
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.JobUiLimits)).ToLowerInvariant())
+            foreach ($property in @('CreationFlags', 'SpawnSucceeded')) { $values.Add([string]$run.$property) }
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.SpawnError)).ToLowerInvariant())
             $values.Add($(if ($null -eq $run.ChildExit) { 'none' } else { [string]$run.ChildExit }))
             foreach ($property in @('Stdout', 'Stderr')) {
@@ -2052,6 +2078,76 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             String::from_utf8(output.stdout).unwrap().trim(),
             format!("PASS {}", cases.len())
         );
+    }
+
+    #[test]
+    fn session0_diagnostic_job_ui_limit_names_cover_every_documented_bit() {
+        assert_eq!(
+            describe_job_ui_limits(0x0000_00fe),
+            "handles=0;readclipboard=1;writeclipboard=1;systemparameters=1;displaysettings=1;\
+globalatoms=1;desktop=1;exitwindows=1;unknown=0x00000000"
+        );
+        assert_eq!(
+            describe_job_ui_limits(0),
+            "handles=0;readclipboard=0;writeclipboard=0;systemparameters=0;displaysettings=0;\
+globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
+        );
+        assert!(describe_job_ui_limits(0x0000_00ff).starts_with("handles=1;"));
+        // A bit outside the documented set stays visible instead of being dropped silently.
+        assert!(describe_job_ui_limits(0x0000_01fe).ends_with("unknown=0x00000100"));
+    }
+
+    #[test]
+    fn session0_diagnostic_user_object_label_describes_the_current_station() {
+        // SAFETY: the process window station handle is owned by this process and stays valid.
+        let label = diagnostic_user_object_label(unsafe { GetProcessWindowStation() });
+        println!("station label: {label}");
+        assert!(
+            label.starts_with("unavailable:gle=")
+                || label
+                    == format!("label=absent;implied_integrity={SECURITY_MANDATORY_MEDIUM_RID}")
+                || (label.starts_with("label_aces=[") && label.ends_with(']')),
+            "unexpected label shape: {label}"
+        );
+    }
+
+    #[test]
+    fn session0_diagnostic_ui_probe_names_its_first_refusal() {
+        let token = ActionToken::create().expect("action token");
+        // SAFETY: both user-object handles are owned by this process for its lifetime.
+        let (station, desktop) = unsafe {
+            (
+                GetProcessWindowStation(),
+                GetThreadDesktop(GetCurrentThreadId()),
+            )
+        };
+        let station = user_object_identity(station)
+            .map(|(_, name)| name)
+            .expect("station name");
+        let desktop = user_object_identity(desktop)
+            .map(|(_, name)| name)
+            .expect("desktop name");
+        let probe = diagnostic_ui_probe(&token, &station, &desktop);
+        println!("ui probe: {probe}");
+        if probe.starts_with("unavailable:gle=") {
+            return;
+        }
+        let (head, tail) = probe.split_once(";steps=[").expect("probe steps");
+        let steps: Vec<&str> = tail.trim_end_matches(']').split(',').collect();
+        assert_eq!(steps.len(), 6, "probe steps: {probe}");
+        let reported = head
+            .split_once("first_failure=")
+            .expect("probe first failure")
+            .1;
+        // The named failure has to be the first refused step, not any later one.
+        match steps.iter().find(|step| step.contains(";allowed=false;")) {
+            Some(step) => {
+                let name = step.split_once(":mask=").expect("step name").0;
+                let error = step.rsplit_once("gle=").expect("step error").1;
+                assert_eq!(reported, format!("{name};gle={error}"));
+            }
+            None => assert_eq!(reported, "none"),
+        }
     }
 
     #[test]
@@ -2145,6 +2241,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Session0DiagnosticRun {
         job_ui_restrictions: u32,
+        job_ui_limits: String,
         creation_flags: u32,
         spawn_succeeded: bool,
         spawn_error: String,
@@ -2157,6 +2254,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         fn empty() -> Self {
             Self {
                 job_ui_restrictions: 0,
+                job_ui_limits: describe_job_ui_limits(0),
                 creation_flags: 0,
                 spawn_succeeded: false,
                 spawn_error: String::new(),
@@ -2167,7 +2265,13 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         }
 
         fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
+            // The names are a decode table for the mask, not a second measurement: a record whose
+            // names disagree with its own mask was edited between the job query and here.
+            if self.job_ui_limits != describe_job_ui_limits(self.job_ui_restrictions) {
+                return Err("diagnostic run UI limit names".into());
+            }
             payload.u32(self.job_ui_restrictions);
+            write_text(payload, &self.job_ui_limits)?;
             payload.u32(self.creation_flags);
             payload.bool(self.spawn_succeeded);
             write_text(payload, &self.spawn_error)?;
@@ -2181,6 +2285,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
 
         fn decode_from(reader: &mut Reader<'_>) -> Result<Self, String> {
             let job_ui_restrictions = reader.u32().map_err(|_| "diagnostic run UI")?;
+            let job_ui_limits = read_text(reader)?;
             let creation_flags = reader.u32().map_err(|_| "diagnostic creation flags")?;
             let spawn_succeeded = read_strict_bool(reader)?;
             let spawn_error = read_text(reader)?;
@@ -2191,6 +2296,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             };
             Ok(Self {
                 job_ui_restrictions,
+                job_ui_limits,
                 creation_flags,
                 spawn_succeeded,
                 spawn_error,
@@ -2212,9 +2318,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         station: String,
         desktop: String,
         station_dacl: String,
+        station_sacl: String,
         desktop_dacl: String,
+        desktop_sacl: String,
         station_access: String,
         desktop_access: String,
+        ui_probe: String,
         cwd: String,
         environment_hash: String,
         baseline: Session0DiagnosticRun,
@@ -2233,19 +2342,28 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 markers: Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED,
                 classification: Session0DiagnosticOutcome::NoWindowCausal,
                 session_id: 0,
-                broker: "user=S-1-5-80-1;integrity=8192;groups=[];privileges=[]".into(),
-                action: "user=S-1-5-80-1;integrity=8192;restricted=[];groups=[];privileges=[]"
+                broker: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
+groups=[];privileges=[]"
+                    .into(),
+                action: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
+restricted=[];groups=[];privileges=[]"
                     .into(),
                 station: "Service-0x0-3e7$".into(),
                 desktop: "Default".into(),
                 station_dacl: "unavailable:gle=5".into(),
+                station_sacl: "label=absent;implied_integrity=8192".into(),
                 desktop_dacl: "unavailable:gle=5".into(),
+                desktop_sacl: "label_aces=[type=17;flags=0;mask=0x00000001;sid=S-1-16-8192]".into(),
                 station_access: "mask=0x0000006e;allowed=false;gle=5".into(),
                 desktop_access: "mask=0x000000cf;allowed=false;gle=5".into(),
+                ui_probe: "scope=broker-impersonated;first_failure=station:maximum_allowed;gle=5;\
+steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
+                    .into(),
                 cwd: "C:\\Sembazuru\\診断".into(),
                 environment_hash: "0".repeat(64),
                 baseline: Session0DiagnosticRun {
                     job_ui_restrictions: 0x0000_00fe,
+                    job_ui_limits: describe_job_ui_limits(0x0000_00fe),
                     creation_flags: 0x0008_0404,
                     spawn_succeeded: true,
                     spawn_error: "baseline-error-測定".into(),
@@ -2255,6 +2373,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 },
                 no_window: Session0DiagnosticRun {
                     job_ui_restrictions: 0x0000_00fe,
+                    job_ui_limits: describe_job_ui_limits(0x0000_00fe),
                     creation_flags: 0x0808_0404,
                     spawn_succeeded: true,
                     spawn_error: "no-window-error".into(),
@@ -2321,9 +2440,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 &self.station,
                 &self.desktop,
                 &self.station_dacl,
+                &self.station_sacl,
                 &self.desktop_dacl,
+                &self.desktop_sacl,
                 &self.station_access,
                 &self.desktop_access,
+                &self.ui_probe,
                 &self.cwd,
                 &self.environment_hash,
             ] {
@@ -2372,7 +2494,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             )?;
             let session_id = reader.u32().map_err(|_| "diagnostic session")?;
             let mut fields = Vec::new();
-            for _ in 0..10 {
+            for _ in 0..13 {
                 fields.push(read_text(&mut reader)?);
             }
             let baseline = Session0DiagnosticRun::decode_from(&mut reader)?;
@@ -2388,9 +2510,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 station: fields.remove(0),
                 desktop: fields.remove(0),
                 station_dacl: fields.remove(0),
+                station_sacl: fields.remove(0),
                 desktop_dacl: fields.remove(0),
+                desktop_sacl: fields.remove(0),
                 station_access: fields.remove(0),
                 desktop_access: fields.remove(0),
+                ui_probe: fields.remove(0),
                 cwd: fields.remove(0),
                 environment_hash: fields.remove(0),
                 baseline,
@@ -2538,10 +2663,19 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         } else {
             String::new()
         };
+        let policy = token_info(handle, TokenMandatoryPolicy)
+            .map_err(|error| error.to_string())
+            // SAFETY: TokenMandatoryPolicy returns exactly a TOKEN_MANDATORY_POLICY.
+            .map(|info| unsafe { (*info.as_ptr().cast::<TOKEN_MANDATORY_POLICY>()).Policy });
         Ok(format!(
-            "user={};integrity={};groups={groups:?};privileges={privileges:?}{restricted}",
+            "user={};integrity={};mandatory_policy={};groups={groups:?};\
+privileges={privileges:?}{restricted}",
             sid_string(user.User.Sid).map_err(|error| error.to_string())?,
             integrity_rid(handle).map_err(|error| error.to_string())?,
+            policy.map_or_else(
+                |error| format!("unavailable:{error}"),
+                |value| format!("0x{value:08x}")
+            ),
         ))
     }
 
@@ -2610,6 +2744,165 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             ));
         }
         format!("control=0x{control:04x};aces=[{}]", aces.join(","))
+    }
+
+    /// The mandatory label of a user object. `LABEL_SECURITY_INFORMATION` reads the label ACE
+    /// without `SE_SECURITY_NAME`, so the service can record it. Integrity is evaluated before the
+    /// DACL, which is why an access denial cannot be attributed to the DACL without this.
+    fn diagnostic_user_object_label(handle: HANDLE) -> String {
+        let request = LABEL_SECURITY_INFORMATION;
+        let mut needed = 0;
+        // SAFETY: the sizing probe has a valid request and writable length output.
+        if unsafe { GetUserObjectSecurity(handle, &request, null_mut(), 0, &mut needed) } == 0 {
+            // SAFETY: GetLastError is read immediately after the failing sizing probe.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+                return format!("unavailable:gle={error}");
+            }
+        }
+        let mut storage = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        // SAFETY: storage has the reported byte capacity; all pointers remain live through the call.
+        if unsafe {
+            GetUserObjectSecurity(
+                handle,
+                &request,
+                storage.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        let descriptor = storage.as_mut_ptr().cast();
+        let (mut present, mut defaulted, mut sacl) = (0, 0, null_mut());
+        // SAFETY: descriptor points to the returned self-relative descriptor; outputs are valid.
+        if unsafe { GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted) }
+            == 0
+        {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        if present == 0 || sacl.is_null() {
+            // No label ACE. Windows then treats the object as Medium, so no-write-up cannot be
+            // what refuses a Medium action; the denial has to come from the DACL.
+            return format!("label=absent;implied_integrity={SECURITY_MANDATORY_MEDIUM_RID}");
+        }
+        let mut aces = Vec::new();
+        // SAFETY: the SACL is owned by the live descriptor and AceCount bounds the iteration.
+        for index in 0..unsafe { (*sacl).AceCount } as u32 {
+            let mut raw = null_mut();
+            // SAFETY: index is within AceCount and `raw` receives the descriptor-owned ACE.
+            if unsafe { GetAce(sacl, index, &mut raw) } == 0 {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                return format!("unavailable:gle={}", unsafe { GetLastError() });
+            }
+            // SAFETY: `raw` points at a descriptor-owned ACE whose header is always readable.
+            let ace = unsafe { &*(raw.cast::<SYSTEM_MANDATORY_LABEL_ACE>()) };
+            if u32::from(ace.Header.AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                // Only the label ACE has this body; record the type and read no further.
+                aces.push(format!("type={};not-a-label", ace.Header.AceType));
+                continue;
+            }
+            let sid = sid_string((&ace.SidStart as *const u32).cast_mut().cast())
+                .unwrap_or_else(|error| format!("sid-error={error}"));
+            aces.push(format!(
+                "type={};flags={};mask=0x{:08x};sid={sid}",
+                ace.Header.AceType, ace.Header.AceFlags, ace.Mask
+            ));
+        }
+        format!("label_aces=[{}]", aces.join(","))
+    }
+
+    /// Every `JOB_OBJECT_UILIMIT_*` bit of a measured mask, named and stated as set or clear. The
+    /// Job UI limits refuse window-station and desktop APIs in a layer of their own, above the
+    /// DACL, so the record has to say which ones are in force without an external decode table.
+    fn describe_job_ui_limits(mask: u32) -> String {
+        const NAMED: [(u32, &str); 8] = [
+            (JOB_OBJECT_UILIMIT_HANDLES, "handles"),
+            (JOB_OBJECT_UILIMIT_READCLIPBOARD, "readclipboard"),
+            (JOB_OBJECT_UILIMIT_WRITECLIPBOARD, "writeclipboard"),
+            (JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, "systemparameters"),
+            (JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, "displaysettings"),
+            (JOB_OBJECT_UILIMIT_GLOBALATOMS, "globalatoms"),
+            (JOB_OBJECT_UILIMIT_DESKTOP, "desktop"),
+            (JOB_OBJECT_UILIMIT_EXITWINDOWS, "exitwindows"),
+        ];
+        let mut parts = Vec::with_capacity(NAMED.len() + 1);
+        let mut covered = 0;
+        for (bit, name) in NAMED {
+            covered |= bit;
+            parts.push(format!("{name}={}", u32::from(mask & bit != 0)));
+        }
+        parts.push(format!("unknown=0x{:08x}", mask & !covered));
+        parts.join(";")
+    }
+
+    /// The ordered user-object opens that process initialisation needs, attempted under the action
+    /// token, naming the first one that is refused and its Win32 error. The child dies inside
+    /// `user32` initialisation before any code of ours runs, so this is a broker-side stand-in and
+    /// not an in-child API trace: it says which open a token like this one is refused, not which
+    /// call the dead child made last.
+    fn diagnostic_ui_probe(token: &ActionToken, station: &str, desktop: &str) -> String {
+        let station_wide: Vec<u16> = OsStr::new(station).encode_wide().chain(Some(0)).collect();
+        let desktop_wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
+        token
+            .impersonated(|| {
+                let mut steps = Vec::new();
+                let mut first_failure = None;
+                for (name, mask) in [
+                    ("station:maximum_allowed", MAXIMUM_ALLOWED),
+                    ("station:read_attributes", WINSTA_READATTRIBUTES as u32),
+                    ("station:action_mask", 0x6e),
+                    ("desktop:maximum_allowed", MAXIMUM_ALLOWED),
+                    ("desktop:read_objects", DESKTOP_READOBJECTS),
+                    ("desktop:action_mask", 0xcf),
+                ] {
+                    let opened = if name.starts_with("station:") {
+                        // SAFETY: the station name is NUL-terminated and live through the call.
+                        let handle = unsafe { OpenWindowStationW(station_wide.as_ptr(), 0, mask) };
+                        if handle.is_null() {
+                            None
+                        } else {
+                            // SAFETY: OpenWindowStationW returned this owned user-object handle.
+                            unsafe { CloseWindowStation(handle) };
+                            Some(())
+                        }
+                    } else {
+                        // SAFETY: the desktop name is valid and the process station is unchanged.
+                        let handle = unsafe { OpenDesktopW(desktop_wide.as_ptr(), 0, 0, mask) };
+                        if handle.is_null() {
+                            None
+                        } else {
+                            // SAFETY: OpenDesktopW returned this owned user-object handle.
+                            unsafe { CloseDesktop(handle) };
+                            Some(())
+                        }
+                    };
+                    // SAFETY: GetLastError is read immediately after the open above.
+                    let error = if opened.is_some() {
+                        0
+                    } else {
+                        unsafe { GetLastError() }
+                    };
+                    steps.push(format!(
+                        "{name}:mask=0x{mask:08x};allowed={};gle={error}",
+                        opened.is_some()
+                    ));
+                    if opened.is_none() && first_failure.is_none() {
+                        first_failure = Some(format!("{name};gle={error}"));
+                    }
+                }
+                Ok(format!(
+                    "scope=broker-impersonated;first_failure={};steps=[{}]",
+                    first_failure.unwrap_or_else(|| "none".into()),
+                    steps.join(",")
+                ))
+            })
+            .unwrap_or_else(|error| {
+                format!("unavailable:gle={}", error.raw_os_error().unwrap_or(0))
+            })
     }
 
     fn diagnostic_open_access(
@@ -2769,6 +3062,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             .job()
             .ui_restrictions_for_test()
             .map_err(|error| format!("job UI query: {error}"))?;
+        record.job_ui_limits = describe_job_ui_limits(record.job_ui_restrictions);
         let expected_ui = 0x0000_00fe;
         if record.job_ui_restrictions != expected_ui {
             drop(process);
@@ -2847,9 +3141,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             station,
             desktop,
             station_dacl: diagnostic_user_object_dacl(station_handle),
+            station_sacl: diagnostic_user_object_label(station_handle),
             desktop_dacl: diagnostic_user_object_dacl(desktop_handle),
+            desktop_sacl: diagnostic_user_object_label(desktop_handle),
             station_access: "unavailable:action-not-created".into(),
             desktop_access: "unavailable:action-not-created".into(),
+            ui_probe: "unavailable:action-not-created".into(),
             cwd: config.fixture_root.display().to_string(),
             environment_hash: "0".repeat(64),
             baseline: Session0DiagnosticRun::empty(),
@@ -2870,6 +3167,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         {
             (record.station_access, record.desktop_access) =
                 diagnostic_open_access(&action, &record.station, &record.desktop);
+            record.ui_probe = diagnostic_ui_probe(&action, &record.station, &record.desktop);
         }
         let scratch = match PrivateScratch::create(
             &config.record_directory,
