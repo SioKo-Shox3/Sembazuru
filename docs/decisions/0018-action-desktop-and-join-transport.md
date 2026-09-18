@@ -1,6 +1,6 @@
 # 0018: アクション専用デスクトップと Join の受け渡し経路
 
-- 状態: 方向を採択、実装前に追加実測が必要
+- 状態: 決定 2（Join の受け渡し）は確定。決定 1（アクション専用デスクトップ）は実装前の実測が残る
 - 日付: 2026-09-17
 - 前提: `docs/verification/2026-09-17-session0.md`（Session 0 の A/B 実測）、ADR 0016（ローカル特権分離）
 
@@ -91,9 +91,53 @@ payload を読む。`FILE_FLAG_FIRST_PIPE_INSTANCE`、`PIPE_REJECT_REMOTE_CLIENT
 `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` で接続し、名前を先取りした偽サーバーに
 昇格トークンを impersonate されないようにする。
 
-### 未決: パイプの DACL を誰に絞るか
+### 決定: パイプの DACL は Administrators のみ
 
-ここで二者の意見が割れた。
+二者の意見が割れたが、2026-09-18 に GPT が (b) を撤回し、**(a) Administrators のみ**で一致した。
+根拠は logon SID の不一致の実証ではなく、**正規の helper が既に満たしている認可に合わせ、
+不要な読み取り許可を増やさないこと**。`storectl` の `authorize`
+(`crates/config-store/src/bin/sembazuru_storectl.rs:271`) は token-maintenance 動詞・Administrators 所属・
+昇格を要求する。別の管理者アカウントで昇格しても同じ条件を満たすので、(a) は GUI と helper の
+logon SID の一致に依存しない。
+
+| 案 | GUI と同じ logon SID を持つ非昇格コード | 正規の昇格 helper |
+|---|---|---|
+| (a) Administrators のみ | BA が deny-only なので許可しない | 有効な BA で許可 |
+| (b) logon SID のみ | logon SID で許可してしまう | その SID を持つことに依存 |
+| (c) 両方 | logon SID で許可してしまう | BA で許可 |
+
+(c) は AND にならない。同じ権限を与える許可 ACE は、どちらかに一致すれば通る。deny-only の BA は
+別の logon SID の許可を打ち消さない。(b)/(c) の余分な読み取り許可は、名前の先取り検出ではなく
+**秘密の機密性**の問題として評価する。PID 照合を終えるまで payload を書かなければ接続だけでは漏れないが、
+正規の helper に要らない許可を足す理由がない。(a) も特定の helper を識別しないので、PID 照合は依然必要。
+
+実測で分かったのは次の2点で、どちらも UAC 前後の SID 一致の証拠ではない
+（`docs/verification/2026-09-18-interactive-station-and-logon-sid.md`）。
+
+- 非昇格の管理者トークンでは `S-1-5-32-544` が deny-only (`0x10`) で、許可 ACE に一致しない。
+- logon SID (`SE_GROUP_LOGON_ID`) は生の `TokenGroups` にしか現れない。`whoami /groups` と
+  .NET の `WindowsIdentity.Groups` は返さない。logon SID を使う実装はここで足を取られる。
+
+#### 実装時の罠
+
+- 権限 mask を広げすぎない。一方向なら `PIPE_ACCESS_OUTBOUND` と `D:P(A;;GR;;;BA)` が出発点。
+  双方向にする場合、`GENERIC_WRITE` は `FILE_CREATE_PIPE_INSTANCE` を含むのでそのまま許可しない。
+- PID 照合の前に秘密を書かない。`SEE_MASK_NOCLOSEPROCESS` のハンドルを保持したまま
+  `GetNamedPipeClientProcessId` と突き合わせ、取得も照合も失敗したら中止する。helper 側の
+  `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` は相手確認とは別の目的なので維持する。
+- `FILE_FLAG_FIRST_PIPE_INSTANCE` は作成時の競合検出であって、最後のハンドルが閉じた後まで名前を
+  予約しない。サーバーハンドルを閉じて同名で作り直す経路を作らない。
+- Administrators のみを「同一ユーザーの悪意あるコードからの完全な隔離」と呼ばない。GUI 自身が秘密を持ち、
+  所有者には暗黙の `WRITE_DAC` がある。UAC を security boundary としない整理を維持する。
+
+#### この決定が誤りだと分かる観測
+
+- 正規の UAC 経路で `authorize` を通る helper が、適正な要求アクセス権でも BA のみのパイプに接続できず、
+  logon SID の ACE を足したときだけ成功する。
+- DACL の変更もハンドルの継承・複製もなしに、BA が deny-only の非昇格クライアントに
+  `FILE_READ_DATA` が許可される。
+
+#### 二者の当初の主張（記録）
 
 - Fable: **Administrators のみ**。標準ユーザーが GUI を使うと `runas` は別の管理者アカウントで
   子を起動するため、GUI のユーザー SID に絞ると昇格側が繋げない。非昇格プロセスは
@@ -131,7 +175,24 @@ UAC が無効な環境では join の保護は無い。これは文書化の対�
 1回の認可・1回の上限・1つの `Zeroizing` バッファで扱うのが契約と一致すること。
 分割メッセージにすると解析・再試行・順序付けの失敗状態が増える。
 
-### 未定義として残っているもの
+### 決定: Join 後のサービス反映は storectl join が担当する
 
-Join 後に誰がサービスを再起動して新しい設定を反映するか。storectl が昇格中に行えるが、
-現在どの文書にも書かれていない。
+昇格した `storectl join` の責任範囲を次の順に固定する。順序は既存実装から強制される。
+サービスは稼働中に root の lease を保持し (`enter_service_runtime_at`,
+`crates/config-store/src/windows.rs:573`)、更新側は共有モード 0 の排他 lease を取って、衝突したら Busy を返す
+(`acquire_committed_root_lease`, `crates/config-store/src/windows.rs:1105`)。稼働中に書き換えてから
+再起動する順序では更新が Busy で拒否され、逆に更新ガードを保持したまま起動するとサービス側が lease を取れない。
+
+1. 既存の `authorize` を通し、payload のサイズ・形式・許可フィールドを検証する。
+2. SCM 経由で `SembazuruDaemon` と `SembazuruWorker` を停止し、停止完了を確認する。
+3. 更新ガードを取得し、既存の journal による 3 対象の更新を完了する。
+4. **更新ガードを解放してから**サービスを起動し、結果を GUI に返す。
+
+SCM 操作は対象名と操作を固定し、停止・開始・状態照会の権限だけを要求する。GUI や Status/Admin に
+権限を足さない。**設定更新の完了とサービス反映の完了は別の結果にする。** 起動に失敗したら
+「保存済み・反映未完了」と返し、Join 成功にしない。未完了 journal が残る場合は既存の回復処理を使う
+（現実装も未完了 journal があるサービス起動を拒否する: `crates/config-store/src/token_update.rs:694`）。
+
+罠が2つある。設定更新ガードだけでは別の Join による停止・起動の交錯を防げないので、再起動までの
+Join 全体を直列化する必要がある。また現コードは実行ループ開始前に `Running` を報告する
+(`crates/agent/src/service.rs:188`) ため、SCM の `Running` 一回を動作確認の代用にしない。

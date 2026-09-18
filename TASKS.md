@@ -106,8 +106,17 @@
 - 調査済み: storectl は現在 MSI 埋め込みの CA 用で、インストールされない (installer/sembazuru.wxs:21)。helper 化には配置と署名対象の追加が要る。
 - 調査済み: `worker_toml.rs` が平文 cluster_token を書く形は実系と不整合。実系は DPAPI の machine secret を使うので、Join ではトークンを設定ファイルに書かず join payload で別に渡す。
 - decided: 受け渡しは (b) GUI が立てた一回限りの名前付きパイプ。GPT と Fable の双方が (b) を推し、一時ファイルと GUI 全体の昇格を退けた。payload は 1 本のバージョン付き長さ前置の封筒で、MachineTokenUpdate の3フィールドに 1:1 対応。詳細と到達点の限界は docs/decisions/0018-action-desktop-and-join-transport.md。
-- 残る未決: パイプの DACL を Administrators のみにするか logon SID に絞るかで助言が割れた。標準ユーザーの GUI から別の管理者アカウントで同意したときに通るかを実測して決める。
-- 未定義: Join 後に誰がサービスを再起動して設定を反映するか。
+- decided: パイプの DACL は **Administrators のみ**。2026-09-18 に GPT が logon SID 案を撤回し二者一致。
+  根拠は logon SID 不一致の実証ではなく、`storectl` の `authorize` が既に要求する認可に合わせ、
+  不要な読み取り許可を足さないこと。詳細と罠は docs/decisions/0018-action-desktop-and-join-transport.md。
+- decided: Join 後のサービス反映は昇格した `storectl join` が担当する。停止 → 更新ガード取得 → journal 適用 →
+  **ガード解放後に**起動、の順。設定更新の完了とサービス反映の完了を別の結果にし、起動失敗は Join 成功にしない。
+- measured: 非昇格の管理者トークンでは `S-1-5-32-544` が deny-only、logon SID は生の `TokenGroups` に
+  しか現れない（`whoami /groups` と .NET は返さない）。記録は
+  docs/verification/2026-09-18-interactive-station-and-logon-sid.md。
+- 未実測: 同一ユーザーの UAC 昇格で logon SID が保たれるか、別の管理者アカウント経路で通るか。
+  どちらも (a) を選ぶ理由には要らないが、実装後に「Medium の GUI が BA のみのパイプを作る → 昇格 helper が
+  接続する → PID 照合後にダミー payload を渡す」と「非昇格クライアントの読み取り拒否」を実測する。
 
 ## T-011: アクションがウィンドウステーションとデスクトップを開けるようにする
 - status: todo (設計未決)
