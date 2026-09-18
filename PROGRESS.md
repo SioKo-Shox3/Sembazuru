@@ -62,7 +62,13 @@
 - T-001 の PowerShell での成功ログは `.harness/runs/20260908-082159/verify-T-001-1.txt`〜`verify-T-001-9.txt`。一方、cmd を使う runner の recheck は 2 回 exit 101。親の collect が特殊な環境変数の名前を拒否することを単独テストで再現した。成功ログだけでは完了条件を満たさない。
 - 20260908-082159 の自動反復は、コード変更なしの再検証が 2 回失敗したため所有プロセスを確認して停止した。実行中の反復は残していない。根拠は .harness/loop-state.json と各 recheck ログ。記録上の done を blocked に訂正した。
 - このターンで新たな git push の指示はない。新規変更は作業ブランチへのコミットまで。
-- 2026-09-18 の push は `3fbed87` まで。以後 `57e5d8e` までの 7 コミットは未 push。
+- 2026-09-18 の push は `3fbed87` まで。以後 14 コミットが未 push。
+- T-014〜T-018 の独立評価は NEEDS_WORK。blocking 6 件のうち 4 件を解消した
+  (e69df3f: 終端・停止後の復旧・journal の再開、9f0944b: MSI 検査の期待値)。
+  **残る blocking は T-020（接続と送信の期限）と T-021（一瞬の Running で反映成功としない）。**
+- 最終の全体検査: `rustup run 1.98.1 cargo test --workspace --locked` が exit 0。
+  `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 -Static` も exit 0。
+  証拠は .harness/final-workspace.log と .harness/T-022-static.log。
 - 診断の実測に使った run: https://github.com/SioKo-Shox3/Sembazuru/actions/runs/35347944739
   **run 全体が success**。session0 job も、パッケージ job も成功した。artifact は
   `Sembazuru-0.0.3-msi` (10,397,287 bytes) と `Sembazuru-0.0.3-bundle` (35,965,115 bytes) の2件。
