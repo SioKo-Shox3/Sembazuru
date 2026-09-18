@@ -64,4 +64,7 @@
 - このターンで新たな git push の指示はない。新規変更は作業ブランチへのコミットまで。
 - 2026-09-18 の push は `3fbed87` まで。以後 `57e5d8e` までの 7 コミットは未 push。
 - 診断の実測に使った run: https://github.com/SioKo-Shox3/Sembazuru/actions/runs/35347944739
-  （session0 job は success。パッケージ job の結果はこのセッションでは確認していない。）
+  **run 全体が success**。session0 job も、パッケージ job も成功した。artifact は
+  `Sembazuru-0.0.3-msi` (10,397,287 bytes) と `Sembazuru-0.0.3-bundle` (35,965,115 bytes) の2件。
+  T-002 で「どちらの run も artifact 0 件」と記録した状態からは前進している。ブランチ ref なので
+  公開はしていない。この MSI は SHA 3fbed87 のもので、storectl を配置する 57e5d8e を含まない。
