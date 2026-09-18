@@ -130,3 +130,19 @@
 - paths: crates/worker/src/sandbox.rs, hooks/test/m6_worker_window_station_probe.ps1, docs/verification/**, TASKS.md, PROGRESS.md
 - notes: T-011 の設計に入る前の前提確認。GPT の留保「SACL 未測定なので DACL だけが原因とは断定できない。MIC は DACL より先に評価される」に答える。診断は test 限定で、製品の起動条件は変更しない。
 - notes: 最小権限は現在「プローブした値」であって実測値ではない。mask を1ビットずつ削って境界を出す作業は、この診断が揃ってから別タスクにする。
+
+## T-013: junction を含む一時ツリーの後始末が失敗する
+- status: todo
+- done-when: `tests::trace_publish_rejects_reparse_source_directory` がローカルで成功する。失敗の原因が
+  このマシンの環境なのか `remove_dir_all` の扱いなのかを区別して記録し、環境依存なら検査側で扱う。
+- verify: `rustup run 1.98.1 cargo test -p sembazuru-worker --lib trace_publish_rejects_reparse_source_directory --locked`
+- paths: crates/worker/src/lib.rs, TASKS.md, PROGRESS.md
+- measured: T-012 の検証中に発見。`crates/worker/src/lib.rs:1754` の `remove_dir_all(root)` が
+  `Os { code: 145, DirectoryNotEmpty }` で落ちる。root には `real/`（`read.sbzt` を含む）と、
+  それを指す junction `source-junction` がある。`publish_trace_directory` 自体の判定
+  （junction を拒否し destination を作らない）は成功しており、失敗するのは後始末だけ。
+- measured: T-012 の差分を stash した HEAD でも同じく失敗する。1.97.0 と 1.98.1 の両方で失敗する。
+  ツールチェーンの退行でも T-012 の差分由来でもない。
+- notes: c16ba9c 時点の `.harness/final-rust-workspace.log` では workspace 全体が exit 0 だった。
+  その後にこのマシン側で変わったもの（junction の削除権限、常駐ソフトのハンドル保持）を先に疑う。
+  CI で同じ失敗が出るかを確認してから、製品コードとテストのどちらを直すかを決める。
