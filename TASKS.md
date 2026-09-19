@@ -326,3 +326,32 @@
   検査が素通りでないことは、`StoreCtlExe` コンポーネントを一時的に外すと
   `storectl must be installed exactly once as a File (found 0)` で落ち、戻すと PASS に戻ることで確認した。
   証拠は .harness/T-022-static.log。MSI テーブル側の検査は MSI が要るので CI が初出。
+
+## T-023: M6.1b の worker VFS が attestation で落ちる
+- status: todo
+- done-when: CI の C++ job で `m6_worker_vfs_redirect` 相当の M6.1b ゲートが通る。worker の
+  `event=attestation-failed` の原因を特定し、ゲート側の用意不足か製品側の欠陥かを区別して記録する。
+- verify: CI の `C++ hooks + tracer (MSVC) (windows-2022)` job
+- paths: crates/worker/src/**, hooks/src/vfs_attestation.cpp, hooks/test/**, TASKS.md, PROGRESS.md
+- measured: run 35353309959 (SHA 15fbabf) の job 105626448958。
+  `M6.1b WORKER VFS GATE FAIL: hosted cl.exe /GL VFS probe failed (exit=-1) /
+  plain direct /GL compiler failed (exit=72) / hosted cl.exe /GL CreateFile diagnostic was
+  incomplete or invalid (exit=3)` と `M6_SERVICE_STDERR service=worker event=attestation-failed`。
+- notes: T-009 は「`m6_worker_vfs_redirect.ps1` は worker 経由なので attestation の用意不足の影響を
+  受けない」と記録していた。worker 自身が `attestation-failed` を出しているので、その前提を先に確かめる。
+- notes: `plain direct /GL compiler failed (exit=72)` は VFS を介さない経路なので、フック層より前の
+  段で既に失敗している可能性がある。そちらを先に切り分ける。
+
+## T-024: M3.5 の速度ゲートが統計的に不安定
+- status: todo
+- done-when: `hooks/test/vfs_bench.ps1` の永続パイプ判定が、hosted runner の雑音の下でも
+  意味のある回帰だけを落とす。合格条件の根拠（何回中何回、なぜ）を記録する。
+- verify: `pwsh -NoProfile -File hooks/test/vfs_bench.ps1`
+- paths: hooks/test/vfs_bench.ps1, TASKS.md, PROGRESS.md
+- measured: run 35353309959 の job 105626449002。
+  `persistent pipe did not reduce median CreateFile latency reliably: forced-wins=5/9 (expected >=8)`。
+  実測差は `[29.4, 15.8, 10.2, -11.4, 10.7, -14.1, -1.5, -26, 6.6]` us で符号が混在している。
+  ローカルでは T-009 のとき PASS しており（9.9秒）、環境差が出ている。
+- notes: 9 回中 8 回という符号検定は、1 回あたりのばらつきが効果量と同程度のときに落ちる。
+  中央値の差そのものに閾値を置く、反復数を増やす、外れ値を落とす、のどれを採るかを決めて根拠を書く。
+  判定を緩めるだけの変更にしない。回帰を見逃さない根拠を示す。

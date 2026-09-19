@@ -62,7 +62,19 @@
 - T-001 の PowerShell での成功ログは `.harness/runs/20260908-082159/verify-T-001-1.txt`〜`verify-T-001-9.txt`。一方、cmd を使う runner の recheck は 2 回 exit 101。親の collect が特殊な環境変数の名前を拒否することを単独テストで再現した。成功ログだけでは完了条件を満たさない。
 - 20260908-082159 の自動反復は、コード変更なしの再検証が 2 回失敗したため所有プロセスを確認して停止した。実行中の反復は残していない。根拠は .harness/loop-state.json と各 recheck ログ。記録上の done を blocked に訂正した。
 - このターンで新たな git push の指示はない。新規変更は作業ブランチへのコミットまで。
-- 2026-09-18 の push は `3fbed87` まで。以後 14 コミットが未 push。
+- **訂正**: 「未 push」という記録は誤りだった。`chore/two-pc-preparation` は `15fbabf` まで
+  GitHub に上がっており、**PR #4 が開いている**。このブランチへの push は PR の CI を起動する。
+- PR #4 の CI (run 35353309959、SHA 15fbabf) は **failure**。内訳は3件で、**いずれも今回の
+  Join 実装由来ではない**。
+  - `Rust (fmt, clippy, test)` は **success**。今回の Rust 変更はすべて CI を通っている。
+  - installer job: `MSI LIFECYCLE TABLE PASS` と `STATIC LIFECYCLE SOURCE PASS` は通った
+    （T-018 と T-022 は実 MSI に対して CI で検証できた）。落ちているのは
+    `installed worker plain control failed: exit=-1073741502` = 既知の 0xC0000142 (T-011)。
+  - C++ (windows-2022): M6.1b の worker VFS が attestation で落ちる → T-023。
+  - C++ (windows-2025): M3.5 の速度ゲートが統計的に不安定 → T-024。
+- **P0 (`process_injection_failure.ps1`) は hosted runner で PASS した**（両 OS）。T-008 の修正が
+  GitHub 上でも効いていることを初めて確認できた。NEXT_FINDINGS の「一度で緑になると期待しない」
+  という予測どおり、その先の段が新しい失敗として現れている。
 - T-014〜T-018 の独立評価は NEEDS_WORK。blocking 6 件のうち 4 件を解消した
   (e69df3f: 終端・停止後の復旧・journal の再開、9f0944b: MSI 検査の期待値)。
   **残る blocking は T-020（接続と送信の期限）と T-021（一瞬の Running で反映成功としない）。**
