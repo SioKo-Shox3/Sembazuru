@@ -866,16 +866,29 @@ pub(crate) struct ActionDesktop {
 // `STATION_SWITCH`, so it never travels with this value.
 unsafe impl Send for ActionDesktop {}
 
+/// Why an action did not get its own station and desktop.
+pub(crate) enum DesktopSetupError {
+    /// This environment will not create them, and the broker's own state is untouched. An
+    /// interactive session refuses `CreateWindowStation` outright, so this is the ordinary case
+    /// outside the service.
+    Unavailable(io::Error),
+    /// The broker is no longer on its own window station. Nothing may be started after this: a
+    /// child would inherit an action's station, the handle to the broker's own is gone, and every
+    /// later action would take the wrong station as the one to restore.
+    BrokerStationLost(io::Error),
+}
+
 impl ActionDesktop {
-    pub(crate) fn create(token: &ActionToken) -> io::Result<Self> {
+    pub(crate) fn create(token: &ActionToken) -> Result<Self, DesktopSetupError> {
         // A fresh random name plus CWF_CREATE_ONLY: a name another process already holds is a
         // failure here, never a silent second handle to somebody else's object.
-        let name = format!("sbz-{}", secure_random_hex()?);
-        let sddl = action_object_sddl(token, ACTION_STATION_RIGHTS)?;
-        let desktop_sddl = action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?;
+        let unavailable = DesktopSetupError::Unavailable;
+        let name = format!("sbz-{}", secure_random_hex().map_err(unavailable)?);
+        let sddl = action_object_sddl(token, ACTION_STATION_RIGHTS).map_err(unavailable)?;
+        let desktop_sddl = action_object_sddl(token, ACTION_DESKTOP_RIGHTS).map_err(unavailable)?;
         let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
 
-        let station_descriptor = security_descriptor(&sddl)?;
+        let station_descriptor = security_descriptor(&sddl).map_err(unavailable)?;
         let station_attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: station_descriptor.0,
@@ -891,25 +904,34 @@ impl ActionDesktop {
             )
         };
         if station.is_null() {
-            return Err(stage_error("create window station"));
+            return Err(unavailable(stage_error("create window station")));
         }
         let station = OwnedWindowStation(station);
 
-        let desktop_descriptor = security_descriptor(&desktop_sddl)?;
+        let desktop_descriptor = security_descriptor(&desktop_sddl).map_err(unavailable)?;
         let desktop_attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: desktop_descriptor.0,
             bInheritHandle: 0,
         };
         let desktop = {
-            let _serialized = STATION_SWITCH
-                .lock()
-                .map_err(|_| io::Error::other("station switch poisoned"))?;
+            // A poisoned lock means a previous holder panicked between the switch and the restore,
+            // so this process may already be sitting on somebody else's station. That is the one
+            // failure that must not become a fallback.
+            let _serialized = STATION_SWITCH.lock().map_err(|_| {
+                DesktopSetupError::BrokerStationLost(io::Error::other(
+                    "a previous action left the window station switch unfinished",
+                ))
+            })?;
             // SAFETY: the current station handle is owned by the process and stays valid.
             let previous = unsafe { GetProcessWindowStation() };
+            if previous.is_null() {
+                // Without a handle to go back to, switching away would be one-way.
+                return Err(unavailable(stage_error("read the broker window station")));
+            }
             // SAFETY: the station was just created with a handle that permits the switch.
             if unsafe { SetProcessWindowStation(station.0) } == 0 {
-                return Err(stage_error("switch to the action station"));
+                return Err(unavailable(stage_error("switch to the action station")));
             }
             // SAFETY: the name and descriptor are live; the process station is the new one.
             let desktop = unsafe {
@@ -927,15 +949,21 @@ impl ActionDesktop {
             // before the station handle is dropped: closing the current station fails.
             // SAFETY: `previous` is this process's own station handle, still valid.
             let restored = unsafe { SetProcessWindowStation(previous) };
-            if desktop.is_null() {
-                return Err(io::Error::other(format!(
-                    "action desktop: create desktop failed ({created})"
+            if restored == 0 {
+                // Checked before the desktop result, because a broker left on the wrong station is
+                // the graver of the two and must not be hidden by the failure that came with it.
+                if !desktop.is_null() {
+                    // SAFETY: the desktop was created above and is closed exactly once here.
+                    unsafe { CloseDesktop(desktop) };
+                }
+                return Err(DesktopSetupError::BrokerStationLost(stage_error(
+                    "restore the broker window station",
                 )));
             }
-            if restored == 0 {
-                // SAFETY: the desktop was created above and is closed exactly once here.
-                unsafe { CloseDesktop(desktop) };
-                return Err(io::Error::other("window station was not restored"));
+            if desktop.is_null() {
+                return Err(unavailable(io::Error::other(format!(
+                    "action desktop: create desktop failed ({created})"
+                ))));
             }
             OwnedDesktop(desktop)
         };
@@ -972,6 +1000,7 @@ impl ActionDesktop {
         let name = format!("sbz-{}", secure_random_hex()?);
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let descriptor = security_descriptor(&action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?)?;
+
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
@@ -1018,19 +1047,29 @@ fn action_object_sddl(token: &ActionToken, rights: u32) -> io::Result<String> {
 /// station instead — exactly today's behaviour, no wider. Under the service, where the station can
 /// be created, the action gets its own. A fallback is reported once per process, because in Session
 /// 0 it means the machine is back on the arrangement that produces `0xC0000142`.
-fn action_desktop_or_inherit(token: &ActionToken) -> Option<ActionDesktop> {
+fn action_desktop_or_inherit(token: &ActionToken) -> io::Result<Option<ActionDesktop>> {
+    inherit_decision(ActionDesktop::create(token))
+}
+
+/// Separates the two failures: one is an environment that cannot give the action its own objects,
+/// the other is a broker that can no longer be trusted to start anything at all.
+fn inherit_decision(
+    result: Result<ActionDesktop, DesktopSetupError>,
+) -> io::Result<Option<ActionDesktop>> {
     static REPORTED: std::sync::Once = std::sync::Once::new();
-    match ActionDesktop::create(token) {
-        Ok(desktop) => Some(desktop),
-        Err(error) => {
+    match result {
+        Ok(desktop) => Ok(Some(desktop)),
+        Err(DesktopSetupError::Unavailable(error)) => {
             REPORTED.call_once(|| {
                 eprintln!(
                     "sembazuru-worker: per-action window station unavailable ({error}); \
                      actions inherit the broker's station"
                 );
             });
-            None
+            Ok(None)
         }
+        // Nothing may be started from a broker that is no longer on its own station.
+        Err(DesktopSetupError::BrokerStationLost(error)) => Err(error),
     }
 }
 
@@ -1516,7 +1555,7 @@ impl RestrictedProcess {
         // The action's own station and desktop, when this environment allows them. A null
         // `lpDesktop` means the child inherits the broker's, which is what happens today and what
         // fails under the service in Session 0.
-        let desktop = action_desktop_or_inherit(token);
+        let desktop = action_desktop_or_inherit(token)?;
         startup.StartupInfo.lpDesktop = desktop
             .as_ref()
             .map_or(null_mut(), ActionDesktop::lp_desktop);
@@ -1530,9 +1569,21 @@ impl RestrictedProcess {
         if let Some(observed) = observed_creation_flags {
             *observed = creation_flags;
         }
+        // A null `lpDesktop` means the child takes whichever station this process is on at the
+        // moment of the call, so an inheriting start must not overlap another action's switch.
+        // With an explicit per-action desktop there is nothing to race against.
+        let _inheriting = if desktop.is_none() {
+            Some(
+                STATION_SWITCH
+                    .lock()
+                    .map_err(|_| io::Error::other("the window station switch is unfinished"))?,
+            )
+        } else {
+            None
+        };
         // SAFETY: all UTF-16 buffers are NUL-terminated and live; command_line is mutable;
         // only the three inheritable stdio handles in the attribute list can cross the boundary.
-        if unsafe {
+        let started = unsafe {
             CreateProcessAsUserW(
                 token.handle(),
                 prepared.application.as_ptr(),
@@ -1546,8 +1597,9 @@ impl RestrictedProcess {
                 &startup.StartupInfo,
                 &mut info,
             )
-        } == 0
-        {
+        };
+        drop(_inheriting);
+        if started == 0 {
             return Err(io::Error::other(format!(
                 "create_process: OS error {}",
                 io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -2378,6 +2430,26 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 Ok(Ok(true))
             })
             .expect("impersonation is available to the broker")
+    }
+
+    #[test]
+    fn a_broker_left_on_the_wrong_station_stops_the_action() {
+        // An environment that simply will not create the objects is ordinary: the action runs the
+        // way it does today. A broker that failed to switch back is not: its next child would
+        // inherit an action's station, and every later action would take that as the one to
+        // restore. The two must not collapse into the same fallback.
+        let fallback = inherit_decision(Err(DesktopSetupError::Unavailable(io::Error::other(
+            "this session will not create a window station",
+        ))))
+        .expect("an unavailable station is not fatal");
+        assert!(fallback.is_none(), "the action inherits instead");
+
+        let fatal = inherit_decision(Err(DesktopSetupError::BrokerStationLost(io::Error::other(
+            "restore the broker window station failed",
+        ))))
+        .map(|_| ())
+        .expect_err("a lost broker station must stop the action");
+        assert!(fatal.to_string().contains("restore"), "{fatal}");
     }
 
     #[test]
