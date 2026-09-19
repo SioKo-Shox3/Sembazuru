@@ -175,7 +175,7 @@ impl eframe::App for SembazuruApp {
             }
             Tab::Monitor => monitor::render(ui, &self.shared.snapshot()),
             Tab::Services => self.services.render(ui, &ctx),
-            Tab::Join => self.join_panel.render(ui, &mut self.services, &ctx),
+            Tab::Join => self.join_panel.render(ui),
             Tab::Settings => self
                 .config
                 .render(ui, &self.commands, &mut self.services, &ctx),

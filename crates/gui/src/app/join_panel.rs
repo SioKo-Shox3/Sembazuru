@@ -1,17 +1,14 @@
-//! Join-a-cluster wizard panel (M11): collects worker settings, previews the
-//! validated worker.toml, and asks the configured writer to persist it before
-//! restarting the local worker service.
+//! Join-a-cluster wizard panel (M11): collects worker settings, previews the validated
+//! worker.toml, and hands the whole join to an elevated helper as one transaction.
+//!
+//! The panel does not restart anything itself. Stopping the services, writing the three targets,
+//! and starting them again all belong to the one transaction the helper runs (ADR 0018), because
+//! the store refuses a write while the services hold their own lease on it.
 
 use eframe::egui;
 
+use crate::join::submit::{JoinSubmitter, PipeJoinSubmitter, outcome_notice, payload_for};
 use crate::join::worker_toml::{JoinError, JoinInput, render_worker_toml, validate};
-use crate::join::writer::{ConfigWriter, StubConfigWriter, WriteError, WriteTarget};
-use crate::svcctl::Service;
-
-use super::services::RestartOutcome;
-
-const CONFIG_WRITE_UNCONFIGURED: &str = "config-write mechanism not configured (roadmap §2.0, owner-managed); cannot persist config from the GUI yet";
-const CONFIG_WRITE_DOC_LABEL: &str = "docs/superpowers/plans/2026-07-02-gui-completion.md §2.0";
 
 pub struct JoinPanel {
     agent: String,
@@ -23,9 +20,8 @@ pub struct JoinPanel {
     detected: bool,
     lan_ips: Vec<String>,
     detected_lan_ip: Option<String>,
-    writer: Box<dyn ConfigWriter>,
+    submitter: Box<dyn JoinSubmitter>,
     notice: String,
-    show_write_docs_link: bool,
 }
 
 impl Default for JoinPanel {
@@ -40,9 +36,8 @@ impl Default for JoinPanel {
             detected: false,
             lan_ips: Vec::new(),
             detected_lan_ip: None,
-            writer: Box::new(StubConfigWriter),
+            submitter: Box::new(PipeJoinSubmitter),
             notice: String::new(),
-            show_write_docs_link: false,
         }
     }
 }
@@ -71,8 +66,9 @@ impl JoinPanel {
         self.lan_ips = ip.into_iter().collect();
     }
 
-    pub fn preview_toml(&self) -> Result<String, JoinError> {
-        let input = JoinInput {
+    /// The wizard's current answers, in the shape validation accepts.
+    fn input(&self) -> JoinInput {
+        JoinInput {
             agent: self.agent.clone(),
             cluster_token: self.cluster_token.clone(),
             listen_addr: self.listen_addr.clone(),
@@ -80,16 +76,14 @@ impl JoinPanel {
             detected_lan_ip: self.detected_lan_ip_for_input(),
             participation_mode: self.participation_mode.clone(),
             allow_insecure_lan: self.allow_insecure_lan,
-        };
-        validate(input).map(|join| render_worker_toml(&join))
+        }
     }
 
-    pub fn render(
-        &mut self,
-        ui: &mut egui::Ui,
-        services: &mut super::services::ServicesPanel,
-        ctx: &egui::Context,
-    ) {
+    pub fn preview_toml(&self) -> Result<String, JoinError> {
+        validate(self.input()).map(|join| render_worker_toml(&join))
+    }
+
+    pub fn render(&mut self, ui: &mut egui::Ui) {
         self.detect_lan_ips_once();
 
         ui.heading("Join a cluster as a worker");
@@ -171,22 +165,25 @@ impl JoinPanel {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Preview worker.toml").clicked() {
-                self.show_write_docs_link = false;
                 self.notice = self
                     .preview_toml()
                     .unwrap_or_else(|e| format!("Invalid join settings: {e:?}"));
             }
-            if ui.button("Apply & restart worker").clicked() {
-                self.apply(services, ctx);
+            if ui
+                .button("Join (asks for elevation)")
+                .on_hover_text(
+                    "Saves the token and the worker configuration together, then restarts the \
+                     daemon and the worker on them. Windows asks for administrator approval.",
+                )
+                .clicked()
+            {
+                self.apply();
             }
         });
 
         if !self.notice.is_empty() {
             ui.separator();
             ui.label(&self.notice);
-            if self.show_write_docs_link {
-                ui.hyperlink_to(CONFIG_WRITE_DOC_LABEL, CONFIG_WRITE_DOC_LABEL);
-            }
         }
     }
 
@@ -210,36 +207,34 @@ impl JoinPanel {
             .or_else(|| self.lan_ips.first().cloned())
     }
 
-    fn apply(&mut self, services: &mut super::services::ServicesPanel, ctx: &egui::Context) {
-        self.show_write_docs_link = false;
-        let toml = match self.preview_toml() {
-            Ok(toml) => toml,
+    /// Validates, builds the one transaction, and hands it over.
+    pub fn apply(&mut self) {
+        let join = match validate(self.input()) {
+            Ok(join) => join,
             Err(err) => {
                 self.notice = format!("Invalid join settings: {err:?}");
                 return;
             }
         };
-
-        match self.writer.write(WriteTarget::WorkerToml, &toml) {
-            Ok(()) => match services.restart(Service::Worker, ctx) {
-                RestartOutcome::Started => {
-                    self.notice = "worker.toml saved; restarting Worker service…".to_string();
-                }
-                RestartOutcome::Busy => {
-                    self.notice = "worker.toml saved; Worker restart did not start because another service action is running. Use the Services tab to retry.".to_string();
-                }
-                RestartOutcome::NoAction => {
-                    self.notice = "worker.toml saved; Worker restart did not start because the service is not installed or its state is unknown. Use the Services tab to inspect it.".to_string();
-                }
-            },
-            Err(WriteError::MechanismUnconfigured) => {
-                self.notice = CONFIG_WRITE_UNCONFIGURED.to_string();
-                self.show_write_docs_link = true;
-            }
+        let payload = match payload_for(&join) {
+            Ok(payload) => payload,
             Err(err) => {
-                self.notice = format!("Write failed: {err}");
+                // The envelope refuses what the store would refuse anyway, so say which field.
+                self.notice = format!("Invalid join settings: {err}");
+                return;
             }
-        }
+        };
+        self.notice = outcome_notice(self.submitter.submit(&payload));
+    }
+
+    /// Replaces the elevation-backed submitter. Only tests stand in for the helper.
+    pub fn set_submitter_for_test(&mut self, submitter: Box<dyn JoinSubmitter>) {
+        self.submitter = submitter;
+    }
+
+    /// The line the operator is currently shown.
+    pub fn notice_for_test(&self) -> &str {
+        &self.notice
     }
 }
 

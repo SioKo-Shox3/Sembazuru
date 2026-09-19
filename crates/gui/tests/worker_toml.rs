@@ -54,7 +54,14 @@ fn renders_expected_toml_keys() {
     let out = validate(base()).expect("valid");
     let toml = render_worker_toml(&out);
     assert!(toml.contains("agent = \"http://192.168.1.10:50070\""));
-    assert!(toml.contains("cluster_token = \"shared-secret\""));
+    // The token is deliberately absent: the machine store keeps it as a DPAPI secret and the join
+    // carries it in the payload's own field (ADR 0018), so a copy here would be a second home for
+    // a credential that is supposed to have exactly one.
+    assert!(
+        !toml.contains("cluster_token"),
+        "the rendered configuration must not carry the token: {toml}"
+    );
+    assert!(!toml.contains("shared-secret"), "{toml}");
     assert!(toml.contains("listen_addr = \"0.0.0.0:50061\""));
     assert!(toml.contains("advertise = \"http://192.168.1.11:50061\""));
     assert!(toml.contains("participation_mode = \"adaptive\""));
