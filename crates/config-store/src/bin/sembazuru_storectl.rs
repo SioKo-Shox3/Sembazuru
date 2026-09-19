@@ -365,6 +365,45 @@ mod service_control {
     /// A service settles well inside this; the bound only keeps a stuck service from hanging a join.
     const SETTLE: Duration = Duration::from_secs(30);
 
+    /// How long a started service has to stay `Running` before the join treats it as reflected.
+    ///
+    /// This is a dwell, not a readiness signal, and it is worth being exact about what it buys.
+    /// Both services report `Running` before they are serving: the daemon at
+    /// `crates/agent/src/service.rs:188`, before its run loop, and the worker at
+    /// `crates/worker/src/service.rs:198`, before `crates/worker/src/run.rs:53` binds its listener.
+    /// A service that fails during that initialisation — a taken port, a bad configuration — leaves
+    /// `Running` inside this window and is caught. One that fails later is outside what this
+    /// sequence claims to have checked, and the join does not claim otherwise.
+    const RUNNING_DWELL: Duration = Duration::from_secs(5);
+
+    /// How often the dwell samples the service's state.
+    const SAMPLE: Duration = Duration::from_millis(200);
+
+    /// Reads a dwell's samples. An empty run proves nothing, and anything but `Running` is a fall.
+    pub(super) fn dwell_verdict(samples: &[ServiceState]) -> StoreResult<()> {
+        if samples.is_empty() || samples.iter().any(|state| *state != ServiceState::Running) {
+            return Err(MachineStoreErrorClass::Io);
+        }
+        Ok(())
+    }
+
+    /// Waits for `Running`, then keeps watching for the dwell.
+    fn confirm_running(service: &Service) -> StoreResult<()> {
+        settle(service, |state| state == ServiceState::Running)?;
+        let until = Instant::now() + RUNNING_DWELL;
+        let mut samples = Vec::new();
+        while Instant::now() < until {
+            std::thread::sleep(SAMPLE);
+            samples.push(
+                service
+                    .query_status()
+                    .map_err(|_| MachineStoreErrorClass::Io)?
+                    .current_state,
+            );
+        }
+        dwell_verdict(&samples)
+    }
+
     fn manager() -> StoreResult<ServiceManager> {
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
             .map_err(|_| MachineStoreErrorClass::Io)
@@ -437,9 +476,7 @@ mod service_control {
                     .start(&[] as &[&OsStr])
                     .map_err(|_| MachineStoreErrorClass::Io)?;
             }
-            // Running is where the SCM's report ends; whether the daemon is serving is a separate
-            // question this sequence does not claim to have answered.
-            settle(&service, |state| state == ServiceState::Running)?;
+            confirm_running(&service)?;
         }
         Ok(())
     }
@@ -1363,6 +1400,26 @@ mod tests {
             JoinField::Preserve,
         )
         .expect("fixture payload")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_service_that_leaves_running_during_the_dwell_is_not_reflected() {
+        use windows_service::service::ServiceState;
+
+        assert!(service_control::dwell_verdict(&[ServiceState::Running; 3]).is_ok());
+        for fallen in [
+            vec![],
+            vec![ServiceState::Running, ServiceState::StopPending],
+            vec![ServiceState::Running, ServiceState::Stopped],
+            vec![ServiceState::StartPending, ServiceState::Running],
+        ] {
+            assert_eq!(
+                service_control::dwell_verdict(&fallen),
+                Err(MachineStoreErrorClass::Io),
+                "accepted {fallen:?}"
+            );
+        }
     }
 
     #[test]
