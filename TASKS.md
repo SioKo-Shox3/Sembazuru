@@ -150,6 +150,20 @@
 - measured: 結線後も worker の lib テストは 160 passed / 0 failed（制限プロセスを実際に起動する
   検査を含む）。ローカルではフォールバックが働き、今日と同じくブローカーのステーションを継承する。
   証拠は .harness/T-011-gates.log と .harness/T-011-workspace.log。
+- review: 独立評価 NEEDS_WORK。blocking 2 件を a947eaf で解消した。(1) 復帰の失敗が継承
+  フォールバックへ潰れ、ブローカーがアクションのステーションに残ったまま起動を続けうる経路、
+  (2) 継承起動が別アクションの切り替えと重なりうる競合。前者は失敗の種類を分けて致命にし、
+  後者は同じ相互排他の下で起動する形にした。証拠は .harness/T-011-review.txt。a947eaf 自体は未評価。
+- residual: 評価の非阻害指摘。(a) `CreateProcessAsUserW` が要求するアクセスと今回のマスクは同一では
+  ない。ただし接続処理には `MAXIMUM_ALLOWED` の記述もあり、除外した3権限だけを理由に「必ず失敗する」
+  とは断定できない。Session 0 で子の初期化が通るかを確かめるまで未確定。
+  (b) デスクトップヒープの枯渇に対する扱いが無い。相互排他は作成を直列化するが生存数は制限しない。
+  枯渇時は継承へ戻るので、Session 0 では既知の起動不能経路へ戻る。
+  (c) デスクトップで測った結果は、ステーションへの接続や子の初期化には一般化できない。
+  非対話ステーションでは generic rights の対応も異なる。
+  (d) `#[ignore]` のプローブは本番のマスク `0x7037F` を試していない（`0x6037F` まで）。
+  (e) 既存の Session 0 診断はブローカー側を測るので、再実行だけでは専用オブジェクトの
+  `StationAccess`/`DesktopAccess` を証明できない。
 - 残る未検証: (1) Session 0 で実際に `CreateWindowStation` が成功するか、
   (2) `CreateProcessAsUser` が要求するアクセスを `ACTION_STATION_RIGHTS` / `ACTION_DESKTOP_RIGHTS`
   で満たせるか（満たせなければ 0xC0000142 が続く）、(3) デスクトップヒープの上限と並列度、
