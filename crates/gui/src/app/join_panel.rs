@@ -7,7 +7,11 @@
 
 use eframe::egui;
 
+use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+
 use crate::join::submit::{JoinSubmitter, PipeJoinSubmitter, outcome_notice, payload_for};
+use crate::join::transport::TransportError;
 use crate::join::worker_toml::{JoinError, JoinInput, render_worker_toml, validate};
 
 pub struct JoinPanel {
@@ -20,8 +24,11 @@ pub struct JoinPanel {
     detected: bool,
     lan_ips: Vec<String>,
     detected_lan_ip: Option<String>,
-    submitter: Box<dyn JoinSubmitter>,
+    submitter: Arc<dyn JoinSubmitter>,
     notice: String,
+    /// Set while a join runs on its own thread. The panel keeps drawing meanwhile.
+    busy: bool,
+    result_rx: Option<Receiver<Result<(), TransportError>>>,
 }
 
 impl Default for JoinPanel {
@@ -36,8 +43,10 @@ impl Default for JoinPanel {
             detected: false,
             lan_ips: Vec::new(),
             detected_lan_ip: None,
-            submitter: Box::new(PipeJoinSubmitter),
+            submitter: Arc::new(PipeJoinSubmitter),
             notice: String::new(),
+            busy: false,
+            result_rx: None,
         }
     }
 }
@@ -83,7 +92,8 @@ impl JoinPanel {
         validate(self.input()).map(|join| render_worker_toml(&join))
     }
 
-    pub fn render(&mut self, ui: &mut egui::Ui) {
+    pub fn render(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.poll_result();
         self.detect_lan_ips_once();
 
         ui.heading("Join a cluster as a worker");
@@ -169,18 +179,24 @@ impl JoinPanel {
                     .preview_toml()
                     .unwrap_or_else(|e| format!("Invalid join settings: {e:?}"));
             }
-            if ui
-                .button("Join (asks for elevation)")
+            let join = ui
+                .add_enabled(!self.busy, egui::Button::new("Join (asks for elevation)"))
                 .on_hover_text(
                     "Saves the token and the worker configuration together, then restarts the \
                      daemon and the worker on them. Windows asks for administrator approval.",
-                )
-                .clicked()
-            {
-                self.apply();
+                );
+            if join.clicked() {
+                let ctx = ctx.clone();
+                self.apply(move || ctx.request_repaint());
             }
         });
 
+        if self.busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("The join is running. The services restart as part of it.");
+            });
+        }
         if !self.notice.is_empty() {
             ui.separator();
             ui.label(&self.notice);
@@ -207,8 +223,16 @@ impl JoinPanel {
             .or_else(|| self.lan_ips.first().cloned())
     }
 
-    /// Validates, builds the one transaction, and hands it over.
-    pub fn apply(&mut self) {
+    /// Validates, builds the one transaction, and starts handing it over.
+    ///
+    /// The hand-over runs on its own thread. A join waits for a person to answer an elevation
+    /// prompt and then for two services to stop and start, which is minutes in the worst case; on
+    /// the drawing thread that would be a frozen window. `repaint` wakes the UI when the result
+    /// lands — a closure rather than the egui context, so this logic stays testable without one.
+    pub fn apply(&mut self, repaint: impl Fn() + Send + 'static) {
+        if self.busy {
+            return;
+        }
         let join = match validate(self.input()) {
             Ok(join) => join,
             Err(err) => {
@@ -224,12 +248,40 @@ impl JoinPanel {
                 return;
             }
         };
-        self.notice = outcome_notice(self.submitter.submit(&payload));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let submitter = Arc::clone(&self.submitter);
+        self.busy = true;
+        self.result_rx = Some(rx);
+        self.notice = "Joining. Windows will ask for administrator approval…".to_owned();
+        std::thread::spawn(move || {
+            let result = submitter.submit(&payload);
+            // The receiver is gone only if the panel itself is gone, and then nobody is waiting.
+            let _ = tx.send(result);
+            repaint();
+        });
+    }
+
+    /// Takes the result of a finished join, if one has landed. Never blocks.
+    fn poll_result(&mut self) {
+        if let Some(result) = self.result_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.busy = false;
+            self.result_rx = None;
+            self.notice = outcome_notice(result);
+        }
     }
 
     /// Replaces the elevation-backed submitter. Only tests stand in for the helper.
-    pub fn set_submitter_for_test(&mut self, submitter: Box<dyn JoinSubmitter>) {
+    pub fn set_submitter_for_test(&mut self, submitter: Arc<dyn JoinSubmitter>) {
         self.submitter = submitter;
+    }
+
+    /// Blocks until a started join reports back. Tests only; the panel polls instead.
+    pub fn wait_for_result_for_test(&mut self) {
+        if let Some(rx) = self.result_rx.take() {
+            let result = rx.recv().expect("the join thread reports its result");
+            self.busy = false;
+            self.notice = outcome_notice(result);
+        }
     }
 
     /// The line the operator is currently shown.

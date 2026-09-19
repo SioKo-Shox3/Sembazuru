@@ -129,14 +129,20 @@ mod imp {
 
     use super::{JOIN_PIPE_SDDL, TransportError, peer_is_the_launched_helper, pipe_name};
 
-    /// How long the helper has to connect and finish. The helper's own work is short; this only
-    /// bounds a hang, including a UAC prompt the user leaves open.
-    const HELPER_TIMEOUT_MS: u32 = 120_000;
-
-    /// How long the whole hand-over may take, from creating the pipe to the last byte written.
+    /// How long the helper may take from launch to exit.
     ///
-    /// The helper's own work is short. This bounds a hang: a helper that never connects, a client
-    /// that stops reading, or a UAC prompt the user leaves open.
+    /// This has to cover the helper's whole transaction, not just the hand-over. `storectl join`
+    /// stops two services and starts two, each with its own 30-second settle, and each start is
+    /// followed by a 5-second dwell: about 130 seconds before the journal work is counted. A bound
+    /// under that would report a timeout for a join that is still running and about to succeed.
+    /// See `service_control` in `crates/config-store/src/bin/sembazuru_storectl.rs`.
+    const HELPER_TIMEOUT_MS: u32 = 300_000;
+
+    /// How long the hand-over may take, from waiting for the connection to the last byte written.
+    ///
+    /// Separate from, and much shorter than, the helper's own budget: the helper reads the envelope
+    /// as soon as it connects and only then starts its long work, so this bounds a hang — a helper
+    /// that never connects, one that stops reading, or a UAC prompt left open — not the join.
     const HANDOVER_TIMEOUT: Duration = Duration::from_secs(120);
 
     /// One overlapped operation and the event it completes on.
@@ -202,6 +208,10 @@ mod imp {
             // SAFETY: both handles are live for the call and the count matches the array.
             let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, remaining) };
             if waited != WAIT_OBJECT_0 {
+                // Read before abandoning: `CancelIoEx` and `GetOverlappedResult` set their own
+                // error, which would otherwise be reported in place of the wait's.
+                // SAFETY: GetLastError is read immediately after the failing wait.
+                let failure = unsafe { GetLastError() };
                 self.abandon(pipe);
                 return Err(match waited {
                     WAIT_TIMEOUT => TransportError::Timeout,
@@ -209,11 +219,7 @@ mod imp {
                     value if value == WAIT_OBJECT_0 + 1 => TransportError::Peer(format!(
                         "the join helper exited before it finished the {what}"
                     )),
-                    // SAFETY: GetLastError is read immediately after the failing wait.
-                    _ => TransportError::Peer(format!(
-                        "waiting for the {what} failed ({})",
-                        unsafe { GetLastError() }
-                    )),
+                    _ => TransportError::Peer(format!("waiting for the {what} failed ({failure})")),
                 });
             }
             let mut transferred = 0u32;
