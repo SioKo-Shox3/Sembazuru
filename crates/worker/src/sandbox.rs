@@ -7,7 +7,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, LocalFree,
@@ -28,12 +28,16 @@ use windows_sys::Win32::Security::{
     TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinMediumLabelSid,
     WinRestrictedCodeSid, WinWorldSid,
 };
-use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, DELETE, WRITE_DAC};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::StationsAndDesktops::{
+    CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
+    GetProcessWindowStation, HDESK, HWINSTA, SetProcessWindowStation,
+};
 use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
@@ -45,6 +49,7 @@ use windows_sys::Win32::System::Threading::{
     ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::CWF_CREATE_ONLY;
 
 use crate::job::JobObject;
 
@@ -800,6 +805,263 @@ impl ActionPipeSecurity {
     }
 }
 
+/// Access an action needs on its own window station.
+///
+/// `WINSTA_ALL_ACCESS` plus `READ_CONTROL`, and deliberately none of `DELETE`, `WRITE_DAC`, or
+/// `WRITE_OWNER`: `CreateProcessAsUser` requires the token's user to have read and write access to
+/// the target station, but an action that could rewrite its own station's DACL could also let
+/// another action in.
+const ACTION_STATION_RIGHTS: u32 = 0x0002_037f;
+
+/// The same shape for the desktop: `DESKTOP_ALL` plus `READ_CONTROL`, without the three standard
+/// rights that would let the action change who may reach it.
+const ACTION_DESKTOP_RIGHTS: u32 = 0x0002_01ff;
+
+/// Serializes the station switch that creating a desktop requires.
+///
+/// `CreateDesktop` can only create on the calling process's *current* window station, so the broker
+/// has to switch, create, and switch back. That is process-wide state, and actions are started in
+/// parallel, so the window has to be held by one action at a time.
+static STATION_SWITCH: Mutex<()> = Mutex::new(());
+
+struct OwnedWindowStation(HWINSTA);
+
+impl Drop for OwnedWindowStation {
+    fn drop(&mut self) {
+        // SAFETY: this handle came from CreateWindowStationW and is closed exactly once. Closing
+        // the station the process is currently using fails; the creator restores its own first.
+        unsafe { CloseWindowStation(self.0) };
+    }
+}
+
+struct OwnedDesktop(HDESK);
+
+impl Drop for OwnedDesktop {
+    fn drop(&mut self) {
+        // SAFETY: this handle came from CreateDesktopW and is closed exactly once. Closing a
+        // desktop still used by a thread of this process fails, and this one never is.
+        unsafe { CloseDesktop(self.0) };
+    }
+}
+
+/// One action's own window station and desktop.
+///
+/// Session 0's service station grants only the service SID and Administrators. The action's token
+/// is restricted, so the access check runs twice, and the restricted list —
+/// `[action_sid, Everyone, Authenticated Users, Users, RESTRICTED]` — matches no entry there. That
+/// is what refuses it: measured on a hosted runner on 2026-09-18, every open failed with
+/// `ERROR_ACCESS_DENIED`, `MAXIMUM_ALLOWED` included, while the objects carried no integrity label
+/// at all. Widening the shared station would hand every restricted action the same access to an
+/// object all of the session's LocalSystem services use; giving each action its own object, named
+/// in its DACL by its own random SID, satisfies both halves of the check and keeps actions apart.
+pub(crate) struct ActionDesktop {
+    lp_desktop: Vec<u16>,
+    _desktop: OwnedDesktop,
+    _station: OwnedWindowStation,
+}
+
+// SAFETY: the two fields are kernel handles, which are process-wide and not bound to the thread
+// that created them. Nothing here caches thread state, and the only operations are the closes in
+// each field's Drop. The station switch that creation needs is process-wide and is serialized by
+// `STATION_SWITCH`, so it never travels with this value.
+unsafe impl Send for ActionDesktop {}
+
+impl ActionDesktop {
+    pub(crate) fn create(token: &ActionToken) -> io::Result<Self> {
+        // A fresh random name plus CWF_CREATE_ONLY: a name another process already holds is a
+        // failure here, never a silent second handle to somebody else's object.
+        let name = format!("sbz-{}", secure_random_hex()?);
+        let sddl = action_object_sddl(token, ACTION_STATION_RIGHTS)?;
+        let desktop_sddl = action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?;
+        let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+
+        let station_descriptor = security_descriptor(&sddl)?;
+        let station_attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: station_descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: the name and the descriptor are live for the call; success transfers one handle.
+        let station = unsafe {
+            CreateWindowStationW(
+                wide_name.as_ptr(),
+                CWF_CREATE_ONLY,
+                ACTION_STATION_RIGHTS | WRITE_DAC | DELETE,
+                &station_attributes,
+            )
+        };
+        if station.is_null() {
+            return Err(stage_error("create window station"));
+        }
+        let station = OwnedWindowStation(station);
+
+        let desktop_descriptor = security_descriptor(&desktop_sddl)?;
+        let desktop_attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: desktop_descriptor.0,
+            bInheritHandle: 0,
+        };
+        let desktop = {
+            let _serialized = STATION_SWITCH
+                .lock()
+                .map_err(|_| io::Error::other("station switch poisoned"))?;
+            // SAFETY: the current station handle is owned by the process and stays valid.
+            let previous = unsafe { GetProcessWindowStation() };
+            // SAFETY: the station was just created with a handle that permits the switch.
+            if unsafe { SetProcessWindowStation(station.0) } == 0 {
+                return Err(stage_error("switch to the action station"));
+            }
+            // SAFETY: the name and descriptor are live; the process station is the new one.
+            let desktop = unsafe {
+                CreateDesktopW(
+                    wide_name.as_ptr(),
+                    null(),
+                    null(),
+                    0,
+                    ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
+                    &desktop_attributes,
+                )
+            };
+            let created = io::Error::last_os_error();
+            // Restore before anything else can observe this process on the action's station, and
+            // before the station handle is dropped: closing the current station fails.
+            // SAFETY: `previous` is this process's own station handle, still valid.
+            let restored = unsafe { SetProcessWindowStation(previous) };
+            if desktop.is_null() {
+                return Err(io::Error::other(format!(
+                    "action desktop: create desktop failed ({created})"
+                )));
+            }
+            if restored == 0 {
+                // SAFETY: the desktop was created above and is closed exactly once here.
+                unsafe { CloseDesktop(desktop) };
+                return Err(io::Error::other("window station was not restored"));
+            }
+            OwnedDesktop(desktop)
+        };
+
+        let lp_desktop: Vec<u16> = format!("{name}\\{name}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        Ok(Self {
+            lp_desktop,
+            _desktop: desktop,
+            _station: station,
+        })
+    }
+
+    /// The `station\desktop` pair, in the form `STARTUPINFO.lpDesktop` takes.
+    pub(crate) fn lp_desktop(&self) -> *mut u16 {
+        self.lp_desktop.as_ptr().cast_mut()
+    }
+
+    /// Creates only the desktop, on whatever station this process is already using.
+    ///
+    /// An interactive user session refuses `CreateWindowStation` outright: measured on a normal
+    /// desktop session, every variant is denied with `ERROR_ACCESS_DENIED`, a null security
+    /// descriptor included, which is the same wall `private_station_unnamed_create_*` records. The
+    /// station half of this design can therefore only be exercised where the broker actually runs,
+    /// under the service in Session 0. The desktop half carries the same descriptor and asks the
+    /// same question of the restricted side, and it can be created here, so that is what the tests
+    /// on a developer machine prove.
+    #[cfg(test)]
+    fn desktop_on_current_station_for_test(
+        token: &ActionToken,
+    ) -> io::Result<(String, OwnedDesktop)> {
+        let name = format!("sbz-{}", secure_random_hex()?);
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let descriptor = security_descriptor(&action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?)?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: the name and the descriptor are live for the call.
+        let desktop = unsafe {
+            CreateDesktopW(
+                wide.as_ptr(),
+                null(),
+                null(),
+                0,
+                ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
+                &attributes,
+            )
+        };
+        if desktop.is_null() {
+            return Err(stage_error("create desktop on the current station"));
+        }
+        Ok((name, OwnedDesktop(desktop)))
+    }
+}
+
+/// The descriptor both per-action user objects carry: the broker may manage it, this one action
+/// may use it, and nobody else is named at all.
+///
+/// Naming the action's own random SID is the point. The token is restricted, so the access check
+/// runs against the restricted list as well, and that list holds only
+/// `[action_sid, Everyone, Authenticated Users, Users, RESTRICTED]`. An entry for the action SID is
+/// the one way to satisfy that half without also admitting every other restricted action.
+fn action_object_sddl(token: &ActionToken, rights: u32) -> io::Result<String> {
+    let broker = sid_string(token.broker_sid())?;
+    Ok(format!(
+        "O:{broker}D:P(A;;GA;;;{broker})(A;;0x{rights:08x};;;{})",
+        sid_string(token.action_sid.0)?
+    ))
+}
+
+/// Builds the action's own station and desktop, or reports once why this environment cannot.
+///
+/// Creating a window station is refused outside the service: on an ordinary desktop session every
+/// variant is denied, a null descriptor included. Failing the action there would break every
+/// developer run and every gate that starts a worker as a user, so the child inherits the broker's
+/// station instead — exactly today's behaviour, no wider. Under the service, where the station can
+/// be created, the action gets its own. A fallback is reported once per process, because in Session
+/// 0 it means the machine is back on the arrangement that produces `0xC0000142`.
+fn action_desktop_or_inherit(token: &ActionToken) -> Option<ActionDesktop> {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    match ActionDesktop::create(token) {
+        Ok(desktop) => Some(desktop),
+        Err(error) => {
+            REPORTED.call_once(|| {
+                eprintln!(
+                    "sembazuru-worker: per-action window station unavailable ({error}); \
+                     actions inherit the broker's station"
+                );
+            });
+            None
+        }
+    }
+}
+
+/// Names which step of the per-action station setup failed, keeping the operating system's own
+/// error attached. Without the stage, every failure here reads as one indistinguishable denial.
+fn stage_error(stage: &str) -> io::Error {
+    io::Error::other(format!(
+        "action desktop: {stage} failed ({})",
+        io::Error::last_os_error()
+    ))
+}
+
+/// Converts one SDDL string into a descriptor whose allocation is freed on drop.
+fn security_descriptor(sddl: &str) -> io::Result<LocalAllocation> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = null_mut();
+    // SAFETY: the SDDL is NUL-terminated and descriptor is a valid out pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(LocalAllocation(descriptor))
+}
+
 fn create_secured_directory(path: &Path, sddl: &str) -> io::Result<()> {
     let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = null_mut();
@@ -1185,6 +1447,9 @@ pub(crate) struct RestrictedProcess {
     stdout: Option<OwnedHandle>,
     stderr: Option<OwnedHandle>,
     job: Arc<JobObject>,
+    /// Kept alive for the process's lifetime: a window station and desktop exist only while a
+    /// handle or a process references them, and the action's process is that reference.
+    _desktop: Option<ActionDesktop>,
 }
 
 impl RestrictedProcess {
@@ -1248,6 +1513,13 @@ impl RestrictedProcess {
         startup.StartupInfo.hStdInput = inherited[0];
         startup.StartupInfo.hStdOutput = inherited[1];
         startup.StartupInfo.hStdError = inherited[2];
+        // The action's own station and desktop, when this environment allows them. A null
+        // `lpDesktop` means the child inherits the broker's, which is what happens today and what
+        // fails under the service in Session 0.
+        let desktop = action_desktop_or_inherit(token);
+        startup.StartupInfo.lpDesktop = desktop
+            .as_ref()
+            .map_or(null_mut(), ActionDesktop::lp_desktop);
         startup.lpAttributeList = attributes.ptr();
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         let creation_flags =
@@ -1331,6 +1603,7 @@ impl RestrictedProcess {
             stdout: Some(stdout_parent),
             stderr: Some(stderr_parent),
             job,
+            _desktop: desktop,
         })
     }
 
@@ -2086,6 +2359,171 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             String::from_utf8(output.stdout).unwrap().trim(),
             format!("PASS {}", cases.len())
         );
+    }
+
+    /// Opens a named desktop on this process's current station under one action token, the way a
+    /// started action's own access check would run against it.
+    fn action_desktop_open(token: &ActionToken, desktop: &str, mask: u32) -> Result<bool, u32> {
+        let wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
+        token
+            .impersonated(|| {
+                // SAFETY: the name is NUL-terminated and live for the call.
+                let handle = unsafe { OpenDesktopW(wide.as_ptr(), 0, 0, mask) };
+                if handle.is_null() {
+                    // SAFETY: GetLastError is read immediately after the failing open.
+                    return Ok(Err(unsafe { GetLastError() }));
+                }
+                // SAFETY: OpenDesktopW returned this owned user-object handle.
+                unsafe { CloseDesktop(handle) };
+                Ok(Ok(true))
+            })
+            .expect("impersonation is available to the broker")
+    }
+
+    #[test]
+    fn a_per_action_user_object_admits_its_own_action_and_refuses_another() {
+        // This is the mechanism behind the Session 0 failure, measured directly. Both tokens are
+        // restricted, so every access check runs twice, and both carry the same broker user on the
+        // normal side. The only thing separating them is the restricted side: the descriptor names
+        // one action's random SID and not the other's. The service station fails exactly there —
+        // it names neither (docs/verification/2026-09-18-session0-label-and-restricted-sids.md).
+        let mine = ActionToken::create().expect("action token");
+        let theirs = ActionToken::create().expect("a second action token");
+        let (name, _desktop) = ActionDesktop::desktop_on_current_station_for_test(&mine)
+            .expect("a desktop can be created on the current station");
+
+        assert_eq!(
+            action_desktop_open(&mine, &name, ACTION_DESKTOP_RIGHTS),
+            Ok(true),
+            "the owning action must reach its own desktop"
+        );
+        match action_desktop_open(&theirs, &name, ACTION_DESKTOP_RIGHTS) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("another action reached this desktop: {other:?}"),
+        }
+        // Even the weakest possible request is refused: the other action has no entry at all, so
+        // there is no narrower mask that would have let it in.
+        match action_desktop_open(&theirs, &name, MAXIMUM_ALLOWED) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("another action was granted something: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_per_action_user_object_names_only_the_broker_and_that_action() {
+        let token = ActionToken::create().expect("action token");
+        let (_name, desktop) = ActionDesktop::desktop_on_current_station_for_test(&token)
+            .expect("a desktop can be created on the current station");
+        let broker = sid_string(token.broker_sid()).expect("broker sid");
+        let action = sid_string(token.action_sid.0).expect("action sid");
+
+        let dacl = diagnostic_user_object_dacl(desktop.0);
+        assert!(
+            dacl.contains(&format!("sid={broker}")),
+            "the broker has to stay able to manage the object: {dacl}"
+        );
+        assert!(
+            dacl.contains(&format!("mask=0x{ACTION_DESKTOP_RIGHTS:08x};sid={action}")),
+            "the action needs exactly its own rights: {dacl}"
+        );
+        // Everyone, Authenticated Users, Users and RESTRICTED are in every action's restricted
+        // list, so an entry for any of them would open this object to all actions at once.
+        for forbidden in [
+            "S-1-1-0",
+            "S-1-5-11",
+            "S-1-5-32-545",
+            "S-1-5-12",
+            "S-1-5-32-544",
+        ] {
+            assert!(
+                !dacl.contains(&format!("sid={forbidden}")),
+                "{forbidden} must not be an allow entry: {dacl}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_action_descriptor_withholds_the_rights_that_would_reopen_it() {
+        let token = ActionToken::create().expect("action token");
+        for rights in [ACTION_STATION_RIGHTS, ACTION_DESKTOP_RIGHTS] {
+            // An action that could rewrite its own object's descriptor could also let another
+            // action in, which is the one thing this design buys.
+            assert_eq!(
+                rights & (DELETE | WRITE_DAC | WRITE_OWNER),
+                0,
+                "{rights:#x}"
+            );
+            assert_ne!(rights & READ_CONTROL, 0, "{rights:#x}");
+            let sddl = action_object_sddl(&token, rights).expect("the descriptor is expressible");
+            assert!(security_descriptor(&sddl).is_ok(), "{sddl}");
+            assert!(
+                sddl.contains("D:P"),
+                "inherited entries must not apply: {sddl}"
+            );
+        }
+    }
+
+    /// Records that an interactive session cannot create a window station. Run it under the
+    /// service in Session 0, where the product needs the same call to succeed.
+    #[test]
+    #[ignore = "environment probe; meaningful only under the service in Session 0"]
+    fn probe_window_station_creation_variants() {
+        let token = ActionToken::create().expect("action token");
+        let broker_only = format!(
+            "D:P(A;;GA;;;{})",
+            sid_string(token.broker_sid()).expect("broker sid")
+        );
+        let with_action = action_object_sddl(&token, ACTION_STATION_RIGHTS).expect("sddl");
+        for (label, sddl, access) in [
+            ("null sd, all access", None, 0x0000_037fu32),
+            ("null sd, maximum allowed", None, MAXIMUM_ALLOWED),
+            (
+                "broker only, all access",
+                Some(broker_only.clone()),
+                0x0000_037f,
+            ),
+            ("broker only, +standard", Some(broker_only), 0x0006_037f),
+            (
+                "with action, all access",
+                Some(with_action.clone()),
+                0x0000_037f,
+            ),
+            ("with action, +standard", Some(with_action), 0x0006_037f),
+        ] {
+            let name = format!("sbz-probe-{}", secure_random_hex().expect("nonce"));
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let descriptor = sddl
+                .as_deref()
+                .map(|text| security_descriptor(text).expect("the probe's own SDDL parses"));
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor
+                    .as_ref()
+                    .map_or(null_mut(), |allocation| allocation.0),
+                bInheritHandle: 0,
+            };
+            // SAFETY: the name and any descriptor are live for the call.
+            let handle = unsafe {
+                CreateWindowStationW(
+                    wide.as_ptr(),
+                    CWF_CREATE_ONLY,
+                    access,
+                    if descriptor.is_some() {
+                        &attributes
+                    } else {
+                        null()
+                    },
+                )
+            };
+            if handle.is_null() {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                println!("{label}: DENIED gle={}", unsafe { GetLastError() });
+            } else {
+                println!("{label}: created");
+                // SAFETY: the call returned an owned handle, closed once here.
+                unsafe { CloseWindowStation(handle) };
+            }
+        }
     }
 
     #[test]
