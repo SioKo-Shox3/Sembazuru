@@ -95,7 +95,7 @@
 - review: 独立評価 PASS、blocking なし。ゲートの合否判定と製品の fail-closed 要件を弱める変更はないと確認された。非阻害の指摘2件（生成が途中で失敗したときの解放漏れ、置き換え時の二重解放）は 0dfbfd6 で解消し、4ゲートを再実行して PASS。証拠は .harness/T-009-review.txt。
 
 ## T-010: GUI の Join を storectl 経由の特権書き込みにする
-- status: todo (設計未決の分岐あり)
+- status: todo (設計と実装は完了、昇格を伴う実測だけ残り)
 - done-when: GUI の Join が machine token・daemon 設定・worker 設定を原子的に永続化し、ProgramData の ACL と status_admin の default-deny を緩めない。秘密が argv とディスクに残らない。Join 後にサービスが新しい設定で動く。
 - verify: `cargo test -p sembazuru-config-store --locked`
 - verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`（ACL 保護が不変であること）
@@ -265,7 +265,7 @@
 - notes: 現状 `installer/sembazuru.wxs:21` の CA 用でインストールされない。配置と署名対象の追加が要る。
 
 ## T-019: GUI のウィザードを Join の経路へつなぐ
-- status: todo
+- status: done
 - done-when: 参加ウィザードの入力が `JoinPayload` になり、`join::transport::deliver` を通って
   保存される。`StubConfigWriter` の `MechanismUnconfigured` がこの経路から消える。
   昇格の辞退、helper の不在、`join-saved-not-applied` が、利用者に区別できる形で表示される。
@@ -276,21 +276,34 @@
   トークンは payload の `cluster_token` として渡し、設定ファイルには書かない。
 - notes: 昇格を伴う実測（Medium の GUI がパイプを作り、昇格 helper が接続して PID 照合後に
   payload を受け取る）は人が UAC を押す必要がある。結線が済んでから1回行う。
+- resolution: 432f62a。ウィザードの答えを `payload_for` が1つの取引にし、`JoinSubmitter` 越しに
+  `transport::deliver` へ渡す。トークンは `#[serde(skip)]` で worker.toml から外し、封筒の
+  専用フィールドで運ぶ。daemon 設定は Preserve。パネルは自分で再起動せず、保存の成功と反映の成功を
+  別の文言で伝える。`ConfigWriter` と `StubConfigWriter` は機構が決まったので撤去した。
+- measured: `cargo test -p sembazuru-gui` の 10 スイートすべて ok。ヘルパー役の記録係を差し込み、
+  封筒にトークンと worker 設定が入ること、プレビューにトークンが出ないこと、検証に落ちる入力が
+  ヘルパーへ渡らないこと、exit code 12 が「保存済み・反映未完了」として読めることを検査した。
+  worker.toml にトークンが入ることを期待していた既存検査は期待を反転した。
+- 残り: 昇格を伴う実機の受け渡しは未実測。
 
 ## T-020: Join の接続と送信に期限を持たせる
-- status: todo
+- status: done
 - done-when: GUI 側の `ConnectNamedPipe` と書き込みが、helper が接続せずに終了した場合や応答しない
   場合に有界時間で戻る。helper のプロセスハンドルと期限の両方を待機の対象にする。成功経路の
   受け渡しは従来どおり成立する。
 - verify: `rustup run 1.98.1 cargo test -p sembazuru-gui --locked`
 - paths: crates/gui/src/join/transport.rs, TASKS.md, PROGRESS.md
 - notes: 独立評価の blocking。同期の `ConnectNamedPipe` は待ち続ける。現在の 120 秒は
-  `hand_over` が終わったあとの `wait_for_helper` にしか効かない。`FILE_FLAG_OVERLAPPED` で
-  パイプを作り、接続・書き込みを overlapped にして、イベントと helper のプロセスハンドルを
-  一緒に待つ形にする。同期のまま短い待ちを繰り返す形は、取りこぼしと競合を増やすので避ける。
+  `hand_over` が終わったあとの `wait_for_helper` にしか効かない。
+- resolution: f155d24。`FILE_FLAG_OVERLAPPED` でパイプを作り、接続と書き込みを overlapped にして、
+  完了イベント・helper のプロセスハンドル・期限を一緒に待つ。諦めるときは `CancelIoEx` のあと
+  完了を待ってから構造体とバッファを手放す。`FlushFileBuffers` は外した（パイプでは読み手が
+  全部読むまで戻らず、無制限に待つ経路になる）。
+- measured: 先に終了させた stand-in プロセスのハンドルを渡すと、受け渡しが即座に
+  `Peer("... exited ...")` で戻る。検査全体が 0.02 秒で終わる。修正前はこの検査が戻らない。
 
 ## T-021: サービスの反映を一瞬の Running で判定しない
-- status: todo
+- status: done
 - done-when: `join` がサービスの起動を「初期化まで到達した」ことで判定する。`Running` を報告した
   直後に失敗して停止する場合を失敗として扱う。判定の根拠を1つに決めて記録する。
 - verify: `rustup run 1.98.1 cargo test -p sembazuru-config-store --locked`
@@ -300,9 +313,16 @@
   `crates/agent/src/service.rs:188` で実行ループ開始前に `Running` を報告する。ポート競合などで
   直後に落ちても、その間の `Running` を観測すると `join-applied` を返してしまう。
   ADR 0018 の「SCM の `Running` 一回を動作確認の代用にしない」を満たしていない。
-- notes: 判定の候補は (a) 一定時間 `Running` が継続することの確認、(b) Status プレーンへの問い合わせ、
-  (c) サービス側が初期化完了を報告する仕組みの追加。(b) は ADR 0016 の境界に触れるので、
-  選ぶ前に影響を確認する。
+- decided: (a) 一定時間 `Running` が継続することの確認。(b) Status プレーンへの問い合わせは
+  ADR 0016 の境界に触れ、(c) サービス側の初期化完了報告は両サービスの変更を要する。
+  初期化中に落ちる失敗を捕まえるには (a) で足り、代償が最も小さい。
+- resolution: 6ff46ac。`Running` に到達したあと 5 秒間 200ms ごとに状態を標本化し、`Running` を
+  外れたら反映失敗とする。標本が0件の場合も証拠が無いので失敗とする。判定は `dwell_verdict` に
+  切り出した。
+- limitation: これは滞留の確認であって準備完了の信号ではない。窓の外で落ちる失敗は、この手順が
+  確認したと主張する範囲に入らない。コメントとこの記録の両方に明示した。
+- measured: `dwell_verdict` が `[Running; 3]` を通し、空・`StopPending` 混在・`Stopped` 混在・
+  `StartPending` 先頭のいずれも落とすことを検査した。
 
 ## T-022: storectl の配置を MSI 検査の期待値と一致させる
 - status: done
@@ -355,3 +375,11 @@
 - notes: 9 回中 8 回という符号検定は、1 回あたりのばらつきが効果量と同程度のときに落ちる。
   中央値の差そのものに閾値を置く、反復数を増やす、外れ値を落とす、のどれを採るかを決めて根拠を書く。
   判定を緩めるだけの変更にしない。回帰を見逃さない根拠を示す。
+- implemented: T-014〜T-022 で端から端までつながった。封筒 (b13994e)、storectl の join 動詞
+  (1d47100)、GUI 側のパイプ (ba77081)、停止→更新→起動の順序 (dff8e35)、storectl の配置 (57e5d8e)、
+  評価指摘の解消 (e69df3f, 7484fbd)、MSI 検査の期待値 (9f0944b)、受け渡しの期限 (f155d24)、
+  滞留による反映判定 (6ff46ac)、ウィザードの結線 (432f62a)。
+- 残り: 昇格を伴う実機の実測だけ。人が UAC を押す必要があるので、次に人がいるときに1回行う。
+  確認する内容は「Medium の GUI がパイプを作る → 昇格 helper が接続する → PID 照合後に payload を
+  受け取る → 3対象が適用される → 両サービスが新しい設定で滞留する」と、
+  「非昇格クライアントの読み取りが拒否される」の2つ。
