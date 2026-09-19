@@ -93,13 +93,16 @@ pub fn deliver(_payload: &sembazuru_config_store::JoinPayload) -> Result<(), Tra
 #[cfg(windows)]
 mod imp {
     use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::os::windows::io::{
+        AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle, RawHandle,
+    };
     use std::ptr::null_mut;
+    use std::time::{Duration, Instant};
 
     use sembazuru_config_store::JoinPayload;
     use windows_sys::Win32::Foundation::{
-        ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_PIPE_CONNECTED, GetLastError,
-        INVALID_HANDLE_VALUE, LocalFree, WAIT_TIMEOUT,
+        ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError,
+        HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -109,14 +112,15 @@ mod imp {
     };
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, PIPE_ACCESS_OUTBOUND, WriteFile,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_OUTBOUND, WriteFile,
     };
+    use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, GetProcessId, WaitForSingleObject,
+        CreateEventW, GetExitCodeProcess, GetProcessId, WaitForMultipleObjects, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -128,6 +132,99 @@ mod imp {
     /// How long the helper has to connect and finish. The helper's own work is short; this only
     /// bounds a hang, including a UAC prompt the user leaves open.
     const HELPER_TIMEOUT_MS: u32 = 120_000;
+
+    /// How long the whole hand-over may take, from creating the pipe to the last byte written.
+    ///
+    /// The helper's own work is short. This bounds a hang: a helper that never connects, a client
+    /// that stops reading, or a UAC prompt the user leaves open.
+    const HANDOVER_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// One overlapped operation and the event it completes on.
+    ///
+    /// The `OVERLAPPED` is boxed and never moved while an operation is in flight, because the
+    /// kernel keeps writing to it until the operation completes or its cancellation settles.
+    struct Pending {
+        event: OwnedHandle,
+        overlapped: Box<OVERLAPPED>,
+    }
+
+    impl Pending {
+        fn new() -> Result<Self, TransportError> {
+            // Manual reset, initially unsignalled: the kernel signals it once, and nothing else
+            // resets it behind this code's back.
+            // SAFETY: a null descriptor and a null name are the documented unnamed-event form.
+            let event = unsafe { CreateEventW(null_mut(), 1, 0, null_mut()) };
+            if event.is_null() {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                return Err(TransportError::Create(unsafe { GetLastError() }));
+            }
+            // SAFETY: CreateEventW returned one owned kernel handle.
+            let event = unsafe { OwnedHandle::from_raw_handle(event as RawHandle) };
+            // SAFETY: OVERLAPPED is a plain C struct whose zeroed form is the documented initial
+            // state for an operation that carries no offset.
+            let mut overlapped: Box<OVERLAPPED> = Box::new(unsafe { std::mem::zeroed() });
+            overlapped.hEvent = event.as_raw_handle() as HANDLE;
+            Ok(Self { event, overlapped })
+        }
+
+        fn ptr(&mut self) -> *mut OVERLAPPED {
+            std::ptr::addr_of_mut!(*self.overlapped)
+        }
+
+        /// Gives up on the operation and waits for the kernel to finish with the structure.
+        ///
+        /// The wait is what makes dropping this safe: until the cancellation settles, the kernel
+        /// may still be writing into the `OVERLAPPED` and reading the buffer it was given.
+        fn abandon(&mut self, pipe: HANDLE) {
+            // SAFETY: both the pipe handle and the structure are live for the call.
+            unsafe { CancelIoEx(pipe, self.ptr()) };
+            let mut transferred = 0u32;
+            // SAFETY: the same live handle and structure; `TRUE` waits for the settled result.
+            unsafe { GetOverlappedResult(pipe, self.ptr(), &mut transferred, 1) };
+        }
+
+        /// Waits for this operation, the helper's exit, or the deadline, whichever comes first.
+        fn settle(
+            &mut self,
+            pipe: HANDLE,
+            helper: BorrowedHandle<'_>,
+            deadline: Instant,
+            what: &'static str,
+        ) -> Result<u32, TransportError> {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(u128::from(u32::MAX - 1)) as u32;
+            let handles = [
+                self.event.as_raw_handle() as HANDLE,
+                helper.as_raw_handle() as HANDLE,
+            ];
+            // SAFETY: both handles are live for the call and the count matches the array.
+            let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, remaining) };
+            if waited != WAIT_OBJECT_0 {
+                self.abandon(pipe);
+                return Err(match waited {
+                    WAIT_TIMEOUT => TransportError::Timeout,
+                    // The helper is gone, so nothing will ever complete this operation.
+                    value if value == WAIT_OBJECT_0 + 1 => TransportError::Peer(format!(
+                        "the join helper exited before it finished the {what}"
+                    )),
+                    // SAFETY: GetLastError is read immediately after the failing wait.
+                    _ => TransportError::Peer(format!(
+                        "waiting for the {what} failed ({})",
+                        unsafe { GetLastError() }
+                    )),
+                });
+            }
+            let mut transferred = 0u32;
+            // SAFETY: the operation is signalled complete; `FALSE` therefore does not block.
+            if unsafe { GetOverlappedResult(pipe, self.ptr(), &mut transferred, 0) } == 0 {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                return Err(TransportError::Write(unsafe { GetLastError() }));
+            }
+            Ok(transferred)
+        }
+    }
 
     /// One unconnected join pipe, owned by the GUI.
     pub struct JoinPipe {
@@ -206,7 +303,7 @@ mod imp {
             let handle = unsafe {
                 CreateNamedPipeW(
                     name_w.as_ptr(),
-                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     1,
                     64 * 1024,
@@ -246,18 +343,25 @@ mod imp {
         /// the helper's next read would fail rather than end, losing a payload it already has.
         fn hand_over(
             self,
-            launched: &OwnedHandle,
+            launched: BorrowedHandle<'_>,
             payload: &JoinPayload,
         ) -> Result<(), TransportError> {
-            let server = self.server.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
-            // SAFETY: the server handle is live and this pipe has exactly one instance.
-            let connected = unsafe { ConnectNamedPipe(server, null_mut()) };
+            let deadline = Instant::now() + HANDOVER_TIMEOUT;
+            let server = self.server.as_raw_handle() as HANDLE;
+            let mut pending = Pending::new()?;
+            // Overlapped, so a helper that never connects cannot hold this thread forever. The
+            // wait below gives up when the helper exits or the deadline passes.
+            // SAFETY: the server handle and the pending structure are live for the call.
+            let connected = unsafe { ConnectNamedPipe(server, pending.ptr()) };
             if connected == 0 {
                 // SAFETY: GetLastError is read immediately after the failing call.
-                let error = unsafe { GetLastError() };
-                // A client that connected between creation and this call is already connected.
-                if error != ERROR_PIPE_CONNECTED {
-                    return Err(TransportError::Peer(format!("connect failed ({error})")));
+                match unsafe { GetLastError() } {
+                    ERROR_IO_PENDING => {
+                        pending.settle(server, launched, deadline, "connection")?;
+                    }
+                    // A client that connected between creation and this call is already connected.
+                    ERROR_PIPE_CONNECTED => {}
+                    error => return Err(TransportError::Peer(format!("connect failed ({error})"))),
                 }
             }
 
@@ -266,7 +370,7 @@ mod imp {
             let queried = unsafe { GetNamedPipeClientProcessId(server, &mut client) };
             let client = (queried != 0).then_some(client);
             // SAFETY: the launched handle is live, which is what keeps its id from being recycled.
-            let expected = unsafe { GetProcessId(launched.as_raw_handle() as _) };
+            let expected = unsafe { GetProcessId(launched.as_raw_handle() as HANDLE) };
             let expected = (expected != 0).then_some(expected);
             if !peer_is_the_launched_helper(client, expected) {
                 // Nothing has been written, and dropping this pipe closes the handle, which drops
@@ -282,30 +386,36 @@ mod imp {
                 .map_err(|_| TransportError::Write(ERROR_ACCESS_DENIED))?;
             let mut written_total = 0usize;
             while written_total < bytes.len() {
-                let mut written = 0u32;
                 let chunk = &bytes[written_total..];
-                // SAFETY: the slice is live for the call and the count fits the remaining length.
-                if unsafe {
+                let mut pending = Pending::new()?;
+                // A helper that stops reading would block a synchronous write once the pipe's
+                // buffer fills, so this write is overlapped and waited on with the same deadline.
+                // The count is taken from the overlapped result, not from a synchronous output.
+                // SAFETY: the slice and the pending structure stay live until `settle` below has
+                // either completed the write or waited out its cancellation.
+                let started = unsafe {
                     WriteFile(
                         server,
                         chunk.as_ptr(),
                         chunk.len() as u32,
-                        &mut written,
                         null_mut(),
+                        pending.ptr(),
                     )
-                } == 0
-                    || written == 0
-                {
-                    // SAFETY: GetLastError is read immediately after the failing write.
+                };
+                // SAFETY: GetLastError is read immediately after the call above.
+                if started == 0 && unsafe { GetLastError() } != ERROR_IO_PENDING {
+                    // SAFETY: the same immediate read of the failing call's error.
                     return Err(TransportError::Write(unsafe { GetLastError() }));
+                }
+                let written = pending.settle(server, launched, deadline, "hand-over")?;
+                if written == 0 {
+                    return Err(TransportError::Write(0));
                 }
                 written_total += written as usize;
             }
-            // Blocks until the helper has consumed the bytes, so closing below cannot cut the
-            // payload short.
-            // SAFETY: the server handle is live and connected.
-            unsafe { FlushFileBuffers(server) };
-            // Dropping `self` closes the server handle, and that close is the helper's end of file.
+            // No flush: on a pipe it blocks until the reader has drained everything, which is an
+            // unbounded wait on the helper. The bytes are already in the pipe, they survive this
+            // handle closing, and the close is what gives the helper its end of file.
             Ok(())
         }
     }
@@ -383,7 +493,7 @@ mod imp {
     pub fn deliver(payload: &JoinPayload) -> Result<(), TransportError> {
         let pipe = JoinPipe::create()?;
         let helper = launch_helper(pipe.name())?;
-        let handed = pipe.hand_over(&helper, payload);
+        let handed = pipe.hand_over(helper.as_handle(), payload);
         let finished = wait_for_helper(&helper);
         // A failed hand-over is the more specific fault, so it wins over the helper's exit code.
         handed?;
@@ -480,6 +590,50 @@ mod imp {
         }
 
         #[test]
+        fn a_helper_that_never_connects_does_not_hold_the_hand_over() {
+            use std::process::{Command, Stdio};
+
+            use sembazuru_config_store::JoinField;
+
+            let pipe = JoinPipe::create().expect("create the join pipe");
+            let mut child = Command::new("cmd.exe")
+                .args(["/d", "/c", "exit", "0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn a stand-in helper");
+            // Let it finish first, so the wait has to notice an exit rather than win a race.
+            child.wait().expect("the stand-in helper exits");
+            let payload = JoinPayload::new(
+                JoinField::replace(b"cluster-token"),
+                JoinField::Preserve,
+                JoinField::Preserve,
+            )
+            .expect("fixture payload");
+
+            let started = Instant::now();
+            // SAFETY: `child` still owns the process handle and outlives this borrow.
+            let handle = unsafe { BorrowedHandle::borrow_raw(child.as_raw_handle()) };
+            let error = pipe
+                .hand_over(handle, &payload)
+                .expect_err("a helper that never connects cannot be handed a payload");
+            let elapsed = started.elapsed();
+
+            // The whole point: this returns on the helper's exit, not on the 120-second deadline.
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "the hand-over waited {elapsed:?} for a helper that had already exited"
+            );
+            match error {
+                TransportError::Peer(reason) => {
+                    assert!(reason.contains("exited"), "unexpected reason: {reason}");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        #[test]
         fn a_second_instance_of_the_same_name_is_refused() {
             let pipe = JoinPipe::create().expect("create the join pipe");
             let name_w: Vec<u16> = std::ffi::OsStr::new(pipe.name())
@@ -495,7 +649,7 @@ mod imp {
             let second = unsafe {
                 CreateNamedPipeW(
                     name_w.as_ptr(),
-                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     1,
                     64 * 1024,
