@@ -119,7 +119,7 @@
   接続する → PID 照合後にダミー payload を渡す」と「非昇格クライアントの読み取り拒否」を実測する。
 
 ## T-011: アクションがウィンドウステーションとデスクトップを開けるようにする
-- status: todo (設計未決)
+- status: todo (実装済み、Session 0 の実測だけ残り)
 - done-when: Session 0 のサービス配下で、制限付き・Medium 整合性のアクショントークンが起動したプロセスが 0xC0000142 にならず動く。ステーションとデスクトップの許可範囲を、アクションが必要とする最小に保つ。`m9_installer_acl.ps1` の ACL 検証と worker sandbox の既存の隔離（UI 制限ジョブ、breakaway 不可、制限トークン）を緩めない。
 - verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`
 - verify: Session 0 診断を再実行し、`StationAccess`/`DesktopAccess` が allowed=true になること
@@ -136,8 +136,24 @@
   記録は docs/verification/2026-09-18-session0-label-and-restricted-sids.md。
 - scope: 与えるべきは「もっと狭い mask」ではなく、制限側を満たす `action_sid` の ACE そのもの。
   許可が皆無なので、mask を1ビットずつ削って境界を出す作業には意味が無い。
-- 残る未検証: `CreateProcessAsUser` が対象ステーション/デスクトップへの full access を要求する点と、
-  最小権限だけを与える構成との折り合い。
+- implemented: 2f0e8b1。`ActionDesktop` がアクションごとにステーションとデスクトップを作り、
+  記述子はブローカーとそのアクションの乱数 SID だけを名指す。アクションには
+  DELETE / WRITE_DAC / WRITE_OWNER を与えない。`spawn_inner` が `lpDesktop` にその対を渡す。
+  デスクトップ作成に要るプロセスのステーション切り替えは `STATION_SWITCH` で直列化し、必ず戻す。
+- measured: **機構はローカルで実証した。** 同じブローカーを持つ2つの制限付きアクショントークンに対し、
+  記述子がアクション A の SID を名指すデスクトップを、A は開けて B は開けない（B は
+  `MAXIMUM_ALLOWED` でも `ERROR_ACCESS_DENIED`）。制限側の検査を満たす一致点がアクション SID だけに
+  なっていることの直接の確認になる。
+- measured: **対話セッションではウィンドウステーションを作成できない。** NULL 記述子を含むすべての
+  変種が `ERROR_ACCESS_DENIED`。T-006 の `private_station_unnamed_create_*` が記録していた壁と同じ。
+  したがってステーション側の経路はローカルで実行できず、`#[ignore]` のプローブとして残してある。
+- measured: 結線後も worker の lib テストは 160 passed / 0 failed（制限プロセスを実際に起動する
+  検査を含む）。ローカルではフォールバックが働き、今日と同じくブローカーのステーションを継承する。
+  証拠は .harness/T-011-gates.log と .harness/T-011-workspace.log。
+- 残る未検証: (1) Session 0 で実際に `CreateWindowStation` が成功するか、
+  (2) `CreateProcessAsUser` が要求するアクセスを `ACTION_STATION_RIGHTS` / `ACTION_DESKTOP_RIGHTS`
+  で満たせるか（満たせなければ 0xC0000142 が続く）、(3) デスクトップヒープの上限と並列度、
+  (4) Job の UI 制限 (0xfe) が別層として残ること。
 
 ## T-012: Session 0 診断に整合性ラベルと制限 SID を足す
 - status: done
