@@ -355,7 +355,7 @@
   証拠は .harness/T-022-static.log。MSI テーブル側の検査は MSI が要るので CI が初出。
 
 ## T-023: M6.1b の worker VFS が attestation で落ちる
-- status: todo
+- status: todo (原因は特定、修正は worker を起動できる場所でしか確かめられない)
 - done-when: CI の C++ job で `m6_worker_vfs_redirect` 相当の M6.1b ゲートが通る。worker の
   `event=attestation-failed` の原因を特定し、ゲート側の用意不足か製品側の欠陥かを区別して記録する。
 - verify: CI の `C++ hooks + tracer (MSVC) (windows-2022)` job
@@ -366,8 +366,27 @@
   incomplete or invalid (exit=3)` と `M6_SERVICE_STDERR service=worker event=attestation-failed`。
 - notes: T-009 は「`m6_worker_vfs_redirect.ps1` は worker 経由なので attestation の用意不足の影響を
   受けない」と記録していた。worker 自身が `attestation-failed` を出しているので、その前提を先に確かめる。
-- notes: `plain direct /GL compiler failed (exit=72)` は VFS を介さない経路なので、フック層より前の
-  段で既に失敗している可能性がある。そちらを先に切り分ける。
+- diagnosed: **`attestation-failed` は原因ではなく結果。** 直接の原因はコンパイラのドライバエラー:
+  `cl : Command line error D8037 : cannot create temporary il file; clean temp directory of old il files`。
+  `/GL` は一時 IL ファイルを TMP に作る。それが作れずコンパイルが失敗し、注入された子が
+  attachment を登録しないまま終わるので、fail-closed の attestation 検査
+  (`vfs_attestation_slots_valid`、`slot_count != 0` を要求) が落ちる。順序は
+  「cl が失敗 → スロット未登録 → attestation 失敗」であって逆ではない。
+- diagnosed: ゲート自身も同じ判断をしている。`M6_CL_GL_DIFFERENTIAL` が
+  `cause=vfs-or-injection` ではなく **`observation=both-failed-common-boundary-consistent`** を出しており、
+  VFS 経路と `--no-vfs` の素の経路が同じ理由で落ちたこと、つまり **VFS の境界より手前が原因**であることを
+  記録している。したがって製品の VFS/attestation 側の欠陥ではない。
+- diagnosed: D8037 の直前に `M6_CL_GL_SCRATCH_CANARY_FAIL stage=30 error=267` が出ている。
+  267 は `ERROR_DIRECTORY`。`/GL` の TMP/TEMP はアクションの private scratch を指す
+  (プローブは TMP==TEMP==`SEMBAZURU_VFS_SCRATCH` を検査する)。その scratch が、その時点で
+  一時ファイルの作成に使えない状態だったことになる。
+- 次の実験: worker を起動できる場所で M6.1b を回し、(1) `/GL` の直前に TMP/TEMP の実体が存在し
+  書き込めるかを記録する、(2) scratch canary の delete-on-close / delete-disposition の後始末が
+  完了してから次のアクションの scratch を作っているかを確認する、(3) windows-2025 で通り
+  windows-2022 で落ちる差が何かを見る。ローカルでは worker/SCM の起動が認められていないため未実施。
+- notes: ゲート側の文言を直して誤った帰属（VFS が壊れているように読める2件の failure）を避けたいが、
+  このスクリプトは自分のソース文言と順序を静的に自己検査しており、ローカルでは実行できない。
+  盲目的に触ると「1件の明確な失敗」が「ゲートが起動しない」に悪化するので、実行できる場所でやる。
 
 ## T-024: M3.5 の速度ゲートが統計的に不安定
 - status: done
