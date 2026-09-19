@@ -7,7 +7,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, LocalFree,
@@ -28,12 +28,16 @@ use windows_sys::Win32::Security::{
     TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinMediumLabelSid,
     WinRestrictedCodeSid, WinWorldSid,
 };
-use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, DELETE, WRITE_DAC};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::StationsAndDesktops::{
+    CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
+    GetProcessWindowStation, HDESK, HWINSTA, SetProcessWindowStation,
+};
 use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
@@ -45,6 +49,7 @@ use windows_sys::Win32::System::Threading::{
     ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::CWF_CREATE_ONLY;
 
 use crate::job::JobObject;
 
@@ -800,6 +805,302 @@ impl ActionPipeSecurity {
     }
 }
 
+/// Access an action needs on its own window station.
+///
+/// `WINSTA_ALL_ACCESS` plus `READ_CONTROL`, and deliberately none of `DELETE`, `WRITE_DAC`, or
+/// `WRITE_OWNER`: `CreateProcessAsUser` requires the token's user to have read and write access to
+/// the target station, but an action that could rewrite its own station's DACL could also let
+/// another action in.
+const ACTION_STATION_RIGHTS: u32 = 0x0002_037f;
+
+/// The same shape for the desktop: `DESKTOP_ALL` plus `READ_CONTROL`, without the three standard
+/// rights that would let the action change who may reach it.
+const ACTION_DESKTOP_RIGHTS: u32 = 0x0002_01ff;
+
+/// Serializes the station switch that creating a desktop requires.
+///
+/// `CreateDesktop` can only create on the calling process's *current* window station, so the broker
+/// has to switch, create, and switch back. That is process-wide state, and actions are started in
+/// parallel, so the window has to be held by one action at a time.
+static STATION_SWITCH: Mutex<()> = Mutex::new(());
+
+struct OwnedWindowStation(HWINSTA);
+
+impl Drop for OwnedWindowStation {
+    fn drop(&mut self) {
+        // SAFETY: this handle came from CreateWindowStationW and is closed exactly once. Closing
+        // the station the process is currently using fails; the creator restores its own first.
+        unsafe { CloseWindowStation(self.0) };
+    }
+}
+
+struct OwnedDesktop(HDESK);
+
+impl Drop for OwnedDesktop {
+    fn drop(&mut self) {
+        // SAFETY: this handle came from CreateDesktopW and is closed exactly once. Closing a
+        // desktop still used by a thread of this process fails, and this one never is.
+        unsafe { CloseDesktop(self.0) };
+    }
+}
+
+/// One action's own window station and desktop.
+///
+/// Session 0's service station grants only the service SID and Administrators. The action's token
+/// is restricted, so the access check runs twice, and the restricted list —
+/// `[action_sid, Everyone, Authenticated Users, Users, RESTRICTED]` — matches no entry there. That
+/// is what refuses it: measured on a hosted runner on 2026-09-18, every open failed with
+/// `ERROR_ACCESS_DENIED`, `MAXIMUM_ALLOWED` included, while the objects carried no integrity label
+/// at all. Widening the shared station would hand every restricted action the same access to an
+/// object all of the session's LocalSystem services use; giving each action its own object, named
+/// in its DACL by its own random SID, satisfies both halves of the check and keeps actions apart.
+pub(crate) struct ActionDesktop {
+    lp_desktop: Vec<u16>,
+    _desktop: OwnedDesktop,
+    _station: OwnedWindowStation,
+}
+
+// SAFETY: the two fields are kernel handles, which are process-wide and not bound to the thread
+// that created them. Nothing here caches thread state, and the only operations are the closes in
+// each field's Drop. The station switch that creation needs is process-wide and is serialized by
+// `STATION_SWITCH`, so it never travels with this value.
+unsafe impl Send for ActionDesktop {}
+
+/// Why an action did not get its own station and desktop.
+pub(crate) enum DesktopSetupError {
+    /// This environment will not create them, and the broker's own state is untouched. An
+    /// interactive session refuses `CreateWindowStation` outright, so this is the ordinary case
+    /// outside the service.
+    Unavailable(io::Error),
+    /// The broker is no longer on its own window station. Nothing may be started after this: a
+    /// child would inherit an action's station, the handle to the broker's own is gone, and every
+    /// later action would take the wrong station as the one to restore.
+    BrokerStationLost(io::Error),
+}
+
+impl ActionDesktop {
+    pub(crate) fn create(token: &ActionToken) -> Result<Self, DesktopSetupError> {
+        // A fresh random name plus CWF_CREATE_ONLY: a name another process already holds is a
+        // failure here, never a silent second handle to somebody else's object.
+        let unavailable = DesktopSetupError::Unavailable;
+        let name = format!("sbz-{}", secure_random_hex().map_err(unavailable)?);
+        let sddl = action_object_sddl(token, ACTION_STATION_RIGHTS).map_err(unavailable)?;
+        let desktop_sddl = action_object_sddl(token, ACTION_DESKTOP_RIGHTS).map_err(unavailable)?;
+        let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+
+        let station_descriptor = security_descriptor(&sddl).map_err(unavailable)?;
+        let station_attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: station_descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: the name and the descriptor are live for the call; success transfers one handle.
+        let station = unsafe {
+            CreateWindowStationW(
+                wide_name.as_ptr(),
+                CWF_CREATE_ONLY,
+                ACTION_STATION_RIGHTS | WRITE_DAC | DELETE,
+                &station_attributes,
+            )
+        };
+        if station.is_null() {
+            return Err(unavailable(stage_error("create window station")));
+        }
+        let station = OwnedWindowStation(station);
+
+        let desktop_descriptor = security_descriptor(&desktop_sddl).map_err(unavailable)?;
+        let desktop_attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: desktop_descriptor.0,
+            bInheritHandle: 0,
+        };
+        let desktop = {
+            // A poisoned lock means a previous holder panicked between the switch and the restore,
+            // so this process may already be sitting on somebody else's station. That is the one
+            // failure that must not become a fallback.
+            let _serialized = STATION_SWITCH.lock().map_err(|_| {
+                DesktopSetupError::BrokerStationLost(io::Error::other(
+                    "a previous action left the window station switch unfinished",
+                ))
+            })?;
+            // SAFETY: the current station handle is owned by the process and stays valid.
+            let previous = unsafe { GetProcessWindowStation() };
+            if previous.is_null() {
+                // Without a handle to go back to, switching away would be one-way.
+                return Err(unavailable(stage_error("read the broker window station")));
+            }
+            // SAFETY: the station was just created with a handle that permits the switch.
+            if unsafe { SetProcessWindowStation(station.0) } == 0 {
+                return Err(unavailable(stage_error("switch to the action station")));
+            }
+            // SAFETY: the name and descriptor are live; the process station is the new one.
+            let desktop = unsafe {
+                CreateDesktopW(
+                    wide_name.as_ptr(),
+                    null(),
+                    null(),
+                    0,
+                    ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
+                    &desktop_attributes,
+                )
+            };
+            let created = io::Error::last_os_error();
+            // Restore before anything else can observe this process on the action's station, and
+            // before the station handle is dropped: closing the current station fails.
+            // SAFETY: `previous` is this process's own station handle, still valid.
+            let restored = unsafe { SetProcessWindowStation(previous) };
+            if restored == 0 {
+                // Checked before the desktop result, because a broker left on the wrong station is
+                // the graver of the two and must not be hidden by the failure that came with it.
+                if !desktop.is_null() {
+                    // SAFETY: the desktop was created above and is closed exactly once here.
+                    unsafe { CloseDesktop(desktop) };
+                }
+                return Err(DesktopSetupError::BrokerStationLost(stage_error(
+                    "restore the broker window station",
+                )));
+            }
+            if desktop.is_null() {
+                return Err(unavailable(io::Error::other(format!(
+                    "action desktop: create desktop failed ({created})"
+                ))));
+            }
+            OwnedDesktop(desktop)
+        };
+
+        let lp_desktop: Vec<u16> = format!("{name}\\{name}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        Ok(Self {
+            lp_desktop,
+            _desktop: desktop,
+            _station: station,
+        })
+    }
+
+    /// The `station\desktop` pair, in the form `STARTUPINFO.lpDesktop` takes.
+    pub(crate) fn lp_desktop(&self) -> *mut u16 {
+        self.lp_desktop.as_ptr().cast_mut()
+    }
+
+    /// Creates only the desktop, on whatever station this process is already using.
+    ///
+    /// An interactive user session refuses `CreateWindowStation` outright: measured on a normal
+    /// desktop session, every variant is denied with `ERROR_ACCESS_DENIED`, a null security
+    /// descriptor included, which is the same wall `private_station_unnamed_create_*` records. The
+    /// station half of this design can therefore only be exercised where the broker actually runs,
+    /// under the service in Session 0. The desktop half carries the same descriptor and asks the
+    /// same question of the restricted side, and it can be created here, so that is what the tests
+    /// on a developer machine prove.
+    #[cfg(test)]
+    fn desktop_on_current_station_for_test(
+        token: &ActionToken,
+    ) -> io::Result<(String, OwnedDesktop)> {
+        let name = format!("sbz-{}", secure_random_hex()?);
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let descriptor = security_descriptor(&action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?)?;
+
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: the name and the descriptor are live for the call.
+        let desktop = unsafe {
+            CreateDesktopW(
+                wide.as_ptr(),
+                null(),
+                null(),
+                0,
+                ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
+                &attributes,
+            )
+        };
+        if desktop.is_null() {
+            return Err(stage_error("create desktop on the current station"));
+        }
+        Ok((name, OwnedDesktop(desktop)))
+    }
+}
+
+/// The descriptor both per-action user objects carry: the broker may manage it, this one action
+/// may use it, and nobody else is named at all.
+///
+/// Naming the action's own random SID is the point. The token is restricted, so the access check
+/// runs against the restricted list as well, and that list holds only
+/// `[action_sid, Everyone, Authenticated Users, Users, RESTRICTED]`. An entry for the action SID is
+/// the one way to satisfy that half without also admitting every other restricted action.
+fn action_object_sddl(token: &ActionToken, rights: u32) -> io::Result<String> {
+    let broker = sid_string(token.broker_sid())?;
+    Ok(format!(
+        "O:{broker}D:P(A;;GA;;;{broker})(A;;0x{rights:08x};;;{})",
+        sid_string(token.action_sid.0)?
+    ))
+}
+
+/// Builds the action's own station and desktop, or reports once why this environment cannot.
+///
+/// Creating a window station is refused outside the service: on an ordinary desktop session every
+/// variant is denied, a null descriptor included. Failing the action there would break every
+/// developer run and every gate that starts a worker as a user, so the child inherits the broker's
+/// station instead — exactly today's behaviour, no wider. Under the service, where the station can
+/// be created, the action gets its own. A fallback is reported once per process, because in Session
+/// 0 it means the machine is back on the arrangement that produces `0xC0000142`.
+fn action_desktop_or_inherit(token: &ActionToken) -> io::Result<Option<ActionDesktop>> {
+    inherit_decision(ActionDesktop::create(token))
+}
+
+/// Separates the two failures: one is an environment that cannot give the action its own objects,
+/// the other is a broker that can no longer be trusted to start anything at all.
+fn inherit_decision(
+    result: Result<ActionDesktop, DesktopSetupError>,
+) -> io::Result<Option<ActionDesktop>> {
+    static REPORTED: std::sync::Once = std::sync::Once::new();
+    match result {
+        Ok(desktop) => Ok(Some(desktop)),
+        Err(DesktopSetupError::Unavailable(error)) => {
+            REPORTED.call_once(|| {
+                eprintln!(
+                    "sembazuru-worker: per-action window station unavailable ({error}); \
+                     actions inherit the broker's station"
+                );
+            });
+            Ok(None)
+        }
+        // Nothing may be started from a broker that is no longer on its own station.
+        Err(DesktopSetupError::BrokerStationLost(error)) => Err(error),
+    }
+}
+
+/// Names which step of the per-action station setup failed, keeping the operating system's own
+/// error attached. Without the stage, every failure here reads as one indistinguishable denial.
+fn stage_error(stage: &str) -> io::Error {
+    io::Error::other(format!(
+        "action desktop: {stage} failed ({})",
+        io::Error::last_os_error()
+    ))
+}
+
+/// Converts one SDDL string into a descriptor whose allocation is freed on drop.
+fn security_descriptor(sddl: &str) -> io::Result<LocalAllocation> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = null_mut();
+    // SAFETY: the SDDL is NUL-terminated and descriptor is a valid out pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(LocalAllocation(descriptor))
+}
+
 fn create_secured_directory(path: &Path, sddl: &str) -> io::Result<()> {
     let wide_sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
     let mut descriptor = null_mut();
@@ -1145,9 +1446,19 @@ enum SpawnFailure {
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum TestJobProfile {
+enum TestCreationProfile {
     Production,
-    DesktopRelaxed,
+    NoWindow,
+}
+
+#[cfg(test)]
+impl TestCreationProfile {
+    fn creation_flags(self, production: u32) -> u32 {
+        match self {
+            Self::Production => production,
+            Self::NoWindow => production | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+        }
+    }
 }
 
 struct SuspendedGuardian(Option<OwnedHandle>);
@@ -1175,6 +1486,9 @@ pub(crate) struct RestrictedProcess {
     stdout: Option<OwnedHandle>,
     stderr: Option<OwnedHandle>,
     job: Arc<JobObject>,
+    /// Kept alive for the process's lifetime: a window station and desktop exist only while a
+    /// handle or a process references them, and the action's process is that reference.
+    _desktop: Option<ActionDesktop>,
 }
 
 impl RestrictedProcess {
@@ -1193,42 +1507,34 @@ impl RestrictedProcess {
             #[cfg(test)]
             None,
             #[cfg(test)]
-            TestJobProfile::Production,
+            TestCreationProfile::Production,
+            #[cfg(test)]
+            None,
             handles,
         )
     }
 
     #[cfg(test)]
-    fn spawn_without_desktop_limit_for_test(
+    fn spawn_for_session0_diagnostic(
         token: &ActionToken,
         command: &RestrictedCommand,
+        profile: TestCreationProfile,
+        creation_flags: &mut u32,
     ) -> io::Result<Self> {
-        Self::spawn_inner(token, command, None, TestJobProfile::DesktopRelaxed, &[])
+        *creation_flags = 0;
+        Self::spawn_inner(token, command, None, profile, Some(creation_flags), &[])
     }
 
     fn spawn_inner(
         token: &ActionToken,
         command: &RestrictedCommand,
         #[cfg(test)] failure: Option<SpawnFailure>,
-        #[cfg(test)] job_profile: TestJobProfile,
+        #[cfg(test)] creation_profile: TestCreationProfile,
+        #[cfg(test)] observed_creation_flags: Option<&mut u32>,
         inherited_handles: &[HANDLE],
     ) -> io::Result<Self> {
         let mut prepared = prepare_command(command)?;
-        let job = Arc::new({
-            #[cfg(test)]
-            {
-                match job_profile {
-                    TestJobProfile::Production => JobObject::new_kill_on_close()?,
-                    TestJobProfile::DesktopRelaxed => {
-                        JobObject::new_kill_on_close_without_desktop_limit_for_test()?
-                    }
-                }
-            }
-            #[cfg(not(test))]
-            {
-                JobObject::new_kill_on_close()?
-            }
-        });
+        let job = Arc::new(JobObject::new_kill_on_close()?);
         let (stdin, stdin_parent) = stdio_pipe(true)?;
         let (stdout, stdout_parent) = stdio_pipe(false)?;
         let (stderr, stderr_parent) = stdio_pipe(false)?;
@@ -1246,11 +1552,38 @@ impl RestrictedProcess {
         startup.StartupInfo.hStdInput = inherited[0];
         startup.StartupInfo.hStdOutput = inherited[1];
         startup.StartupInfo.hStdError = inherited[2];
+        // The action's own station and desktop, when this environment allows them. A null
+        // `lpDesktop` means the child inherits the broker's, which is what happens today and what
+        // fails under the service in Session 0.
+        let desktop = action_desktop_or_inherit(token)?;
+        startup.StartupInfo.lpDesktop = desktop
+            .as_ref()
+            .map_or(null_mut(), ActionDesktop::lp_desktop);
         startup.lpAttributeList = attributes.ptr();
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+        let creation_flags =
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        #[cfg(test)]
+        let creation_flags = creation_profile.creation_flags(creation_flags);
+        #[cfg(test)]
+        if let Some(observed) = observed_creation_flags {
+            *observed = creation_flags;
+        }
+        // A null `lpDesktop` means the child takes whichever station this process is on at the
+        // moment of the call, so an inheriting start must not overlap another action's switch.
+        // With an explicit per-action desktop there is nothing to race against.
+        let _inheriting = if desktop.is_none() {
+            Some(
+                STATION_SWITCH
+                    .lock()
+                    .map_err(|_| io::Error::other("the window station switch is unfinished"))?,
+            )
+        } else {
+            None
+        };
         // SAFETY: all UTF-16 buffers are NUL-terminated and live; command_line is mutable;
         // only the three inheritable stdio handles in the attribute list can cross the boundary.
-        if unsafe {
+        let started = unsafe {
             CreateProcessAsUserW(
                 token.handle(),
                 prepared.application.as_ptr(),
@@ -1258,14 +1591,15 @@ impl RestrictedProcess {
                 null(),
                 null(),
                 1,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                creation_flags,
                 prepared.environment.as_ptr().cast(),
                 prepared.cwd.as_ptr(),
                 &startup.StartupInfo,
                 &mut info,
             )
-        } == 0
-        {
+        };
+        drop(_inheriting);
+        if started == 0 {
             return Err(io::Error::other(format!(
                 "create_process: OS error {}",
                 io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -1321,6 +1655,7 @@ impl RestrictedProcess {
             stdout: Some(stdout_parent),
             stderr: Some(stderr_parent),
             job,
+            _desktop: desktop,
         })
     }
 
@@ -1477,26 +1812,34 @@ mod tests {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetUserObjectSecurity,
-        ImpersonateLoggedOnUser, LookupPrivilegeValueW, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, RevertToSelf, SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED,
-        SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
-        TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenGroups,
-        TokenIsAppContainer, TokenPrivileges, TokenRestrictedSids, TokenSessionId, TokenUser,
-        WinCreatorOwnerRightsSid,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl,
+        GetUserObjectSecurity, ImpersonateLoggedOnUser, LABEL_SECURITY_INFORMATION,
+        LookupPrivilegeValueW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, RevertToSelf,
+        SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
+        SYSTEM_MANDATORY_LABEL_ACE, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
+        TOKEN_MANDATORY_POLICY, TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid,
+        TokenCapabilities, TokenGroups, TokenIsAppContainer, TokenMandatoryPolicy, TokenPrivileges,
+        TokenRestrictedSids, TokenSessionId, TokenUser, WinCreatorOwnerRightsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
-    use windows_sys::Win32::System::JobObjects::{IsProcessInJob, JOB_OBJECT_UILIMIT_HANDLES};
-    use windows_sys::Win32::System::StationsAndDesktops::{
-        CloseDesktop, CloseWindowStation, CreateWindowStationW, GetProcessWindowStation,
-        GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW, OpenWindowStationW,
-        SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
+        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
+        JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     };
-    use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseDesktop, CloseWindowStation, CreateWindowStationW, DESKTOP_READOBJECTS,
+        GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW,
+        OpenWindowStationW, SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    };
     use windows_sys::Win32::System::Threading::{
         CreateEventW, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
     };
@@ -1514,9 +1857,9 @@ mod tests {
     const WINDOW_STATION_SCM_SMOKE_SERVICE: &str = "SembazuruWindowStationProbeSmoke";
     const WINDOW_STATION_SCM_SMOKE_SELECTOR: &str =
         "sandbox::tests::window_station_scm_dispatcher_smoke_role";
-    const WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL: u32 = 0x5342_5a31;
-    const WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT: u32 = 0x5342_5a32;
-    const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5a33;
+    const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL: u32 = 0x5342_5b31;
+    const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT: u32 = 0x5342_5b32;
+    const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5b33;
     const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
     const WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE: u32 = 0x5342_5afe;
 
@@ -1528,22 +1871,22 @@ mod tests {
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
-    const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4432;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 3;
+    const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 5;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
     enum Session0DiagnosticOutcome {
-        DesktopCausal = 1,
-        DesktopNotSufficient = 2,
+        NoWindowCausal = 1,
+        NoWindowNotSufficient = 2,
         Indeterminate = 3,
     }
 
     impl Session0DiagnosticOutcome {
         fn decode(value: u8) -> Result<Self, String> {
             match value {
-                1 => Ok(Self::DesktopCausal),
-                2 => Ok(Self::DesktopNotSufficient),
+                1 => Ok(Self::NoWindowCausal),
+                2 => Ok(Self::NoWindowNotSufficient),
                 3 => Ok(Self::Indeterminate),
                 _ => Err("diagnostic classification".into()),
             }
@@ -1551,8 +1894,8 @@ mod tests {
 
         fn service_magic(self) -> u32 {
             match self {
-                Self::DesktopCausal => WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
-                Self::DesktopNotSufficient => WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT,
+                Self::NoWindowCausal => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL,
+                Self::NoWindowNotSufficient => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT,
                 Self::Indeterminate => WINDOW_STATION_SCM_SMOKE_INDETERMINATE,
             }
         }
@@ -1561,18 +1904,18 @@ mod tests {
     fn classify_session0_diagnostic_ab(
         baseline_spawn_succeeded: bool,
         baseline_exit: Option<u32>,
-        desktop_relaxed_spawn_succeeded: bool,
-        desktop_relaxed_exit: Option<u32>,
+        no_window_spawn_succeeded: bool,
+        no_window_exit: Option<u32>,
     ) -> Session0DiagnosticOutcome {
         if !baseline_spawn_succeeded || baseline_exit != Some(0xc000_0142) {
             return Session0DiagnosticOutcome::Indeterminate;
         }
-        if !desktop_relaxed_spawn_succeeded {
+        if !no_window_spawn_succeeded {
             return Session0DiagnosticOutcome::Indeterminate;
         }
-        match desktop_relaxed_exit {
-            Some(0) => Session0DiagnosticOutcome::DesktopCausal,
-            Some(0xc000_0142) => Session0DiagnosticOutcome::DesktopNotSufficient,
+        match no_window_exit {
+            Some(0) => Session0DiagnosticOutcome::NoWindowCausal,
+            Some(0xc000_0142) => Session0DiagnosticOutcome::NoWindowNotSufficient,
             _ => Session0DiagnosticOutcome::Indeterminate,
         }
     }
@@ -1647,7 +1990,7 @@ mod tests {
     #[test]
     fn window_station_scm_contract_rejects_aliases_and_extra_arguments() {
         assert_ne!(
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL,
             WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE
         );
         let valid_process: Vec<OsString> = [
@@ -1729,53 +2072,619 @@ mod tests {
         }
     }
 
+    fn diagnostic_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn diagnostic_properties(record: &Session0DiagnosticRecord) -> String {
+        let mut fields = vec![
+            diagnostic_hex(record.nonce.as_bytes()),
+            record.markers.to_string(),
+            (record.classification as u8).to_string(),
+            record.session_id.to_string(),
+        ];
+        for text in [
+            &record.broker,
+            &record.action,
+            &record.station,
+            &record.desktop,
+            &record.station_dacl,
+            &record.station_sacl,
+            &record.desktop_dacl,
+            &record.desktop_sacl,
+            &record.station_access,
+            &record.desktop_access,
+            &record.ui_probe,
+            &record.cwd,
+            &record.environment_hash,
+        ] {
+            fields.push(diagnostic_hex(text.as_bytes()));
+        }
+        for run in [&record.baseline, &record.no_window] {
+            fields.extend([
+                run.job_ui_restrictions.to_string(),
+                diagnostic_hex(run.job_ui_limits.as_bytes()),
+                run.creation_flags.to_string(),
+                if run.spawn_succeeded { "True" } else { "False" }.into(),
+                diagnostic_hex(run.spawn_error.as_bytes()),
+                run.child_exit
+                    .map_or_else(|| "none".into(), |value| value.to_string()),
+                diagnostic_hex(run.stdout.as_bytes()),
+                diagnostic_hex(run.stderr.as_bytes()),
+            ]);
+        }
+        fields.join("\t")
+    }
+
+    struct Session0DiagnosticCase {
+        name: &'static str,
+        bytes: Vec<u8>,
+        nonce: String,
+        expected: Option<Session0DiagnosticRecord>,
+    }
+
+    fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
+        let record = Session0DiagnosticRecord::fixture();
+        let bytes = record.encode().unwrap();
+        let mut cases = Vec::new();
+        let mut accept = |name, record: Session0DiagnosticRecord| {
+            cases.push(Session0DiagnosticCase {
+                name,
+                bytes: record.encode().unwrap(),
+                nonce: record.nonce.clone(),
+                expected: Some(record),
+            });
+        };
+        accept("v5", record.clone());
+        let mut not_sufficient = record.clone();
+        not_sufficient.no_window.child_exit = Some(0xc000_0142);
+        not_sufficient.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
+        accept("no-window-not-sufficient", not_sufficient);
+        let mut partial = record.clone();
+        partial.markers = Session0DiagnosticRecord::ENTRY;
+        partial.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("partial", partial);
+        let mut outside_session0 = record.clone();
+        outside_session0.session_id = 1;
+        outside_session0.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("nonzero-session", outside_session0);
+        let mut failed = record.clone();
+        failed.no_window = Session0DiagnosticRun::empty();
+        failed.no_window.spawn_error = "unobserved".into();
+        failed.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("spawn-failed-unobserved", failed);
+        let mut bounded = record.clone();
+        bounded.broker = "b".repeat(32768);
+        let remaining =
+            Session0DiagnosticRecord::MAX_BYTES - (bounded.encode().unwrap().len() - 44);
+        bounded.action.push_str(&"a".repeat(remaining));
+        accept("payload-65536", bounded);
+
+        let mut reject = |name, bytes| {
+            cases.push(Session0DiagnosticCase {
+                name,
+                bytes,
+                nonce: record.nonce.clone(),
+                expected: None,
+            });
+        };
+        let u32_patch = |offset: usize, value: u32| {
+            let mut changed = bytes.clone();
+            changed[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            changed
+        };
+        reject("old-magic", u32_patch(0, 0x5342_4432));
+        reject("old-version", u32_patch(4, 3));
+        let mut nonce = bytes.clone();
+        nonce[8] = b'1';
+        reject("nonce-mismatch", nonce);
+        let mut nonhex = bytes.clone();
+        nonhex[8] = b'g';
+        reject("nonce-nonhex", nonhex);
+        let mut truncated = bytes[..bytes.len() - 1].to_vec();
+        let truncated_length = (truncated.len() - 44) as u32;
+        truncated[40..44].copy_from_slice(&truncated_length.to_le_bytes());
+        reject("truncated", truncated);
+        reject("payload-length", u32_patch(40, (bytes.len() - 43) as u32));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let trailing_length = (trailing.len() - 44) as u32;
+        trailing[40..44].copy_from_slice(&trailing_length.to_le_bytes());
+        reject("trailing", trailing);
+        let mut invalid_utf8 = bytes.clone();
+        invalid_utf8[54] = 0xff;
+        reject("invalid-utf8", invalid_utf8);
+        let mut baseline_offset = 50;
+        for _ in 0..13 {
+            let length = u32::from_le_bytes(
+                bytes[baseline_offset..baseline_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            baseline_offset += 4 + length as usize;
+        }
+        // The baseline run is the UI mask, the names of that mask, the creation flags, and then
+        // the spawn-succeeded flag; the names are variable length, so the rest is measured here.
+        let baseline_names_offset = baseline_offset + 4;
+        let baseline_names_length = u32::from_le_bytes(
+            bytes[baseline_names_offset..baseline_names_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let baseline_flags_offset = baseline_names_offset + 4 + baseline_names_length;
+        let mut invalid_bool = bytes.clone();
+        invalid_bool[baseline_flags_offset + 4] = 2;
+        reject("invalid-bool", invalid_bool);
+        let mut renamed_job_ui = bytes.clone();
+        renamed_job_ui[baseline_names_offset + 4] = b'X';
+        reject("job-ui-limit-names", renamed_job_ui);
+        let mut unknown_marker = bytes.clone();
+        unknown_marker[44] |= 8;
+        reject("unknown-marker", unknown_marker);
+        let mut missing_entry = bytes.clone();
+        missing_entry[44] &= !Session0DiagnosticRecord::ENTRY;
+        reject("missing-entry", missing_entry);
+        let mut unknown_classification = bytes.clone();
+        unknown_classification[45] = 4;
+        reject("unknown-classification", unknown_classification);
+        let mut false_classification = bytes.clone();
+        false_classification[45] = 2;
+        reject("false-classification", false_classification);
+        let mut partial_causal = bytes.clone();
+        partial_causal[44] = Session0DiagnosticRecord::ENTRY;
+        reject("partial-causal", partial_causal);
+        reject("nonzero-session-causal", u32_patch(46, 1));
+        reject(
+            "extra-creation-bit",
+            u32_patch(baseline_flags_offset, 0x0008_0405),
+        );
+        let mut relaxed_job_ui = u32_patch(baseline_offset, 0xbe);
+        let relaxed_names = describe_job_ui_limits(0xbe);
+        // Every name is fixed width, so the record stays internally consistent and the rejection
+        // still has to come from the A/B Job UI constraint rather than from the names check.
+        assert_eq!(relaxed_names.len(), baseline_names_length);
+        relaxed_job_ui
+            [baseline_names_offset + 4..baseline_names_offset + 4 + baseline_names_length]
+            .copy_from_slice(relaxed_names.as_bytes());
+        reject("relaxed-job-ui", relaxed_job_ui);
+        let mut invalid_hash = bytes.clone();
+        invalid_hash[baseline_offset - 64] = b'g';
+        reject("environment-hash-nonhex", invalid_hash);
+        cases
+            .iter_mut()
+            .find(|case| case.name == "nonce-nonhex")
+            .unwrap()
+            .nonce = "g123456789abcdef0123456789abcdef".into();
+        let mut oversized = cases
+            .iter()
+            .find(|case| case.name == "payload-65536")
+            .unwrap()
+            .bytes
+            .clone();
+        let action_offset = 54 + 32768;
+        let action_length = u32::from_le_bytes(
+            oversized[action_offset..action_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        oversized.insert(action_offset + 4, b'a');
+        oversized[action_offset..action_offset + 4]
+            .copy_from_slice(&(action_length + 1).to_le_bytes());
+        oversized[40..44].copy_from_slice(&65537u32.to_le_bytes());
+        cases.push(Session0DiagnosticCase {
+            name: "payload-65537",
+            bytes: oversized,
+            nonce: record.nonce.clone(),
+            expected: None,
+        });
+        cases
+    }
+
     #[test]
     fn session0_diagnostic_record_codec_rejects_tampering() {
-        let record = Session0DiagnosticRecord::fixture();
-        let bytes = record.encode().expect("diagnostic record encode");
-        assert_eq!(
-            Session0DiagnosticRecord::decode(&bytes, &record.nonce).expect("diagnostic decode"),
-            record
-        );
-        for malformed in [
-            Vec::new(),
-            bytes[..bytes.len() - 1].to_vec(),
-            {
-                let mut value = bytes.clone();
-                value[0] ^= 1;
-                value
-            },
-            {
-                let mut value = bytes.clone();
-                value.extend_from_slice(&[0]);
-                value
-            },
-        ] {
-            assert!(Session0DiagnosticRecord::decode(&malformed, &record.nonce).is_err());
+        for case in session0_diagnostic_corpus() {
+            let decoded = Session0DiagnosticRecord::decode(&case.bytes, &case.nonce);
+            match case.expected {
+                Some(expected) => assert_eq!(decoded.unwrap(), expected, "{}", case.name),
+                None => assert!(decoded.is_err(), "accepted {}", case.name),
+            }
         }
-        assert!(Session0DiagnosticRecord::decode(&bytes, "0").is_err());
-        let mut inconsistent = record;
-        inconsistent.classification = Session0DiagnosticOutcome::DesktopNotSufficient;
+        let mut inconsistent = Session0DiagnosticRecord::fixture();
+        inconsistent.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
         assert!(inconsistent.encode().is_err());
+    }
+
+    #[test]
+    fn session0_diagnostic_creation_flags_differ_only_by_no_window() {
+        let production =
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        let baseline = TestCreationProfile::Production.creation_flags(production);
+        let no_window = TestCreationProfile::NoWindow.creation_flags(production);
+        assert_eq!(baseline, 0x0008_0404);
+        assert_eq!(no_window, 0x0808_0404);
+        assert_eq!(
+            baseline ^ no_window,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+        );
+    }
+
+    #[test]
+    fn session0_diagnostic_record_matches_powershell_contract() {
+        use std::process::{Command, Stdio};
+
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromHexString([Console]::In.ReadLine()))
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Probe PowerShell syntax error.' }
+foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+    $definitions = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+    }, $true))
+    if ($definitions.Count -ne 1) { throw "Expected one parser function: $name" }
+    . ([ScriptBlock]::Create($definitions[0].Extent.Text))
+}
+$count = 0
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $parts = $line.Split("`t", 5)
+    $bytes = [Convert]::FromHexString($parts[2])
+    $record = $null
+    $rejected = $false
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] }
+    catch { $rejected = $true }
+    if ($parts[3] -ceq 'reject') {
+        if (-not $rejected) { throw "Accepted malformed case $($parts[0])" }
+    } else {
+        if ($rejected -or $null -eq $record) { throw "Rejected valid case $($parts[0])" }
+        if (@($record.PSObject.Properties).Count -ne 19) { throw 'Record property count mismatch.' }
+        $values = [Collections.Generic.List[string]]::new()
+        $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
+        foreach ($property in @('Markers', 'Classification', 'SessionId')) { $values.Add([string]$record.$property) }
+        foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'Cwd', 'EnvironmentHash')) {
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
+        }
+        foreach ($run in @($record.Baseline, $record.NoWindow)) {
+            if (@($run.PSObject.Properties).Count -ne 8) { throw 'Run property count mismatch.' }
+            $values.Add([string]$run.JobUi)
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.JobUiLimits)).ToLowerInvariant())
+            foreach ($property in @('CreationFlags', 'SpawnSucceeded')) { $values.Add([string]$run.$property) }
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.SpawnError)).ToLowerInvariant())
+            $values.Add($(if ($null -eq $run.ChildExit) { 'none' } else { [string]$run.ChildExit }))
+            foreach ($property in @('Stdout', 'Stderr')) {
+                $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.$property)).ToLowerInvariant())
+            }
+        }
+        if (($values -join "`t") -cne $parts[4]) { throw "Property mismatch: $($parts[0])" }
+    }
+    $count++
+}
+[Console]::WriteLine("PASS $count")
+"#;
+        let cases = session0_diagnostic_corpus();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hooks/test/m6_worker_window_station_probe.ps1");
+        let mut input = format!("{}\n", diagnostic_hex(path.to_str().unwrap().as_bytes()));
+        for case in &cases {
+            let expected = case.expected.as_ref().map(diagnostic_properties);
+            input.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                case.name,
+                case.nonce,
+                diagnostic_hex(&case.bytes),
+                if expected.is_some() {
+                    "accept"
+                } else {
+                    "reject"
+                },
+                expected.unwrap_or_default(),
+            ));
+        }
+        let mut child = Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pwsh is required for the record contract");
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child
+            .wait_with_output()
+            .expect("PowerShell contract process wait");
+        let written = writer.join().expect("PowerShell input writer");
+        assert!(
+            output.status.success(),
+            "PowerShell contract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        written.expect("PowerShell corpus input");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("PASS {}", cases.len())
+        );
+    }
+
+    /// Opens a named desktop on this process's current station under one action token, the way a
+    /// started action's own access check would run against it.
+    fn action_desktop_open(token: &ActionToken, desktop: &str, mask: u32) -> Result<bool, u32> {
+        let wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
+        token
+            .impersonated(|| {
+                // SAFETY: the name is NUL-terminated and live for the call.
+                let handle = unsafe { OpenDesktopW(wide.as_ptr(), 0, 0, mask) };
+                if handle.is_null() {
+                    // SAFETY: GetLastError is read immediately after the failing open.
+                    return Ok(Err(unsafe { GetLastError() }));
+                }
+                // SAFETY: OpenDesktopW returned this owned user-object handle.
+                unsafe { CloseDesktop(handle) };
+                Ok(Ok(true))
+            })
+            .expect("impersonation is available to the broker")
+    }
+
+    #[test]
+    fn a_broker_left_on_the_wrong_station_stops_the_action() {
+        // An environment that simply will not create the objects is ordinary: the action runs the
+        // way it does today. A broker that failed to switch back is not: its next child would
+        // inherit an action's station, and every later action would take that as the one to
+        // restore. The two must not collapse into the same fallback.
+        let fallback = inherit_decision(Err(DesktopSetupError::Unavailable(io::Error::other(
+            "this session will not create a window station",
+        ))))
+        .expect("an unavailable station is not fatal");
+        assert!(fallback.is_none(), "the action inherits instead");
+
+        let fatal = inherit_decision(Err(DesktopSetupError::BrokerStationLost(io::Error::other(
+            "restore the broker window station failed",
+        ))))
+        .map(|_| ())
+        .expect_err("a lost broker station must stop the action");
+        assert!(fatal.to_string().contains("restore"), "{fatal}");
+    }
+
+    #[test]
+    fn a_per_action_user_object_admits_its_own_action_and_refuses_another() {
+        // This is the mechanism behind the Session 0 failure, measured directly. Both tokens are
+        // restricted, so every access check runs twice, and both carry the same broker user on the
+        // normal side. The only thing separating them is the restricted side: the descriptor names
+        // one action's random SID and not the other's. The service station fails exactly there —
+        // it names neither (docs/verification/2026-09-18-session0-label-and-restricted-sids.md).
+        let mine = ActionToken::create().expect("action token");
+        let theirs = ActionToken::create().expect("a second action token");
+        let (name, _desktop) = ActionDesktop::desktop_on_current_station_for_test(&mine)
+            .expect("a desktop can be created on the current station");
+
+        assert_eq!(
+            action_desktop_open(&mine, &name, ACTION_DESKTOP_RIGHTS),
+            Ok(true),
+            "the owning action must reach its own desktop"
+        );
+        match action_desktop_open(&theirs, &name, ACTION_DESKTOP_RIGHTS) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("another action reached this desktop: {other:?}"),
+        }
+        // Even the weakest possible request is refused: the other action has no entry at all, so
+        // there is no narrower mask that would have let it in.
+        match action_desktop_open(&theirs, &name, MAXIMUM_ALLOWED) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("another action was granted something: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_per_action_user_object_names_only_the_broker_and_that_action() {
+        let token = ActionToken::create().expect("action token");
+        let (_name, desktop) = ActionDesktop::desktop_on_current_station_for_test(&token)
+            .expect("a desktop can be created on the current station");
+        let broker = sid_string(token.broker_sid()).expect("broker sid");
+        let action = sid_string(token.action_sid.0).expect("action sid");
+
+        let dacl = diagnostic_user_object_dacl(desktop.0);
+        assert!(
+            dacl.contains(&format!("sid={broker}")),
+            "the broker has to stay able to manage the object: {dacl}"
+        );
+        assert!(
+            dacl.contains(&format!("mask=0x{ACTION_DESKTOP_RIGHTS:08x};sid={action}")),
+            "the action needs exactly its own rights: {dacl}"
+        );
+        // Everyone, Authenticated Users, Users and RESTRICTED are in every action's restricted
+        // list, so an entry for any of them would open this object to all actions at once.
+        for forbidden in [
+            "S-1-1-0",
+            "S-1-5-11",
+            "S-1-5-32-545",
+            "S-1-5-12",
+            "S-1-5-32-544",
+        ] {
+            assert!(
+                !dacl.contains(&format!("sid={forbidden}")),
+                "{forbidden} must not be an allow entry: {dacl}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_action_descriptor_withholds_the_rights_that_would_reopen_it() {
+        let token = ActionToken::create().expect("action token");
+        for rights in [ACTION_STATION_RIGHTS, ACTION_DESKTOP_RIGHTS] {
+            // An action that could rewrite its own object's descriptor could also let another
+            // action in, which is the one thing this design buys.
+            assert_eq!(
+                rights & (DELETE | WRITE_DAC | WRITE_OWNER),
+                0,
+                "{rights:#x}"
+            );
+            assert_ne!(rights & READ_CONTROL, 0, "{rights:#x}");
+            let sddl = action_object_sddl(&token, rights).expect("the descriptor is expressible");
+            assert!(security_descriptor(&sddl).is_ok(), "{sddl}");
+            assert!(
+                sddl.contains("D:P"),
+                "inherited entries must not apply: {sddl}"
+            );
+        }
+    }
+
+    /// Records that an interactive session cannot create a window station. Run it under the
+    /// service in Session 0, where the product needs the same call to succeed.
+    #[test]
+    #[ignore = "environment probe; meaningful only under the service in Session 0"]
+    fn probe_window_station_creation_variants() {
+        let token = ActionToken::create().expect("action token");
+        let broker_only = format!(
+            "D:P(A;;GA;;;{})",
+            sid_string(token.broker_sid()).expect("broker sid")
+        );
+        let with_action = action_object_sddl(&token, ACTION_STATION_RIGHTS).expect("sddl");
+        for (label, sddl, access) in [
+            ("null sd, all access", None, 0x0000_037fu32),
+            ("null sd, maximum allowed", None, MAXIMUM_ALLOWED),
+            (
+                "broker only, all access",
+                Some(broker_only.clone()),
+                0x0000_037f,
+            ),
+            ("broker only, +standard", Some(broker_only), 0x0006_037f),
+            (
+                "with action, all access",
+                Some(with_action.clone()),
+                0x0000_037f,
+            ),
+            ("with action, +standard", Some(with_action), 0x0006_037f),
+        ] {
+            let name = format!("sbz-probe-{}", secure_random_hex().expect("nonce"));
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let descriptor = sddl
+                .as_deref()
+                .map(|text| security_descriptor(text).expect("the probe's own SDDL parses"));
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor
+                    .as_ref()
+                    .map_or(null_mut(), |allocation| allocation.0),
+                bInheritHandle: 0,
+            };
+            // SAFETY: the name and any descriptor are live for the call.
+            let handle = unsafe {
+                CreateWindowStationW(
+                    wide.as_ptr(),
+                    CWF_CREATE_ONLY,
+                    access,
+                    if descriptor.is_some() {
+                        &attributes
+                    } else {
+                        null()
+                    },
+                )
+            };
+            if handle.is_null() {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                println!("{label}: DENIED gle={}", unsafe { GetLastError() });
+            } else {
+                println!("{label}: created");
+                // SAFETY: the call returned an owned handle, closed once here.
+                unsafe { CloseWindowStation(handle) };
+            }
+        }
+    }
+
+    #[test]
+    fn session0_diagnostic_job_ui_limit_names_cover_every_documented_bit() {
+        assert_eq!(
+            describe_job_ui_limits(0x0000_00fe),
+            "handles=0;readclipboard=1;writeclipboard=1;systemparameters=1;displaysettings=1;\
+globalatoms=1;desktop=1;exitwindows=1;unknown=0x00000000"
+        );
+        assert_eq!(
+            describe_job_ui_limits(0),
+            "handles=0;readclipboard=0;writeclipboard=0;systemparameters=0;displaysettings=0;\
+globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
+        );
+        assert!(describe_job_ui_limits(0x0000_00ff).starts_with("handles=1;"));
+        // A bit outside the documented set stays visible instead of being dropped silently.
+        assert!(describe_job_ui_limits(0x0000_01fe).ends_with("unknown=0x00000100"));
+    }
+
+    #[test]
+    fn session0_diagnostic_user_object_label_describes_the_current_station() {
+        // SAFETY: the process window station handle is owned by this process and stays valid.
+        let label = diagnostic_user_object_label(unsafe { GetProcessWindowStation() });
+        println!("station label: {label}");
+        assert!(
+            label.starts_with("unavailable:gle=")
+                || label
+                    == format!("label=absent;implied_integrity={SECURITY_MANDATORY_MEDIUM_RID}")
+                || (label.starts_with("label_aces=[") && label.ends_with(']')),
+            "unexpected label shape: {label}"
+        );
+    }
+
+    #[test]
+    fn session0_diagnostic_ui_probe_names_its_first_refusal() {
+        let token = ActionToken::create().expect("action token");
+        // SAFETY: both user-object handles are owned by this process for its lifetime.
+        let (station, desktop) = unsafe {
+            (
+                GetProcessWindowStation(),
+                GetThreadDesktop(GetCurrentThreadId()),
+            )
+        };
+        let station = user_object_identity(station)
+            .map(|(_, name)| name)
+            .expect("station name");
+        let desktop = user_object_identity(desktop)
+            .map(|(_, name)| name)
+            .expect("desktop name");
+        let probe = diagnostic_ui_probe(&token, &station, &desktop);
+        println!("ui probe: {probe}");
+        if probe.starts_with("unavailable:gle=") {
+            return;
+        }
+        let (head, tail) = probe.split_once(";steps=[").expect("probe steps");
+        let steps: Vec<&str> = tail.trim_end_matches(']').split(',').collect();
+        assert_eq!(steps.len(), 6, "probe steps: {probe}");
+        let reported = head
+            .split_once("first_failure=")
+            .expect("probe first failure")
+            .1;
+        // The named failure has to be the first refused step, not any later one.
+        match steps.iter().find(|step| step.contains(";allowed=false;")) {
+            Some(step) => {
+                let name = step.split_once(":mask=").expect("step name").0;
+                let error = step.rsplit_once("gle=").expect("step error").1;
+                assert_eq!(reported, format!("{name};gle={error}"));
+            }
+            None => assert_eq!(reported, "none"),
+        }
     }
 
     #[test]
     fn session0_diagnostic_maps_only_the_ab_outcomes_to_service_magics() {
         assert_eq!(
-            Session0DiagnosticOutcome::DesktopCausal.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL
+            Session0DiagnosticOutcome::NoWindowCausal.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL
         );
         assert_eq!(
-            Session0DiagnosticOutcome::DesktopNotSufficient.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT
+            Session0DiagnosticOutcome::NoWindowNotSufficient.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT
         );
         assert_eq!(
             Session0DiagnosticOutcome::Indeterminate.service_magic(),
             WINDOW_STATION_SCM_SMOKE_INDETERMINATE
         );
         for outcome in [
-            Session0DiagnosticOutcome::DesktopCausal,
-            Session0DiagnosticOutcome::DesktopNotSufficient,
+            Session0DiagnosticOutcome::NoWindowCausal,
+            Session0DiagnosticOutcome::NoWindowNotSufficient,
             Session0DiagnosticOutcome::Indeterminate,
         ] {
             assert_eq!(
@@ -1790,11 +2699,11 @@ mod tests {
     fn session0_diagnostic_ab_classifier_requires_the_baseline_signature() {
         assert_eq!(
             classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0)),
-            Session0DiagnosticOutcome::DesktopCausal
+            Session0DiagnosticOutcome::NoWindowCausal
         );
         assert_eq!(
             classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0xc000_0142)),
-            Session0DiagnosticOutcome::DesktopNotSufficient
+            Session0DiagnosticOutcome::NoWindowNotSufficient
         );
         for variant in [None, Some(1), Some(0xc000_0142)] {
             assert_eq!(
@@ -1833,9 +2742,10 @@ mod tests {
             "OpenAclMutation(string path, bool directory)",
             "0x001301bf",
             "0x000000fe",
-            "0x000000be",
-            "DESKTOP_CAUSAL",
-            "DESKTOP_NOT_SUFFICIENT",
+            "0x00080404",
+            "0x08080404",
+            "NO_WINDOW_CAUSAL",
+            "NO_WINDOW_NOT_SUFFICIENT",
             "held throwaway process reap timed out",
             "cleanup forced termination did not stop the throwaway service",
         ] {
@@ -1846,9 +2756,11 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct Session0DiagnosticRun {
         job_ui_restrictions: u32,
+        job_ui_limits: String,
+        creation_flags: u32,
         spawn_succeeded: bool,
         spawn_error: String,
         child_exit: Option<u32>,
@@ -1860,6 +2772,8 @@ mod tests {
         fn empty() -> Self {
             Self {
                 job_ui_restrictions: 0,
+                job_ui_limits: describe_job_ui_limits(0),
+                creation_flags: 0,
                 spawn_succeeded: false,
                 spawn_error: String::new(),
                 child_exit: None,
@@ -1869,7 +2783,14 @@ mod tests {
         }
 
         fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
+            // The names are a decode table for the mask, not a second measurement: a record whose
+            // names disagree with its own mask was edited between the job query and here.
+            if self.job_ui_limits != describe_job_ui_limits(self.job_ui_restrictions) {
+                return Err("diagnostic run UI limit names".into());
+            }
             payload.u32(self.job_ui_restrictions);
+            write_text(payload, &self.job_ui_limits)?;
+            payload.u32(self.creation_flags);
             payload.bool(self.spawn_succeeded);
             write_text(payload, &self.spawn_error)?;
             payload.bool(self.child_exit.is_some());
@@ -1882,6 +2803,8 @@ mod tests {
 
         fn decode_from(reader: &mut Reader<'_>) -> Result<Self, String> {
             let job_ui_restrictions = reader.u32().map_err(|_| "diagnostic run UI")?;
+            let job_ui_limits = read_text(reader)?;
+            let creation_flags = reader.u32().map_err(|_| "diagnostic creation flags")?;
             let spawn_succeeded = read_strict_bool(reader)?;
             let spawn_error = read_text(reader)?;
             let child_exit = if read_strict_bool(reader)? {
@@ -1891,6 +2814,8 @@ mod tests {
             };
             Ok(Self {
                 job_ui_restrictions,
+                job_ui_limits,
+                creation_flags,
                 spawn_succeeded,
                 spawn_error,
                 child_exit,
@@ -1900,7 +2825,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct Session0DiagnosticRecord {
         nonce: String,
         markers: u8,
@@ -1911,13 +2836,16 @@ mod tests {
         station: String,
         desktop: String,
         station_dacl: String,
+        station_sacl: String,
         desktop_dacl: String,
+        desktop_sacl: String,
         station_access: String,
         desktop_access: String,
+        ui_probe: String,
         cwd: String,
         environment_hash: String,
         baseline: Session0DiagnosticRun,
-        desktop_relaxed: Session0DiagnosticRun,
+        no_window: Session0DiagnosticRun,
     }
 
     impl Session0DiagnosticRecord {
@@ -1930,36 +2858,68 @@ mod tests {
             Self {
                 nonce: "0123456789abcdef0123456789abcdef".into(),
                 markers: Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED,
-                classification: Session0DiagnosticOutcome::DesktopCausal,
+                classification: Session0DiagnosticOutcome::NoWindowCausal,
                 session_id: 0,
-                broker: "user=S-1-5-80-1;integrity=8192;groups=[];privileges=[]".into(),
-                action: "user=S-1-5-80-1;integrity=8192;restricted=[];groups=[];privileges=[]"
+                broker: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
+groups=[];privileges=[]"
+                    .into(),
+                action: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
+restricted=[];groups=[];privileges=[]"
                     .into(),
                 station: "Service-0x0-3e7$".into(),
                 desktop: "Default".into(),
                 station_dacl: "unavailable:gle=5".into(),
+                station_sacl: "label=absent;implied_integrity=8192".into(),
                 desktop_dacl: "unavailable:gle=5".into(),
+                desktop_sacl: "label_aces=[type=17;flags=0;mask=0x00000001;sid=S-1-16-8192]".into(),
                 station_access: "mask=0x0000006e;allowed=false;gle=5".into(),
                 desktop_access: "mask=0x000000cf;allowed=false;gle=5".into(),
-                cwd: "C:\\Sembazuru".into(),
+                ui_probe: "scope=broker-impersonated;first_failure=station:maximum_allowed;gle=5;\
+steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
+                    .into(),
+                cwd: "C:\\Sembazuru\\診断".into(),
                 environment_hash: "0".repeat(64),
                 baseline: Session0DiagnosticRun {
                     job_ui_restrictions: 0x0000_00fe,
+                    job_ui_limits: describe_job_ui_limits(0x0000_00fe),
+                    creation_flags: 0x0008_0404,
                     spawn_succeeded: true,
-                    spawn_error: String::new(),
+                    spawn_error: "baseline-error-測定".into(),
                     child_exit: Some(0xc000_0142),
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: "baseline-stdout-診断".into(),
+                    stderr: "baseline-stderr".into(),
                 },
-                desktop_relaxed: Session0DiagnosticRun {
-                    job_ui_restrictions: 0x0000_00be,
+                no_window: Session0DiagnosticRun {
+                    job_ui_restrictions: 0x0000_00fe,
+                    job_ui_limits: describe_job_ui_limits(0x0000_00fe),
+                    creation_flags: 0x0808_0404,
                     spawn_succeeded: true,
-                    spawn_error: String::new(),
+                    spawn_error: "no-window-error".into(),
                     child_exit: Some(0),
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: "no-window-stdout".into(),
+                    stderr: "no-window-stderr-観測".into(),
                 },
             }
+        }
+
+        fn expected_classification(&self) -> Session0DiagnosticOutcome {
+            if self.markers != Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED
+                || self.session_id != 0
+                || !self.baseline.spawn_succeeded
+                || !self.no_window.spawn_succeeded
+                || self.baseline.job_ui_restrictions != 0xfe
+                || self.no_window.job_ui_restrictions != 0xfe
+                || self.baseline.creation_flags != 0x0008_0404
+                || self.no_window.creation_flags != 0x0808_0404
+            {
+                return Session0DiagnosticOutcome::Indeterminate;
+            }
+            classify_session0_diagnostic_ab(
+                self.baseline.spawn_succeeded,
+                self.baseline.child_exit,
+                self.no_window.spawn_succeeded,
+                self.no_window.child_exit,
+            )
         }
 
         fn encode(&self) -> Result<Vec<u8>, String> {
@@ -1975,15 +2935,17 @@ mod tests {
             {
                 return Err("environment hash".into());
             }
-            if self.markers & Self::SPAWN_RETURNED != 0
-                && self.classification
-                    != classify_session0_diagnostic_ab(
-                        self.baseline.spawn_succeeded,
-                        self.baseline.child_exit,
-                        self.desktop_relaxed.spawn_succeeded,
-                        self.desktop_relaxed.child_exit,
-                    )
-            {
+            for (run, expected_flags) in [
+                (&self.baseline, 0x0008_0404),
+                (&self.no_window, 0x0808_0404),
+            ] {
+                if run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe || run.creation_flags != expected_flags)
+                {
+                    return Err("diagnostic A/B flags or Job UI".into());
+                }
+            }
+            if self.classification != self.expected_classification() {
                 return Err("diagnostic A/B classification".into());
             }
             let mut payload = Writer::new();
@@ -1996,21 +2958,24 @@ mod tests {
                 &self.station,
                 &self.desktop,
                 &self.station_dacl,
+                &self.station_sacl,
                 &self.desktop_dacl,
+                &self.desktop_sacl,
                 &self.station_access,
                 &self.desktop_access,
+                &self.ui_probe,
                 &self.cwd,
                 &self.environment_hash,
             ] {
                 write_text(&mut payload, value)?;
             }
             self.baseline.encode_into(&mut payload)?;
-            self.desktop_relaxed.encode_into(&mut payload)?;
+            self.no_window.encode_into(&mut payload)?;
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
-            let mut bytes = Vec::with_capacity(48 + payload.len());
+            let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_VERSION.to_le_bytes());
             bytes.extend_from_slice(self.nonce.as_bytes());
@@ -2047,11 +3012,11 @@ mod tests {
             )?;
             let session_id = reader.u32().map_err(|_| "diagnostic session")?;
             let mut fields = Vec::new();
-            for _ in 0..10 {
+            for _ in 0..13 {
                 fields.push(read_text(&mut reader)?);
             }
             let baseline = Session0DiagnosticRun::decode_from(&mut reader)?;
-            let desktop_relaxed = Session0DiagnosticRun::decode_from(&mut reader)?;
+            let no_window = Session0DiagnosticRun::decode_from(&mut reader)?;
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -2063,13 +3028,16 @@ mod tests {
                 station: fields.remove(0),
                 desktop: fields.remove(0),
                 station_dacl: fields.remove(0),
+                station_sacl: fields.remove(0),
                 desktop_dacl: fields.remove(0),
+                desktop_sacl: fields.remove(0),
                 station_access: fields.remove(0),
                 desktop_access: fields.remove(0),
+                ui_probe: fields.remove(0),
                 cwd: fields.remove(0),
                 environment_hash: fields.remove(0),
                 baseline,
-                desktop_relaxed,
+                no_window,
             };
             record.encode().map(|_| record)
         }
@@ -2154,7 +3122,7 @@ mod tests {
             ServiceExitCode::Win32(0),
             std::time::Duration::from_secs(10),
         )?;
-        if exit_code == WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL {
+        if exit_code == WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL {
             set(
                 ServiceState::Running,
                 ServiceExitCode::Win32(0),
@@ -2213,10 +3181,19 @@ mod tests {
         } else {
             String::new()
         };
+        let policy = token_info(handle, TokenMandatoryPolicy)
+            .map_err(|error| error.to_string())
+            // SAFETY: TokenMandatoryPolicy returns exactly a TOKEN_MANDATORY_POLICY.
+            .map(|info| unsafe { (*info.as_ptr().cast::<TOKEN_MANDATORY_POLICY>()).Policy });
         Ok(format!(
-            "user={};integrity={};groups={groups:?};privileges={privileges:?}{restricted}",
+            "user={};integrity={};mandatory_policy={};groups={groups:?};\
+privileges={privileges:?}{restricted}",
             sid_string(user.User.Sid).map_err(|error| error.to_string())?,
             integrity_rid(handle).map_err(|error| error.to_string())?,
+            policy.map_or_else(
+                |error| format!("unavailable:{error}"),
+                |value| format!("0x{value:08x}")
+            ),
         ))
     }
 
@@ -2285,6 +3262,166 @@ mod tests {
             ));
         }
         format!("control=0x{control:04x};aces=[{}]", aces.join(","))
+    }
+
+    /// The mandatory label of a user object. `LABEL_SECURITY_INFORMATION` reads the label ACE
+    /// without `SE_SECURITY_NAME`, so the service can record it. Integrity is evaluated before the
+    /// DACL, which is why an access denial cannot be attributed to the DACL without this.
+    fn diagnostic_user_object_label(handle: HANDLE) -> String {
+        let request = LABEL_SECURITY_INFORMATION;
+        let mut needed = 0;
+        // SAFETY: the sizing probe has a valid request and writable length output.
+        if unsafe { GetUserObjectSecurity(handle, &request, null_mut(), 0, &mut needed) } == 0 {
+            // SAFETY: GetLastError is read immediately after the failing sizing probe.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+                return format!("unavailable:gle={error}");
+            }
+        }
+        let mut storage = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        // SAFETY: storage has the reported byte capacity; all pointers remain live through the call.
+        if unsafe {
+            GetUserObjectSecurity(
+                handle,
+                &request,
+                storage.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        let descriptor = storage.as_mut_ptr().cast();
+        let (mut present, mut defaulted, mut sacl) = (0, 0, null_mut());
+        // SAFETY: descriptor points to the returned self-relative descriptor; outputs are valid.
+        if unsafe { GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted) }
+            == 0
+        {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        if present == 0 || sacl.is_null() {
+            // No label ACE. Windows then treats the object as Medium, so a refusal of a Medium
+            // action cannot be explained by no-write-up. That does not leave the DACL as the only
+            // candidate: the Job UI restrictions refuse in a layer of their own.
+            return format!("label=absent;implied_integrity={SECURITY_MANDATORY_MEDIUM_RID}");
+        }
+        let mut aces = Vec::new();
+        // SAFETY: the SACL is owned by the live descriptor and AceCount bounds the iteration.
+        for index in 0..unsafe { (*sacl).AceCount } as u32 {
+            let mut raw = null_mut();
+            // SAFETY: index is within AceCount and `raw` receives the descriptor-owned ACE.
+            if unsafe { GetAce(sacl, index, &mut raw) } == 0 {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                return format!("unavailable:gle={}", unsafe { GetLastError() });
+            }
+            // SAFETY: `raw` points at a descriptor-owned ACE whose header is always readable.
+            let ace = unsafe { &*(raw.cast::<SYSTEM_MANDATORY_LABEL_ACE>()) };
+            if u32::from(ace.Header.AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                // Only the label ACE has this body; record the type and read no further.
+                aces.push(format!("type={};not-a-label", ace.Header.AceType));
+                continue;
+            }
+            let sid = sid_string((&ace.SidStart as *const u32).cast_mut().cast())
+                .unwrap_or_else(|error| format!("sid-error={error}"));
+            aces.push(format!(
+                "type={};flags={};mask=0x{:08x};sid={sid}",
+                ace.Header.AceType, ace.Header.AceFlags, ace.Mask
+            ));
+        }
+        format!("label_aces=[{}]", aces.join(","))
+    }
+
+    /// Every `JOB_OBJECT_UILIMIT_*` bit of a measured mask, named and stated as set or clear. The
+    /// Job UI limits refuse window-station and desktop APIs in a layer of their own, above the
+    /// DACL, so the record has to say which ones are in force without an external decode table.
+    fn describe_job_ui_limits(mask: u32) -> String {
+        const NAMED: [(u32, &str); 8] = [
+            (JOB_OBJECT_UILIMIT_HANDLES, "handles"),
+            (JOB_OBJECT_UILIMIT_READCLIPBOARD, "readclipboard"),
+            (JOB_OBJECT_UILIMIT_WRITECLIPBOARD, "writeclipboard"),
+            (JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, "systemparameters"),
+            (JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, "displaysettings"),
+            (JOB_OBJECT_UILIMIT_GLOBALATOMS, "globalatoms"),
+            (JOB_OBJECT_UILIMIT_DESKTOP, "desktop"),
+            (JOB_OBJECT_UILIMIT_EXITWINDOWS, "exitwindows"),
+        ];
+        let mut parts = Vec::with_capacity(NAMED.len() + 1);
+        let mut covered = 0;
+        for (bit, name) in NAMED {
+            covered |= bit;
+            parts.push(format!("{name}={}", u32::from(mask & bit != 0)));
+        }
+        parts.push(format!("unknown=0x{:08x}", mask & !covered));
+        parts.join(";")
+    }
+
+    /// The ordered user-object opens that process initialisation needs, attempted under the action
+    /// token, naming the first one that is refused and its Win32 error. The child dies inside
+    /// `user32` initialisation before any code of ours runs, so this is a broker-side stand-in and
+    /// not an in-child API trace: it says which open a token like this one is refused, not which
+    /// call the dead child made last.
+    fn diagnostic_ui_probe(token: &ActionToken, station: &str, desktop: &str) -> String {
+        let station_wide: Vec<u16> = OsStr::new(station).encode_wide().chain(Some(0)).collect();
+        let desktop_wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
+        token
+            .impersonated(|| {
+                let mut steps = Vec::new();
+                let mut first_failure = None;
+                for (name, mask) in [
+                    ("station:maximum_allowed", MAXIMUM_ALLOWED),
+                    ("station:read_attributes", WINSTA_READATTRIBUTES as u32),
+                    ("station:action_mask", 0x6e),
+                    ("desktop:maximum_allowed", MAXIMUM_ALLOWED),
+                    ("desktop:read_objects", DESKTOP_READOBJECTS),
+                    ("desktop:action_mask", 0xcf),
+                ] {
+                    let opened = if name.starts_with("station:") {
+                        // SAFETY: the station name is NUL-terminated and live through the call.
+                        let handle = unsafe { OpenWindowStationW(station_wide.as_ptr(), 0, mask) };
+                        if handle.is_null() {
+                            None
+                        } else {
+                            // SAFETY: OpenWindowStationW returned this owned user-object handle.
+                            unsafe { CloseWindowStation(handle) };
+                            Some(())
+                        }
+                    } else {
+                        // SAFETY: the desktop name is valid and the process station is unchanged.
+                        let handle = unsafe { OpenDesktopW(desktop_wide.as_ptr(), 0, 0, mask) };
+                        if handle.is_null() {
+                            None
+                        } else {
+                            // SAFETY: OpenDesktopW returned this owned user-object handle.
+                            unsafe { CloseDesktop(handle) };
+                            Some(())
+                        }
+                    };
+                    // SAFETY: GetLastError is read immediately after the open above.
+                    let error = if opened.is_some() {
+                        0
+                    } else {
+                        unsafe { GetLastError() }
+                    };
+                    steps.push(format!(
+                        "{name}:mask=0x{mask:08x};allowed={};gle={error}",
+                        opened.is_some()
+                    ));
+                    if opened.is_none() && first_failure.is_none() {
+                        first_failure = Some(format!("{name};gle={error}"));
+                    }
+                }
+                Ok(format!(
+                    "scope=broker-impersonated;first_failure={};steps=[{}]",
+                    first_failure.unwrap_or_else(|| "none".into()),
+                    steps.join(",")
+                ))
+            })
+            .unwrap_or_else(|error| {
+                format!("unavailable:gle={}", error.raw_os_error().unwrap_or(0))
+            })
     }
 
     fn diagnostic_open_access(
@@ -2423,14 +3560,15 @@ mod tests {
     fn run_session0_diagnostic_child(
         action: &ActionToken,
         command: &RestrictedCommand,
-        desktop_relaxed: bool,
+        profile: TestCreationProfile,
     ) -> Result<Session0DiagnosticRun, String> {
         let mut record = Session0DiagnosticRun::empty();
-        let process = if desktop_relaxed {
-            RestrictedProcess::spawn_without_desktop_limit_for_test(action, command)
-        } else {
-            RestrictedProcess::spawn(action, command)
-        };
+        let process = RestrictedProcess::spawn_for_session0_diagnostic(
+            action,
+            command,
+            profile,
+            &mut record.creation_flags,
+        );
         let mut process = match process {
             Ok(process) => process,
             Err(error) => {
@@ -2443,11 +3581,8 @@ mod tests {
             .job()
             .ui_restrictions_for_test()
             .map_err(|error| format!("job UI query: {error}"))?;
-        let expected_ui = if desktop_relaxed {
-            0x0000_00be
-        } else {
-            0x0000_00fe
-        };
+        record.job_ui_limits = describe_job_ui_limits(record.job_ui_restrictions);
+        let expected_ui = 0x0000_00fe;
         if record.job_ui_restrictions != expected_ui {
             drop(process);
             return Err(format!(
@@ -2525,13 +3660,16 @@ mod tests {
             station,
             desktop,
             station_dacl: diagnostic_user_object_dacl(station_handle),
+            station_sacl: diagnostic_user_object_label(station_handle),
             desktop_dacl: diagnostic_user_object_dacl(desktop_handle),
+            desktop_sacl: diagnostic_user_object_label(desktop_handle),
             station_access: "unavailable:action-not-created".into(),
             desktop_access: "unavailable:action-not-created".into(),
+            ui_probe: "unavailable:action-not-created".into(),
             cwd: config.fixture_root.display().to_string(),
             environment_hash: "0".repeat(64),
             baseline: Session0DiagnosticRun::empty(),
-            desktop_relaxed: Session0DiagnosticRun::empty(),
+            no_window: Session0DiagnosticRun::empty(),
         };
         let action = match ActionToken::create() {
             Ok(token) => token,
@@ -2548,6 +3686,7 @@ mod tests {
         {
             (record.station_access, record.desktop_access) =
                 diagnostic_open_access(&action, &record.station, &record.desktop);
+            record.ui_probe = diagnostic_ui_probe(&action, &record.station, &record.desktop);
         }
         let scratch = match PrivateScratch::create(
             &config.record_directory,
@@ -2578,38 +3717,36 @@ mod tests {
         record.environment_hash = environment_hash;
         record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
         // Both runs share the production command, CWD, BASELINE_ENV, TEMP/TMP, and action token.
-        // The test-only Job constructor is the sole variable in the A/B comparison.
-        record.baseline = match run_session0_diagnostic_child(&action, &command, false) {
-            Ok(run) => run,
-            Err(error) => {
-                record.baseline.spawn_error = error;
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    Some(Session0DiagnosticFailureStage::Runtime),
-                );
-            }
-        };
-        record.desktop_relaxed = match run_session0_diagnostic_child(&action, &command, true) {
-            Ok(run) => run,
-            Err(error) => {
-                record.desktop_relaxed.spawn_error = error;
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    Some(Session0DiagnosticFailureStage::Runtime),
-                );
-            }
-        };
+        // CREATE_NO_WINDOW is the sole variable; both runs use the production Job limits.
+        record.baseline =
+            match run_session0_diagnostic_child(&action, &command, TestCreationProfile::Production)
+            {
+                Ok(run) => run,
+                Err(error) => {
+                    record.baseline.spawn_error = error;
+                    return publish_session0_diagnostic(
+                        &record,
+                        config,
+                        Some((scratch.path(), &action)),
+                        Some(Session0DiagnosticFailureStage::Runtime),
+                    );
+                }
+            };
+        record.no_window =
+            match run_session0_diagnostic_child(&action, &command, TestCreationProfile::NoWindow) {
+                Ok(run) => run,
+                Err(error) => {
+                    record.no_window.spawn_error = error;
+                    return publish_session0_diagnostic(
+                        &record,
+                        config,
+                        Some((scratch.path(), &action)),
+                        Some(Session0DiagnosticFailureStage::Runtime),
+                    );
+                }
+            };
         record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
-        record.classification = classify_session0_diagnostic_ab(
-            record.baseline.spawn_succeeded,
-            record.baseline.child_exit,
-            record.desktop_relaxed.spawn_succeeded,
-            record.desktop_relaxed.child_exit,
-        );
+        record.classification = record.expected_classification();
         publish_session0_diagnostic(&record, config, Some((scratch.path(), &action)), None)
     }
 
@@ -4116,28 +5253,30 @@ mod tests {
     }
 
     #[test]
-    fn private_station_unnamed_create_rejects_connected_logon_station() {
+    fn private_station_unnamed_create_cannot_allocate_per_action_station() {
         let token = ActionToken::create().expect("action token");
         let broker = sid_string(token.broker_sid()).expect("broker SID");
         let current = unsafe { GetProcessWindowStation() };
         let before = user_object_identity(current).expect("current identity before create");
         let sddl = format!("O:{broker}D:P(D;;WD;;;OW)(A;;0x00020002;;;{broker})");
-        let created = ActionPipeSecurity(sddl).with_attributes(|attributes| {
-            // SAFETY: attributes points to the live protected descriptor for this synchronous call.
-            let handle = unsafe {
-                CreateWindowStationW(
-                    null(),
-                    CWF_CREATE_ONLY,
-                    READ_CONTROL | WINSTA_READATTRIBUTES as u32,
-                    attributes.cast(),
-                )
-            };
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(AuditWindowStation(Some(handle)))
-        });
-        match created {
+        let create = || {
+            ActionPipeSecurity(sddl.clone()).with_attributes(|attributes| {
+                // SAFETY: attributes points to the live protected descriptor for this synchronous call.
+                let handle = unsafe {
+                    CreateWindowStationW(
+                        null(),
+                        CWF_CREATE_ONLY,
+                        READ_CONTROL | WINSTA_READATTRIBUTES as u32,
+                        attributes.cast(),
+                    )
+                };
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(AuditWindowStation(Some(handle)))
+            })
+        };
+        match create() {
             Err(error) => {
                 let after = user_object_identity(unsafe { GetProcessWindowStation() })
                     .expect("current identity after failed create");
@@ -4155,15 +5294,20 @@ mod tests {
                 }
             }
             Ok(station) => {
+                // A NULL name uses the process logon session, not an action identity.
+                // Keep the first station alive so a second CREATE_ONLY must collide.
+                let second = create();
+                let second_error = second.as_ref().err().and_then(io::Error::raw_os_error);
                 // SAFETY: current is the original live process window-station handle.
                 let restore_ok = unsafe { SetProcessWindowStation(current) } != 0;
                 let restore_error = (!restore_ok).then(io::Error::last_os_error);
                 let restored =
                     restore_ok.then(|| user_object_identity(unsafe { GetProcessWindowStation() }));
                 let identity = user_object_identity(station.handle());
+                let second_close = second.ok().map(AuditWindowStation::close);
                 let close = station.close();
                 eprintln!(
-                    "unnamed station cleanup: restore_ok={restore_ok} restore_error={:?} close_error={:?}",
+                    "unnamed station cleanup: restore_ok={restore_ok} restore_error={:?} second_create_error={second_error:?} second_close={second_close:?} close_error={:?}",
                     restore_error.as_ref().and_then(io::Error::raw_os_error),
                     close.as_ref().err().and_then(io::Error::raw_os_error),
                 );
@@ -4178,10 +5322,19 @@ mod tests {
                 );
                 let identity = identity.expect("created identity");
                 assert!(close.is_ok(), "created station close failed: {close:?}");
-                if identity != before {
-                    panic!("fresh unnamed station supported; design review required: {identity:?}");
+                if let Some(second_close) = second_close {
+                    assert!(
+                        second_close.is_ok(),
+                        "second station close failed: {second_close:?}"
+                    );
+                    panic!("second unnamed CREATE_ONLY unexpectedly succeeded: {identity:?}");
                 }
-                eprintln!("unsupported unnamed station aliases current: {identity:?}");
+                assert_eq!(
+                    second_error,
+                    Some(183),
+                    "indeterminate second unnamed create: {identity:?}"
+                );
+                eprintln!("unnamed station is logon-bound, not action-private: {identity:?}");
             }
         }
     }
@@ -4320,6 +5473,9 @@ mod tests {
         let mut duplicate_env = SandboxProbeRecord::fixture();
         duplicate_env.environment = vec![("Path".into(), "a".into()), ("PATH".into(), "b".into())];
         assert!(duplicate_env.encode().is_err());
+        let mut invalid_env_name = SandboxProbeRecord::fixture();
+        invalid_env_name.environment = vec![("=C:".into(), "C:\\fixture".into())];
+        assert!(invalid_env_name.encode().is_err());
         let mut unsorted_sids = SandboxProbeRecord::fixture();
         unsorted_sids.groups = vec![
             ProbeSid {
@@ -4506,6 +5662,14 @@ mod tests {
         }
 
         fn collect(nonce: String) -> Result<Self, String> {
+            let mut record = Self::collect_process_security(nonce)?;
+            record.environment = normalized_environment()?;
+            Ok(record)
+        }
+
+        // Parent comparisons use security fields only, so they must not collect inherited
+        // environment entries such as cmd.exe's hidden drive variables.
+        fn collect_process_security(nonce: String) -> Result<Self, String> {
             validate_nonce(&nonce)?;
             let token = current_token(TOKEN_QUERY).map_err(|error| error.to_string())?;
             let handle = token.as_raw_handle() as HANDLE;
@@ -4537,7 +5701,7 @@ mod tests {
                 capabilities: token_sid_list(handle, TokenCapabilities)?,
                 integrity_rid: integrity_rid(handle).map_err(|error| error.to_string())?,
                 privileges: token_privileges(handle)?,
-                environment: normalized_environment()?,
+                environment: Vec::new(),
                 in_job: in_job != 0,
             };
             // The record is a canonical comparison surface, so Windows group duplication is
@@ -4555,9 +5719,6 @@ mod tests {
                 });
             }
             record.privileges.sort_unstable();
-            record
-                .environment
-                .sort_by_key(|(name, _)| name.to_ascii_lowercase());
             Ok(record)
         }
     }
@@ -4738,7 +5899,7 @@ mod tests {
             "status={status}"
         );
         let record = SandboxProbeRecord::decode(&std::fs::read(&path).unwrap(), &nonce).unwrap();
-        let expected = SandboxProbeRecord::collect(nonce.clone()).unwrap();
+        let expected = SandboxProbeRecord::collect_process_security(nonce.clone()).unwrap();
         assert_eq!(record.is_appcontainer, expected.is_appcontainer);
         assert_eq!(record.appcontainer_sid, expected.appcontainer_sid);
         assert_eq!(record.restricted_sids, expected.restricted_sids);
@@ -5977,7 +7138,8 @@ mod tests {
                     &token,
                     &command,
                     Some(failure),
-                    TestJobProfile::Production,
+                    TestCreationProfile::Production,
+                    None,
                     &[]
                 )
                 .is_err()

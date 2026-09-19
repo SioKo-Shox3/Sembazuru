@@ -46,6 +46,9 @@ toml = "0.8"
 # also kill its grandchild (the real compiler), which kill_on_drop cannot do.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    # CreateDesktopW is declared with a DEVMODEW parameter, so the Gdi metadata has to be enabled
+    # even though the desktop is created with a null device mode.
+    "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Cryptography",

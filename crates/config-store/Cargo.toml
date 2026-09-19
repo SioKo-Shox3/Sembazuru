@@ -16,6 +16,10 @@ path = "src/bin/sembazuru_storectl.rs"
 
 [target.'cfg(windows)'.dependencies]
 sha2 = "0.10"
+# Stopping and starting the two Sembazuru services around a join, so the machine does not keep
+# running on the configuration the join just replaced. Same crate and version the daemon, worker,
+# and GUI already register and control themselves with.
+windows-service = "0.7"
 toml_edit = "0.20"
 windows-sys = { version = "0.59", features = [
     "Wdk_Foundation",

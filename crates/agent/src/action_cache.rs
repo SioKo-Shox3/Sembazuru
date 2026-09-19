@@ -2250,13 +2250,13 @@ mod tests {
     fn predicted_paths_allow_short_alias_in_declared_root_prefix() {
         let predicted = predicted_paths_for_absolute(
             "predict-root-alias",
-            "C:\\Users\\<user>\\Documents\\Sembazuru\\project\\src\\in.h",
-            Some("c:\\users\\kingka~1\\documents\\sembazuru\\project"),
+            "C:\\Users\\TESTUS~1\\Documents\\Sembazuru\\project\\src\\in.h",
+            Some("c:\\users\\testus~1\\documents\\sembazuru\\project"),
         );
 
         assert_eq!(
             predicted,
-            vec!["c:\\users\\kingka~1\\documents\\sembazuru\\project\\src\\in.h"]
+            vec!["c:\\users\\testus~1\\documents\\sembazuru\\project\\src\\in.h"]
         );
     }
 
@@ -2275,7 +2275,7 @@ mod tests {
     fn predicted_paths_unscoped_reject_ambiguous_short_alias() {
         let predicted = predicted_paths_for_absolute(
             "predict-unscoped-alias",
-            "C:\\Users\\<user>\\project\\src\\in.h",
+            "C:\\Users\\TESTUS~1\\project\\src\\in.h",
             None,
         );
 

@@ -18,6 +18,7 @@ param(
     [string]$WorkRoot = (Join-Path $PSScriptRoot '..\build\vfs-work')
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'vfs_attestation_bootstrap.ps1')
 
 $launcher = Join-Path $BuildDir 'launcher.exe'
 $dll = Join-Path $BuildDir 'sbz_interceptor64.dll'
@@ -114,9 +115,11 @@ try {
     $env:SEMBAZURU_VFS_ROOT = $logicalRoot
     $env:SEMBAZURU_VFS_PIPE = $pipe
     $env:SEMBAZURU_VFS_SCRATCH = $scratch
+    $attestation = New-SbzVfsAttestation 'vfs-redirect'
     try {
         $out = & $launcher $dll $probe $logicalInput 2>&1 | Out-String
     } finally {
+        Remove-SbzVfsAttestation $attestation
         Remove-Item Env:\SEMBAZURU_MODE, Env:\SEMBAZURU_VFS_ROOT, `
             Env:\SEMBAZURU_VFS_PIPE, Env:\SEMBAZURU_VFS_SCRATCH `
             -ErrorAction SilentlyContinue
