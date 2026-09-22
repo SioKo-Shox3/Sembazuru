@@ -20,6 +20,7 @@ param(
     [switch]$RequireClangCl
 )
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'vfs_attestation_bootstrap.ps1')
 
 $launcher = Join-Path $BuildDir 'launcher.exe'
 $dll = Join-Path $BuildDir 'sbz_interceptor64.dll'
@@ -94,12 +95,14 @@ function Compile-UnderVfs {
         $env:SEMBAZURU_VFS_PIPE = $pipe
         $env:SEMBAZURU_VFS_SCRATCH = $Scratch
         if ($ExtraEnv) { $ExtraEnv.GetEnumerator() | ForEach-Object { Set-Item "Env:\$($_.Key)" $_.Value } }
+        $attestation = New-SbzVfsAttestation 'vfs-compile'
         Push-Location $workdir
         try {
             $out = & $launcher $dll $Cc '/nologo' '/c' @Flags $srcAbs "/Fo$OutObj" 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) { Write-Host $out; throw "$Cc under VFS exited $LASTEXITCODE" }
         } finally {
             Pop-Location
+            Remove-SbzVfsAttestation $attestation
             Remove-Item Env:\SEMBAZURU_MODE, Env:\SEMBAZURU_VFS_ROOT, Env:\SEMBAZURU_VFS_PIPE, `
                 Env:\SEMBAZURU_VFS_SCRATCH -ErrorAction SilentlyContinue
             if ($ExtraEnv) { $ExtraEnv.Keys | ForEach-Object { Remove-Item "Env:\$_" -ErrorAction SilentlyContinue } }

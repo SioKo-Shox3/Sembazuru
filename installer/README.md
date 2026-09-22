@@ -1,83 +1,105 @@
-# Sembazuru installer (WiX / MSI)
+# Sembazuru Windows installer
 
-Builds the signed-capable Windows installer that bundles the daemon, worker,
-build-system launcher, the resident GUI, and the C++ hook layer into one MSI
-(ADR 0008 §1). The MSI only **packages** prebuilt binaries — it never participates
-in the product's build path, so it stays compiler-agnostic (clang-cl is a
-first-class target; MSVC is not assumed).
+This directory contains two WiX 5.0.2 projects:
 
-## Layout
+- `Package.wixproj` builds `Sembazuru.msi`, which installs the daemon, worker,
+  build-system launcher, GUI, and C++ hook layer. It embeds
+  `sembazuru-storectl.exe` as an MSI Binary for machine-store custom actions;
+  the helper is not installed as a product file.
+- `Bundle.wixproj` builds `Sembazuru-Setup.exe`, a standard Burn bootstrapper
+  that embeds the Microsoft Visual C++ runtimes and the MSI.
 
-- `sembazuru.wxs` — the package definition (binary placement, services, firewall,
-  per-user GUI autostart, config init, uninstall).
-- `Package.wixproj` — WiX v5 MSBuild SDK project. `dotnet build` restores the WiX
-  SDK and extensions from NuGet; no global `wix` tool is required.
+`Setup.exe` is the end-user entry point on 64-bit Windows. It installs the x64
+VC++ runtime, the x86 VC++ runtime, and then Sembazuru. Both runtime packages are
+permanent prerequisites; Burn reads each architecture's VC runtime registry
+version when `Installed=1` and skips a runtime when that version is equal to or
+newer than the bundled version. Removing Sembazuru does not remove a runtime
+that may be shared by other applications.
 
-## Runtime prerequisite on target machines (VC++ runtime)
+The bundled runtimes are the Microsoft Visual C++ 2015–2022 Redistributable:
 
-The shipped Rust executables are **not** statically linked against the MSVC C runtime
-(no `crt-static`; the workspace sets no `.cargo/config.toml` `target-feature`), so they
-dynamically import `VCRUNTIME140.dll`. Verified with `dumpbin /dependents`:
+- [Microsoft supported downloads](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)
+- [x64 installer](https://aka.ms/vc14/vc_redist.x64.exe)
+- [x86 installer](https://aka.ms/vc14/vc_redist.x86.exe)
 
-```
-> dumpbin /dependents target\release\sembazuru-gui.exe
-    VCRUNTIME140.dll                     <-- part of the VC++ Redistributable
-    api-ms-win-crt-runtime-l1-1-0.dll    <-- Universal CRT (ships with Windows 10+)
-    api-ms-win-crt-{math,string,stdio,locale,heap}-l1-1-0.dll
-```
+`prepare_redist.ps1` verifies each file's Authenticode signature, requires the
+signer to be Microsoft Corporation, checks a numeric four-part product version,
+and writes the verified paths and versions to
+`target/installer/redist/Sembazuru.Redist.props`. With no arguments it downloads
+the two official installers. An offline build can pass both local paths:
 
-The `api-ms-win-crt-*` (UCRT) forwarders are part of Windows 10/11, but `VCRUNTIME140.dll`
-is **not guaranteed** on a clean machine — it comes with the **Microsoft Visual C++
-2015–2022 Redistributable (x64)**. On a fresh target PC without it, the daemon/worker/GUI
-fail to launch with a "VCRUNTIME140.dll was not found" error.
-
-**Resolution (pick one — M12/A6 follow-up):**
-1. **Bundle the redistributable in the MSI** (a WiX merge module / prerequisite), so a
-   clean machine works out of the box. Recommended for a zero-friction installer.
-2. **Statically link the CRT** via `.cargo/config.toml` `[target.x86_64-pc-windows-msvc] rustflags = ["-C", "target-feature=+crt-static"]`, removing the `VCRUNTIME140.dll`
-   dependency entirely (slightly larger exes; validate all crates still build). Cleanest
-   for a self-contained set.
-3. **Document the prerequisite** and have users install the redistributable first (lowest
-   effort, most friction — least preferred for a "zero-config" product).
-
-Until one lands, note this in the release instructions so the first real-machine install
-(M9.7) is not blocked by a missing runtime.
-
-## Prerequisites
-
-1. The product binaries must already be built (the MSI harvests, it does not build):
-   - Rust: `cargo build --release` → `target/release/{sembazuru-daemon,sembazuru-worker,sembazuru,sembazuru-gui}.exe`
-   - C++ hooks, both bitnesses, staged together (mirrors CI):
-     ```
-     cmake -S hooks -B hooks/build   -A x64   && cmake --build hooks/build   --config Release
-     cmake -S hooks -B hooks/build32 -A Win32 && cmake --build hooks/build32 --config Release
-     Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
-     ```
-2. .NET SDK (provides `dotnet build`; the WiX v5 SDK is restored from NuGet).
-
-## Build (unsigned)
-
-From the repository root:
-
-```
-dotnet build installer/Package.wixproj -c Release -p:Platform=x64
+```powershell
+pwsh -NoProfile -File installer/prepare_redist.ps1 `
+  -X64Path 'C:\path\to\vc_redist.x64.exe' `
+  -X86Path 'C:\path\to\vc_redist.x86.exe'
 ```
 
-The MSI is written to `installer/bin/x64/Release/Sembazuru.msi`.
+## Build
 
-Override sources/version for CI or out-of-tree builds:
+The build environment needs the .NET SDK, Rust, CMake, and both native hook
+configurations. End users only need Windows 10/11 x64; they do not need the
+development toolchain when using `Setup.exe`.
 
+Build the release binaries and stage both hook DLLs as usual. The MSI also
+requires the `sembazuru-config-store` package because it supplies the
+`sembazuru-storectl.exe` helper embedded for machine-store custom actions:
+
+```powershell
+cargo build --release -p sembazuru-agent -p sembazuru-worker `
+  -p sembazuru-gui -p sembazuru-config-store
+cmake -S hooks -B hooks/build -A x64
+cmake --build hooks/build --config Release
+cmake -S hooks -B hooks/build32 -A Win32
+cmake --build hooks/build32 --config Release
+Copy-Item hooks/build32/Release/sbz_interceptor32.dll hooks/build/Release/ -Force
 ```
-dotnet build installer/Package.wixproj -c Release -p:Platform=x64 ^
-  -p:SbzVersion=0.0.1 ^
-  -p:SbzRustTarget=<dir with the Rust .exe set> ^
-  -p:SbzHooks=<dir with launcher.exe + sbz_interceptor{64,32}.dll>
+
+Build the MSI first, then prepare the runtimes and build the Bundle:
+
+```powershell
+dotnet build installer/Package.wixproj -c Release -p:Platform=x64 -p:SbzVersion=0.0.3
+pwsh -NoProfile -File installer/prepare_redist.ps1
+dotnet build installer/Bundle.wixproj -c Release -p:Platform=x64 -p:SbzVersion=0.0.3
 ```
 
-## Signing
+The outputs are `installer/bin/x64/Release/Sembazuru.msi` and
+`installer/bin/x64/Release/Sembazuru-Setup.exe`. Override the input paths for an
+out-of-tree build with `-p:SbzMsi=...`, `-p:SbzVCRedistX64=...`, and
+`-p:SbzVCRedistX86=...`; the corresponding four-part runtime versions can be
+passed as `-p:SbzVCRedistX64Version=...` and `-p:SbzVCRedistX86Version=...`.
+`SbzMsi` accepts a repository-relative or absolute path.
 
-The MSI is structured to be signed with `signtool` (Authenticode + RFC3161
-timestamp): sign the individual `.exe`/`.dll` files **before** the build harvests
-them, then sign the final `.msi`. A real OV/EV certificate is out of scope here
-(M7 / release); CI produces an **unsigned** MSI as a green build gate. See
-`hooks/test/sign_smoke.ps1` for the signing mechanism.
+The checked-in defaults for Cargo, the MSI, and the Bundle must agree. Run the
+version gate before packaging:
+
+```powershell
+pwsh -NoProfile -File installer/check_version_sync.ps1
+```
+
+## Upgrade and signing behavior
+
+The MSI keeps its existing Windows Installer product family and
+`MajorUpgrade` rule, but its launch condition blocks upgrades. Uninstall an
+existing Sembazuru installation first, then run the new `Setup.exe`; an MSI
+downgrade is rejected. The Burn Bundle has its own fixed upgrade family for
+identifying Bundle registrations. Installing an MSI by itself does not
+register a Bundle.
+
+Unsigned builds are supported. For a signed release, sign the staged PE files
+before building the MSI, sign the MSI, and build the Bundle with WiX's standard
+Burn signing targets. The release workflow supplies the certificate only in the
+process environment and signs both the detached Burn engine and the outer
+`Setup.exe`:
+
+```powershell
+$env:SBZ_SIGNING_PFX_BASE64 = '<base64 PFX>'
+$env:SBZ_SIGNING_PASSWORD = '<PFX password>'
+$env:SBZ_TIMESTAMP_URL = 'http://timestamp.digicert.com'
+dotnet build installer/Bundle.wixproj -c Release -p:Platform=x64 `
+  -p:SbzVersion=0.0.3 -p:SignOutput=true
+```
+
+The release workflow names the assets
+`Sembazuru-X.Y.Z-x64.msi` and `Sembazuru-X.Y.Z-x64-Setup.exe`. A build without a
+release certificate remains unsigned and follows the existing draft-release
+policy.

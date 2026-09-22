@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Bundle Name="Sembazuru"
+          Manufacturer="Sembazuru Project"
+          Version="$(var.ProductVersion)"
+          UpgradeCode="f6c7cb25-9cb2-4f77-b098-3fd43a3f0a24"
+          Compressed="yes"
+          Condition="VersionNT64">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense"
+                                              LicenseUrl=""
+                                              ShowVersion="yes"
+                                              SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+
+    <!-- The VC++ installers publish their version under these architecture-
+         specific runtime keys. Search each registry view explicitly so x86 is
+         not missed by the 64-bit Bundle. An equal or newer version is skipped. -->
+    <util:RegistrySearch Id="VCRedistX64PresentSearch"
+                         Root="HKLM"
+                         Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+                         Value="Installed"
+                         Result="value"
+                         Variable="VCRedistX64Present"
+                         Bitness="always64"
+                         Condition="VersionNT64" />
+    <util:RegistrySearch Id="VCRedistX64VersionSearch"
+                         Root="HKLM"
+                         Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+                         Value="Version"
+                         Result="value"
+                         Variable="VCRedistX64Installed"
+                         Bitness="always64"
+                         Condition="VersionNT64" />
+    <util:RegistrySearch Id="VCRedistX86PresentSearch"
+                         Root="HKLM"
+                         Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86"
+                         Value="Installed"
+                         Result="value"
+                         Variable="VCRedistX86Present"
+                         Bitness="always32"
+                         Condition="VersionNT64" />
+    <util:RegistrySearch Id="VCRedistX86VersionSearch"
+                         Root="HKLM"
+                         Key="SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x86"
+                         Value="Version"
+                         Result="value"
+                         Variable="VCRedistX86Installed"
+                         Bitness="always32"
+                         Condition="VersionNT64" />
+
+    <Chain>
+      <ExePackage Id="VCRedistX64"
+                  DisplayName="Microsoft Visual C++ 2015-2022 Redistributable (x64)"
+                  SourceFile="$(var.VCRedistX64)"
+                  Name="vc_redist.x64.exe"
+                  Compressed="yes"
+                  PerMachine="yes"
+                  Permanent="yes"
+                  Vital="yes"
+                  InstallCondition="VersionNT64"
+                  DetectCondition="VCRedistX64Present = 1 AND VCRedistX64Installed &gt;= v$(var.VCRedistX64Version)"
+                  InstallArguments="/install /quiet /norestart"
+                  RepairArguments="/repair /quiet /norestart"
+                  UninstallArguments="/uninstall /quiet /norestart">
+        <!-- 1638 is the VC redist's already-newer result; Burn also treats it as
+             success if the installed version changes after detection. -->
+        <ExitCode Value="1638" Behavior="success" />
+      </ExePackage>
+
+      <ExePackage Id="VCRedistX86"
+                  DisplayName="Microsoft Visual C++ 2015-2022 Redistributable (x86)"
+                  SourceFile="$(var.VCRedistX86)"
+                  Name="vc_redist.x86.exe"
+                  Compressed="yes"
+                  PerMachine="yes"
+                  Permanent="yes"
+                  Vital="yes"
+                  InstallCondition="VersionNT64"
+                  DetectCondition="VCRedistX86Present = 1 AND VCRedistX86Installed &gt;= v$(var.VCRedistX86Version)"
+                  InstallArguments="/install /quiet /norestart"
+                  RepairArguments="/repair /quiet /norestart"
+                  UninstallArguments="/uninstall /quiet /norestart">
+        <ExitCode Value="1638" Behavior="success" />
+      </ExePackage>
+
+      <MsiPackage Id="SembazuruMsi"
+                  DisplayName="Sembazuru"
+                  SourceFile="$(var.MsiSource)"
+                  Compressed="yes"
+                  Vital="yes"
+                  InstallCondition="VersionNT64" />
+    </Chain>
+  </Bundle>
+</Wix>
