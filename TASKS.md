@@ -119,7 +119,7 @@
   接続する → PID 照合後にダミー payload を渡す」と「非昇格クライアントの読み取り拒否」を実測する。
 
 ## T-011: アクションがウィンドウステーションとデスクトップを開けるようにする
-- status: todo (実装済み、Session 0 の実測だけ残り)
+- status: todo (実測で設計の前提が崩れた。設計の選び直しが必要)
 - done-when: Session 0 のサービス配下で、制限付き・Medium 整合性のアクショントークンが起動したプロセスが 0xC0000142 にならず動く。ステーションとデスクトップの許可範囲を、アクションが必要とする最小に保つ。`m9_installer_acl.ps1` の ACL 検証と worker sandbox の既存の隔離（UI 制限ジョブ、breakaway 不可、制限トークン）を緩めない。
 - verify: `pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 ...`
 - verify: Session 0 診断を再実行し、`StationAccess`/`DesktopAccess` が allowed=true になること
@@ -175,6 +175,15 @@
   ただし installer ジョブではサービスの標準エラーが残らないので、「作成できずに継承へ戻った」のか
   「作成できたのに子が落ちた」のかは区別できない。区別には a59fa7e の診断 v6（`ActionDesktop` 欄）を
   Release のブランチ指定の手動実行で走らせる必要がある。
+- measured: run 35772303618 (SHA b4a46f2、診断 v6)。**Session 0 のサービスでもウィンドウステーションを作れない。**
+  `ActionDesktop=unavailable: create window station failed (Access is denied. (os error 5))`。ブローカーは
+  仮想サービスアカウント (`S-1-5-80-…`) で、新しいステーションを作る権限が無い。継承へ戻り、子は両腕とも
+  `0xc0000142`。記録は docs/verification/2026-09-23-session0-action-station-creation.md。
+- measured: **ADR 0018 が (b) を退けた前提は実際の配置に当てはまらない。** worker のステーションは
+  `Service-0x0-<自分のログオンセッション LUID>$` で実行ごとに変わり、LocalSystem の `3e7` ではない。
+  製品の worker も仮想アカウントでインストールされるので、ステーションは worker 専用で他サービスと共有されない。
+  ただし同じ worker の複数アクションが共有する点は残る。
+- next: 設計の選び直し。ADR 0018 と同じく二者に助言を求めてから決める。
 - 残る未検証: (1) Session 0 で実際に `CreateWindowStation` が成功するか、
   (2) `CreateProcessAsUser` が要求するアクセスを `ACTION_STATION_RIGHTS` / `ACTION_DESKTOP_RIGHTS`
   で満たせるか（満たせなければ 0xC0000142 が続く）、(3) デスクトップヒープの上限と並列度、
