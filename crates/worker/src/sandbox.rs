@@ -1860,6 +1860,7 @@ mod tests {
     const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL: u32 = 0x5342_5b31;
     const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT: u32 = 0x5342_5b32;
     const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5b33;
+    const WINDOW_STATION_SCM_SMOKE_ACTION_STARTS: u32 = 0x5342_5b34;
     const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
     const WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE: u32 = 0x5342_5afe;
 
@@ -1872,7 +1873,7 @@ mod tests {
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
     const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 5;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 6;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
@@ -1880,6 +1881,10 @@ mod tests {
         NoWindowCausal = 1,
         NoWindowNotSufficient = 2,
         Indeterminate = 3,
+        /// どちらの腕の子も起動した。0xC0000142 が消えたことを表す。A/B の問い
+        /// （CREATE_NO_WINDOW が原因か）は、ベースラインが落ちないと成り立たないので、
+        /// この結果はその問いへの答えではなく、起動失敗そのものが解消した記録になる。
+        ActionStarts = 4,
     }
 
     impl Session0DiagnosticOutcome {
@@ -1888,6 +1893,7 @@ mod tests {
                 1 => Ok(Self::NoWindowCausal),
                 2 => Ok(Self::NoWindowNotSufficient),
                 3 => Ok(Self::Indeterminate),
+                4 => Ok(Self::ActionStarts),
                 _ => Err("diagnostic classification".into()),
             }
         }
@@ -1897,6 +1903,7 @@ mod tests {
                 Self::NoWindowCausal => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL,
                 Self::NoWindowNotSufficient => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT,
                 Self::Indeterminate => WINDOW_STATION_SCM_SMOKE_INDETERMINATE,
+                Self::ActionStarts => WINDOW_STATION_SCM_SMOKE_ACTION_STARTS,
             }
         }
     }
@@ -1907,6 +1914,15 @@ mod tests {
         no_window_spawn_succeeded: bool,
         no_window_exit: Option<u32>,
     ) -> Session0DiagnosticOutcome {
+        // 両方の腕が起動して正常終了したなら、起動失敗は消えている。ベースラインの
+        // 失敗を前提とする A/B 分類より先に判定し、成功を「判定不能」として赤にしない。
+        if baseline_spawn_succeeded
+            && baseline_exit == Some(0)
+            && no_window_spawn_succeeded
+            && no_window_exit == Some(0)
+        {
+            return Session0DiagnosticOutcome::ActionStarts;
+        }
         if !baseline_spawn_succeeded || baseline_exit != Some(0xc000_0142) {
             return Session0DiagnosticOutcome::Indeterminate;
         }
@@ -2095,6 +2111,7 @@ mod tests {
             &record.station_access,
             &record.desktop_access,
             &record.ui_probe,
+            &record.action_desktop,
             &record.cwd,
             &record.environment_hash,
         ] {
@@ -2140,6 +2157,11 @@ mod tests {
         not_sufficient.no_window.child_exit = Some(0xc000_0142);
         not_sufficient.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
         accept("no-window-not-sufficient", not_sufficient);
+        let mut both_start = record.clone();
+        both_start.baseline.child_exit = Some(0);
+        both_start.no_window.child_exit = Some(0);
+        both_start.classification = Session0DiagnosticOutcome::ActionStarts;
+        accept("action-starts", both_start);
         let mut partial = record.clone();
         partial.markers = Session0DiagnosticRecord::ENTRY;
         partial.classification = Session0DiagnosticOutcome::Indeterminate;
@@ -2195,7 +2217,7 @@ mod tests {
         invalid_utf8[54] = 0xff;
         reject("invalid-utf8", invalid_utf8);
         let mut baseline_offset = 50;
-        for _ in 0..13 {
+        for _ in 0..14 {
             let length = u32::from_le_bytes(
                 bytes[baseline_offset..baseline_offset + 4]
                     .try_into()
@@ -2225,7 +2247,7 @@ mod tests {
         missing_entry[44] &= !Session0DiagnosticRecord::ENTRY;
         reject("missing-entry", missing_entry);
         let mut unknown_classification = bytes.clone();
-        unknown_classification[45] = 4;
+        unknown_classification[45] = 5;
         reject("unknown-classification", unknown_classification);
         let mut false_classification = bytes.clone();
         false_classification[45] = 2;
@@ -2339,11 +2361,11 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         if (-not $rejected) { throw "Accepted malformed case $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "Rejected valid case $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne 19) { throw 'Record property count mismatch.' }
+        if (@($record.PSObject.Properties).Count -ne 20) { throw 'Record property count mismatch.' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId')) { $values.Add([string]$record.$property) }
-        foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'Cwd', 'EnvironmentHash')) {
+        foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
         foreach ($run in @($record.Baseline, $record.NoWindow)) {
@@ -2560,7 +2582,13 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 Some(with_action.clone()),
                 0x0000_037f,
             ),
-            ("with action, +standard", Some(with_action), 0x0006_037f),
+            // 本番の `ActionDesktop::create` が要求するのと同じ式。値を直書きすると、
+            // 本番の権限を変えたときにこの記録だけ古いままになる。
+            (
+                "with action, production request",
+                Some(with_action),
+                ACTION_STATION_RIGHTS | WRITE_DAC | DELETE,
+            ),
         ] {
             let name = format!("sbz-probe-{}", secure_random_hex().expect("nonce"));
             let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
@@ -2682,10 +2710,15 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
             Session0DiagnosticOutcome::Indeterminate.service_magic(),
             WINDOW_STATION_SCM_SMOKE_INDETERMINATE
         );
+        assert_eq!(
+            Session0DiagnosticOutcome::ActionStarts.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_ACTION_STARTS
+        );
         for outcome in [
             Session0DiagnosticOutcome::NoWindowCausal,
             Session0DiagnosticOutcome::NoWindowNotSufficient,
             Session0DiagnosticOutcome::Indeterminate,
+            Session0DiagnosticOutcome::ActionStarts,
         ] {
             assert_eq!(
                 Session0DiagnosticOutcome::decode(outcome as u8).unwrap(),
@@ -2693,6 +2726,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
             );
         }
         assert!(Session0DiagnosticOutcome::decode(0).is_err());
+        assert!(Session0DiagnosticOutcome::decode(5).is_err());
     }
 
     #[test]
@@ -2715,6 +2749,28 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
             classify_session0_diagnostic_ab(false, Some(0xc000_0142), true, Some(0)),
             Session0DiagnosticOutcome::Indeterminate
         );
+        // 起動失敗が消えた記録は、両方の腕が起動して正常終了したときだけ出る。
+        assert_eq!(
+            classify_session0_diagnostic_ab(true, Some(0), true, Some(0)),
+            Session0DiagnosticOutcome::ActionStarts
+        );
+        for (baseline_spawn, baseline_exit, no_window_spawn, no_window_exit) in [
+            (true, Some(0), true, Some(0xc000_0142)),
+            (true, Some(0), false, None),
+            (true, Some(0), true, None),
+            (false, Some(0), true, Some(0)),
+        ] {
+            assert_eq!(
+                classify_session0_diagnostic_ab(
+                    baseline_spawn,
+                    baseline_exit,
+                    no_window_spawn,
+                    no_window_exit
+                ),
+                Session0DiagnosticOutcome::Indeterminate,
+                "only both arms starting cleanly counts as the failure being gone"
+            );
+        }
     }
 
     #[test]
@@ -2842,6 +2898,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         station_access: String,
         desktop_access: String,
         ui_probe: String,
+        action_desktop: String,
         cwd: String,
         environment_hash: String,
         baseline: Session0DiagnosticRun,
@@ -2877,6 +2934,7 @@ restricted=[];groups=[];privileges=[]"
                 ui_probe: "scope=broker-impersonated;first_failure=station:maximum_allowed;gle=5;\
 steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                     .into(),
+                action_desktop: "created".into(),
                 cwd: "C:\\Sembazuru\\診断".into(),
                 environment_hash: "0".repeat(64),
                 baseline: Session0DiagnosticRun {
@@ -2964,6 +3022,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 &self.station_access,
                 &self.desktop_access,
                 &self.ui_probe,
+                &self.action_desktop,
                 &self.cwd,
                 &self.environment_hash,
             ] {
@@ -3012,7 +3071,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             )?;
             let session_id = reader.u32().map_err(|_| "diagnostic session")?;
             let mut fields = Vec::new();
-            for _ in 0..13 {
+            for _ in 0..14 {
                 fields.push(read_text(&mut reader)?);
             }
             let baseline = Session0DiagnosticRun::decode_from(&mut reader)?;
@@ -3034,6 +3093,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 station_access: fields.remove(0),
                 desktop_access: fields.remove(0),
                 ui_probe: fields.remove(0),
+                action_desktop: fields.remove(0),
                 cwd: fields.remove(0),
                 environment_hash: fields.remove(0),
                 baseline,
@@ -3666,6 +3726,7 @@ privileges={privileges:?}{restricted}",
             station_access: "unavailable:action-not-created".into(),
             desktop_access: "unavailable:action-not-created".into(),
             ui_probe: "unavailable:action-not-created".into(),
+            action_desktop: "unavailable:action-not-created".into(),
             cwd: config.fixture_root.display().to_string(),
             environment_hash: "0".repeat(64),
             baseline: Session0DiagnosticRun::empty(),
@@ -3688,6 +3749,16 @@ privileges={privileges:?}{restricted}",
                 diagnostic_open_access(&action, &record.station, &record.desktop);
             record.ui_probe = diagnostic_ui_probe(&action, &record.station, &record.desktop);
         }
+        // 製品の起動経路と同じ呼び出しで、この環境がアクション専用のステーションと
+        // デスクトップを作れるかを記録する。作れたかどうかと子の終了コードを突き合わせると、
+        // 起動の成否を専用オブジェクトに帰属できる。作ったオブジェクトはこの場で閉じる。
+        record.action_desktop = match ActionDesktop::create(&action) {
+            Ok(_desktop) => "created".into(),
+            Err(DesktopSetupError::Unavailable(error)) => format!("unavailable:{error}"),
+            Err(DesktopSetupError::BrokerStationLost(error)) => {
+                format!("broker-station-lost:{error}")
+            }
+        };
         let scratch = match PrivateScratch::create(
             &config.record_directory,
             &format!("action-{}", config.nonce),

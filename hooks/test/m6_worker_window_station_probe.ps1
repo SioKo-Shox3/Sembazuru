@@ -41,6 +41,7 @@ $selector = 'sandbox::tests::window_station_scm_dispatcher_smoke_role'
 $noWindowCausalMagic = [uint32]0x53425b31
 $noWindowNotSufficientMagic = [uint32]0x53425b32
 $indeterminateMagic = [uint32]0x53425b33
+$actionStartsMagic = [uint32]0x53425b34
 $contractFailureMagic = [uint32]0x53425aff
 $diagnosticFailureMagic = [uint32]0x53425afe
 $brokerTokenFailureMagic = [uint32]0x53425af0
@@ -1044,7 +1045,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
         throw 'Session 0 diagnostic record length is outside its bounded contract.'
     }
     if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
-        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]5) {
+        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]6) {
         throw 'Session 0 diagnostic record magic/version mismatch.'
     }
     if ($Nonce -cnotmatch '\A[0-9a-fA-F]{32}\z') { throw 'Session 0 diagnostic nonce is malformed.' }
@@ -1068,17 +1069,17 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     $offset.Value++
     $sessionId = Read-Session0U32 $Bytes $offset
     $fields = [Collections.Generic.List[string]]::new()
-    for ($index = 0; $index -lt 13; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
+    for ($index = 0; $index -lt 14; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
     $baseline = Read-Session0DiagnosticRun $Bytes $offset
     $noWindow = Read-Session0DiagnosticRun $Bytes $offset
     if ($offset.Value -ne $Bytes.Length) { throw 'Session 0 diagnostic record has trailing bytes.' }
     if (($markers -band 0xf8) -ne 0 -or ($markers -band 1) -eq 0) {
         throw 'Session 0 diagnostic markers are invalid.'
     }
-    if ($classification -lt 1 -or $classification -gt 3) {
+    if ($classification -lt 1 -or $classification -gt 4) {
         throw 'Session 0 diagnostic classification is invalid.'
     }
-    if ($fields[12] -cnotmatch '\A[0-9a-fA-F]{64}\z') {
+    if ($fields[13] -cnotmatch '\A[0-9a-fA-F]{64}\z') {
         throw 'Session 0 diagnostic environment hash is invalid.'
     }
     if (($baseline.SpawnSucceeded -and ($baseline.JobUi -ne [uint32]0x000000fe -or
@@ -1089,6 +1090,15 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     }
     $expectedClassification = 3
     if ($markers -eq 7 -and $sessionId -eq 0 -and
+        $baseline.SpawnSucceeded -and $noWindow.SpawnSucceeded -and
+        $baseline.JobUi -eq [uint32]0x000000fe -and $noWindow.JobUi -eq [uint32]0x000000fe -and
+        $baseline.CreationFlags -eq [uint32]0x00080404 -and
+        $noWindow.CreationFlags -eq [uint32]0x08080404 -and
+        $null -ne $baseline.ChildExit -and $baseline.ChildExit -eq [uint32]0 -and
+        $null -ne $noWindow.ChildExit -and $noWindow.ChildExit -eq [uint32]0) {
+        # 両方の腕が起動した。Rust 側と同じく、ベースラインの失敗を前提とする分類より先に判定する。
+        $expectedClassification = 4
+    } elseif ($markers -eq 7 -and $sessionId -eq 0 -and
         $baseline.SpawnSucceeded -and $noWindow.SpawnSucceeded -and
         $baseline.JobUi -eq [uint32]0x000000fe -and $noWindow.JobUi -eq [uint32]0x000000fe -and
         $baseline.CreationFlags -eq [uint32]0x00080404 -and
@@ -1108,7 +1118,8 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
         Broker = $fields[0]; Action = $fields[1]; Station = $fields[2]; Desktop = $fields[3]
         StationDacl = $fields[4]; StationSacl = $fields[5]; DesktopDacl = $fields[6]
         DesktopSacl = $fields[7]; StationAccess = $fields[8]; DesktopAccess = $fields[9]
-        UiProbe = $fields[10]; Cwd = $fields[11]; EnvironmentHash = $fields[12]
+        UiProbe = $fields[10]; ActionDesktop = $fields[11]; Cwd = $fields[12]
+        EnvironmentHash = $fields[13]
         Baseline = $baseline; NoWindow = $noWindow
     }
 }
@@ -1310,6 +1321,7 @@ try {
         ($status.ServiceSpecificExitCode -ne $noWindowCausalMagic -and
          $status.ServiceSpecificExitCode -ne $noWindowNotSufficientMagic -and
          $status.ServiceSpecificExitCode -ne $indeterminateMagic -and
+         $status.ServiceSpecificExitCode -ne $actionStartsMagic -and
          $status.ServiceSpecificExitCode -ne $brokerTokenFailureMagic -and
          $status.ServiceSpecificExitCode -ne $publishFailureMagic -and
          $status.ServiceSpecificExitCode -ne $scratchCleanupFailureMagic -and
@@ -1348,6 +1360,7 @@ try {
         1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
         2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
         3 = @{ Name = 'INDETERMINATE'; Magic = $indeterminateMagic }
+        4 = @{ Name = 'ACTION_STARTS'; Magic = $actionStartsMagic }
     }
     if (-not $classificationMap.ContainsKey([int]$record.Classification)) {
         throw 'Session 0 diagnostic classification is invalid.'
@@ -1363,7 +1376,7 @@ try {
     foreach ($property in @(
         'Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl',
         'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe',
-        'Cwd', 'EnvironmentHash'
+        'ActionDesktop', 'Cwd', 'EnvironmentHash'
     )) {
         $detail.Add(('{0}={1}' -f $property, (Format-BoundedDiagnosticText $record.$property)))
     }
@@ -1565,6 +1578,10 @@ if ($diagnosticClassification -eq 'INDETERMINATE') {
         "INDETERMINATE: $diagnosticDetail; the measurement did not determine whether CREATE_NO_WINDOW is causal."
     )
     exit 1
+}
+if ($diagnosticClassification -eq 'ACTION_STARTS') {
+    Write-Host "ACTION_STARTS: $diagnosticDetail; both arms started and exited cleanly, so the 0xc0000142 launch failure is gone."
+    exit 0
 }
 if ($diagnosticClassification -eq 'NO_WINDOW_CAUSAL') {
     Write-Host "NO_WINDOW_CAUSAL: $diagnosticDetail; CREATE_NO_WINDOW changed the baseline 0xc0000142 exit to zero."
