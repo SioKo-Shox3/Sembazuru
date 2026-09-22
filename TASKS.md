@@ -183,7 +183,10 @@
   `Service-0x0-<自分のログオンセッション LUID>$` で実行ごとに変わり、LocalSystem の `3e7` ではない。
   製品の worker も仮想アカウントでインストールされるので、ステーションは worker 専用で他サービスと共有されない。
   ただし同じ worker の複数アクションが共有する点は残る。
-- next: 設計の選び直し。ADR 0018 と同じく二者に助言を求めてから決める。
+- decided (提案、ユーザー承認待ち): ADR 0018 の改訂 (2026-09-23)。worker-actions の乱数 SID を全アクションの
+  制限 SID 列へトークン生成時に組み込み、worker のステーションに非継承の ACE を1つだけ足し、デスクトップは
+  アクションごとに分ける。ステーションの権限は測定で決める（候補 0x0002 / 0x0022）。GPT の助言は
+  .harness/T-011-advisor-gpt-2.txt。
 - 残る未検証: (1) Session 0 で実際に `CreateWindowStation` が成功するか、
   (2) `CreateProcessAsUser` が要求するアクセスを `ACTION_STATION_RIGHTS` / `ACTION_DESKTOP_RIGHTS`
   で満たせるか（満たせなければ 0xC0000142 が続く）、(3) デスクトップヒープの上限と並列度、
