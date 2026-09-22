@@ -170,6 +170,11 @@
   ベースラインの失敗を前提にしていたため、直ると INDETERMINATE で赤になっていた）。読み方は、
   created かつ ACTION_STARTS なら T-011 が効いた、unavailable なら Session 0 でも作成を拒否される、
   created なのに 0xC0000142 なら権限か Job の UI 制限の層が次の容疑。プローブの要求マスクも本番と同じ式に揃えた。
+- measured-ci: run 35444179338 (SHA eeff1f2、T-011 を含む) の installer ジョブは依然として
+  `installed worker plain control failed: exit=-1073741502` (0xC0000142)。**T-011 はまだ効いていない。**
+  ただし installer ジョブではサービスの標準エラーが残らないので、「作成できずに継承へ戻った」のか
+  「作成できたのに子が落ちた」のかは区別できない。区別には a59fa7e の診断 v6（`ActionDesktop` 欄）を
+  Release のブランチ指定の手動実行で走らせる必要がある。
 - 残る未検証: (1) Session 0 で実際に `CreateWindowStation` が成功するか、
   (2) `CreateProcessAsUser` が要求するアクセスを `ACTION_STATION_RIGHTS` / `ACTION_DESKTOP_RIGHTS`
   で満たせるか（満たせなければ 0xC0000142 が続く）、(3) デスクトップヒープの上限と並列度、
@@ -449,6 +454,8 @@
   閾値が素通りでないことは、勝ちの閾値を 99 に変異させると
   `persistent pipe lost on 1 of 21 pairs: reuse is not paying for itself` で落ち、戻すと通ることで確認した。
   証拠は .harness/T-024-local-2.log と .harness/T-024-mutation-wins.log。
+- measured-ci: run 35444179338 (SHA eeff1f2) の windows-2025 で `VFS BENCH GATE PASS`。これまで M3.5 で
+  止まっていた同じ OS の失敗箇所が、その先の M6.1b（T-023）へ進んだ。
 - limitation: 「再利用が少し速い」と「再利用は効いていない」の区別は、この雑音の下では付かない。
   区別したいなら、プローブが生の標本を出して集約する形へ変える必要がある。今回はそこまでやっていない。
 - implemented: T-014〜T-022 で端から端までつながった。封筒 (b13994e)、storectl の join 動詞
