@@ -164,6 +164,12 @@
   (d) `#[ignore]` のプローブは本番のマスク `0x7037F` を試していない（`0x6037F` まで）。
   (e) 既存の Session 0 診断はブローカー側を測るので、再実行だけでは専用オブジェクトの
   `StationAccess`/`DesktopAccess` を証明できない。
+- measurement-ready: a59fa7e。Session 0 診断を version 6 にし、専用ステーションとデスクトップの
+  作成可否 (`ActionDesktop` = created / unavailable / broker-station-lost) を製品と同じ呼び出しで記録する。
+  両腕の子が起動して正常終了したら `ACTION_STARTS` に分類してジョブを成功で終える（これまでは
+  ベースラインの失敗を前提にしていたため、直ると INDETERMINATE で赤になっていた）。読み方は、
+  created かつ ACTION_STARTS なら T-011 が効いた、unavailable なら Session 0 でも作成を拒否される、
+  created なのに 0xC0000142 なら権限か Job の UI 制限の層が次の容疑。プローブの要求マスクも本番と同じ式に揃えた。
 - 残る未検証: (1) Session 0 で実際に `CreateWindowStation` が成功するか、
   (2) `CreateProcessAsUser` が要求するアクセスを `ACTION_STATION_RIGHTS` / `ACTION_DESKTOP_RIGHTS`
   で満たせるか（満たせなければ 0xC0000142 が続く）、(3) デスクトップヒープの上限と並列度、
