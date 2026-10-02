@@ -51,8 +51,8 @@ use tonic::{Request, Response, Status};
 use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
 
 use crate::sandbox::{
-    ActionPipeSecurity, ActionToken, PrivateRuntime, PrivateScratch, RestrictedCommand,
-    RestrictedProcess, VfsAttestation, secure_random_hex,
+    ActionPipeSecurity, ActionStationLease, ActionToken, PrivateRuntime, PrivateScratch,
+    RestrictedCommand, RestrictedProcess, VfsAttestation, secure_random_hex,
 };
 use crate::vfs_pipe::{ActionVfsServer, start_secured_action_vfs};
 
@@ -236,6 +236,7 @@ pub struct WorkerService {
     aborts: Arc<Mutex<HashMap<String, Arc<JobObject>>>>,
     cluster_token: Option<String>,
     worker_id: String,
+    action_station: Arc<ActionStationLease>,
 }
 
 impl Default for WorkerService {
@@ -245,18 +246,39 @@ impl Default for WorkerService {
 }
 
 impl WorkerService {
-    /// A worker admitting up to `available_parallelism()` concurrent actions.
+    /// 既定の並列度で worker を作る。ステーション lease を取得できない場合は panic する。
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A worker admitting up to `capacity` concurrent actions; up to
-    /// `QUEUE_FACTOR × capacity` more may queue (reported as `QUEUED`), beyond
-    /// which `Execute` is rejected with `RESOURCE_EXHAUSTED`. `capacity` ≥ 1.
+    /// 既定の並列度で worker を作り、ステーション lease の取得失敗を返す。
+    pub fn try_new() -> io::Result<Self> {
+        Self::try_with_capacity(default_capacity())
+    }
+
+    /// `capacity` 件まで同時実行し、さらに `QUEUE_FACTOR × capacity` 件をキューに受け入れる。
+    /// ステーション lease の取得に失敗した場合は panic する。
     pub fn with_capacity(capacity: u32) -> Self {
-        // Clamp to [1, MAX_CAPACITY]: a 0 would admit nothing, and a misconfigured
-        // huge value (e.g. u32::MAX) would overflow `capacity * QUEUE_FACTOR` below
-        // (panic in debug / wrap in release) — RES-001.
+        Self::try_with_capacity(capacity).expect("worker ステーション lease を取得できない")
+    }
+
+    /// 既定の並列度で worker を作り、ステーション lease の取得失敗を返す。
+    pub fn try_with_capacity(capacity: u32) -> io::Result<Self> {
+        Ok(Self::with_capacity_and_station(
+            capacity,
+            Arc::new(ActionStationLease::acquire()?),
+        ))
+    }
+
+    pub(crate) fn with_station(station: Arc<ActionStationLease>) -> Self {
+        Self::with_capacity_and_station(default_capacity(), station)
+    }
+
+    pub(crate) fn with_capacity_and_station(
+        capacity: u32,
+        station: Arc<ActionStationLease>,
+    ) -> Self {
+        // capacity を [1, MAX_CAPACITY] に制限し、キュー容量の計算でのオーバーフローを防ぐ。
         let capacity = capacity.clamp(1, MAX_CAPACITY);
         Self {
             running: Arc::new(AtomicU32::new(0)),
@@ -270,6 +292,7 @@ impl WorkerService {
             aborts: Arc::new(Mutex::new(HashMap::new())),
             cluster_token: None,
             worker_id: crate::coordination::default_worker_id(),
+            action_station: station,
         }
     }
 
@@ -813,6 +836,7 @@ async fn run_action(
     served: Arc<std::sync::atomic::AtomicU64>,
     ceiling: std::time::Duration,
     scratch_root: Arc<PathBuf>,
+    action_station: Arc<ActionStationLease>,
     // Held for the whole task (queued + running) so the accepted-work backlog
     // stays bounded; released on drop when the action leaves the worker.
     _accept: tokio::sync::OwnedSemaphorePermit,
@@ -892,7 +916,16 @@ async fn run_action(
         attestation,
         trace,
         resolved_tool_digest,
-    } = match build_child(&cmd, vfs_plan, predicted_paths, session_id, &scratch_root).await {
+    } = match build_child(
+        &cmd,
+        vfs_plan,
+        predicted_paths,
+        session_id,
+        &scratch_root,
+        action_station.clone(),
+    )
+    .await
+    {
         Ok(parts) => parts,
         Err(detail) => {
             let _ = tx.send(state_event(ActionState::Failed, &detail)).await;
@@ -1043,6 +1076,7 @@ async fn build_child(
     // handshake. Empty/unused on the plain path (it has no data plane).
     session_id: String,
     scratch_root: &Path,
+    action_station: Arc<ActionStationLease>,
 ) -> Result<BuiltChild, String> {
     if !scratch_root.is_absolute() {
         return Err(setup_err(
@@ -1050,8 +1084,8 @@ async fn build_child(
             scratch_root.display(),
         ));
     }
-    let token =
-        ActionToken::create().map_err(|error| setup_err("action token setup failed", error))?;
+    let token = ActionToken::create_for_worker(action_station)
+        .map_err(|error| setup_err("action token setup failed", error))?;
     let leaf = format!(
         "action-{}",
         secure_random_hex().map_err(|error| setup_err("scratch identity failed", error))?
@@ -1317,6 +1351,7 @@ impl Execution for WorkerService {
             Arc::clone(&self.served),
             self.ceiling,
             Arc::clone(&self.scratch_root),
+            Arc::clone(&self.action_station),
             accept,
         ));
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -1352,7 +1387,8 @@ impl Execution for WorkerService {
 pub async fn serve_on_listener(
     listener: TcpListener,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    serve_on_listener_with(listener, WorkerService::new()).await
+    let station = Arc::new(ActionStationLease::acquire()?);
+    serve_on_listener_with(listener, WorkerService::with_station(station)).await
 }
 
 /// Like [`serve_on_listener`], but with a caller-provided service so the worker

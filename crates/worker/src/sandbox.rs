@@ -7,25 +7,31 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, LocalFree,
-    SetHandleInformation, WAIT_OBJECT_0,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation, SetLastError,
+    WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_WINDOW_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Security::{
-    AllocateAndInitializeSid, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-    FreeSid, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    IsTokenRestricted, SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY,
-    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
-    TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinMediumLabelSid,
+    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, AddAce, AllocateAndInitializeSid,
+    CreateRestrictedToken, CreateWellKnownSid, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
+    EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSidIdentifierAuthority, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation,
+    InitializeAcl, IsTokenRestricted, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    WinAuthenticatedUserSid, WinBuiltinUsersSid, WinLocalSystemSid, WinMediumLabelSid,
     WinRestrictedCodeSid, WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, DELETE, WRITE_DAC};
@@ -35,21 +41,24 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::StationsAndDesktops::{
-    CloseDesktop, CloseWindowStation, CreateDesktopW, CreateWindowStationW,
-    GetProcessWindowStation, HDESK, HWINSTA, SetProcessWindowStation,
+    CloseDesktop, CreateDesktopW, GetProcessWindowStation, GetUserObjectInformationW, HDESK,
+    HWINSTA, UOI_NAME,
 };
+use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateSemaphoreW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenProcessToken,
-    OpenSemaphoreW, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ReleaseSemaphore,
-    ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW, CreateProcessAsUserW,
+    CreateSemaphoreW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenEventW,
+    OpenProcessToken, OpenSemaphoreW, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    ReleaseMutex, ReleaseSemaphore, ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::CWF_CREATE_ONLY;
+
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+const WAIT_ABANDONED_0: u32 = 0x0000_0080;
 
 use crate::job::JobObject;
 
@@ -385,9 +394,13 @@ impl Drop for VfsAttestation {
 
 struct ActionSid(*mut c_void);
 
-// SAFETY: the allocation is uniquely owned, is never dereferenced without the
-// owning `ActionToken`, and Windows permits SID inspection/freeing on any thread.
+// SAFETY: SID は割り当て後に変更せず、Windows は任意のスレッドから検査・解放できる。
+// 所有権により、参照中に割り当てが解放されることはない。
 unsafe impl Send for ActionSid {}
+unsafe impl Sync for ActionSid {}
+
+const ACTION_SID_PREFIX: [u32; 4] = [0x626d_6553, 0x7275_7a61, 0x6361_2e75, 0x6e6f_6974];
+const WORKER_ACTIONS_SID_PREFIX: [u32; 4] = [0x626d_6553, 0x7275_7a61, 0x6f77_2e75, 0x7265_6b72];
 
 pub(crate) fn secure_random_hex() -> io::Result<String> {
     let mut nonce = [0u8; 16];
@@ -408,6 +421,10 @@ pub(crate) fn secure_random_hex() -> io::Result<String> {
 
 impl ActionSid {
     fn random() -> io::Result<Self> {
+        Self::random_with_prefix(ACTION_SID_PREFIX, "action identity unavailable")
+    }
+
+    fn random_with_prefix(prefix: [u32; 4], failure: &'static str) -> io::Result<Self> {
         let mut nonce = [0u32; 4];
         // SAFETY: a null algorithm plus SYSTEM_PREFERRED uses the OS CSPRNG and nonce is writable.
         if unsafe {
@@ -419,20 +436,19 @@ impl ActionSid {
             )
         } != 0
         {
-            return Err(io::Error::other("action identity unavailable"));
+            return Err(io::Error::other(failure));
         }
         let mut sid = null_mut();
-        // The first four subauthorities publicly encode "Sembazuru.action"; the remaining
-        // 128 random bits are independent of remote action ids, PIDs, and wall time.
-        // SAFETY: authority and out pointer are valid; success transfers a FreeSid allocation.
+        // 先頭4つの subauthority が用途を識別し、残る128 bitはOSの乱数から得る。
+        // SAFETY: authority と出力先は有効で、成功時の割り当てを FreeSid が所有する。
         if unsafe {
             AllocateAndInitializeSid(
                 &SECURITY_RESOURCE_MANAGER_AUTHORITY,
                 8,
-                0x626d_6553,
-                0x7275_7a61,
-                0x6361_2e75,
-                0x6e6f_6974,
+                prefix[0],
+                prefix[1],
+                prefix[2],
+                prefix[3],
                 nonce[0],
                 nonce[1],
                 nonce[2],
@@ -447,6 +463,22 @@ impl ActionSid {
     }
 }
 
+struct WorkerActionsSid(ActionSid);
+
+impl WorkerActionsSid {
+    fn random() -> io::Result<Self> {
+        ActionSid::random_with_prefix(
+            WORKER_ACTIONS_SID_PREFIX,
+            "worker アクション SID を生成できない",
+        )
+        .map(Self)
+    }
+
+    fn sid(&self) -> *mut c_void {
+        self.0.0
+    }
+}
+
 impl Drop for ActionSid {
     fn drop(&mut self) {
         // SAFETY: self.0 is the outstanding AllocateAndInitializeSid result.
@@ -458,9 +490,12 @@ pub(crate) struct ActionToken {
     token: OwnedHandle,
     action_sid: ActionSid,
     broker_user: Vec<usize>,
+    station_name: String,
+    station_lease: Option<Arc<ActionStationLease>>,
 }
 
 impl ActionToken {
+    #[cfg(test)]
     pub(crate) fn create() -> io::Result<Self> {
         let token = current_token(
             TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
@@ -468,7 +503,35 @@ impl ActionToken {
         Self::create_from_token(token.as_raw_handle() as HANDLE)
     }
 
+    #[cfg(test)]
     fn create_from_token(source: HANDLE) -> io::Result<Self> {
+        let worker_actions_sid = Arc::new(WorkerActionsSid::random()?);
+        Self::create_from_token_with_station(
+            source,
+            worker_actions_sid,
+            current_window_station_name()?,
+            None,
+        )
+    }
+
+    pub(crate) fn create_for_worker(station_lease: Arc<ActionStationLease>) -> io::Result<Self> {
+        let source = current_token(
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+        )?;
+        Self::create_from_token_with_station(
+            source.as_raw_handle() as HANDLE,
+            Arc::clone(&station_lease.worker_actions_sid),
+            station_lease.station_name.clone(),
+            Some(station_lease),
+        )
+    }
+
+    fn create_from_token_with_station(
+        source: HANDLE,
+        worker_actions_sid: Arc<WorkerActionsSid>,
+        station_name: String,
+        station_lease: Option<Arc<ActionStationLease>>,
+    ) -> io::Result<Self> {
         if is_token_restricted(source) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
@@ -483,17 +546,23 @@ impl ActionToken {
         ] {
             sid_storage.push(well_known_sid(kind)?);
         }
-        let mut restrictions = vec![SID_AND_ATTRIBUTES {
-            Sid: action_sid.0,
-            Attributes: 0,
-        }];
+        let mut restrictions = vec![
+            SID_AND_ATTRIBUTES {
+                Sid: worker_actions_sid.sid(),
+                Attributes: 0,
+            },
+            SID_AND_ATTRIBUTES {
+                Sid: action_sid.0,
+                Attributes: 0,
+            },
+        ];
         restrictions.extend(sid_storage.iter_mut().map(|sid| SID_AND_ATTRIBUTES {
             Sid: sid.as_mut_ptr().cast(),
             Attributes: 0,
         }));
         let mut restricted = null_mut();
-        // SAFETY: source is queryable/duplicable; the SID pointers remain alive for this call;
-        // the returned primary token is transferred to OwnedHandle and never ambient-fallbacks.
+        // SAFETY: source は照会・複製可能で、SID は呼び出し中に有効である。
+        // 返されたプライマリトークンは OwnedHandle に移し、暗黙のトークンへ戻さない。
         if unsafe {
             CreateRestrictedToken(
                 source,
@@ -517,6 +586,8 @@ impl ActionToken {
             token,
             action_sid,
             broker_user,
+            station_name,
+            station_lease,
         })
     }
 
@@ -545,6 +616,549 @@ impl ActionToken {
         let _revert = Revert;
         operation()
     }
+}
+
+/// worker が現在使っているサービスステーションを借用し、共有 SID の許可を管理する。
+/// `station` は `GetProcessWindowStation` の戻り値であり、この構造体は閉じない。
+pub(crate) struct ActionStationLease {
+    station: HWINSTA,
+    station_name: String,
+    worker_actions_sid: Arc<WorkerActionsSid>,
+    broker_sid: String,
+    update_mutex_name: Option<String>,
+    active_marker: Option<OwnedHandle>,
+}
+
+// SAFETY: HWINSTA はプロセス全体で有効な借用ハンドルであり、SID と名前は不変。
+unsafe impl Send for ActionStationLease {}
+unsafe impl Sync for ActionStationLease {}
+
+impl ActionStationLease {
+    /// 実行中の worker と競合しないように DACL 更新を直列化してから lease を返す。
+    pub(crate) fn acquire() -> io::Result<Self> {
+        let station = unsafe { GetProcessWindowStation() };
+        if station.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let station_name = user_object_name(station as HANDLE)?;
+        let process_token = current_token(TOKEN_QUERY)?;
+        let broker_user = token_info(process_token.as_raw_handle() as HANDLE, TokenUser)?;
+        // SAFETY: TokenUser 情報は broker_user が生存する間有効。
+        let broker_sid = unsafe { (*(broker_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let broker_sid_text = sid_string(broker_sid)?;
+        let mut local_system = well_known_sid(WinLocalSystemSid)?;
+        // LocalSystem のセッション共有ステーションと対話用 WinSta0 の DACL は変更しない。
+        if unsafe { EqualSid(broker_sid, local_system.as_mut_ptr().cast()) } != 0
+            && !station_name.eq_ignore_ascii_case("WinSta0")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "LocalSystem の共有ステーションは変更しない",
+            ));
+        }
+
+        let worker_actions_sid = Arc::new(WorkerActionsSid::random()?);
+        let is_interactive = station_name.eq_ignore_ascii_case("WinSta0");
+        let is_service_station = station_name.starts_with("Service-0x0-")
+            && station_name.ends_with('$')
+            && station_name.len() > "Service-0x0-$".len();
+        if !is_interactive && !is_service_station {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker のウィンドウステーションを識別できない",
+            ));
+        }
+
+        let mut lease = Self {
+            station,
+            station_name,
+            worker_actions_sid,
+            broker_sid: broker_sid_text,
+            update_mutex_name: None,
+            active_marker: None,
+        };
+        if is_service_station {
+            let mutex_name = format!(
+                "Local\\Sembazuru.WindowStationUpdate.{}",
+                lease.station_name
+            );
+            let marker_name = worker_actions_marker_name(lease.worker_actions_sid.sid())?;
+            let _update = StationUpdateGuard::acquire(&mutex_name, &lease.broker_sid)?;
+            let marker = create_active_marker(&marker_name, &lease.broker_sid)?;
+            if let Err(error) =
+                update_station_acl(lease.station, Some(lease.worker_actions_sid.sid()), None)
+            {
+                if let Err(cleanup) =
+                    update_station_acl(lease.station, None, Some(lease.worker_actions_sid.sid()))
+                {
+                    eprintln!(
+                        "sembazuru-worker: 起動失敗後のステーション ACL 後始末に失敗: {cleanup}"
+                    );
+                }
+                return Err(error);
+            }
+            lease.update_mutex_name = Some(mutex_name);
+            lease.active_marker = Some(marker);
+        }
+        Ok(lease)
+    }
+}
+
+impl Drop for ActionStationLease {
+    fn drop(&mut self) {
+        let Some(mutex_name) = &self.update_mutex_name else {
+            return;
+        };
+        let result = (|| {
+            let _update = StationUpdateGuard::acquire(mutex_name, &self.broker_sid)?;
+            update_station_acl(self.station, None, Some(self.worker_actions_sid.sid()))
+        })();
+        if let Err(error) = result {
+            eprintln!("sembazuru-worker: ステーション ACL の lease 解放に失敗: {error}");
+        }
+    }
+}
+
+struct StationUpdateGuard(OwnedHandle);
+
+impl StationUpdateGuard {
+    fn acquire(name: &str, broker_sid: &str) -> io::Result<Self> {
+        let sddl = format!("D:P(A;;GA;;;{broker_sid})");
+        let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let handle = with_sddl_attributes(&sddl, |attributes| {
+            // SAFETY: 保護記述子と名前は CreateMutexW の呼び出し中に有効である。
+            let mutex = unsafe { CreateMutexW(attributes, 0, wide_name.as_ptr()) };
+            if mutex.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                // SAFETY: CreateMutexW が返した一意のカーネルハンドルを所有する。
+                Ok(unsafe { OwnedHandle::from_raw_handle(mutex as RawHandle) })
+            }
+        })?;
+        let waited = unsafe { WaitForSingleObject(handle.as_raw_handle() as HANDLE, INFINITE) };
+        if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED_0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for StationUpdateGuard {
+    fn drop(&mut self) {
+        // SAFETY: acquire はこのスレッドが mutex を所有してから戻る。
+        if unsafe { ReleaseMutex(self.0.as_raw_handle() as HANDLE) } == 0 {
+            eprintln!("sembazuru-worker: ステーション更新 mutex の解放に失敗");
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AceBlob {
+    words: Vec<u32>,
+    byte_len: usize,
+}
+
+impl AceBlob {
+    fn from_ptr(ace: *const c_void, byte_len: usize) -> io::Result<Self> {
+        if byte_len < size_of::<ACE_HEADER>() || !byte_len.is_multiple_of(size_of::<u32>()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ステーション ACE のサイズが不正",
+            ));
+        }
+        let word_count = byte_len / size_of::<u32>();
+        let mut words = vec![0u32; word_count];
+        // SAFETY: GetAce が返した byte_len バイトは読み取り可能で、両領域は整列し重ならない。
+        unsafe { std::ptr::copy_nonoverlapping(ace.cast::<u32>(), words.as_mut_ptr(), word_count) };
+        Ok(Self { words, byte_len })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: words は初期化済み byte_len バイトを所有し、ACE の各フィールドに整列する。
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.byte_len) }
+    }
+
+    fn header(&self) -> &ACE_HEADER {
+        // SAFETY: ACE_HEADER より短いバッファは構築時に拒否している。
+        unsafe { &*self.words.as_ptr().cast::<ACE_HEADER>() }
+    }
+
+    fn simple_allow(&self) -> Option<(String, u8, u32)> {
+        let bytes = self.bytes();
+        if u32::from(self.header().AceType) != ACCESS_ALLOWED_ACE_TYPE || self.byte_len < 16 {
+            return None;
+        }
+        let sid = unsafe { bytes.as_ptr().add(8).cast_mut().cast::<c_void>() };
+        // SAFETY: SID は有効な ACL から複製した ACCESS_ALLOWED_ACE の内部にある。
+        let sid_len = unsafe { GetLengthSid(sid) } as usize;
+        if sid_len < 8 || 8usize.checked_add(sid_len)? > self.byte_len {
+            return None;
+        }
+        let mask = u32::from_ne_bytes(bytes[4..8].try_into().ok()?);
+        Some((sid_string(sid).ok()?, self.header().AceFlags, mask))
+    }
+
+    fn worker_actions_sid(&self) -> Option<String> {
+        let (sid_text, flags, mask) = self.simple_allow()?;
+        if flags != 0 || mask != 0x0002 {
+            return None;
+        }
+        let sid = unsafe { self.bytes().as_ptr().add(8).cast_mut().cast::<c_void>() };
+        if is_worker_actions_sid(sid) {
+            Some(sid_text)
+        } else {
+            None
+        }
+    }
+}
+
+fn user_object_name(handle: HANDLE) -> io::Result<String> {
+    let mut buffer = vec![0u16; 1024];
+    let mut used = 0;
+    // SAFETY: 借用した USER オブジェクトのハンドルは有効で、バッファは書き込み可能。
+    if unsafe {
+        GetUserObjectInformationW(
+            handle,
+            UOI_NAME,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * size_of::<u16>()) as u32,
+            &mut used,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let length = (used as usize / size_of::<u16>()).min(buffer.len());
+    if length == 0 || buffer[length - 1] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "USER オブジェクト名が終端されていない",
+        ));
+    }
+    Ok(String::from_utf16_lossy(&buffer[..length - 1]))
+}
+
+#[cfg(test)]
+fn current_window_station_name() -> io::Result<String> {
+    let station = unsafe { GetProcessWindowStation() };
+    if station.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    user_object_name(station as HANDLE)
+}
+
+fn worker_actions_marker_name(sid: *mut c_void) -> io::Result<String> {
+    Ok(format!(
+        "Local\\Sembazuru.WorkerActions.Active.{}",
+        sid_string(sid)?
+    ))
+}
+
+fn create_active_marker(name: &str, broker_sid: &str) -> io::Result<OwnedHandle> {
+    let sddl = format!("D:P(A;;GA;;;{broker_sid})");
+    let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    with_sddl_attributes(&sddl, |attributes| {
+        unsafe { SetLastError(0) };
+        // SAFETY: 保護記述子と名前は CreateEventW の呼び出し中に有効である。
+        let event = unsafe { CreateEventW(attributes, 1, 0, wide_name.as_ptr()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let last_error = unsafe { GetLastError() };
+        // 乱数 SID が既存の別 worker のマーカーへ誤って結び付く場合は拒否する。
+        if last_error == ERROR_ALREADY_EXISTS {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(event) };
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "worker アクション lease のマーカーが既に存在する",
+            ));
+        }
+        // SAFETY: CreateEventW が返した一意のカーネルハンドルを所有する。
+        Ok(unsafe { OwnedHandle::from_raw_handle(event as RawHandle) })
+    })
+}
+
+fn is_worker_actions_sid(sid: *mut c_void) -> bool {
+    let authority = unsafe { GetSidIdentifierAuthority(sid) };
+    if authority.is_null()
+        || unsafe { (*authority).Value != SECURITY_RESOURCE_MANAGER_AUTHORITY.Value }
+    {
+        return false;
+    }
+    let count = unsafe { GetSidSubAuthorityCount(sid) };
+    if count.is_null() || unsafe { *count } != 8 {
+        return false;
+    }
+    WORKER_ACTIONS_SID_PREFIX
+        .iter()
+        .enumerate()
+        .all(|(index, expected)| {
+            let part = unsafe { GetSidSubAuthority(sid, index as u32) };
+            !part.is_null() && unsafe { *part == *expected }
+        })
+}
+
+fn acl_aces(acl: *mut ACL) -> io::Result<(u8, Vec<AceBlob>)> {
+    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: acl は有効な DACL で、info は API が定める出力形式である。
+    if unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut aces = Vec::with_capacity(info.AceCount as usize);
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        // SAFETY: index はこの ACL から取得した ACE 数の範囲内である。
+        if unsafe { GetAce(acl, index, &mut raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetAce が返した ACE ヘッダーは ACL 内で有効である。
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        aces.push(AceBlob::from_ptr(raw, header.AceSize as usize)?);
+    }
+    // SAFETY: acl は有効で、ACL ヘッダーからリビジョンを取得できる。
+    let revision = unsafe { (*acl).AclRevision };
+    Ok((revision, aces))
+}
+
+fn station_dacl(station: HWINSTA) -> io::Result<(u16, u8, Vec<AceBlob>)> {
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: station は GetProcessWindowStation から借用し、出力先は有効である。
+    let error = unsafe {
+        GetSecurityInfo(
+            station as HANDLE,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    if descriptor.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ステーションのセキュリティ記述子がない",
+        ));
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    let (mut present, mut descriptor_dacl, mut defaulted) = (0, null_mut(), 0);
+    // SAFETY: descriptor は有効なままで、すべての出力先が有効である。
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut present,
+            &mut descriptor_dacl,
+            &mut defaulted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if present == 0 || descriptor_dacl.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker ステーションの DACL がないか null である",
+        ));
+    }
+    let (mut control, mut descriptor_revision) = (0, 0);
+    // SAFETY: descriptor は GetSecurityInfo が返した有効なセキュリティ記述子である。
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut descriptor_revision) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let (acl_revision, aces) = acl_aces(descriptor_dacl)?;
+    Ok((control, acl_revision, aces))
+}
+
+fn stale_worker_action_sids(aces: &[AceBlob]) -> io::Result<Vec<String>> {
+    let mut stale = Vec::new();
+    for ace in aces {
+        let Some(sid) = ace.worker_actions_sid() else {
+            continue;
+        };
+        let marker_name = format!("Local\\Sembazuru.WorkerActions.Active.{sid}");
+        let wide_marker: Vec<u16> = marker_name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: マーカー名は NUL 終端され、返されたハンドルは下で所有権を得る。
+        let event = unsafe { OpenEventW(SYNCHRONIZE_ACCESS, 0, wide_marker.as_ptr()) };
+        if event.is_null() {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_FILE_NOT_FOUND {
+                stale.push(sid);
+                continue;
+            }
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // SAFETY: OpenEventW が返した一意のカーネルハンドルを所有する。
+        drop(unsafe { OwnedHandle::from_raw_handle(event as RawHandle) });
+    }
+    stale.sort_unstable();
+    stale.dedup();
+    Ok(stale)
+}
+
+fn rewrite_station_aces(
+    aces: &[AceBlob],
+    add_sid: Option<*mut c_void>,
+    remove_sid: Option<*mut c_void>,
+    stale_sid_strings: &[String],
+) -> io::Result<Vec<AceBlob>> {
+    let mut rewritten = Vec::with_capacity(aces.len() + usize::from(add_sid.is_some()));
+    let mut removed = 0usize;
+    for ace in aces {
+        let info = ace.simple_allow();
+        let matches_remove = remove_sid.is_some_and(|sid| {
+            info.as_ref().is_some_and(|(text, flags, mask)| {
+                *flags == 0
+                    && *mask == 0x0002
+                    && sid_string(sid).is_ok_and(|expected| expected == *text)
+            })
+        });
+        let matches_stale = info
+            .as_ref()
+            .is_some_and(|(sid, flags, mask)| {
+                *flags == 0
+                    && *mask == 0x0002
+                    && stale_sid_strings.iter().any(|stale| stale == sid)
+            });
+        if matches_remove || matches_stale {
+            removed += 1;
+        } else {
+            rewritten.push(ace.clone());
+        }
+    }
+    if remove_sid.is_some() && removed != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker ステーションの ACE 数が解放前に変わった",
+        ));
+    }
+    if let Some(sid) = add_sid {
+        let expected_sid = sid_string(sid)?;
+        if aces.iter().any(|ace| {
+            ace.simple_allow()
+                .is_some_and(|(text, _, _)| text == expected_sid)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "worker SID の ACE が既に存在する",
+            ));
+        }
+        rewritten.push(allow_ace(sid)?);
+    }
+    Ok(rewritten)
+}
+
+fn allow_ace(sid: *mut c_void) -> io::Result<AceBlob> {
+    let sid_len = unsafe { GetLengthSid(sid) } as usize;
+    let byte_len = 8usize
+        .checked_add(sid_len)
+        .filter(|len| *len <= u16::MAX as usize && len.is_multiple_of(size_of::<u32>()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "worker SID の長さが不正"))?;
+    let mut words = vec![0u32; byte_len / size_of::<u32>()];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), byte_len) };
+    bytes[0] = ACCESS_ALLOWED_ACE_TYPE as u8;
+    bytes[1] = 0;
+    bytes[2..4].copy_from_slice(&(byte_len as u16).to_ne_bytes());
+    bytes[4..8].copy_from_slice(&0x0002u32.to_ne_bytes());
+    // SAFETY: destination は整列済みで書き込み可能な ACE バッファ内の SID 分の領域である。
+    unsafe { std::ptr::copy_nonoverlapping(sid.cast::<u8>(), bytes.as_mut_ptr().add(8), sid_len) };
+    Ok(AceBlob { words, byte_len })
+}
+
+fn set_station_dacl(
+    station: HWINSTA,
+    control: u16,
+    revision: u8,
+    aces: &[AceBlob],
+) -> io::Result<()> {
+    let ace_bytes = aces
+        .iter()
+        .try_fold(0usize, |total, ace| total.checked_add(ace.byte_len));
+    let total = size_of::<ACL>()
+        .checked_add(ace_bytes.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "ステーション ACL のサイズが上限を超えた")
+        })?)
+        .filter(|size| *size <= u16::MAX as usize)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ステーション ACL が大きすぎる"))?;
+    let mut storage = vec![0usize; total.div_ceil(size_of::<usize>())];
+    let acl = storage.as_mut_ptr().cast::<ACL>();
+    // SAFETY: storage は整列済みで、ACL ヘッダーと複製する全 ACE を格納できる。
+    if unsafe { InitializeAcl(acl, total as u32, u32::from(revision)) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for ace in aces {
+        // SAFETY: 各 ACE バッファは整列済みで完全な内容を持ち、AddAce の呼び出し中に有効。
+        if unsafe {
+            AddAce(
+                acl,
+                u32::from(revision),
+                u32::MAX,
+                ace.words.as_ptr().cast(),
+                ace.byte_len as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let protection = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        0
+    };
+    // SAFETY: station は借用され、acl は SetSecurityInfo が戻るまで有効である。
+    let error = unsafe {
+        SetSecurityInfo(
+            station as HANDLE,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            null_mut(),
+            null_mut(),
+            acl,
+            null_mut(),
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    Ok(())
+}
+
+fn update_station_acl(
+    station: HWINSTA,
+    add_sid: Option<*mut c_void>,
+    remove_sid: Option<*mut c_void>,
+) -> io::Result<()> {
+    let (control, revision, before) = station_dacl(station)?;
+    let stale = stale_worker_action_sids(&before)?;
+    let expected = rewrite_station_aces(&before, add_sid, remove_sid, &stale)?;
+    if expected == before {
+        return Ok(());
+    }
+    set_station_dacl(station, control, revision, &expected)?;
+    let (_, _, actual) = station_dacl(station)?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker ステーション DACL の読み戻しが要求した ACL と異なる",
+        ));
+    }
+    Ok(())
 }
 
 struct LocalAllocation(*mut c_void);
@@ -805,34 +1419,8 @@ impl ActionPipeSecurity {
     }
 }
 
-/// Access an action needs on its own window station.
-///
-/// `WINSTA_ALL_ACCESS` plus `READ_CONTROL`, and deliberately none of `DELETE`, `WRITE_DAC`, or
-/// `WRITE_OWNER`: `CreateProcessAsUser` requires the token's user to have read and write access to
-/// the target station, but an action that could rewrite its own station's DACL could also let
-/// another action in.
-const ACTION_STATION_RIGHTS: u32 = 0x0002_037f;
-
-/// The same shape for the desktop: `DESKTOP_ALL` plus `READ_CONTROL`, without the three standard
-/// rights that would let the action change who may reach it.
+/// デスクトップを使うアクションの権限。ACL や所有者を変更する標準権限は含めない。
 const ACTION_DESKTOP_RIGHTS: u32 = 0x0002_01ff;
-
-/// Serializes the station switch that creating a desktop requires.
-///
-/// `CreateDesktop` can only create on the calling process's *current* window station, so the broker
-/// has to switch, create, and switch back. That is process-wide state, and actions are started in
-/// parallel, so the window has to be held by one action at a time.
-static STATION_SWITCH: Mutex<()> = Mutex::new(());
-
-struct OwnedWindowStation(HWINSTA);
-
-impl Drop for OwnedWindowStation {
-    fn drop(&mut self) {
-        // SAFETY: this handle came from CreateWindowStationW and is closed exactly once. Closing
-        // the station the process is currently using fails; the creator restores its own first.
-        unsafe { CloseWindowStation(self.0) };
-    }
-}
 
 struct OwnedDesktop(HDESK);
 
@@ -844,155 +1432,69 @@ impl Drop for OwnedDesktop {
     }
 }
 
-/// One action's own window station and desktop.
-///
-/// Session 0's service station grants only the service SID and Administrators. The action's token
-/// is restricted, so the access check runs twice, and the restricted list —
-/// `[action_sid, Everyone, Authenticated Users, Users, RESTRICTED]` — matches no entry there. That
-/// is what refuses it: measured on a hosted runner on 2026-09-18, every open failed with
-/// `ERROR_ACCESS_DENIED`, `MAXIMUM_ALLOWED` included, while the objects carried no integrity label
-/// at all. Widening the shared station would hand every restricted action the same access to an
-/// object all of the session's LocalSystem services use; giving each action its own object, named
-/// in its DACL by its own random SID, satisfies both halves of the check and keeps actions apart.
+/// 共有ステーション上に作る、1アクション専用のデスクトップ。
 pub(crate) struct ActionDesktop {
     lp_desktop: Vec<u16>,
     _desktop: OwnedDesktop,
-    _station: OwnedWindowStation,
+    _station_lease: Option<Arc<ActionStationLease>>,
 }
 
-// SAFETY: the two fields are kernel handles, which are process-wide and not bound to the thread
-// that created them. Nothing here caches thread state, and the only operations are the closes in
-// each field's Drop. The station switch that creation needs is process-wide and is serialized by
-// `STATION_SWITCH`, so it never travels with this value.
+// SAFETY: デスクトップハンドルと lease はプロセス内で共有し、Drop はデスクトップだけを閉じる。
 unsafe impl Send for ActionDesktop {}
 
-/// Why an action did not get its own station and desktop.
-pub(crate) enum DesktopSetupError {
-    /// This environment will not create them, and the broker's own state is untouched. An
-    /// interactive session refuses `CreateWindowStation` outright, so this is the ordinary case
-    /// outside the service.
-    Unavailable(io::Error),
-    /// The broker is no longer on its own window station. Nothing may be started after this: a
-    /// child would inherit an action's station, the handle to the broker's own is gone, and every
-    /// later action would take the wrong station as the one to restore.
-    BrokerStationLost(io::Error),
-}
-
 impl ActionDesktop {
-    pub(crate) fn create(token: &ActionToken) -> Result<Self, DesktopSetupError> {
-        // A fresh random name plus CWF_CREATE_ONLY: a name another process already holds is a
-        // failure here, never a silent second handle to somebody else's object.
-        let unavailable = DesktopSetupError::Unavailable;
-        let name = format!("sbz-{}", secure_random_hex().map_err(unavailable)?);
-        let sddl = action_object_sddl(token, ACTION_STATION_RIGHTS).map_err(unavailable)?;
-        let desktop_sddl = action_object_sddl(token, ACTION_DESKTOP_RIGHTS).map_err(unavailable)?;
-        let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-
-        let station_descriptor = security_descriptor(&sddl).map_err(unavailable)?;
-        let station_attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: station_descriptor.0,
-            bInheritHandle: 0,
-        };
-        // SAFETY: the name and the descriptor are live for the call; success transfers one handle.
-        let station = unsafe {
-            CreateWindowStationW(
-                wide_name.as_ptr(),
-                CWF_CREATE_ONLY,
-                ACTION_STATION_RIGHTS | WRITE_DAC | DELETE,
-                &station_attributes,
-            )
-        };
+    pub(crate) fn create(token: &ActionToken) -> io::Result<Self> {
+        let station = unsafe { GetProcessWindowStation() };
         if station.is_null() {
-            return Err(unavailable(stage_error("create window station")));
+            return Err(io::Error::last_os_error());
         }
-        let station = OwnedWindowStation(station);
-
-        let desktop_descriptor = security_descriptor(&desktop_sddl).map_err(unavailable)?;
+        let current_station = user_object_name(station as HANDLE)?;
+        if !current_station.eq_ignore_ascii_case(&token.station_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker のウィンドウステーションが起動時から変わっている",
+            ));
+        }
+        let name = format!("sbz-{}", secure_random_hex()?);
+        let desktop_sddl = action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?;
+        let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let desktop_descriptor = security_descriptor(&desktop_sddl)?;
         let desktop_attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: desktop_descriptor.0,
             bInheritHandle: 0,
         };
-        let desktop = {
-            // A poisoned lock means a previous holder panicked between the switch and the restore,
-            // so this process may already be sitting on somebody else's station. That is the one
-            // failure that must not become a fallback.
-            let _serialized = STATION_SWITCH.lock().map_err(|_| {
-                DesktopSetupError::BrokerStationLost(io::Error::other(
-                    "a previous action left the window station switch unfinished",
-                ))
-            })?;
-            // SAFETY: the current station handle is owned by the process and stays valid.
-            let previous = unsafe { GetProcessWindowStation() };
-            if previous.is_null() {
-                // Without a handle to go back to, switching away would be one-way.
-                return Err(unavailable(stage_error("read the broker window station")));
-            }
-            // SAFETY: the station was just created with a handle that permits the switch.
-            if unsafe { SetProcessWindowStation(station.0) } == 0 {
-                return Err(unavailable(stage_error("switch to the action station")));
-            }
-            // SAFETY: the name and descriptor are live; the process station is the new one.
-            let desktop = unsafe {
-                CreateDesktopW(
-                    wide_name.as_ptr(),
-                    null(),
-                    null(),
-                    0,
-                    ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
-                    &desktop_attributes,
-                )
-            };
-            let created = io::Error::last_os_error();
-            // Restore before anything else can observe this process on the action's station, and
-            // before the station handle is dropped: closing the current station fails.
-            // SAFETY: `previous` is this process's own station handle, still valid.
-            let restored = unsafe { SetProcessWindowStation(previous) };
-            if restored == 0 {
-                // Checked before the desktop result, because a broker left on the wrong station is
-                // the graver of the two and must not be hidden by the failure that came with it.
-                if !desktop.is_null() {
-                    // SAFETY: the desktop was created above and is closed exactly once here.
-                    unsafe { CloseDesktop(desktop) };
-                }
-                return Err(DesktopSetupError::BrokerStationLost(stage_error(
-                    "restore the broker window station",
-                )));
-            }
-            if desktop.is_null() {
-                return Err(unavailable(io::Error::other(format!(
-                    "action desktop: create desktop failed ({created})"
-                ))));
-            }
-            OwnedDesktop(desktop)
+        // SAFETY: 名前と保護記述子は CreateDesktopW の呼び出し中に有効である。
+        let desktop = unsafe {
+            CreateDesktopW(
+                wide_name.as_ptr(),
+                null(),
+                null(),
+                0,
+                ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
+                &desktop_attributes,
+            )
         };
-
-        let lp_desktop: Vec<u16> = format!("{name}\\{name}")
+        if desktop.is_null() {
+            return Err(stage_error("create action desktop"));
+        }
+        let lp_desktop: Vec<u16> = format!("{}\\{name}", token.station_name)
             .encode_utf16()
             .chain(Some(0))
             .collect();
         Ok(Self {
             lp_desktop,
-            _desktop: desktop,
-            _station: station,
+            _desktop: OwnedDesktop(desktop),
+            _station_lease: token.station_lease.clone(),
         })
     }
 
-    /// The `station\desktop` pair, in the form `STARTUPINFO.lpDesktop` takes.
+    /// `STARTUPINFO.lpDesktop` に渡す `station\desktop` の組を返す。
     pub(crate) fn lp_desktop(&self) -> *mut u16 {
         self.lp_desktop.as_ptr().cast_mut()
     }
 
-    /// Creates only the desktop, on whatever station this process is already using.
-    ///
-    /// An interactive user session refuses `CreateWindowStation` outright: measured on a normal
-    /// desktop session, every variant is denied with `ERROR_ACCESS_DENIED`, a null security
-    /// descriptor included, which is the same wall `private_station_unnamed_create_*` records. The
-    /// station half of this design can therefore only be exercised where the broker actually runs,
-    /// under the service in Session 0. The desktop half carries the same descriptor and asks the
-    /// same question of the restricted side, and it can be created here, so that is what the tests
-    /// on a developer machine prove.
+    /// テスト用に現在のステーションへ明示 DACL のデスクトップだけを作る。
     #[cfg(test)]
     fn desktop_on_current_station_for_test(
         token: &ActionToken,
@@ -1006,7 +1508,7 @@ impl ActionDesktop {
             lpSecurityDescriptor: descriptor.0,
             bInheritHandle: 0,
         };
-        // SAFETY: the name and the descriptor are live for the call.
+        // SAFETY: 名前と記述子は呼び出し中に有効である。
         let desktop = unsafe {
             CreateDesktopW(
                 wide.as_ptr(),
@@ -1037,40 +1539,6 @@ fn action_object_sddl(token: &ActionToken, rights: u32) -> io::Result<String> {
         "O:{broker}D:P(A;;GA;;;{broker})(A;;0x{rights:08x};;;{})",
         sid_string(token.action_sid.0)?
     ))
-}
-
-/// Builds the action's own station and desktop, or reports once why this environment cannot.
-///
-/// Creating a window station is refused outside the service: on an ordinary desktop session every
-/// variant is denied, a null descriptor included. Failing the action there would break every
-/// developer run and every gate that starts a worker as a user, so the child inherits the broker's
-/// station instead — exactly today's behaviour, no wider. Under the service, where the station can
-/// be created, the action gets its own. A fallback is reported once per process, because in Session
-/// 0 it means the machine is back on the arrangement that produces `0xC0000142`.
-fn action_desktop_or_inherit(token: &ActionToken) -> io::Result<Option<ActionDesktop>> {
-    inherit_decision(ActionDesktop::create(token))
-}
-
-/// Separates the two failures: one is an environment that cannot give the action its own objects,
-/// the other is a broker that can no longer be trusted to start anything at all.
-fn inherit_decision(
-    result: Result<ActionDesktop, DesktopSetupError>,
-) -> io::Result<Option<ActionDesktop>> {
-    static REPORTED: std::sync::Once = std::sync::Once::new();
-    match result {
-        Ok(desktop) => Ok(Some(desktop)),
-        Err(DesktopSetupError::Unavailable(error)) => {
-            REPORTED.call_once(|| {
-                eprintln!(
-                    "sembazuru-worker: per-action window station unavailable ({error}); \
-                     actions inherit the broker's station"
-                );
-            });
-            Ok(None)
-        }
-        // Nothing may be started from a broker that is no longer on its own station.
-        Err(DesktopSetupError::BrokerStationLost(error)) => Err(error),
-    }
 }
 
 /// Names which step of the per-action station setup failed, keeping the operating system's own
@@ -1488,7 +1956,7 @@ pub(crate) struct RestrictedProcess {
     job: Arc<JobObject>,
     /// Kept alive for the process's lifetime: a window station and desktop exist only while a
     /// handle or a process references them, and the action's process is that reference.
-    _desktop: Option<ActionDesktop>,
+    _desktop: ActionDesktop,
 }
 
 impl RestrictedProcess {
@@ -1552,13 +2020,9 @@ impl RestrictedProcess {
         startup.StartupInfo.hStdInput = inherited[0];
         startup.StartupInfo.hStdOutput = inherited[1];
         startup.StartupInfo.hStdError = inherited[2];
-        // The action's own station and desktop, when this environment allows them. A null
-        // `lpDesktop` means the child inherits the broker's, which is what happens today and what
-        // fails under the service in Session 0.
-        let desktop = action_desktop_or_inherit(token)?;
-        startup.StartupInfo.lpDesktop = desktop
-            .as_ref()
-            .map_or(null_mut(), ActionDesktop::lp_desktop);
+        // 作成時に明示した保護 DACL のデスクトップを、station 名とともに指定する。
+        let desktop = ActionDesktop::create(token)?;
+        startup.StartupInfo.lpDesktop = desktop.lp_desktop();
         startup.lpAttributeList = attributes.ptr();
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         let creation_flags =
@@ -1569,20 +2033,7 @@ impl RestrictedProcess {
         if let Some(observed) = observed_creation_flags {
             *observed = creation_flags;
         }
-        // A null `lpDesktop` means the child takes whichever station this process is on at the
-        // moment of the call, so an inheriting start must not overlap another action's switch.
-        // With an explicit per-action desktop there is nothing to race against.
-        let _inheriting = if desktop.is_none() {
-            Some(
-                STATION_SWITCH
-                    .lock()
-                    .map_err(|_| io::Error::other("the window station switch is unfinished"))?,
-            )
-        } else {
-            None
-        };
-        // SAFETY: all UTF-16 buffers are NUL-terminated and live; command_line is mutable;
-        // only the three inheritable stdio handles in the attribute list can cross the boundary.
+        // SAFETY: UTF-16 buffers are NUL-terminated and live; only the handle list may cross.
         let started = unsafe {
             CreateProcessAsUserW(
                 token.handle(),
@@ -1598,7 +2049,6 @@ impl RestrictedProcess {
                 &mut info,
             )
         };
-        drop(_inheriting);
         if started == 0 {
             return Err(io::Error::other(format!(
                 "create_process: OS error {}",
@@ -1816,10 +2266,11 @@ mod tests {
         GetUserObjectSecurity, ImpersonateLoggedOnUser, LABEL_SECURITY_INFORMATION,
         LookupPrivilegeValueW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, RevertToSelf,
         SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
-        SYSTEM_MANDATORY_LABEL_ACE, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
-        TOKEN_MANDATORY_POLICY, TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid,
-        TokenCapabilities, TokenGroups, TokenIsAppContainer, TokenMandatoryPolicy, TokenPrivileges,
-        TokenRestrictedSids, TokenSessionId, TokenUser, WinCreatorOwnerRightsSid,
+        SYSTEM_MANDATORY_LABEL_ACE, TOKEN_APPCONTAINER_INFORMATION, TOKEN_DEFAULT_DACL,
+        TOKEN_GROUPS, TOKEN_MANDATORY_POLICY, TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid,
+        TokenCapabilities, TokenDefaultDacl, TokenGroups, TokenIsAppContainer,
+        TokenMandatoryPolicy, TokenPrivileges, TokenRestrictedSids, TokenSessionId, TokenUser,
+        WinCreatorOwnerRightsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CREATE_ALWAYS, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -1863,6 +2314,7 @@ mod tests {
     const WINDOW_STATION_SCM_SMOKE_ACTION_STARTS: u32 = 0x5342_5b34;
     const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
     const WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE: u32 = 0x5342_5afe;
+    const ACTION_STATION_PROBE_RIGHTS: u32 = 0x0002_037f;
 
     #[derive(Clone, Debug)]
     struct Session0DiagnosticConfig {
@@ -2455,32 +2907,30 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
 
     #[test]
-    fn a_broker_left_on_the_wrong_station_stops_the_action() {
-        // An environment that simply will not create the objects is ordinary: the action runs the
-        // way it does today. A broker that failed to switch back is not: its next child would
-        // inherit an action's station, and every later action would take that as the one to
-        // restore. The two must not collapse into the same fallback.
-        let fallback = inherit_decision(Err(DesktopSetupError::Unavailable(io::Error::other(
-            "this session will not create a window station",
-        ))))
-        .expect("an unavailable station is not fatal");
-        assert!(fallback.is_none(), "the action inherits instead");
+    fn action_desktop_creation_uses_an_explicit_station_and_desktop_pair() {
+        let token = ActionToken::create().expect("action token");
+        let desktop = ActionDesktop::create(&token).expect("action desktop");
+        let value =
+            String::from_utf16(&desktop.lp_desktop[..desktop.lp_desktop.len().saturating_sub(1)])
+                .expect("UTF-16 desktop path");
+        assert!(value.starts_with(&format!("{}\\sbz-", token.station_name)));
+        assert!(desktop._station_lease.is_none());
+    }
 
-        let fatal = inherit_decision(Err(DesktopSetupError::BrokerStationLost(io::Error::other(
-            "restore the broker window station failed",
-        ))))
-        .map(|_| ())
-        .expect_err("a lost broker station must stop the action");
-        assert!(fatal.to_string().contains("restore"), "{fatal}");
+    #[test]
+    fn action_desktop_creation_refuses_a_station_mismatch_without_fallback() {
+        let mut token = ActionToken::create().expect("action token");
+        token.station_name.push_str("-unexpected");
+        let result = ActionDesktop::create(&token);
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
     }
 
     #[test]
     fn a_per_action_user_object_admits_its_own_action_and_refuses_another() {
-        // This is the mechanism behind the Session 0 failure, measured directly. Both tokens are
-        // restricted, so every access check runs twice, and both carry the same broker user on the
-        // normal side. The only thing separating them is the restricted side: the descriptor names
-        // one action's random SID and not the other's. The service station fails exactly there —
-        // it names neither (docs/verification/2026-09-18-session0-label-and-restricted-sids.md).
+        // 制限 SID 列に対応する ACE があるアクションだけが自分のデスクトップを開ける。
         let mine = ActionToken::create().expect("action token");
         let theirs = ActionToken::create().expect("a second action token");
         let (name, _desktop) = ActionDesktop::desktop_on_current_station_for_test(&mine)
@@ -2491,6 +2941,10 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             Ok(true),
             "the owning action must reach its own desktop"
         );
+        match action_desktop_open(&mine, &name, WRITE_DAC) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("an action changed its desktop DACL: {other:?}"),
+        }
         match action_desktop_open(&theirs, &name, ACTION_DESKTOP_RIGHTS) {
             Err(ERROR_ACCESS_DENIED) => {}
             other => panic!("another action reached this desktop: {other:?}"),
@@ -2539,22 +2993,17 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     #[test]
     fn the_action_descriptor_withholds_the_rights_that_would_reopen_it() {
         let token = ActionToken::create().expect("action token");
-        for rights in [ACTION_STATION_RIGHTS, ACTION_DESKTOP_RIGHTS] {
-            // An action that could rewrite its own object's descriptor could also let another
-            // action in, which is the one thing this design buys.
-            assert_eq!(
-                rights & (DELETE | WRITE_DAC | WRITE_OWNER),
-                0,
-                "{rights:#x}"
-            );
-            assert_ne!(rights & READ_CONTROL, 0, "{rights:#x}");
-            let sddl = action_object_sddl(&token, rights).expect("the descriptor is expressible");
-            assert!(security_descriptor(&sddl).is_ok(), "{sddl}");
-            assert!(
-                sddl.contains("D:P"),
-                "inherited entries must not apply: {sddl}"
-            );
-        }
+        let rights = ACTION_DESKTOP_RIGHTS;
+        // 自分の DACL を変更できる権限をアクションへ渡さない。
+        assert_eq!(
+            rights & (DELETE | WRITE_DAC | WRITE_OWNER),
+            0,
+            "{rights:#x}"
+        );
+        assert_ne!(rights & READ_CONTROL, 0, "{rights:#x}");
+        let sddl = action_object_sddl(&token, rights).expect("DACL を構成できる");
+        assert!(security_descriptor(&sddl).is_ok(), "{sddl}");
+        assert!(sddl.contains("D:P"), "保護 DACL が必要: {sddl}");
     }
 
     /// Records that an interactive session cannot create a window station. Run it under the
@@ -2567,7 +3016,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             "D:P(A;;GA;;;{})",
             sid_string(token.broker_sid()).expect("broker sid")
         );
-        let with_action = action_object_sddl(&token, ACTION_STATION_RIGHTS).expect("sddl");
+        let with_action = action_object_sddl(&token, ACTION_STATION_PROBE_RIGHTS).expect("sddl");
         for (label, sddl, access) in [
             ("null sd, all access", None, 0x0000_037fu32),
             ("null sd, maximum allowed", None, MAXIMUM_ALLOWED),
@@ -2582,12 +3031,11 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 Some(with_action.clone()),
                 0x0000_037f,
             ),
-            // 本番の `ActionDesktop::create` が要求するのと同じ式。値を直書きすると、
-            // 本番の権限を変えたときにこの記録だけ古いままになる。
+            // 旧案のステーション作成プローブに使う要求マスク。
             (
                 "with action, production request",
                 Some(with_action),
-                ACTION_STATION_RIGHTS | WRITE_DAC | DELETE,
+                ACTION_STATION_PROBE_RIGHTS | WRITE_DAC | DELETE,
             ),
         ] {
             let name = format!("sbz-probe-{}", secure_random_hex().expect("nonce"));
@@ -3749,15 +4197,10 @@ privileges={privileges:?}{restricted}",
                 diagnostic_open_access(&action, &record.station, &record.desktop);
             record.ui_probe = diagnostic_ui_probe(&action, &record.station, &record.desktop);
         }
-        // 製品の起動経路と同じ呼び出しで、この環境がアクション専用のステーションと
-        // デスクトップを作れるかを記録する。作れたかどうかと子の終了コードを突き合わせると、
-        // 起動の成否を専用オブジェクトに帰属できる。作ったオブジェクトはこの場で閉じる。
+        // 製品と同じ呼び出しで共有ステーション上のアクション用デスクトップを作り、結果を記録する。
         record.action_desktop = match ActionDesktop::create(&action) {
             Ok(_desktop) => "created".into(),
-            Err(DesktopSetupError::Unavailable(error)) => format!("unavailable:{error}"),
-            Err(DesktopSetupError::BrokerStationLost(error)) => {
-                format!("broker-station-lost:{error}")
-            }
+            Err(error) => format!("unavailable:{error}"),
         };
         let scratch = match PrivateScratch::create(
             &config.record_directory,
@@ -6385,6 +6828,105 @@ privileges={privileges:?}{restricted}",
         assert!(a.only_change_notify_enabled().unwrap());
         assert!(integrity_rid(a.handle()).unwrap() <= 0x2000);
         set_medium_integrity(a.handle()).unwrap();
+    }
+
+    fn token_default_dacl_sids(token: HANDLE) -> Vec<String> {
+        let info = token_info(token, TokenDefaultDacl).expect("default DACL token information");
+        // SAFETY: TokenDefaultDacl returns a TOKEN_DEFAULT_DACL within the owned buffer.
+        let default_dacl = unsafe { &*(info.as_ptr().cast::<TOKEN_DEFAULT_DACL>()) };
+        if default_dacl.DefaultDacl.is_null() {
+            return Vec::new();
+        }
+        let (_, aces) = acl_aces(default_dacl.DefaultDacl).expect("valid token default DACL");
+        aces.iter()
+            .filter_map(AceBlob::simple_allow)
+            .map(|(sid, _, _)| sid)
+            .collect()
+    }
+
+    #[test]
+    fn worker_actions_sid_is_shared_restricted_only_and_not_in_default_dacl() {
+        let worker_sid = Arc::new(WorkerActionsSid::random().unwrap());
+        let station_name = current_window_station_name().unwrap();
+        let source = current_token(
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+        )
+        .unwrap();
+        let a = ActionToken::create_from_token_with_station(
+            source.as_raw_handle() as HANDLE,
+            Arc::clone(&worker_sid),
+            station_name.clone(),
+            None,
+        )
+        .unwrap();
+        let b = ActionToken::create_from_token_with_station(
+            source.as_raw_handle() as HANDLE,
+            Arc::clone(&worker_sid),
+            station_name,
+            None,
+        )
+        .unwrap();
+        let shared_sid = sid_string(worker_sid.sid()).unwrap();
+        for token in [&a, &b] {
+            let restricted = token_sid_list(token.handle(), TokenRestrictedSids).unwrap();
+            assert!(restricted.iter().any(|entry| entry.sid == shared_sid));
+            assert!(
+                restricted
+                    .iter()
+                    .any(|entry| { entry.sid == sid_string(token.action_sid.0).unwrap() })
+            );
+            assert!(!token_default_dacl_sids(token.handle()).contains(&shared_sid));
+        }
+        // 共通 SID は共有し、各 action_sid は個別に生成する。
+        assert_eq!(unsafe { EqualSid(a.action_sid.0, b.action_sid.0) }, 0);
+    }
+
+    #[test]
+    fn station_acl_add_remove_and_stale_cleanup_preserve_other_aces() {
+        let broker_sid = current_user_sid_string().unwrap();
+        let descriptor =
+            security_descriptor(&format!("D:P(A;;GA;;;{broker_sid})(A;;GR;;;WD)")).unwrap();
+        let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        let (revision, before) = acl_aces(dacl).unwrap();
+        let worker_a = WorkerActionsSid::random().unwrap();
+        let worker_b = WorkerActionsSid::random().unwrap();
+        let with_a = rewrite_station_aces(&before, Some(worker_a.sid()), None, &[]).unwrap();
+        let with_a_and_b = rewrite_station_aces(&with_a, Some(worker_b.sid()), None, &[]).unwrap();
+        assert_eq!(with_a_and_b.len(), before.len() + 2);
+        assert_eq!(&with_a_and_b[..before.len()], before.as_slice());
+        assert_eq!(
+            with_a_and_b[before.len()].simple_allow(),
+            Some((sid_string(worker_a.sid()).unwrap(), 0, 0x0002))
+        );
+        assert_eq!(
+            with_a_and_b[before.len() + 1].simple_allow(),
+            Some((sid_string(worker_b.sid()).unwrap(), 0, 0x0002))
+        );
+
+        let stale = vec![sid_string(worker_a.sid()).unwrap()];
+        let after_stale_cleanup = rewrite_station_aces(&with_a_and_b, None, None, &stale).unwrap();
+        assert_eq!(after_stale_cleanup.len(), before.len() + 1);
+        assert_eq!(&after_stale_cleanup[..before.len()], before.as_slice());
+        assert_eq!(
+            after_stale_cleanup.last().unwrap().simple_allow(),
+            Some((sid_string(worker_b.sid()).unwrap(), 0, 0x0002))
+        );
+
+        let after_a_release =
+            rewrite_station_aces(&with_a_and_b, None, Some(worker_a.sid()), &[]).unwrap();
+        assert_eq!(after_a_release.len(), before.len() + 1);
+        assert_eq!(&after_a_release[..before.len()], before.as_slice());
+        let after_b_release =
+            rewrite_station_aces(&after_a_release, None, Some(worker_b.sid()), &[]).unwrap();
+        assert_eq!(after_b_release, before);
+        assert_ne!(revision, 0);
     }
 
     #[test]
