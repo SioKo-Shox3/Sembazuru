@@ -2048,10 +2048,9 @@ impl RestrictedProcess {
         token: &ActionToken,
         command: &RestrictedCommand,
         profile: TestCreationProfile,
-        creation_flags: &mut u32,
+        observation: &mut tests::Session0DiagnosticRun,
     ) -> io::Result<Self> {
-        *creation_flags = 0;
-        Self::spawn_inner(token, command, None, profile, Some(creation_flags), &[])
+        Self::spawn_inner(token, command, None, profile, Some(observation), &[])
     }
 
     fn spawn_inner(
@@ -2059,7 +2058,7 @@ impl RestrictedProcess {
         command: &RestrictedCommand,
         #[cfg(test)] failure: Option<SpawnFailure>,
         #[cfg(test)] creation_profile: TestCreationProfile,
-        #[cfg(test)] observed_creation_flags: Option<&mut u32>,
+        #[cfg(test)] observation: Option<&mut tests::Session0DiagnosticRun>,
         inherited_handles: &[HANDLE],
     ) -> io::Result<Self> {
         let mut prepared = prepare_command(command)?;
@@ -2091,8 +2090,8 @@ impl RestrictedProcess {
         #[cfg(test)]
         let creation_flags = creation_profile.creation_flags(creation_flags);
         #[cfg(test)]
-        if let Some(observed) = observed_creation_flags {
-            *observed = creation_flags;
+        if let Some(observed) = observation {
+            observed.capture(token, &desktop, creation_flags);
         }
         // SAFETY: UTF-16 buffers are NUL-terminated and live; only the handle list may cross.
         let started = unsafe {
@@ -2402,7 +2401,7 @@ mod tests {
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
     const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 6;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 7;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
@@ -2657,7 +2656,20 @@ mod tests {
                     .map_or_else(|| "none".into(), |value| value.to_string()),
                 diagnostic_hex(run.stdout.as_bytes()),
                 diagnostic_hex(run.stderr.as_bytes()),
+                diagnostic_hex(run.target_desktop.as_bytes()),
+                diagnostic_hex(run.target_dacl.as_bytes()),
+                diagnostic_hex(run.target_sacl.as_bytes()),
+                diagnostic_hex(run.target_access.as_bytes()),
+                diagnostic_hex(run.isolation.as_bytes()),
+                run.lifecycle.to_string(),
             ]);
+        }
+        for value in [
+            &record.worker_actions_sid,
+            &record.station_ace,
+            &record.station_cleanup,
+        ] {
+            fields.push(diagnostic_hex(value.as_bytes()));
         }
         fields.join("\t")
     }
@@ -2681,7 +2693,7 @@ mod tests {
                 expected: Some(record),
             });
         };
-        accept("v5", record.clone());
+        accept("v7", record.clone());
         let mut not_sufficient = record.clone();
         not_sufficient.no_window.child_exit = Some(0xc000_0142);
         not_sufficient.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
@@ -2691,6 +2703,81 @@ mod tests {
         both_start.no_window.child_exit = Some(0);
         both_start.classification = Session0DiagnosticOutcome::ActionStarts;
         accept("action-starts", both_start);
+        let mut labelled = record.clone();
+        labelled.baseline.target_sacl =
+            "label_aces=[type=17;flags=16;mask=0x00000001;sid=S-1-16-8192]".into();
+        accept("target-explicit-label", labelled);
+        // 起動が正常でも、実測の欠落を成功に変換してはいけない。
+        for (name, lifecycle) in [
+            ("missing-isolation", 13),
+            ("missing-tree-exit", 11),
+            ("missing-desktop-cleanup", 7),
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.baseline.child_exit = Some(0);
+            incomplete.baseline.lifecycle = lifecycle;
+            incomplete.classification = Session0DiagnosticOutcome::Indeterminate;
+            accept(name, incomplete);
+        }
+        for name in [
+            "station-inherited-ace",
+            "station-wider-mask",
+            "missing-station-cleanup",
+            "broker-default-target",
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.baseline.child_exit = Some(0);
+            match name {
+                "station-inherited-ace" => {
+                    incomplete.station_ace = "count=1;flags=2;mask=0x00000002".into()
+                }
+                "station-wider-mask" => {
+                    incomplete.station_ace = "count=1;flags=0;mask=0x00000022".into()
+                }
+                "missing-station-cleanup" => incomplete.station_cleanup = "unconfirmed".into(),
+                _ => {
+                    incomplete.baseline.target_desktop = format!("{}\\Default", incomplete.station)
+                }
+            }
+            incomplete.classification = Session0DiagnosticOutcome::Indeterminate;
+            accept(name, incomplete);
+        }
+        for name in [
+            "target-dacl-unavailable",
+            "target-sacl-empty",
+            "target-access-denied",
+            "isolation-contradiction",
+            "target-dacl-unprotected",
+            "target-sacl-error",
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.baseline.child_exit = Some(0);
+            incomplete.baseline.lifecycle = 13;
+            match name {
+                "target-dacl-unavailable" => {
+                    incomplete.baseline.target_dacl = "unavailable:gle=5".into()
+                }
+                "target-sacl-empty" => incomplete.baseline.target_sacl.clear(),
+                "target-access-denied" => {
+                    incomplete.baseline.target_access =
+                        VERIFIED_TARGET_ACCESS.replace("allowed=true", "allowed=false")
+                }
+                "isolation-contradiction" => {
+                    incomplete.baseline.isolation = VERIFIED_TARGET_ISOLATION
+                        .replace("other_maximum=Err(5)", "other_maximum=Ok(true)")
+                }
+                "target-dacl-unprotected" => {
+                    incomplete.baseline.target_dacl =
+                        incomplete.baseline.target_dacl.replace("0x1004", "0x0004")
+                }
+                _ => {
+                    incomplete.baseline.target_sacl =
+                        "label_aces=[type=17;flags=0;mask=0x00000001;sid=sid-error=5]".into()
+                }
+            }
+            incomplete.classification = Session0DiagnosticOutcome::Indeterminate;
+            accept(name, incomplete);
+        }
         let mut partial = record.clone();
         partial.markers = Session0DiagnosticRecord::ENTRY;
         partial.classification = Session0DiagnosticOutcome::Indeterminate;
@@ -2763,6 +2850,12 @@ mod tests {
                 .unwrap(),
         ) as usize;
         let baseline_flags_offset = baseline_names_offset + 4 + baseline_names_length;
+        let mut run_payload = Writer::new();
+        record.baseline.encode_into(&mut run_payload).unwrap();
+        let lifecycle_offset = baseline_offset + run_payload.into_bytes().len() - 1;
+        let mut invalid_lifecycle = bytes.clone();
+        invalid_lifecycle[lifecycle_offset] = 0x80;
+        reject("unknown-lifecycle", invalid_lifecycle);
         let mut invalid_bool = bytes.clone();
         invalid_bool[baseline_flags_offset + 4] = 2;
         reject("invalid-bool", invalid_bool);
@@ -2828,7 +2921,123 @@ mod tests {
             nonce: record.nonce.clone(),
             expected: None,
         });
+        let forged: Vec<_> = cases
+            .iter()
+            .filter(|case| {
+                matches!(
+                    case.name,
+                    "missing-isolation"
+                        | "missing-tree-exit"
+                        | "missing-desktop-cleanup"
+                        | "station-inherited-ace"
+                        | "station-wider-mask"
+                        | "missing-station-cleanup"
+                        | "broker-default-target"
+                )
+            })
+            .map(|case| {
+                let mut bytes = case.bytes.clone();
+                bytes[45] = Session0DiagnosticOutcome::ActionStarts as u8;
+                Session0DiagnosticCase {
+                    name: case.name,
+                    bytes,
+                    nonce: case.nonce.clone(),
+                    expected: None,
+                }
+            })
+            .collect();
+        cases.extend(forged);
+        // 観測が欠けた記録の隔離ビットと分類を両方改ざんしても拒否する。
+        let forged: Vec<_> = cases
+            .iter()
+            .filter(|case| {
+                case.expected.is_some()
+                    && (case.name.starts_with("target-") || case.name == "isolation-contradiction")
+                    && case.name != "target-explicit-label"
+            })
+            .map(|case| {
+                let mut bytes = case.bytes.clone();
+                let mut offset = 50;
+                for _ in 0..14 {
+                    let len =
+                        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4 + len;
+                }
+                let mut run = Writer::new();
+                case.expected
+                    .as_ref()
+                    .unwrap()
+                    .baseline
+                    .encode_into(&mut run)
+                    .unwrap();
+                bytes[offset + run.into_bytes().len() - 1] = 15;
+                bytes[45] = Session0DiagnosticOutcome::ActionStarts as u8;
+                Session0DiagnosticCase {
+                    name: case.name,
+                    bytes,
+                    nonce: case.nonce.clone(),
+                    expected: None,
+                }
+            })
+            .collect();
+        cases.extend(forged);
         cases
+    }
+
+    #[test]
+    fn session0_diagnostic_observes_spawn_target_and_cleanup_with_reused_lease() {
+        let station = unsafe { GetProcessWindowStation() };
+        let before = station_dacl(station).unwrap();
+        let lease = Arc::new(ActionStationLease::acquire().unwrap());
+        // この単体テストは対話 station の DACL を変更しない経路だけで走る。
+        assert_eq!(lease.station_name, "WinSta0");
+        let sid = sid_string(lease.worker_actions_sid.sid()).unwrap();
+        let weak = Arc::downgrade(&lease);
+        let mut names = Vec::new();
+        // lease の再利用は製品フラグで確認する。NO_WINDOW の成立性は別の測定対象。
+        for _ in 0..2 {
+            let token = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
+            assert!(
+                token_sid_list(token.handle(), TokenRestrictedSids)
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.sid == sid)
+            );
+            let root = private_scratch_root();
+            let scratch = PrivateScratch::create(&root, "diagnostic", &token).unwrap();
+            let (command, _) = session0_diagnostic_command(scratch.path()).unwrap();
+            let run =
+                run_session0_diagnostic_child(&token, &command, TestCreationProfile::Production)
+                    .unwrap();
+            assert!(run.spawn_succeeded, "{run:?}");
+            assert_eq!(run.child_exit, Some(0), "{run:?}");
+            assert_eq!(run.lifecycle & 13, 13, "{run:?}");
+            assert!(run.target_desktop.starts_with("WinSta0\\sbz-"));
+            assert!(
+                run.target_dacl
+                    .contains(&sid_string(token.action_sid.0).unwrap())
+            );
+            assert!(!run.target_dacl.contains(&sid));
+            assert!(run.isolation.contains("other_maximum=Err(5)"), "{run:?}");
+            assert!(
+                run.isolation
+                    .contains("write_dac=Err(5);write_owner=Err(5)"),
+                "{run:?}"
+            );
+            assert!(
+                run.isolation
+                    .contains("default_dacl_safe=true;tcb_absent=true"),
+                "{run:?}"
+            );
+            names.push(run.target_desktop);
+            drop(scratch);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        assert_ne!(names[0], names[1]);
+        drop(lease);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(station_dacl(station).unwrap(), before);
+        assert_eq!(unsafe { GetProcessWindowStation() }, station);
     }
 
     #[test]
@@ -2871,7 +3080,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw 'Probe PowerShell syntax error.' }
-foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -2890,7 +3099,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         if (-not $rejected) { throw "Accepted malformed case $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "Rejected valid case $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne 20) { throw 'Record property count mismatch.' }
+        if (@($record.PSObject.Properties).Count -ne 23) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId')) { $values.Add([string]$record.$property) }
@@ -2898,15 +3107,19 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
         foreach ($run in @($record.Baseline, $record.NoWindow)) {
-            if (@($run.PSObject.Properties).Count -ne 8) { throw 'Run property count mismatch.' }
+            if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
             $values.Add([string]$run.JobUi)
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.JobUiLimits)).ToLowerInvariant())
             foreach ($property in @('CreationFlags', 'SpawnSucceeded')) { $values.Add([string]$run.$property) }
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.SpawnError)).ToLowerInvariant())
             $values.Add($(if ($null -eq $run.ChildExit) { 'none' } else { [string]$run.ChildExit }))
-            foreach ($property in @('Stdout', 'Stderr')) {
+            foreach ($property in @('Stdout', 'Stderr', 'TargetDesktop', 'TargetDacl', 'TargetSacl', 'TargetAccess', 'Isolation')) {
                 $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.$property)).ToLowerInvariant())
             }
+            $values.Add([string]$run.Lifecycle)
+        }
+        foreach ($property in @('WorkerActionsSid', 'StationAce', 'StationCleanup')) {
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
         if (($values -join "`t") -cne $parts[4]) { throw "Property mismatch: $($parts[0])" }
     }
@@ -3008,8 +3221,9 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     #[test]
     fn a_per_action_user_object_admits_its_own_action_and_refuses_another() {
         // 制限 SID 列に対応する ACE があるアクションだけが自分のデスクトップを開ける。
-        let mine = ActionToken::create().expect("action token");
-        let theirs = ActionToken::create().expect("a second action token");
+        let lease = Arc::new(ActionStationLease::acquire().unwrap());
+        let mine = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
+        let theirs = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
         let (name, _desktop) = ActionDesktop::desktop_on_current_station_for_test(&mine)
             .expect("a desktop can be created on the current station");
 
@@ -3026,8 +3240,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             Err(ERROR_ACCESS_DENIED) => {}
             other => panic!("another action reached this desktop: {other:?}"),
         }
-        // Even the weakest possible request is refused: the other action has no entry at all, so
-        // there is no narrower mask that would have let it in.
+        // 共有 SID が同じでも、他アクションには権限を1ビットも与えない。
         match action_desktop_open(&theirs, &name, MAXIMUM_ALLOWED) {
             Err(ERROR_ACCESS_DENIED) => {}
             other => panic!("another action was granted something: {other:?}"),
@@ -3337,8 +3550,96 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         }
     }
 
+    const VERIFIED_TARGET_ACCESS: &str = concat!(
+        "scope=broker-impersonated;first_failure=none;steps=[",
+        "station:maximum_allowed:mask=0x02000000;allowed=true;gle=0,",
+        "station:read_attributes:mask=0x00000002;allowed=true;gle=0,",
+        "station:action_mask:mask=0x00000002;allowed=true;gle=0,",
+        "desktop:maximum_allowed:mask=0x02000000;allowed=true;gle=0,",
+        "desktop:read_objects:mask=0x00000001;allowed=true;gle=0,",
+        "desktop:action_mask:mask=0x000201ff;allowed=true;gle=0]"
+    );
+    const VERIFIED_TARGET_ISOLATION: &str = concat!(
+        "own=Ok(true);other_maximum=Err(5);default_maximum=Err(5);",
+        "write_dac=Err(5);write_owner=Err(5);default_dacl_safe=true;tcb_absent=true"
+    );
+
+    fn diagnostic_target_dacl_complete(value: &str) -> bool {
+        let Some((control, aces)) = value
+            .strip_prefix("control=0x")
+            .and_then(|v| v.split_once(";aces=["))
+        else {
+            return false;
+        };
+        if control.len() != 4
+            || !control.bytes().all(|v| v.is_ascii_hexdigit())
+            || u16::from_str_radix(control, 16).unwrap() & SE_DACL_PROTECTED == 0
+        {
+            return false;
+        }
+        let Some(aces) = aces.strip_suffix(']') else {
+            return false;
+        };
+        let parts: Vec<_> = aces.split(',').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+        let mut sids = Vec::new();
+        for (ace, prefix) in parts.iter().zip([
+            "type=0;flags=0;mask=0x000f01ff;sid=",
+            "type=0;flags=0;mask=0x000201ff;sid=",
+        ]) {
+            let Some(sid) = ace.strip_prefix(prefix) else {
+                return false;
+            };
+            let Some(numbers) = sid.strip_prefix("S-1-") else {
+                return false;
+            };
+            if numbers.split('-').count() < 2
+                || !numbers
+                    .split('-')
+                    .all(|part| !part.is_empty() && part.bytes().all(|v| v.is_ascii_digit()))
+            {
+                return false;
+            }
+            sids.push(sid);
+        }
+        sids[0] != sids[1]
+    }
+
+    fn diagnostic_target_label_complete(value: &str) -> bool {
+        if value == "label=absent;implied_integrity=8192" {
+            return true;
+        }
+        let Some(aces) = value
+            .strip_prefix("label_aces=[")
+            .and_then(|v| v.strip_suffix(']'))
+        else {
+            return false;
+        };
+        aces.split(',').all(|ace| {
+            let Some((flags, rest)) = ace
+                .strip_prefix("type=17;flags=")
+                .and_then(|v| v.split_once(";mask=0x"))
+            else {
+                return false;
+            };
+            let Some((mask, integrity)) = rest.split_once(";sid=S-1-16-") else {
+                return false;
+            };
+            !flags.is_empty()
+                && flags.bytes().all(|v| v.is_ascii_digit())
+                && flags.parse::<u8>().is_ok()
+                && mask.len() == 8
+                && mask.bytes().all(|v| v.is_ascii_hexdigit())
+                && !integrity.is_empty()
+                && integrity.bytes().all(|v| v.is_ascii_digit())
+                && integrity.parse::<u32>().is_ok()
+        })
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
-    struct Session0DiagnosticRun {
+    pub(super) struct Session0DiagnosticRun {
         job_ui_restrictions: u32,
         job_ui_limits: String,
         creation_flags: u32,
@@ -3347,9 +3648,23 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         child_exit: Option<u32>,
         stdout: String,
         stderr: String,
+        target_desktop: String,
+        target_dacl: String,
+        target_sacl: String,
+        target_access: String,
+        isolation: String,
+        // 作成、隔離確認、全子孫終了、デスクトップ消滅の実測ビット。
+        lifecycle: u8,
     }
 
     impl Session0DiagnosticRun {
+        fn observations_verified(&self) -> bool {
+            diagnostic_target_dacl_complete(&self.target_dacl)
+                && diagnostic_target_label_complete(&self.target_sacl)
+                && self.target_access == VERIFIED_TARGET_ACCESS
+                && self.isolation == VERIFIED_TARGET_ISOLATION
+        }
+
         fn empty() -> Self {
             Self {
                 job_ui_restrictions: 0,
@@ -3360,12 +3675,95 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 child_exit: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                target_desktop: String::new(),
+                target_dacl: String::new(),
+                target_sacl: String::new(),
+                target_access: String::new(),
+                isolation: String::new(),
+                lifecycle: 0,
+            }
+        }
+
+        pub(super) fn capture(
+            &mut self,
+            action: &ActionToken,
+            desktop: &ActionDesktop,
+            flags: u32,
+        ) {
+            self.creation_flags = flags;
+            self.lifecycle = 1;
+            self.target_desktop =
+                String::from_utf16_lossy(&desktop.lp_desktop[..desktop.lp_desktop.len() - 1]);
+            self.target_dacl = diagnostic_user_object_dacl(desktop._desktop.0);
+            self.target_sacl = diagnostic_user_object_label(desktop._desktop.0);
+            let name = self.target_desktop.rsplit('\\').next().unwrap();
+            self.target_access = diagnostic_ui_probe(action, &action.station_name, name);
+            let result = (|| -> Result<bool, String> {
+                let lease = action
+                    .station_lease
+                    .as_ref()
+                    .ok_or("station_lease_missing")?;
+                let other =
+                    ActionToken::create_for_worker(Arc::clone(lease)).map_err(|e| e.to_string())?;
+                let own = action_desktop_open(action, name, ACTION_DESKTOP_RIGHTS);
+                let foreign = action_desktop_open(&other, name, MAXIMUM_ALLOWED);
+                let default = action_desktop_open(action, "Default", MAXIMUM_ALLOWED);
+                let write_dac = action_desktop_open(action, name, WRITE_DAC);
+                let write_owner = action_desktop_open(action, name, WRITE_OWNER);
+                let sid = sid_string(lease.worker_actions_sid.sid()).map_err(|e| e.to_string())?;
+                let default_dacl_safe = !token_default_dacl_sids(action.handle())
+                    .map_err(|e| e.to_string())?
+                    .contains(&sid);
+                let tcb_absent = diagnostic_tcb_absent(action.handle())?;
+                self.isolation = format!(
+                    "own={own:?};other_maximum={foreign:?};default_maximum={default:?};write_dac={write_dac:?};write_owner={write_owner:?};default_dacl_safe={default_dacl_safe};tcb_absent={tcb_absent}"
+                );
+                Ok(own == Ok(true)
+                    && foreign == Err(ERROR_ACCESS_DENIED)
+                    && default == Err(ERROR_ACCESS_DENIED)
+                    && write_dac == Err(ERROR_ACCESS_DENIED)
+                    && write_owner == Err(ERROR_ACCESS_DENIED)
+                    && default_dacl_safe
+                    && tcb_absent)
+            })();
+            match result {
+                Ok(true) if self.observations_verified() => self.lifecycle |= 2,
+                Ok(_) => {}
+                Err(error) => self.isolation = format!("unavailable:{error}"),
+            }
+        }
+
+        fn observe_desktop_release(&mut self) {
+            if self.lifecycle & 1 == 0 {
+                return;
+            }
+            let name = self.target_desktop.rsplit('\\').next().unwrap();
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: broker が所有した名前を現在の station で照会する。拒否を消滅と扱わない。
+            let handle = unsafe { OpenDesktopW(wide.as_ptr(), 0, 0, READ_CONTROL) };
+            if handle.is_null() {
+                let error = unsafe { GetLastError() };
+                if error == ERROR_FILE_NOT_FOUND {
+                    self.lifecycle |= 8;
+                } else {
+                    self.spawn_error
+                        .push_str(&format!(";desktop_cleanup:gle={error}"));
+                }
+            } else {
+                unsafe { CloseDesktop(handle) };
+                self.spawn_error.push_str(";desktop_cleanup:still-present");
             }
         }
 
         fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
-            // The names are a decode table for the mask, not a second measurement: a record whose
-            // names disagree with its own mask was edited between the job query and here.
+            // 名称は mask の展開表。照会した mask と一致しない記録を拒否する。
+            if self.lifecycle & !15 != 0
+                || (self.lifecycle & 14 != 0 && self.lifecycle & 1 == 0)
+                || (self.lifecycle & 4 != 0 && !self.spawn_succeeded)
+                || (self.lifecycle & 2 != 0 && !self.observations_verified())
+            {
+                return Err("diagnostic lifecycle".into());
+            }
             if self.job_ui_limits != describe_job_ui_limits(self.job_ui_restrictions) {
                 return Err("diagnostic run UI limit names".into());
             }
@@ -3379,7 +3777,18 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 payload.u32(exit);
             }
             write_text(payload, &self.stdout)?;
-            write_text(payload, &self.stderr)
+            write_text(payload, &self.stderr)?;
+            for value in [
+                &self.target_desktop,
+                &self.target_dacl,
+                &self.target_sacl,
+                &self.target_access,
+                &self.isolation,
+            ] {
+                write_text(payload, value)?;
+            }
+            payload.u8(self.lifecycle);
+            Ok(())
         }
 
         fn decode_from(reader: &mut Reader<'_>) -> Result<Self, String> {
@@ -3402,6 +3811,12 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 child_exit,
                 stdout: read_text(reader)?,
                 stderr: read_text(reader)?,
+                target_desktop: read_text(reader)?,
+                target_dacl: read_text(reader)?,
+                target_sacl: read_text(reader)?,
+                target_access: read_text(reader)?,
+                isolation: read_text(reader)?,
+                lifecycle: reader.u8().map_err(|_| "diagnostic lifecycle")?,
             })
         }
     }
@@ -3428,6 +3843,9 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         environment_hash: String,
         baseline: Session0DiagnosticRun,
         no_window: Session0DiagnosticRun,
+        worker_actions_sid: String,
+        station_ace: String,
+        station_cleanup: String,
     }
 
     impl Session0DiagnosticRecord {
@@ -3448,7 +3866,7 @@ groups=[];privileges=[]"
                 action: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
 restricted=[];groups=[];privileges=[]"
                     .into(),
-                station: "Service-0x0-3e7$".into(),
+                station: "Service-0x0-1234$".into(),
                 desktop: "Default".into(),
                 station_dacl: "unavailable:gle=5".into(),
                 station_sacl: "label=absent;implied_integrity=8192".into(),
@@ -3467,21 +3885,36 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                     job_ui_limits: describe_job_ui_limits(0x0000_00fe),
                     creation_flags: 0x0008_0404,
                     spawn_succeeded: true,
-                    spawn_error: "baseline-error-測定".into(),
+                    spawn_error: String::new(),
                     child_exit: Some(0xc000_0142),
                     stdout: "baseline-stdout-診断".into(),
                     stderr: "baseline-stderr".into(),
+                    target_desktop: "Service-0x0-1234$\\sbz-baseline".into(),
+                    target_dacl: "control=0x1004;aces=[type=0;flags=0;mask=0x000f01ff;sid=S-1-5-80-1,type=0;flags=0;mask=0x000201ff;sid=S-1-9-1]".into(),
+                    target_sacl: "label=absent;implied_integrity=8192".into(),
+                    target_access: VERIFIED_TARGET_ACCESS.into(),
+                    isolation: VERIFIED_TARGET_ISOLATION.into(),
+                    lifecycle: 15,
                 },
                 no_window: Session0DiagnosticRun {
                     job_ui_restrictions: 0x0000_00fe,
                     job_ui_limits: describe_job_ui_limits(0x0000_00fe),
                     creation_flags: 0x0808_0404,
                     spawn_succeeded: true,
-                    spawn_error: "no-window-error".into(),
+                    spawn_error: String::new(),
                     child_exit: Some(0),
                     stdout: "no-window-stdout".into(),
                     stderr: "no-window-stderr-観測".into(),
+                    target_desktop: "Service-0x0-1234$\\sbz-no-window".into(),
+                    target_dacl: "control=0x1004;aces=[type=0;flags=0;mask=0x000f01ff;sid=S-1-5-80-1,type=0;flags=0;mask=0x000201ff;sid=S-1-9-1]".into(),
+                    target_sacl: "label=absent;implied_integrity=8192".into(),
+                    target_access: VERIFIED_TARGET_ACCESS.into(),
+                    isolation: VERIFIED_TARGET_ISOLATION.into(),
+                    lifecycle: 15,
                 },
+                worker_actions_sid: "S-1-5-100-1-2-3-4".into(),
+                station_ace: "count=1;flags=0;mask=0x00000002".into(),
+                station_cleanup: "removed".into(),
             }
         }
 
@@ -3494,6 +3927,23 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 || self.no_window.job_ui_restrictions != 0xfe
                 || self.baseline.creation_flags != 0x0008_0404
                 || self.no_window.creation_flags != 0x0808_0404
+                || self.worker_actions_sid.is_empty()
+                || self.station_ace != "count=1;flags=0;mask=0x00000002"
+                || self.station_cleanup != "removed"
+                || self.baseline.lifecycle != 15
+                || self.no_window.lifecycle != 15
+                || !self.baseline.observations_verified()
+                || !self.no_window.observations_verified()
+                || !self.baseline.spawn_error.is_empty()
+                || !self.no_window.spawn_error.is_empty()
+                || !self
+                    .baseline
+                    .target_desktop
+                    .starts_with(&format!("{}\\sbz-", self.station))
+                || !self
+                    .no_window
+                    .target_desktop
+                    .starts_with(&format!("{}\\sbz-", self.station))
             {
                 return Session0DiagnosticOutcome::Indeterminate;
             }
@@ -3555,6 +4005,13 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             }
             self.baseline.encode_into(&mut payload)?;
             self.no_window.encode_into(&mut payload)?;
+            for value in [
+                &self.worker_actions_sid,
+                &self.station_ace,
+                &self.station_cleanup,
+            ] {
+                write_text(&mut payload, value)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
@@ -3601,6 +4058,9 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             }
             let baseline = Session0DiagnosticRun::decode_from(&mut reader)?;
             let no_window = Session0DiagnosticRun::decode_from(&mut reader)?;
+            let worker_actions_sid = read_text(&mut reader)?;
+            let station_ace = read_text(&mut reader)?;
+            let station_cleanup = read_text(&mut reader)?;
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -3623,6 +4083,9 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 environment_hash: fields.remove(0),
                 baseline,
                 no_window,
+                worker_actions_sid,
+                station_ace,
+                station_cleanup,
             };
             record.encode().map(|_| record)
         }
@@ -3958,10 +4421,10 @@ privileges={privileges:?}{restricted}",
                 for (name, mask) in [
                     ("station:maximum_allowed", MAXIMUM_ALLOWED),
                     ("station:read_attributes", WINSTA_READATTRIBUTES as u32),
-                    ("station:action_mask", 0x6e),
+                    ("station:action_mask", 0x0002),
                     ("desktop:maximum_allowed", MAXIMUM_ALLOWED),
                     ("desktop:read_objects", DESKTOP_READOBJECTS),
-                    ("desktop:action_mask", 0xcf),
+                    ("desktop:action_mask", ACTION_DESKTOP_RIGHTS),
                 ] {
                     let opened = if name.starts_with("station:") {
                         // SAFETY: the station name is NUL-terminated and live through the call.
@@ -4148,16 +4611,13 @@ privileges={privileges:?}{restricted}",
         profile: TestCreationProfile,
     ) -> Result<Session0DiagnosticRun, String> {
         let mut record = Session0DiagnosticRun::empty();
-        let process = RestrictedProcess::spawn_for_session0_diagnostic(
-            action,
-            command,
-            profile,
-            &mut record.creation_flags,
-        );
+        let process =
+            RestrictedProcess::spawn_for_session0_diagnostic(action, command, profile, &mut record);
         let mut process = match process {
             Ok(process) => process,
             Err(error) => {
                 record.spawn_error = format!("spawn: {error}");
+                record.observe_desktop_release();
                 return Ok(record);
             }
         };
@@ -4191,8 +4651,8 @@ privileges={privileges:?}{restricted}",
                 Ok(Err(error)) => Err(format!("wait: {error}")),
                 Err(_) => {
                     process.terminate();
-                    let _ = process.wait().await;
-                    Err("wait: deadline exceeded; terminated and reaped".into())
+                    let cleanup = process.wait().await;
+                    Err(format!("wait: deadline-exceeded;cleanup={cleanup:?}"))
                 }
             }
         });
@@ -4200,7 +4660,10 @@ privileges={privileges:?}{restricted}",
             Ok(exit) => record.child_exit = Some(exit),
             Err(error) => record.spawn_error = error,
         }
-        if let Ok((mut stdout, mut stderr)) = process.take_output() {
+        // 全子孫が終了していないとパイプの EOF は保証できない。
+        if process.tree_finished
+            && let Ok((mut stdout, mut stderr)) = process.take_output()
+        {
             use tokio::io::AsyncReadExt;
             let (stdout, stderr) = runtime.block_on(async {
                 let (mut left, mut right) = (Vec::new(), Vec::new());
@@ -4213,6 +4676,11 @@ privileges={privileges:?}{restricted}",
             record.stdout = String::from_utf8_lossy(&stdout[..stdout.len().min(4096)]).into_owned();
             record.stderr = String::from_utf8_lossy(&stderr[..stderr.len().min(4096)]).into_owned();
         }
+        if process.tree_finished {
+            record.lifecycle |= 4;
+        }
+        drop(process);
+        record.observe_desktop_release();
         Ok(record)
     }
 
@@ -4256,29 +4724,88 @@ privileges={privileges:?}{restricted}",
             environment_hash: "0".repeat(64),
             baseline: Session0DiagnosticRun::empty(),
             no_window: Session0DiagnosticRun::empty(),
+            worker_actions_sid: String::new(),
+            station_ace: "unavailable:not-acquired".into(),
+            station_cleanup: "unavailable:not-acquired".into(),
         };
-        let action = match ActionToken::create() {
+        let lease = match ActionStationLease::acquire() {
+            Ok(lease) => Arc::new(lease),
+            Err(error) => {
+                record.action_desktop = format!("station_lease: {error}");
+                return publish_session0_diagnostic(&record, config, None, None);
+            }
+        };
+        record.worker_actions_sid = sid_string(lease.worker_actions_sid.sid()).unwrap_or_default();
+        record.station_dacl = diagnostic_user_object_dacl(station_handle);
+        record.station_ace = diagnostic_station_ace(station_handle, &record.worker_actions_sid);
+        let stage = collect_session0_action(&mut record, config, Arc::clone(&lease)).err();
+        let weak = Arc::downgrade(&lease);
+        drop(lease);
+        record.station_cleanup = if weak.upgrade().is_none()
+            && diagnostic_station_ace(station_handle, &record.worker_actions_sid) == "count=0"
+        {
+            "removed".into()
+        } else {
+            format!(
+                "unconfirmed;retained={};ace={}",
+                weak.upgrade().is_some(),
+                diagnostic_station_ace(station_handle, &record.worker_actions_sid)
+            )
+        };
+        record.classification = record.expected_classification();
+        publish_session0_diagnostic(&record, config, None, stage)
+    }
+
+    fn diagnostic_station_ace(station: HWINSTA, sid: &str) -> String {
+        match station_dacl(station) {
+            Ok((_, _, aces)) => {
+                let matches: Vec<_> = aces
+                    .iter()
+                    .filter_map(AceBlob::simple_allow)
+                    .filter(|(value, _, _)| value == sid)
+                    .collect();
+                match matches.as_slice() {
+                    [] => "count=0".into(),
+                    [(_, flags, mask)] => format!("count=1;flags={flags};mask=0x{mask:08x}"),
+                    _ => format!("count={}", matches.len()),
+                }
+            }
+            Err(error) => format!("unavailable:{error}"),
+        }
+    }
+
+    fn diagnostic_tcb_absent(token: HANDLE) -> Result<bool, String> {
+        let name: Vec<u16> = "SeTcbPrivilege".encode_utf16().chain(Some(0)).collect();
+        let mut luid = unsafe { std::mem::zeroed() };
+        // SAFETY: 定数名と LUID 出力は呼び出し中に有効。
+        if unsafe { LookupPrivilegeValueW(null(), name.as_ptr(), &mut luid) } == 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        Ok(!token_privileges(token)?
+            .iter()
+            .any(|(low, high, _)| *low == luid.LowPart && *high == luid.HighPart))
+    }
+
+    fn collect_session0_action(
+        record: &mut Session0DiagnosticRecord,
+        config: &Session0DiagnosticConfig,
+        lease: Arc<ActionStationLease>,
+    ) -> Result<(), Session0DiagnosticFailureStage> {
+        let action = match ActionToken::create_for_worker(lease) {
             Ok(token) => token,
             Err(error) => {
-                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
                 record.baseline.spawn_error = format!("action_token: {error}");
-                return publish_session0_diagnostic(&record, config, None, None);
+                return Ok(());
             }
         };
         record.action = diagnostic_token_summary(action.handle(), true)
             .unwrap_or_else(|error| format!("unavailable:{error}"));
-        if !record.station.starts_with("unavailable:")
-            && !record.desktop.starts_with("unavailable:")
-        {
-            (record.station_access, record.desktop_access) =
-                diagnostic_open_access(&action, &record.station, &record.desktop);
-            record.ui_probe = diagnostic_ui_probe(&action, &record.station, &record.desktop);
-        }
-        // 製品と同じ呼び出しで共有ステーション上のアクション用デスクトップを作り、結果を記録する。
-        record.action_desktop = match ActionDesktop::create(&action) {
-            Ok(_desktop) => "created".into(),
-            Err(error) => format!("unavailable:{error}"),
-        };
+        // ここは broker の Default。対象の測定は各 run の Target* に保存する。
+        (record.station_access, record.desktop_access) =
+            diagnostic_open_access(&action, &record.station, &record.desktop);
+        record.ui_probe = diagnostic_ui_probe(&action, &record.station, &record.desktop);
+        record.action_desktop =
+            "scope=per-run;see=TargetDesktop,TargetDacl,TargetAccess,Lifecycle".into();
         let scratch = match PrivateScratch::create(
             &config.record_directory,
             &format!("action-{}", config.nonce),
@@ -4286,59 +4813,43 @@ privileges={privileges:?}{restricted}",
         ) {
             Ok(scratch) => scratch,
             Err(error) => {
-                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
                 record.baseline.spawn_error = format!("private_scratch: {error}");
-                return publish_session0_diagnostic(&record, config, None, None);
+                return Ok(());
             }
         };
-        let (command, environment_hash) = match session0_diagnostic_command(scratch.path()) {
-            Ok(value) => value,
-            Err(error) => {
-                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-                record.baseline.spawn_error = format!("command: {error}");
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    None,
-                );
+        let result = (|| {
+            let (command, environment_hash) = match session0_diagnostic_command(scratch.path()) {
+                Ok(value) => value,
+                Err(error) => {
+                    record.baseline.spawn_error = format!("command: {error}");
+                    return Ok(());
+                }
+            };
+            record.cwd = scratch.path().display().to_string();
+            record.environment_hash = environment_hash;
+            record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
+            // 両方とも製品の Job と共有 SID を使い、作成フラグだけを比較する。
+            for (run, profile) in [
+                (&mut record.baseline, TestCreationProfile::Production),
+                (&mut record.no_window, TestCreationProfile::NoWindow),
+            ] {
+                *run =
+                    run_session0_diagnostic_child(&action, &command, profile).map_err(|error| {
+                        run.spawn_error = error;
+                        Session0DiagnosticFailureStage::Runtime
+                    })?;
             }
-        };
-        record.cwd = scratch.path().display().to_string();
-        record.environment_hash = environment_hash;
-        record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-        // Both runs share the production command, CWD, BASELINE_ENV, TEMP/TMP, and action token.
-        // CREATE_NO_WINDOW is the sole variable; both runs use the production Job limits.
-        record.baseline =
-            match run_session0_diagnostic_child(&action, &command, TestCreationProfile::Production)
-            {
-                Ok(run) => run,
-                Err(error) => {
-                    record.baseline.spawn_error = error;
-                    return publish_session0_diagnostic(
-                        &record,
-                        config,
-                        Some((scratch.path(), &action)),
-                        Some(Session0DiagnosticFailureStage::Runtime),
-                    );
-                }
-            };
-        record.no_window =
-            match run_session0_diagnostic_child(&action, &command, TestCreationProfile::NoWindow) {
-                Ok(run) => run,
-                Err(error) => {
-                    record.no_window.spawn_error = error;
-                    return publish_session0_diagnostic(
-                        &record,
-                        config,
-                        Some((scratch.path(), &action)),
-                        Some(Session0DiagnosticFailureStage::Runtime),
-                    );
-                }
-            };
-        record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
-        record.classification = record.expected_classification();
-        publish_session0_diagnostic(&record, config, Some((scratch.path(), &action)), None)
+            record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
+            Ok(())
+        })();
+        cleanup_session0_diagnostic_scratch(
+            scratch.path(),
+            &config.record_directory,
+            &action,
+            &config.nonce,
+        )
+        .map_err(|_| Session0DiagnosticFailureStage::ScratchCleanup)?;
+        result
     }
 
     #[derive(Clone, Debug)]
@@ -6907,18 +7418,19 @@ privileges={privileges:?}{restricted}",
         set_medium_integrity(a.handle()).unwrap();
     }
 
-    fn token_default_dacl_sids(token: HANDLE) -> Vec<String> {
-        let info = token_info(token, TokenDefaultDacl).expect("default DACL token information");
-        // SAFETY: TokenDefaultDacl returns a TOKEN_DEFAULT_DACL within the owned buffer.
+    fn token_default_dacl_sids(token: HANDLE) -> io::Result<Vec<String>> {
+        let info = token_info(token, TokenDefaultDacl)?;
+        // SAFETY: TokenDefaultDacl は所有バッファ内の TOKEN_DEFAULT_DACL を返す。
         let default_dacl = unsafe { &*(info.as_ptr().cast::<TOKEN_DEFAULT_DACL>()) };
         if default_dacl.DefaultDacl.is_null() {
-            return Vec::new();
+            return Err(io::Error::other("トークンの既定 DACL がありません"));
         }
-        let (_, aces) = acl_aces(default_dacl.DefaultDacl).expect("valid token default DACL");
-        aces.iter()
+        let (_, aces) = acl_aces(default_dacl.DefaultDacl)?;
+        Ok(aces
+            .iter()
             .filter_map(AceBlob::simple_allow)
             .map(|(sid, _, _)| sid)
-            .collect()
+            .collect())
     }
 
     #[test]
@@ -6952,7 +7464,12 @@ privileges={privileges:?}{restricted}",
                     .iter()
                     .any(|entry| { entry.sid == sid_string(token.action_sid.0).unwrap() })
             );
-            assert!(!token_default_dacl_sids(token.handle()).contains(&shared_sid));
+            assert!(
+                !token_default_dacl_sids(token.handle())
+                    .unwrap()
+                    .contains(&shared_sid)
+            );
+            assert!(diagnostic_tcb_absent(token.handle()).unwrap());
         }
         // 共通 SID は共有し、各 action_sid は個別に生成する。
         assert_eq!(unsafe { EqualSid(a.action_sid.0, b.action_sid.0) }, 0);
