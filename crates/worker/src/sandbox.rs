@@ -26,13 +26,12 @@ use windows_sys::Win32::Security::{
     CreateRestrictedToken, CreateWellKnownSid, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
     EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, GetSidIdentifierAuthority, GetSidSubAuthority,
-    GetSidSubAuthorityCount, GetTokenInformation,
-    InitializeAcl, IsTokenRestricted, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES,
-    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
-    WinAuthenticatedUserSid, WinBuiltinUsersSid, WinLocalSystemSid, WinMediumLabelSid,
-    WinRestrictedCodeSid, WinWorldSid,
+    GetSidSubAuthorityCount, GetTokenInformation, InitializeAcl, IsTokenRestricted,
+    PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES, SetTokenInformation,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
+    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser, WinAuthenticatedUserSid,
+    WinBuiltinUsersSid, WinLocalSystemSid, WinMediumLabelSid, WinRestrictedCodeSid, WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, DELETE, WRITE_DAC};
 use windows_sys::Win32::System::Memory::{
@@ -1027,12 +1026,10 @@ fn rewrite_station_aces(
                     && sid_string(sid).is_ok_and(|expected| expected == *text)
             })
         });
-        let matches_stale = info
-            .as_ref()
-            .is_some_and(|(sid, flags, mask)| {
-                *flags == 0
-                    && *mask == 0x0002
-                    && stale_sid_strings.iter().any(|stale| stale == sid)
+        // lease 解放時は自分の ACE だけを外し、他の worker の ACE は保存する。
+        let matches_stale = remove_sid.is_none()
+            && info.as_ref().is_some_and(|(sid, flags, mask)| {
+                *flags == 0 && *mask == 0x0002 && stale_sid_strings.iter().any(|stale| stale == sid)
             });
         if matches_remove || matches_stale {
             removed += 1;
@@ -1091,10 +1088,15 @@ fn set_station_dacl(
         .try_fold(0usize, |total, ace| total.checked_add(ace.byte_len));
     let total = size_of::<ACL>()
         .checked_add(ace_bytes.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "ステーション ACL のサイズが上限を超えた")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ステーション ACL のサイズが上限を超えた",
+            )
         })?)
         .filter(|size| *size <= u16::MAX as usize)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "ステーション ACL が大きすぎる"))?;
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "ステーション ACL が大きすぎる")
+        })?;
     let mut storage = vec![0usize; total.div_ceil(size_of::<usize>())];
     let acl = storage.as_mut_ptr().cast::<ACL>();
     // SAFETY: storage は整列済みで、ACL ヘッダーと複製する全 ACE を格納できる。
@@ -1145,7 +1147,11 @@ fn update_station_acl(
     remove_sid: Option<*mut c_void>,
 ) -> io::Result<()> {
     let (control, revision, before) = station_dacl(station)?;
-    let stale = stale_worker_action_sids(&before)?;
+    let stale = if add_sid.is_some() && remove_sid.is_none() {
+        stale_worker_action_sids(&before)?
+    } else {
+        Vec::new()
+    };
     let expected = rewrite_station_aces(&before, add_sid, remove_sid, &stale)?;
     if expected == before {
         return Ok(());
@@ -6923,6 +6929,15 @@ privileges={privileges:?}{restricted}",
             rewrite_station_aces(&with_a_and_b, None, Some(worker_a.sid()), &[]).unwrap();
         assert_eq!(after_a_release.len(), before.len() + 1);
         assert_eq!(&after_a_release[..before.len()], before.as_slice());
+        let stale_worker_b = sid_string(worker_b.sid()).unwrap();
+        let after_a_release_with_stale_candidate = rewrite_station_aces(
+            &with_a_and_b,
+            None,
+            Some(worker_a.sid()),
+            std::slice::from_ref(&stale_worker_b),
+        )
+        .unwrap();
+        assert_eq!(after_a_release_with_stale_candidate, after_a_release);
         let after_b_release =
             rewrite_station_aces(&after_a_release, None, Some(worker_b.sid()), &[]).unwrap();
         assert_eq!(after_b_release, before);
