@@ -971,8 +971,8 @@ async fn run_action(
         let _ = process.wait().await;
     }
 
-    // `wait` has observed the direct process and terminated the complete Job.
-    // Only then can EOF prove that descendants no longer own either stdio pipe.
+    // wait の成功は Job 全体の終了確認を含む。失敗時も process が隔離資源を保持し、
+    // Drop が回収を再試行する。stdio の EOF だけを子孫終了の証拠にはしない。
     let _ = stdout_reader.await;
     let _ = stderr_reader.await;
 

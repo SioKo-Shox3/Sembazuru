@@ -12,11 +12,11 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
     GetLastError, HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation, SetLastError,
-    WAIT_OBJECT_0,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_WINDOW_OBJECT, SetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT, SE_WINDOW_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
@@ -27,11 +27,12 @@ use windows_sys::Win32::Security::{
     EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, GetSidIdentifierAuthority, GetSidSubAuthority,
     GetSidSubAuthorityCount, GetTokenInformation, InitializeAcl, IsTokenRestricted,
-    PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-    SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL,
-    TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser, WinAuthenticatedUserSid,
-    WinBuiltinUsersSid, WinLocalSystemSid, WinMediumLabelSid, WinRestrictedCodeSid, WinWorldSid,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    WinAuthenticatedUserSid, WinBuiltinUsersSid, WinLocalSystemSid, WinMediumLabelSid,
+    WinRestrictedCodeSid, WinWorldSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, DELETE, WRITE_DAC};
 use windows_sys::Win32::System::Memory::{
@@ -48,12 +49,13 @@ use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexW, CreateProcessAsUserW,
-    CreateSemaphoreW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenEventW,
-    OpenProcessToken, OpenSemaphoreW, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
-    ReleaseMutex, ReleaseSemaphore, ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexExW,
+    CreateProcessAsUserW, CreateSemaphoreW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, OpenEventW, OpenProcessToken, OpenSemaphoreW,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ReleaseMutex, ReleaseSemaphore,
+    ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
@@ -623,9 +625,8 @@ pub(crate) struct ActionStationLease {
     station: HWINSTA,
     station_name: String,
     worker_actions_sid: Arc<WorkerActionsSid>,
-    broker_sid: String,
-    update_mutex_name: Option<String>,
     active_marker: Option<OwnedHandle>,
+    update_mutex: Option<StationUpdateMutex>,
 }
 
 // SAFETY: HWINSTA はプロセス全体で有効な借用ハンドルであり、SID と名前は不変。
@@ -672,44 +673,46 @@ impl ActionStationLease {
             station,
             station_name,
             worker_actions_sid,
-            broker_sid: broker_sid_text,
-            update_mutex_name: None,
+            update_mutex: None,
             active_marker: None,
         };
         if is_service_station {
-            let mutex_name = format!(
-                "Local\\Sembazuru.WindowStationUpdate.{}",
-                lease.station_name
-            );
-            let marker_name = worker_actions_marker_name(lease.worker_actions_sid.sid())?;
-            let _update = StationUpdateGuard::acquire(&mutex_name, &lease.broker_sid)?;
-            let marker = create_active_marker(&marker_name, &lease.broker_sid)?;
-            if let Err(error) =
-                update_station_acl(lease.station, Some(lease.worker_actions_sid.sid()), None)
-            {
-                if let Err(cleanup) =
-                    update_station_acl(lease.station, None, Some(lease.worker_actions_sid.sid()))
-                {
-                    eprintln!(
-                        "sembazuru-worker: 起動失敗後のステーション ACL 後始末に失敗: {cleanup}"
-                    );
-                }
-                return Err(error);
-            }
-            lease.update_mutex_name = Some(mutex_name);
-            lease.active_marker = Some(marker);
+            lease.install_station_acl(&broker_sid_text)?;
         }
         Ok(lease)
+    }
+
+    fn install_station_acl(&mut self, broker_sid: &str) -> io::Result<()> {
+        let mutex_name = format!("Local\\Sembazuru.WindowStationUpdate.{}", self.station_name);
+        let marker_name = worker_actions_marker_name(self.worker_actions_sid.sid())?;
+        self.update_mutex = Some(StationUpdateMutex::open(&mutex_name, broker_sid)?);
+        let _update = self.update_mutex.as_ref().unwrap().lock()?;
+        let marker = create_active_marker(&marker_name, broker_sid)?;
+        if let Err(error) =
+            update_station_acl(self.station, Some(self.worker_actions_sid.sid()), None)
+        {
+            if let Err(cleanup) =
+                update_station_acl(self.station, None, Some(self.worker_actions_sid.sid()))
+            {
+                eprintln!("sembazuru-worker: 起動失敗後のステーション ACL 後始末に失敗: {cleanup}");
+            }
+            return Err(error);
+        }
+        self.active_marker = Some(marker);
+        Ok(())
     }
 }
 
 impl Drop for ActionStationLease {
     fn drop(&mut self) {
-        let Some(mutex_name) = &self.update_mutex_name else {
+        let Some(mutex) = &self.update_mutex else {
             return;
         };
+        if self.active_marker.is_none() {
+            return;
+        }
         let result = (|| {
-            let _update = StationUpdateGuard::acquire(mutex_name, &self.broker_sid)?;
+            let _update = mutex.lock()?;
             update_station_acl(self.station, None, Some(self.worker_actions_sid.sid()))
         })();
         if let Err(error) = result {
@@ -718,34 +721,106 @@ impl Drop for ActionStationLease {
     }
 }
 
-struct StationUpdateGuard(OwnedHandle);
+// READ_CONTROL | SYNCHRONIZE | MUTEX_MODIFY_STATE。取得時にも同じ権限を要求する。
+const STATION_MUTEX_ACCESS: u32 = 0x0012_0001;
 
-impl StationUpdateGuard {
-    fn acquire(name: &str, broker_sid: &str) -> io::Result<Self> {
-        let sddl = format!("D:P(A;;GA;;;{broker_sid})");
+/// 名前の再作成を防ぐため、ACL 更新の合間も lease がハンドルを所有する。
+struct StationUpdateMutex(OwnedHandle);
+
+impl StationUpdateMutex {
+    fn open(name: &str, broker_sid: &str) -> io::Result<Self> {
+        let sddl = format!("O:{broker_sid}D:P(A;;0x{STATION_MUTEX_ACCESS:08x};;;{broker_sid})");
         let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let handle = with_sddl_attributes(&sddl, |attributes| {
-            // SAFETY: 保護記述子と名前は CreateMutexW の呼び出し中に有効である。
-            let mutex = unsafe { CreateMutexW(attributes, 0, wide_name.as_ptr()) };
+            // SAFETY: 記述子と名前は呼び出し中に有効。既存オブジェクトも必要権限で開く。
+            let mutex =
+                unsafe { CreateMutexExW(attributes, wide_name.as_ptr(), 0, STATION_MUTEX_ACCESS) };
             if mutex.is_null() {
                 Err(io::Error::last_os_error())
             } else {
-                // SAFETY: CreateMutexW が返した一意のカーネルハンドルを所有する。
+                // SAFETY: CreateMutexExW が返した一意のカーネルハンドルを所有する。
                 Ok(unsafe { OwnedHandle::from_raw_handle(mutex as RawHandle) })
             }
         })?;
-        let waited = unsafe { WaitForSingleObject(handle.as_raw_handle() as HANDLE, INFINITE) };
-        if waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED_0 {
+        let mutex = Self(handle);
+        mutex.validate(broker_sid)?;
+        Ok(mutex)
+    }
+
+    fn validate(&self, broker_sid: &str) -> io::Result<()> {
+        let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
+        // SAFETY: 所有ハンドルは生存中で、出力先は有効。記述子を解放するまで SID/ACL を使う。
+        let error = unsafe {
+            GetSecurityInfo(
+                self.0.as_raw_handle() as HANDLE,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let descriptor = LocalAllocation(descriptor);
+        let denied = || {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ステーション更新 mutex の所有者または DACL が不正",
+            )
+        };
+        if descriptor.0.is_null() || owner.is_null() || dacl.is_null() {
+            return Err(denied());
+        }
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: GetSecurityInfo が返した有効な記述子を照会する。
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self(handle))
+        let (_, aces) = acl_aces(dacl)?;
+        if sid_string(owner)? != broker_sid
+            || control & SE_DACL_PROTECTED == 0
+            || aces.len() != 1
+            || aces[0].simple_allow() != Some((broker_sid.to_owned(), 0, STATION_MUTEX_ACCESS))
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    fn lock(&self) -> io::Result<StationUpdateGuard<'_>> {
+        self.lock_for(5_000)
+    }
+
+    fn lock_for(&self, timeout_ms: u32) -> io::Result<StationUpdateGuard<'_>> {
+        // SAFETY: mutex ハンドルは guard の借用中も生存する。
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle() as HANDLE, timeout_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(StationUpdateGuard {
+                mutex: self,
+                _same_thread: PhantomData,
+            }),
+            WAIT_TIMEOUT => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ステーション更新 mutex の取得期限を超過",
+            )),
+            _ => Err(io::Error::last_os_error()),
+        }
     }
 }
 
-impl Drop for StationUpdateGuard {
+struct StationUpdateGuard<'a> {
+    mutex: &'a StationUpdateMutex,
+    // mutex は取得したスレッドで解放する。await をまたぐ移動も認めない。
+    _same_thread: PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for StationUpdateGuard<'_> {
     fn drop(&mut self) {
-        // SAFETY: acquire はこのスレッドが mutex を所有してから戻る。
-        if unsafe { ReleaseMutex(self.0.as_raw_handle() as HANDLE) } == 0 {
+        // SAFETY: lock はこのスレッドが mutex を所有してから戻り、guard は Send ではない。
+        if unsafe { ReleaseMutex(self.mutex.0.as_raw_handle() as HANDLE) } == 0 {
             eprintln!("sembazuru-worker: ステーション更新 mutex の解放に失敗");
         }
     }
@@ -1935,34 +2010,14 @@ impl TestCreationProfile {
     }
 }
 
-struct SuspendedGuardian(Option<OwnedHandle>);
-
-impl SuspendedGuardian {
-    fn disarm(mut self) -> OwnedHandle {
-        self.0.take().unwrap()
-    }
-}
-
-impl Drop for SuspendedGuardian {
-    fn drop(&mut self) {
-        if let Some(process) = &self.0 {
-            // SAFETY: a suspended child is still live; terminate then synchronously reap it.
-            unsafe {
-                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
-                WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE);
-            }
-        }
-    }
-}
-
 pub(crate) struct RestrictedProcess {
     process: Option<OwnedHandle>,
     stdout: Option<OwnedHandle>,
     stderr: Option<OwnedHandle>,
     job: Arc<JobObject>,
-    /// Kept alive for the process's lifetime: a window station and desktop exist only while a
-    /// handle or a process references them, and the action's process is that reference.
-    _desktop: ActionDesktop,
+    /// 子孫を含む終了確認まで保持する。確認失敗時は解放せず、OS のプロセス回収に委ねる。
+    desktop: Option<ActionDesktop>,
+    tree_finished: bool,
 }
 
 impl RestrictedProcess {
@@ -2061,10 +2116,15 @@ impl RestrictedProcess {
                 io::Error::last_os_error().raw_os_error().unwrap_or(0)
             )));
         }
-        // SAFETY: CreateProcessAsUserW returned unique live process/thread handles.
-        let guardian = SuspendedGuardian(Some(unsafe {
-            OwnedHandle::from_raw_handle(info.hProcess as RawHandle)
-        }));
+        // SAFETY: CreateProcessAsUserW が返した一意のハンドルを、失敗経路も含む所有者へ渡す。
+        let process = Self {
+            process: Some(unsafe { OwnedHandle::from_raw_handle(info.hProcess as RawHandle) }),
+            stdout: Some(stdout_parent),
+            stderr: Some(stderr_parent),
+            job,
+            desktop: Some(desktop),
+            tree_finished: false,
+        };
         let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread as RawHandle) };
         #[cfg(test)]
         if failure == Some(SpawnFailure::AfterCreate) {
@@ -2075,7 +2135,7 @@ impl RestrictedProcess {
             return Err(io::Error::other("child_token_open: injected failure"));
         }
         let child_token = process_token(
-            guardian.0.as_ref().unwrap().as_raw_handle() as HANDLE,
+            process.process.as_ref().unwrap().as_raw_handle() as HANDLE,
             TOKEN_QUERY,
         )?;
         #[cfg(test)]
@@ -2092,27 +2152,23 @@ impl RestrictedProcess {
                 "suspended child token is not restricted",
             ));
         }
-        job.assign_verified(guardian.0.as_ref().unwrap().as_raw_handle())?;
+        process
+            .job
+            .assign_verified(process.process.as_ref().unwrap().as_raw_handle())?;
         #[cfg(test)]
         if failure == Some(SpawnFailure::BeforeResume) {
             return Err(io::Error::other("before_resume: injected failure"));
         }
         drop(attributes);
         drop((stdin, stdout, stderr));
-        // This is deliberately the final fallible setup step: no child instruction ran earlier.
+        // 再開を最後の失敗可能な手順にし、それまでは子の命令を実行させない。
         let prior = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
         if prior != 1 {
             return Err(io::Error::other(format!(
                 "resume_thread: unexpected count {prior}"
             )));
         }
-        Ok(Self {
-            process: Some(guardian.disarm()),
-            stdout: Some(stdout_parent),
-            stderr: Some(stderr_parent),
-            job,
-            _desktop: desktop,
-        })
+        Ok(process)
     }
 
     #[allow(
@@ -2151,10 +2207,8 @@ impl RestrictedProcess {
         ))
     }
 
-    /// Waits using an independently-owned process handle. Cancelling this future does not kill
-    /// the action or invalidate the detached blocking waiter; the caller must call
-    /// [`terminate`](Self::terminate) and then `wait` again on abort/timeout. Normal completion
-    /// terminates any descendants still alive in the Job after the top process exits.
+    /// 独立したハンドルで直下プロセスを待ち、その後 Job 全体の終了を確認する。
+    /// future のキャンセルだけでは終了しない。再度 wait するか、所有者の Drop が回収する。
     pub(crate) async fn wait(&mut self) -> io::Result<u32> {
         let source = self
             .process
@@ -2162,8 +2216,8 @@ impl RestrictedProcess {
             .ok_or_else(|| io::Error::other("process already reaped"))?;
         let duplicate = {
             let mut duplicate = null_mut();
-            // SAFETY: source and both pseudo-process handles are live. Success transfers one
-            // process-handle reference into `duplicate`, which becomes OwnedHandle below.
+            // SAFETY: source と両方の疑似プロセスハンドルは有効で、複製された参照を
+            // 呼出後に OwnedHandle へ移す。
             if unsafe {
                 DuplicateHandle(
                     GetCurrentProcess(),
@@ -2178,10 +2232,11 @@ impl RestrictedProcess {
             {
                 return Err(io::Error::last_os_error());
             }
-            // SAFETY: DuplicateHandle returned a unique owned handle. Keep the raw pointer
-            // inside this synchronous scope so the async future remains `Send`.
+            // SAFETY: DuplicateHandle の一意な返却ハンドルを所有する。生ポインターは
+            // 同期区間内に留め、future を Send に保つ。
             unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) }
         };
+        let job = Arc::clone(&self.job);
         let code = tokio::task::spawn_blocking(move || {
             let handle = duplicate.as_raw_handle() as HANDLE;
             if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
@@ -2191,21 +2246,22 @@ impl RestrictedProcess {
             if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
                 return Err(io::Error::last_os_error());
             }
+            drop(duplicate);
+            job.terminate_and_wait()?;
             Ok(code)
         })
         .await
         .map_err(|_| io::Error::other("process waiter failed"))??;
-        self.job.terminate();
+        self.tree_finished = true;
         self.process.take();
         Ok(code)
     }
 
-    /// Terminates the complete Job tree and the direct process as a fail-safe.
+    /// Job 全体へ終了を要求する。割当て前の失敗に備えて直下プロセスにも要求する。
     pub(crate) fn terminate(&self) {
         self.job.terminate();
         if let Some(process) = &self.process {
-            // SAFETY: the handle remains owned by self; this is a fail-safe if Job
-            // termination could not reach the direct process during teardown.
+            // SAFETY: 自分が所有するプロセスハンドルへ終了を要求する。
             unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 1) };
         }
     }
@@ -2231,12 +2287,27 @@ impl RestrictedProcess {
 
 impl Drop for RestrictedProcess {
     fn drop(&mut self) {
+        if self.tree_finished {
+            return;
+        }
         self.terminate();
-        if let Some(process) = self.process.take() {
-            // SAFETY: process is owned here; direct terminate covers pre/post-job teardown.
-            unsafe {
-                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
-                WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE);
+        let result = (|| {
+            if let Some(process) = &self.process {
+                // SAFETY: 割当て前の子も、所有ハンドルによって終了を確認する。
+                if unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 30_000) }
+                    != WAIT_OBJECT_0
+                {
+                    return Err(io::Error::other("直下プロセスの終了を確認できない"));
+                }
+            }
+            self.job.terminate_and_wait()
+        })();
+        if let Err(error) = result {
+            eprintln!("sembazuru-worker: ツリーの終了を確認できないため隔離資源を保持: {error}");
+            // 確認不能なツリーから desktop / station の許可を先に取り上げない。
+            // worker のプロセス終了まで保持し、通常の資源解放として扱わない。
+            if let Some(desktop) = self.desktop.take() {
+                std::mem::forget(desktop);
             }
         }
     }
@@ -6887,6 +6958,145 @@ privileges={privileges:?}{restricted}",
         assert_eq!(unsafe { EqualSid(a.action_sid.0, b.action_sid.0) }, 0);
     }
 
+    fn test_mutex_name() -> String {
+        format!(
+            "Local\\Sembazuru.Test.StationMutex.{}",
+            secure_random_hex().unwrap()
+        )
+    }
+
+    fn create_test_mutex(name: &str, sddl: &str) -> OwnedHandle {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        with_sddl_attributes(sddl, |attributes| {
+            // SAFETY: 一意なテスト名と記述子は呼出中に有効。返されたハンドルを所有する。
+            let raw = unsafe { CreateMutexExW(attributes, wide.as_ptr(), 0, STATION_MUTEX_ACCESS) };
+            if raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) })
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn station_mutex_rejects_precreated_wrong_owner_acl_and_rights() {
+        let broker = current_user_sid_string().unwrap();
+        for sddl in [
+            format!("O:{broker}D:P(A;;GA;;;{broker})"),
+            format!("O:{broker}D:P(A;;0x{STATION_MUTEX_ACCESS:08x};;;{broker})(A;;GA;;;WD)"),
+            format!("O:{broker}D:(A;;0x{STATION_MUTEX_ACCESS:08x};;;{broker})"),
+            format!("O:{broker}D:P(A;;0x00100000;;;{broker})"),
+        ] {
+            let name = test_mutex_name();
+            let fake = create_test_mutex(&name, &sddl);
+            // 占有された偽オブジェクトも、待機に入る前に拒否する。
+            assert_eq!(
+                unsafe { WaitForSingleObject(fake.as_raw_handle() as HANDLE, 0) },
+                WAIT_OBJECT_0
+            );
+            let rejected = std::thread::spawn(move || {
+                StationUpdateMutex::open(&name, &broker_for_test()).is_err()
+            });
+            assert!(rejected.join().unwrap());
+            assert_ne!(unsafe { ReleaseMutex(fake.as_raw_handle() as HANDLE) }, 0);
+        }
+        let name = test_mutex_name();
+        let mutex = StationUpdateMutex::open(&name, &broker).unwrap();
+        // 同じ DACL でも、期待する所有者が異なれば採用しない。
+        assert!(mutex.validate("S-1-5-18").is_err());
+    }
+
+    fn broker_for_test() -> String {
+        current_user_sid_string().unwrap()
+    }
+
+    #[test]
+    fn station_mutex_adopts_existing_holds_name_and_bounds_wait() {
+        let broker = current_user_sid_string().unwrap();
+        let name = test_mutex_name();
+        let original = StationUpdateMutex::open(&name, &broker).unwrap();
+        drop(original.lock().unwrap());
+        let adopted = StationUpdateMutex::open(&name, &broker).unwrap();
+        drop(original);
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let raw = unsafe {
+            windows_sys::Win32::System::Threading::OpenMutexW(
+                STATION_MUTEX_ACCESS,
+                0,
+                wide.as_ptr(),
+            )
+        };
+        assert!(!raw.is_null(), "更新間も名前を保持する");
+        drop(unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) });
+        let held = adopted.lock().unwrap();
+        let contender = std::thread::spawn(move || {
+            let other = StationUpdateMutex::open(&name, &broker).unwrap();
+            assert!(
+                matches!(other.lock_for(20), Err(error) if error.kind() == io::ErrorKind::TimedOut)
+            );
+            other
+        })
+        .join()
+        .unwrap();
+        drop(held);
+        drop(contender.lock().unwrap());
+    }
+
+    #[test]
+    fn station_lease_concurrent_updates_preserve_foreign_aces_and_mutex() {
+        let token = ActionToken::create().unwrap();
+        let desktop = ActionDesktop::create(&token).unwrap();
+        // テスト所有の desktop も SE_WINDOW_OBJECT。製品と同じ ACL API を使い、
+        // 現在の station / WinSta0 の DACL は読み書きしない。
+        let object = desktop._desktop.0 as usize;
+        let before = station_dacl(object as HWINSTA).unwrap();
+        let name = secure_random_hex().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let name = name.clone();
+            let ready = ready_tx.clone();
+            let (release, released) = std::sync::mpsc::channel();
+            releases.push(release);
+            threads.push(std::thread::spawn(move || {
+                let mut lease = ActionStationLease {
+                    station: object as HWINSTA,
+                    station_name: name,
+                    worker_actions_sid: Arc::new(WorkerActionsSid::random().unwrap()),
+                    active_marker: None,
+                    update_mutex: None,
+                };
+                ready
+                    .send(lease.install_station_acl(&broker_for_test()))
+                    .unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(lease);
+            }));
+        }
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        }
+        let during = station_dacl(object as HWINSTA).unwrap();
+        assert_eq!(during.2.len(), before.2.len() + 2);
+        assert_eq!(&during.2[..before.2.len()], before.2.as_slice());
+        let mutex_name = format!("Local\\Sembazuru.WindowStationUpdate.{name}");
+        let keeper = StationUpdateMutex::open(&mutex_name, &broker_for_test()).unwrap();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(station_dacl(object as HWINSTA).unwrap(), before);
+        drop(keeper.lock().unwrap());
+    }
+
     #[test]
     fn station_acl_add_remove_and_stale_cleanup_preserve_other_aces() {
         let broker_sid = current_user_sid_string().unwrap();
@@ -7621,6 +7831,205 @@ privileges={privileges:?}{restricted}",
         assert_ne!(process.wait().await.unwrap(), 0);
         drop(process);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn restricted_process_detached_stdio_probe() {
+        if std::env::var_os("SBZ_TREE_CHILD").is_some() {
+            std::fs::write("descendant-ready.tmp", std::process::id().to_string()).unwrap();
+            std::fs::rename("descendant-ready.tmp", "descendant-ready").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        // 子孫は標準入出力を引き継がず、親の終了後も Job 内に残る。
+        for kind in [
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+        ] {
+            let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(kind) };
+            assert_ne!(
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) },
+                0
+            );
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "sandbox::tests::restricted_process_detached_stdio_probe",
+            ])
+            .env("SBZ_TREE_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !Path::new("release-parent").exists() {
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("親の解放指示がない");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Job の所有者が残存子孫を回収するまで、ここでは待たない。
+        drop(child);
+    }
+
+    async fn detached_stdio_tree() -> (
+        RestrictedProcess,
+        Arc<JobObject>,
+        std::sync::Weak<ActionStationLease>,
+        OwnedHandle,
+        PrivateScratch,
+        PathBuf,
+    ) {
+        let lease = Arc::new(ActionStationLease::acquire().unwrap());
+        let weak = Arc::downgrade(&lease);
+        let token = ActionToken::create_for_worker(lease).unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "detached-stdio", &token).unwrap();
+        let probe = scratch.path().join("tree-probe.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        let command = RestrictedCommand::new(probe, scratch.path())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("sandbox::tests::restricted_process_detached_stdio_probe")
+            .env("SystemRoot", std::env::var_os("SystemRoot").unwrap());
+        let process = RestrictedProcess::spawn(&token, &command).unwrap();
+        drop(token);
+        let job = process.job();
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(scratch.path().join("descendant-ready"))
+                    && let Ok(pid) = text.parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("子孫の準備期限");
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE
+                    | windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        assert!(!raw.is_null());
+        let descendant = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+        assert!(job.contains(descendant.as_raw_handle()).unwrap());
+        assert_eq!(job.active_processes().unwrap(), 2);
+        assert!(weak.upgrade().is_some());
+        (process, job, weak, descendant, scratch, root)
+    }
+
+    #[tokio::test]
+    async fn restricted_process_normal_exit_reaps_descendant_after_stdio_eof() {
+        use tokio::io::AsyncReadExt;
+        let (mut process, job, weak, descendant, scratch, root) = detached_stdio_tree().await;
+        let (mut stdout, mut stderr) = process.take_output().unwrap();
+        std::fs::write(scratch.path().join("release-parent"), b"go").unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        // EOF と直下プロセス終了が揃っても、子孫はまだ実行中で lease も生存する。
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+            WAIT_TIMEOUT
+        );
+        assert!(job.active_processes().unwrap() >= 1);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(process.wait().await.unwrap(), 0);
+        assert_eq!(job.active_processes().unwrap(), 0);
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+            WAIT_OBJECT_0
+        );
+        assert!(weak.upgrade().is_some());
+        drop(process);
+        assert!(weak.upgrade().is_none());
+        drop(scratch);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_process_cancel_and_drop_reap_before_last_lease() {
+        for explicit_abort in [true, false] {
+            let (mut process, job, weak, descendant, scratch, root) = detached_stdio_tree().await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), process.wait())
+                    .await
+                    .is_err()
+            );
+            assert!(weak.upgrade().is_some());
+            if explicit_abort {
+                // aborts マップと同じ Job の共有参照から終了を要求する。
+                job.terminate();
+                assert_ne!(process.wait().await.unwrap(), 0);
+            }
+            drop(process);
+            assert_eq!(job.active_processes().unwrap(), 0);
+            assert_eq!(
+                unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+                WAIT_OBJECT_0
+            );
+            assert!(weak.upgrade().is_none());
+            drop(scratch);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn restricted_process_runtime_shutdown_reaps_before_last_lease() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (process, job, weak, descendant, scratch, root) =
+            runtime.block_on(detached_stdio_tree());
+        runtime.spawn(async move {
+            let mut process = process;
+            let _ = process.wait().await;
+        });
+        // worker 停止時と同じ runtime の破棄で、所有する future の Drop を通す。
+        drop(runtime);
+        assert_eq!(job.active_processes().unwrap(), 0);
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+            WAIT_OBJECT_0
+        );
+        assert!(weak.upgrade().is_none());
+        drop(scratch);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_process_cleanup_failure_keeps_desktop_and_station_lease() {
+        use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+        for access in [JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE] {
+            let (mut process, job, weak, _descendant, scratch, root) = detached_stdio_tree().await;
+            // 実ハンドルの権限を絞り、終了要求失敗と照会失敗をそれぞれ発生させる。
+            process.job = Arc::new(job.duplicate_with_access_for_test(access));
+            let desktop = process.desktop.as_ref().unwrap()._desktop.0;
+            process.terminate();
+            assert!(process.wait().await.is_err());
+            assert!(!process.tree_finished);
+            drop(process);
+            assert!(weak.upgrade().is_some());
+            assert!(user_object_name(desktop as HANDLE).is_ok());
+            // テスト側の正規ハンドルで子孫を回収する。保持された隔離資源はテスト終了時に OS が回収する。
+            job.terminate_and_wait().unwrap();
+            drop(scratch);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
