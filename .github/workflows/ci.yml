@@ -214,8 +214,8 @@ jobs:
         run: pwsh -NoProfile -File hooks/test/sign_smoke.ps1
 
   m9-installer:
-    name: M9.6 installer (MSI build + version sync + signing structure)
-    # Builds the signed-capable MSI green gate (ADR 0008 §1). The MSI only packages
+    name: M9.6 installer (MSI + Burn Bundle + version sync + signing structure)
+    # Builds the signed-capable MSI and Burn Bundle green gate (ADR 0008 §1). The MSI only packages
     # prebuilt binaries, so it stays compiler-agnostic; this job does not run the
     # compile/determinism gates (the `hooks` job owns those). The MSI is built
     # UNSIGNED here — a real release swaps in an OV cert (M7 / docs/security/
@@ -253,6 +253,13 @@ jobs:
       # extension from NuGet; no global `wix` tool is needed. Green gate.
       - name: Build MSI (unsigned)
         run: dotnet build installer/Package.wixproj -c Release -p:Platform=x64
+      # Prepare and verify the official x64/x86 VC++ payloads, then embed them and
+      # the fresh MSI in the unsigned standard Burn Bundle.
+      - name: Prepare VC++ redistributables
+        shell: pwsh
+        run: pwsh -NoProfile -File installer/prepare_redist.ps1
+      - name: Build Bundle (unsigned)
+        run: dotnet build installer/Bundle.wixproj -c Release -p:Platform=x64 -p:SbzMsi=installer/bin/x64/Release/Sembazuru.msi
       - name: ProgramData ACLs (protected root, worker-only write, clean uninstall)
         run: pwsh -NoProfile -File hooks/test/m9_installer_acl.ps1 -Msi installer/bin/x64/Release/Sembazuru.msi -StoreCtl target/release/sembazuru-storectl.exe -ExecVfs target/release/examples/exec_vfs.exe
       - name: ProgramData pre-positioning fails closed before services
@@ -268,6 +275,11 @@ jobs:
         with:
           name: Sembazuru-msi-unsigned
           path: installer/bin/x64/Release/Sembazuru.msi
+      - name: Upload Bundle artifact (unsigned)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4 (TEST-001: SHA-pinned)
+        with:
+          name: Sembazuru-bundle-unsigned
+          path: installer/bin/x64/Release/Sembazuru-Setup.exe
       # Prove the signing STRUCTURE over the whole shipped set + the MSI with a
       # placeholder cert (M9.5e). Runs after the upload so the published artifact
       # stays unsigned. A real release swaps in an OV cert + signtool + RFC3161

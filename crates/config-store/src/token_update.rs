@@ -35,7 +35,8 @@ const RECORD_PAYLOAD_OFFSET_OFFSET: usize = 92;
 const RECORD_PAYLOAD_LENGTH_OFFSET: usize = 96;
 const JOURNAL_PAYLOAD_OFFSET: usize =
     JOURNAL_FIRST_RECORD_OFFSET + JOURNAL_RECORD_BYTES * JOURNAL_RECORD_COUNT;
-const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+/// One source of truth with the join envelope, which carries the same bodies.
+const MAX_CONFIG_BYTES: usize = crate::MAX_MACHINE_CONFIG_BYTES;
 const MAX_JOURNAL_BYTES: usize =
     JOURNAL_PAYLOAD_OFFSET + MAX_MACHINE_SECRET_BLOB_BYTES + MAX_CONFIG_BYTES * 2;
 

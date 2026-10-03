@@ -10,41 +10,56 @@ use std::ptr::{null, null_mut};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT, LocalFree,
-    SetHandleInformation, WAIT_OBJECT_0,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
+    GetLastError, HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation, SetLastError,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT, SE_WINDOW_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Security::{
-    AllocateAndInitializeSid, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-    FreeSid, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    IsTokenRestricted, SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY,
-    SID_AND_ATTRIBUTES, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY,
-    TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
-    TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinMediumLabelSid,
+    ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, AddAce, AllocateAndInitializeSid,
+    CreateRestrictedToken, CreateWellKnownSid, DACL_SECURITY_INFORMATION, DISABLE_MAX_PRIVILEGE,
+    EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSidIdentifierAuthority, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation, InitializeAcl, IsTokenRestricted,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, SECURITY_RESOURCE_MANAGER_AUTHORITY, SID_AND_ATTRIBUTES,
+    SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    WinAuthenticatedUserSid, WinBuiltinUsersSid, WinLocalSystemSid, WinMediumLabelSid,
     WinRestrictedCodeSid, WinWorldSid,
 };
-use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
+use windows_sys::Win32::Storage::FileSystem::{CreateDirectoryW, DELETE, WRITE_DAC};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::StationsAndDesktops::{
+    CloseDesktop, CreateDesktopW, GetProcessWindowStation, GetUserObjectInformationW, HDESK,
+    HWINSTA, UOI_NAME,
+};
+use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
 use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SECURITY_MANDATORY_MEDIUM_RID,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateSemaphoreW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenProcessToken,
-    OpenSemaphoreW, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ReleaseSemaphore,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateMutexExW,
+    CreateProcessAsUserW, CreateSemaphoreW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
+    InitializeProcThreadAttributeList, OpenEventW, OpenProcessToken, OpenSemaphoreW,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ReleaseMutex, ReleaseSemaphore,
     ResumeThread, SEMAPHORE_MODIFY_STATE, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
     UpdateProcThreadAttribute, WaitForSingleObject,
 };
+
+const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+const WAIT_ABANDONED_0: u32 = 0x0000_0080;
 
 use crate::job::JobObject;
 
@@ -380,9 +395,13 @@ impl Drop for VfsAttestation {
 
 struct ActionSid(*mut c_void);
 
-// SAFETY: the allocation is uniquely owned, is never dereferenced without the
-// owning `ActionToken`, and Windows permits SID inspection/freeing on any thread.
+// SAFETY: SID は割り当て後に変更せず、Windows は任意のスレッドから検査・解放できる。
+// 所有権により、参照中に割り当てが解放されることはない。
 unsafe impl Send for ActionSid {}
+unsafe impl Sync for ActionSid {}
+
+const ACTION_SID_PREFIX: [u32; 4] = [0x626d_6553, 0x7275_7a61, 0x6361_2e75, 0x6e6f_6974];
+const WORKER_ACTIONS_SID_PREFIX: [u32; 4] = [0x626d_6553, 0x7275_7a61, 0x6f77_2e75, 0x7265_6b72];
 
 pub(crate) fn secure_random_hex() -> io::Result<String> {
     let mut nonce = [0u8; 16];
@@ -403,6 +422,10 @@ pub(crate) fn secure_random_hex() -> io::Result<String> {
 
 impl ActionSid {
     fn random() -> io::Result<Self> {
+        Self::random_with_prefix(ACTION_SID_PREFIX, "action identity unavailable")
+    }
+
+    fn random_with_prefix(prefix: [u32; 4], failure: &'static str) -> io::Result<Self> {
         let mut nonce = [0u32; 4];
         // SAFETY: a null algorithm plus SYSTEM_PREFERRED uses the OS CSPRNG and nonce is writable.
         if unsafe {
@@ -414,20 +437,19 @@ impl ActionSid {
             )
         } != 0
         {
-            return Err(io::Error::other("action identity unavailable"));
+            return Err(io::Error::other(failure));
         }
         let mut sid = null_mut();
-        // The first four subauthorities publicly encode "Sembazuru.action"; the remaining
-        // 128 random bits are independent of remote action ids, PIDs, and wall time.
-        // SAFETY: authority and out pointer are valid; success transfers a FreeSid allocation.
+        // 先頭4つの subauthority が用途を識別し、残る128 bitはOSの乱数から得る。
+        // SAFETY: authority と出力先は有効で、成功時の割り当てを FreeSid が所有する。
         if unsafe {
             AllocateAndInitializeSid(
                 &SECURITY_RESOURCE_MANAGER_AUTHORITY,
                 8,
-                0x626d_6553,
-                0x7275_7a61,
-                0x6361_2e75,
-                0x6e6f_6974,
+                prefix[0],
+                prefix[1],
+                prefix[2],
+                prefix[3],
                 nonce[0],
                 nonce[1],
                 nonce[2],
@@ -442,6 +464,22 @@ impl ActionSid {
     }
 }
 
+struct WorkerActionsSid(ActionSid);
+
+impl WorkerActionsSid {
+    fn random() -> io::Result<Self> {
+        ActionSid::random_with_prefix(
+            WORKER_ACTIONS_SID_PREFIX,
+            "worker アクション SID を生成できない",
+        )
+        .map(Self)
+    }
+
+    fn sid(&self) -> *mut c_void {
+        self.0.0
+    }
+}
+
 impl Drop for ActionSid {
     fn drop(&mut self) {
         // SAFETY: self.0 is the outstanding AllocateAndInitializeSid result.
@@ -453,9 +491,12 @@ pub(crate) struct ActionToken {
     token: OwnedHandle,
     action_sid: ActionSid,
     broker_user: Vec<usize>,
+    station_name: String,
+    station_lease: Option<Arc<ActionStationLease>>,
 }
 
 impl ActionToken {
+    #[cfg(test)]
     pub(crate) fn create() -> io::Result<Self> {
         let token = current_token(
             TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
@@ -463,7 +504,35 @@ impl ActionToken {
         Self::create_from_token(token.as_raw_handle() as HANDLE)
     }
 
+    #[cfg(test)]
     fn create_from_token(source: HANDLE) -> io::Result<Self> {
+        let worker_actions_sid = Arc::new(WorkerActionsSid::random()?);
+        Self::create_from_token_with_station(
+            source,
+            worker_actions_sid,
+            current_window_station_name()?,
+            None,
+        )
+    }
+
+    pub(crate) fn create_for_worker(station_lease: Arc<ActionStationLease>) -> io::Result<Self> {
+        let source = current_token(
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+        )?;
+        Self::create_from_token_with_station(
+            source.as_raw_handle() as HANDLE,
+            Arc::clone(&station_lease.worker_actions_sid),
+            station_lease.station_name.clone(),
+            Some(station_lease),
+        )
+    }
+
+    fn create_from_token_with_station(
+        source: HANDLE,
+        worker_actions_sid: Arc<WorkerActionsSid>,
+        station_name: String,
+        station_lease: Option<Arc<ActionStationLease>>,
+    ) -> io::Result<Self> {
         if is_token_restricted(source) {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
@@ -478,17 +547,23 @@ impl ActionToken {
         ] {
             sid_storage.push(well_known_sid(kind)?);
         }
-        let mut restrictions = vec![SID_AND_ATTRIBUTES {
-            Sid: action_sid.0,
-            Attributes: 0,
-        }];
+        let mut restrictions = vec![
+            SID_AND_ATTRIBUTES {
+                Sid: worker_actions_sid.sid(),
+                Attributes: 0,
+            },
+            SID_AND_ATTRIBUTES {
+                Sid: action_sid.0,
+                Attributes: 0,
+            },
+        ];
         restrictions.extend(sid_storage.iter_mut().map(|sid| SID_AND_ATTRIBUTES {
             Sid: sid.as_mut_ptr().cast(),
             Attributes: 0,
         }));
         let mut restricted = null_mut();
-        // SAFETY: source is queryable/duplicable; the SID pointers remain alive for this call;
-        // the returned primary token is transferred to OwnedHandle and never ambient-fallbacks.
+        // SAFETY: source は照会・複製可能で、SID は呼び出し中に有効である。
+        // 返されたプライマリトークンは OwnedHandle に移し、暗黙のトークンへ戻さない。
         if unsafe {
             CreateRestrictedToken(
                 source,
@@ -512,6 +587,8 @@ impl ActionToken {
             token,
             action_sid,
             broker_user,
+            station_name,
+            station_lease,
         })
     }
 
@@ -540,6 +617,629 @@ impl ActionToken {
         let _revert = Revert;
         operation()
     }
+}
+
+/// worker が現在使っているサービスステーションを借用し、共有 SID の許可を管理する。
+/// `station` は `GetProcessWindowStation` の戻り値であり、この構造体は閉じない。
+pub(crate) struct ActionStationLease {
+    station: HWINSTA,
+    station_name: String,
+    worker_actions_sid: Arc<WorkerActionsSid>,
+    active_marker: Option<OwnedHandle>,
+    update_mutex: Option<StationUpdateMutex>,
+}
+
+// SAFETY: HWINSTA はプロセス全体で有効な借用ハンドルであり、SID と名前は不変。
+unsafe impl Send for ActionStationLease {}
+unsafe impl Sync for ActionStationLease {}
+
+impl ActionStationLease {
+    /// 実行中の worker と競合しないように DACL 更新を直列化してから lease を返す。
+    pub(crate) fn acquire() -> io::Result<Self> {
+        let station = unsafe { GetProcessWindowStation() };
+        if station.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let station_name = user_object_name(station as HANDLE)?;
+        let process_token = current_token(TOKEN_QUERY)?;
+        let broker_user = token_info(process_token.as_raw_handle() as HANDLE, TokenUser)?;
+        // SAFETY: TokenUser 情報は broker_user が生存する間有効。
+        let broker_sid = unsafe { (*(broker_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let broker_sid_text = sid_string(broker_sid)?;
+        let mut local_system = well_known_sid(WinLocalSystemSid)?;
+        // LocalSystem のセッション共有ステーションと対話用 WinSta0 の DACL は変更しない。
+        if unsafe { EqualSid(broker_sid, local_system.as_mut_ptr().cast()) } != 0
+            && !station_name.eq_ignore_ascii_case("WinSta0")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "LocalSystem の共有ステーションは変更しない",
+            ));
+        }
+
+        let worker_actions_sid = Arc::new(WorkerActionsSid::random()?);
+        let is_interactive = station_name.eq_ignore_ascii_case("WinSta0");
+        let is_service_station = station_name.starts_with("Service-0x0-")
+            && station_name.ends_with('$')
+            && station_name.len() > "Service-0x0-$".len();
+        if !is_interactive && !is_service_station {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker のウィンドウステーションを識別できない",
+            ));
+        }
+
+        let mut lease = Self {
+            station,
+            station_name,
+            worker_actions_sid,
+            update_mutex: None,
+            active_marker: None,
+        };
+        if is_service_station {
+            lease.install_station_acl(&broker_sid_text)?;
+        }
+        Ok(lease)
+    }
+
+    fn install_station_acl(&mut self, broker_sid: &str) -> io::Result<()> {
+        let mutex_name = format!("Local\\Sembazuru.WindowStationUpdate.{}", self.station_name);
+        let marker_name = worker_actions_marker_name(self.worker_actions_sid.sid())?;
+        self.update_mutex = Some(StationUpdateMutex::open(&mutex_name, broker_sid)?);
+        let _update = self.update_mutex.as_ref().unwrap().lock()?;
+        let marker = create_active_marker(&marker_name, broker_sid)?;
+        if let Err(error) =
+            update_station_acl(self.station, Some(self.worker_actions_sid.sid()), None)
+        {
+            if let Err(cleanup) =
+                update_station_acl(self.station, None, Some(self.worker_actions_sid.sid()))
+            {
+                eprintln!("sembazuru-worker: 起動失敗後のステーション ACL 後始末に失敗: {cleanup}");
+            }
+            return Err(error);
+        }
+        self.active_marker = Some(marker);
+        Ok(())
+    }
+}
+
+impl Drop for ActionStationLease {
+    fn drop(&mut self) {
+        let Some(mutex) = &self.update_mutex else {
+            return;
+        };
+        if self.active_marker.is_none() {
+            return;
+        }
+        let result = (|| {
+            let _update = mutex.lock()?;
+            update_station_acl(self.station, None, Some(self.worker_actions_sid.sid()))
+        })();
+        if let Err(error) = result {
+            eprintln!("sembazuru-worker: ステーション ACL の lease 解放に失敗: {error}");
+        }
+    }
+}
+
+// READ_CONTROL | SYNCHRONIZE | MUTEX_MODIFY_STATE。取得時にも同じ権限を要求する。
+const STATION_MUTEX_ACCESS: u32 = 0x0012_0001;
+
+/// 名前の再作成を防ぐため、ACL 更新の合間も lease がハンドルを所有する。
+struct StationUpdateMutex(OwnedHandle);
+
+impl StationUpdateMutex {
+    fn open(name: &str, broker_sid: &str) -> io::Result<Self> {
+        let sddl = format!("O:{broker_sid}D:P(A;;0x{STATION_MUTEX_ACCESS:08x};;;{broker_sid})");
+        let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let handle = with_sddl_attributes(&sddl, |attributes| {
+            // SAFETY: 記述子と名前は呼び出し中に有効。既存オブジェクトも必要権限で開く。
+            let mutex =
+                unsafe { CreateMutexExW(attributes, wide_name.as_ptr(), 0, STATION_MUTEX_ACCESS) };
+            if mutex.is_null() {
+                Err(io::Error::last_os_error())
+            } else {
+                // SAFETY: CreateMutexExW が返した一意のカーネルハンドルを所有する。
+                Ok(unsafe { OwnedHandle::from_raw_handle(mutex as RawHandle) })
+            }
+        })?;
+        let mutex = Self(handle);
+        mutex.validate(broker_sid)?;
+        Ok(mutex)
+    }
+
+    fn validate(&self, broker_sid: &str) -> io::Result<()> {
+        let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
+        // SAFETY: 所有ハンドルは生存中で、出力先は有効。記述子を解放するまで SID/ACL を使う。
+        let error = unsafe {
+            GetSecurityInfo(
+                self.0.as_raw_handle() as HANDLE,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let descriptor = LocalAllocation(descriptor);
+        let denied = || {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "ステーション更新 mutex の所有者または DACL が不正",
+            )
+        };
+        if descriptor.0.is_null() || owner.is_null() || dacl.is_null() {
+            return Err(denied());
+        }
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: GetSecurityInfo が返した有効な記述子を照会する。
+        if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (_, aces) = acl_aces(dacl)?;
+        if sid_string(owner)? != broker_sid
+            || control & SE_DACL_PROTECTED == 0
+            || aces.len() != 1
+            || aces[0].simple_allow() != Some((broker_sid.to_owned(), 0, STATION_MUTEX_ACCESS))
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
+    fn lock(&self) -> io::Result<StationUpdateGuard<'_>> {
+        self.lock_for(5_000)
+    }
+
+    fn lock_for(&self, timeout_ms: u32) -> io::Result<StationUpdateGuard<'_>> {
+        // SAFETY: mutex ハンドルは guard の借用中も生存する。
+        match unsafe { WaitForSingleObject(self.0.as_raw_handle() as HANDLE, timeout_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(StationUpdateGuard {
+                mutex: self,
+                _same_thread: PhantomData,
+            }),
+            WAIT_TIMEOUT => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "ステーション更新 mutex の取得期限を超過",
+            )),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+}
+
+struct StationUpdateGuard<'a> {
+    mutex: &'a StationUpdateMutex,
+    // mutex は取得したスレッドで解放する。await をまたぐ移動も認めない。
+    _same_thread: PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for StationUpdateGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: lock はこのスレッドが mutex を所有してから戻り、guard は Send ではない。
+        if unsafe { ReleaseMutex(self.mutex.0.as_raw_handle() as HANDLE) } == 0 {
+            eprintln!("sembazuru-worker: ステーション更新 mutex の解放に失敗");
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AceBlob {
+    words: Vec<u32>,
+    byte_len: usize,
+}
+
+impl AceBlob {
+    fn from_ptr(ace: *const c_void, byte_len: usize) -> io::Result<Self> {
+        if byte_len < size_of::<ACE_HEADER>() || !byte_len.is_multiple_of(size_of::<u32>()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ステーション ACE のサイズが不正",
+            ));
+        }
+        let word_count = byte_len / size_of::<u32>();
+        let mut words = vec![0u32; word_count];
+        // SAFETY: GetAce が返した byte_len バイトは読み取り可能で、両領域は整列し重ならない。
+        unsafe { std::ptr::copy_nonoverlapping(ace.cast::<u32>(), words.as_mut_ptr(), word_count) };
+        Ok(Self { words, byte_len })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: words は初期化済み byte_len バイトを所有し、ACE の各フィールドに整列する。
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.byte_len) }
+    }
+
+    fn header(&self) -> &ACE_HEADER {
+        // SAFETY: ACE_HEADER より短いバッファは構築時に拒否している。
+        unsafe { &*self.words.as_ptr().cast::<ACE_HEADER>() }
+    }
+
+    fn simple_allow(&self) -> Option<(String, u8, u32)> {
+        let bytes = self.bytes();
+        if u32::from(self.header().AceType) != ACCESS_ALLOWED_ACE_TYPE || self.byte_len < 16 {
+            return None;
+        }
+        let sid = unsafe { bytes.as_ptr().add(8).cast_mut().cast::<c_void>() };
+        // SAFETY: SID は有効な ACL から複製した ACCESS_ALLOWED_ACE の内部にある。
+        let sid_len = unsafe { GetLengthSid(sid) } as usize;
+        if sid_len < 8 || 8usize.checked_add(sid_len)? > self.byte_len {
+            return None;
+        }
+        let mask = u32::from_ne_bytes(bytes[4..8].try_into().ok()?);
+        Some((sid_string(sid).ok()?, self.header().AceFlags, mask))
+    }
+
+    fn worker_actions_sid(&self) -> Option<String> {
+        let (sid_text, flags, mask) = self.simple_allow()?;
+        if flags != 0 || mask != 0x0002 {
+            return None;
+        }
+        let sid = unsafe { self.bytes().as_ptr().add(8).cast_mut().cast::<c_void>() };
+        if is_worker_actions_sid(sid) {
+            Some(sid_text)
+        } else {
+            None
+        }
+    }
+}
+
+fn user_object_name(handle: HANDLE) -> io::Result<String> {
+    let mut buffer = vec![0u16; 1024];
+    let mut used = 0;
+    // SAFETY: 借用した USER オブジェクトのハンドルは有効で、バッファは書き込み可能。
+    if unsafe {
+        GetUserObjectInformationW(
+            handle,
+            UOI_NAME,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * size_of::<u16>()) as u32,
+            &mut used,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let length = (used as usize / size_of::<u16>()).min(buffer.len());
+    if length == 0 || buffer[length - 1] != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "USER オブジェクト名が終端されていない",
+        ));
+    }
+    Ok(String::from_utf16_lossy(&buffer[..length - 1]))
+}
+
+#[cfg(test)]
+fn current_window_station_name() -> io::Result<String> {
+    let station = unsafe { GetProcessWindowStation() };
+    if station.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    user_object_name(station as HANDLE)
+}
+
+fn worker_actions_marker_name(sid: *mut c_void) -> io::Result<String> {
+    Ok(format!(
+        "Local\\Sembazuru.WorkerActions.Active.{}",
+        sid_string(sid)?
+    ))
+}
+
+fn create_active_marker(name: &str, broker_sid: &str) -> io::Result<OwnedHandle> {
+    let sddl = format!("D:P(A;;GA;;;{broker_sid})");
+    let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    with_sddl_attributes(&sddl, |attributes| {
+        unsafe { SetLastError(0) };
+        // SAFETY: 保護記述子と名前は CreateEventW の呼び出し中に有効である。
+        let event = unsafe { CreateEventW(attributes, 1, 0, wide_name.as_ptr()) };
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let last_error = unsafe { GetLastError() };
+        // 乱数 SID が既存の別 worker のマーカーへ誤って結び付く場合は拒否する。
+        if last_error == ERROR_ALREADY_EXISTS {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(event) };
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "worker アクション lease のマーカーが既に存在する",
+            ));
+        }
+        // SAFETY: CreateEventW が返した一意のカーネルハンドルを所有する。
+        Ok(unsafe { OwnedHandle::from_raw_handle(event as RawHandle) })
+    })
+}
+
+fn is_worker_actions_sid(sid: *mut c_void) -> bool {
+    let authority = unsafe { GetSidIdentifierAuthority(sid) };
+    if authority.is_null()
+        || unsafe { (*authority).Value != SECURITY_RESOURCE_MANAGER_AUTHORITY.Value }
+    {
+        return false;
+    }
+    let count = unsafe { GetSidSubAuthorityCount(sid) };
+    if count.is_null() || unsafe { *count } != 8 {
+        return false;
+    }
+    WORKER_ACTIONS_SID_PREFIX
+        .iter()
+        .enumerate()
+        .all(|(index, expected)| {
+            let part = unsafe { GetSidSubAuthority(sid, index as u32) };
+            !part.is_null() && unsafe { *part == *expected }
+        })
+}
+
+fn acl_aces(acl: *mut ACL) -> io::Result<(u8, Vec<AceBlob>)> {
+    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: acl は有効な DACL で、info は API が定める出力形式である。
+    if unsafe {
+        GetAclInformation(
+            acl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut aces = Vec::with_capacity(info.AceCount as usize);
+    for index in 0..info.AceCount {
+        let mut raw = null_mut();
+        // SAFETY: index はこの ACL から取得した ACE 数の範囲内である。
+        if unsafe { GetAce(acl, index, &mut raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetAce が返した ACE ヘッダーは ACL 内で有効である。
+        let header = unsafe { &*raw.cast::<ACE_HEADER>() };
+        aces.push(AceBlob::from_ptr(raw, header.AceSize as usize)?);
+    }
+    // SAFETY: acl は有効で、ACL ヘッダーからリビジョンを取得できる。
+    let revision = unsafe { (*acl).AclRevision };
+    Ok((revision, aces))
+}
+
+fn station_dacl(station: HWINSTA) -> io::Result<(u16, u8, Vec<AceBlob>)> {
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    // SAFETY: station は GetProcessWindowStation から借用し、出力先は有効である。
+    let error = unsafe {
+        GetSecurityInfo(
+            station as HANDLE,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    if descriptor.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ステーションのセキュリティ記述子がない",
+        ));
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    let (mut present, mut descriptor_dacl, mut defaulted) = (0, null_mut(), 0);
+    // SAFETY: descriptor は有効なままで、すべての出力先が有効である。
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut present,
+            &mut descriptor_dacl,
+            &mut defaulted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if present == 0 || descriptor_dacl.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "worker ステーションの DACL がないか null である",
+        ));
+    }
+    let (mut control, mut descriptor_revision) = (0, 0);
+    // SAFETY: descriptor は GetSecurityInfo が返した有効なセキュリティ記述子である。
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut descriptor_revision) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let (acl_revision, aces) = acl_aces(descriptor_dacl)?;
+    Ok((control, acl_revision, aces))
+}
+
+fn stale_worker_action_sids(aces: &[AceBlob]) -> io::Result<Vec<String>> {
+    let mut stale = Vec::new();
+    for ace in aces {
+        let Some(sid) = ace.worker_actions_sid() else {
+            continue;
+        };
+        let marker_name = format!("Local\\Sembazuru.WorkerActions.Active.{sid}");
+        let wide_marker: Vec<u16> = marker_name.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: マーカー名は NUL 終端され、返されたハンドルは下で所有権を得る。
+        let event = unsafe { OpenEventW(SYNCHRONIZE_ACCESS, 0, wide_marker.as_ptr()) };
+        if event.is_null() {
+            let error = unsafe { GetLastError() };
+            if error == ERROR_FILE_NOT_FOUND {
+                stale.push(sid);
+                continue;
+            }
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // SAFETY: OpenEventW が返した一意のカーネルハンドルを所有する。
+        drop(unsafe { OwnedHandle::from_raw_handle(event as RawHandle) });
+    }
+    stale.sort_unstable();
+    stale.dedup();
+    Ok(stale)
+}
+
+fn rewrite_station_aces(
+    aces: &[AceBlob],
+    add_sid: Option<*mut c_void>,
+    remove_sid: Option<*mut c_void>,
+    stale_sid_strings: &[String],
+) -> io::Result<Vec<AceBlob>> {
+    let mut rewritten = Vec::with_capacity(aces.len() + usize::from(add_sid.is_some()));
+    let mut removed = 0usize;
+    for ace in aces {
+        let info = ace.simple_allow();
+        let matches_remove = remove_sid.is_some_and(|sid| {
+            info.as_ref().is_some_and(|(text, flags, mask)| {
+                *flags == 0
+                    && *mask == 0x0002
+                    && sid_string(sid).is_ok_and(|expected| expected == *text)
+            })
+        });
+        // lease 解放時は自分の ACE だけを外し、他の worker の ACE は保存する。
+        let matches_stale = remove_sid.is_none()
+            && info.as_ref().is_some_and(|(sid, flags, mask)| {
+                *flags == 0 && *mask == 0x0002 && stale_sid_strings.iter().any(|stale| stale == sid)
+            });
+        if matches_remove || matches_stale {
+            removed += 1;
+        } else {
+            rewritten.push(ace.clone());
+        }
+    }
+    if remove_sid.is_some() && removed != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker ステーションの ACE 数が解放前に変わった",
+        ));
+    }
+    if let Some(sid) = add_sid {
+        let expected_sid = sid_string(sid)?;
+        if aces.iter().any(|ace| {
+            ace.simple_allow()
+                .is_some_and(|(text, _, _)| text == expected_sid)
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "worker SID の ACE が既に存在する",
+            ));
+        }
+        rewritten.push(allow_ace(sid)?);
+    }
+    Ok(rewritten)
+}
+
+fn allow_ace(sid: *mut c_void) -> io::Result<AceBlob> {
+    let sid_len = unsafe { GetLengthSid(sid) } as usize;
+    let byte_len = 8usize
+        .checked_add(sid_len)
+        .filter(|len| *len <= u16::MAX as usize && len.is_multiple_of(size_of::<u32>()))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "worker SID の長さが不正"))?;
+    let mut words = vec![0u32; byte_len / size_of::<u32>()];
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), byte_len) };
+    bytes[0] = ACCESS_ALLOWED_ACE_TYPE as u8;
+    bytes[1] = 0;
+    bytes[2..4].copy_from_slice(&(byte_len as u16).to_ne_bytes());
+    bytes[4..8].copy_from_slice(&0x0002u32.to_ne_bytes());
+    // SAFETY: destination は整列済みで書き込み可能な ACE バッファ内の SID 分の領域である。
+    unsafe { std::ptr::copy_nonoverlapping(sid.cast::<u8>(), bytes.as_mut_ptr().add(8), sid_len) };
+    Ok(AceBlob { words, byte_len })
+}
+
+fn set_station_dacl(
+    station: HWINSTA,
+    control: u16,
+    revision: u8,
+    aces: &[AceBlob],
+) -> io::Result<()> {
+    let ace_bytes = aces
+        .iter()
+        .try_fold(0usize, |total, ace| total.checked_add(ace.byte_len));
+    let total = size_of::<ACL>()
+        .checked_add(ace_bytes.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ステーション ACL のサイズが上限を超えた",
+            )
+        })?)
+        .filter(|size| *size <= u16::MAX as usize)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "ステーション ACL が大きすぎる")
+        })?;
+    let mut storage = vec![0usize; total.div_ceil(size_of::<usize>())];
+    let acl = storage.as_mut_ptr().cast::<ACL>();
+    // SAFETY: storage は整列済みで、ACL ヘッダーと複製する全 ACE を格納できる。
+    if unsafe { InitializeAcl(acl, total as u32, u32::from(revision)) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for ace in aces {
+        // SAFETY: 各 ACE バッファは整列済みで完全な内容を持ち、AddAce の呼び出し中に有効。
+        if unsafe {
+            AddAce(
+                acl,
+                u32::from(revision),
+                u32::MAX,
+                ace.words.as_ptr().cast(),
+                ace.byte_len as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let protection = if control & SE_DACL_PROTECTED != 0 {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        0
+    };
+    // SAFETY: station は借用され、acl は SetSecurityInfo が戻るまで有効である。
+    let error = unsafe {
+        SetSecurityInfo(
+            station as HANDLE,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION | protection,
+            null_mut(),
+            null_mut(),
+            acl,
+            null_mut(),
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    Ok(())
+}
+
+fn update_station_acl(
+    station: HWINSTA,
+    add_sid: Option<*mut c_void>,
+    remove_sid: Option<*mut c_void>,
+) -> io::Result<()> {
+    let (control, revision, before) = station_dacl(station)?;
+    let stale = if add_sid.is_some() && remove_sid.is_none() {
+        stale_worker_action_sids(&before)?
+    } else {
+        Vec::new()
+    };
+    let expected = rewrite_station_aces(&before, add_sid, remove_sid, &stale)?;
+    if expected == before {
+        return Ok(());
+    }
+    set_station_dacl(station, control, revision, &expected)?;
+    let (_, _, actual) = station_dacl(station)?;
+    if actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker ステーション DACL の読み戻しが要求した ACL と異なる",
+        ));
+    }
+    Ok(())
 }
 
 struct LocalAllocation(*mut c_void);
@@ -798,6 +1498,156 @@ impl ActionPipeSecurity {
         };
         operation((&mut attributes as *mut SECURITY_ATTRIBUTES).cast())
     }
+}
+
+/// デスクトップを使うアクションの権限。ACL や所有者を変更する標準権限は含めない。
+const ACTION_DESKTOP_RIGHTS: u32 = 0x0002_01ff;
+
+struct OwnedDesktop(HDESK);
+
+impl Drop for OwnedDesktop {
+    fn drop(&mut self) {
+        // SAFETY: this handle came from CreateDesktopW and is closed exactly once. Closing a
+        // desktop still used by a thread of this process fails, and this one never is.
+        unsafe { CloseDesktop(self.0) };
+    }
+}
+
+/// 共有ステーション上に作る、1アクション専用のデスクトップ。
+pub(crate) struct ActionDesktop {
+    lp_desktop: Vec<u16>,
+    _desktop: OwnedDesktop,
+    _station_lease: Option<Arc<ActionStationLease>>,
+}
+
+// SAFETY: デスクトップハンドルと lease はプロセス内で共有し、Drop はデスクトップだけを閉じる。
+unsafe impl Send for ActionDesktop {}
+
+impl ActionDesktop {
+    pub(crate) fn create(token: &ActionToken) -> io::Result<Self> {
+        let station = unsafe { GetProcessWindowStation() };
+        if station.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let current_station = user_object_name(station as HANDLE)?;
+        if !current_station.eq_ignore_ascii_case(&token.station_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "worker のウィンドウステーションが起動時から変わっている",
+            ));
+        }
+        let name = format!("sbz-{}", secure_random_hex()?);
+        let desktop_sddl = action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?;
+        let wide_name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let desktop_descriptor = security_descriptor(&desktop_sddl)?;
+        let desktop_attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: desktop_descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: 名前と保護記述子は CreateDesktopW の呼び出し中に有効である。
+        let desktop = unsafe {
+            CreateDesktopW(
+                wide_name.as_ptr(),
+                null(),
+                null(),
+                0,
+                ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
+                &desktop_attributes,
+            )
+        };
+        if desktop.is_null() {
+            return Err(stage_error("create action desktop"));
+        }
+        let lp_desktop: Vec<u16> = format!("{}\\{name}", token.station_name)
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        Ok(Self {
+            lp_desktop,
+            _desktop: OwnedDesktop(desktop),
+            _station_lease: token.station_lease.clone(),
+        })
+    }
+
+    /// `STARTUPINFO.lpDesktop` に渡す `station\desktop` の組を返す。
+    pub(crate) fn lp_desktop(&self) -> *mut u16 {
+        self.lp_desktop.as_ptr().cast_mut()
+    }
+
+    /// テスト用に現在のステーションへ明示 DACL のデスクトップだけを作る。
+    #[cfg(test)]
+    fn desktop_on_current_station_for_test(
+        token: &ActionToken,
+    ) -> io::Result<(String, OwnedDesktop)> {
+        let name = format!("sbz-{}", secure_random_hex()?);
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let descriptor = security_descriptor(&action_object_sddl(token, ACTION_DESKTOP_RIGHTS)?)?;
+
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        // SAFETY: 名前と記述子は呼び出し中に有効である。
+        let desktop = unsafe {
+            CreateDesktopW(
+                wide.as_ptr(),
+                null(),
+                null(),
+                0,
+                ACTION_DESKTOP_RIGHTS | WRITE_DAC | DELETE,
+                &attributes,
+            )
+        };
+        if desktop.is_null() {
+            return Err(stage_error("create desktop on the current station"));
+        }
+        Ok((name, OwnedDesktop(desktop)))
+    }
+}
+
+/// The descriptor both per-action user objects carry: the broker may manage it, this one action
+/// may use it, and nobody else is named at all.
+///
+/// Naming the action's own random SID is the point. The token is restricted, so the access check
+/// runs against the restricted list as well, and that list holds only
+/// `[action_sid, Everyone, Authenticated Users, Users, RESTRICTED]`. An entry for the action SID is
+/// the one way to satisfy that half without also admitting every other restricted action.
+fn action_object_sddl(token: &ActionToken, rights: u32) -> io::Result<String> {
+    let broker = sid_string(token.broker_sid())?;
+    Ok(format!(
+        "O:{broker}D:P(A;;GA;;;{broker})(A;;0x{rights:08x};;;{})",
+        sid_string(token.action_sid.0)?
+    ))
+}
+
+/// Names which step of the per-action station setup failed, keeping the operating system's own
+/// error attached. Without the stage, every failure here reads as one indistinguishable denial.
+fn stage_error(stage: &str) -> io::Error {
+    io::Error::other(format!(
+        "action desktop: {stage} failed ({})",
+        io::Error::last_os_error()
+    ))
+}
+
+/// Converts one SDDL string into a descriptor whose allocation is freed on drop.
+fn security_descriptor(sddl: &str) -> io::Result<LocalAllocation> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+    let mut descriptor = null_mut();
+    // SAFETY: the SDDL is NUL-terminated and descriptor is a valid out pointer.
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(LocalAllocation(descriptor))
 }
 
 fn create_secured_directory(path: &Path, sddl: &str) -> io::Result<()> {
@@ -1145,27 +1995,17 @@ enum SpawnFailure {
 
 #[cfg(test)]
 #[derive(Clone, Copy)]
-enum TestJobProfile {
+enum TestCreationProfile {
     Production,
-    DesktopRelaxed,
+    NoWindow,
 }
 
-struct SuspendedGuardian(Option<OwnedHandle>);
-
-impl SuspendedGuardian {
-    fn disarm(mut self) -> OwnedHandle {
-        self.0.take().unwrap()
-    }
-}
-
-impl Drop for SuspendedGuardian {
-    fn drop(&mut self) {
-        if let Some(process) = &self.0 {
-            // SAFETY: a suspended child is still live; terminate then synchronously reap it.
-            unsafe {
-                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
-                WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE);
-            }
+#[cfg(test)]
+impl TestCreationProfile {
+    fn creation_flags(self, production: u32) -> u32 {
+        match self {
+            Self::Production => production,
+            Self::NoWindow => production | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
         }
     }
 }
@@ -1175,6 +2015,9 @@ pub(crate) struct RestrictedProcess {
     stdout: Option<OwnedHandle>,
     stderr: Option<OwnedHandle>,
     job: Arc<JobObject>,
+    /// 子孫を含む終了確認まで保持する。確認失敗時は解放せず、OS のプロセス回収に委ねる。
+    desktop: Option<ActionDesktop>,
+    tree_finished: bool,
 }
 
 impl RestrictedProcess {
@@ -1193,42 +2036,33 @@ impl RestrictedProcess {
             #[cfg(test)]
             None,
             #[cfg(test)]
-            TestJobProfile::Production,
+            TestCreationProfile::Production,
+            #[cfg(test)]
+            None,
             handles,
         )
     }
 
     #[cfg(test)]
-    fn spawn_without_desktop_limit_for_test(
+    fn spawn_for_session0_diagnostic(
         token: &ActionToken,
         command: &RestrictedCommand,
+        profile: TestCreationProfile,
+        observation: &mut tests::Session0DiagnosticRun,
     ) -> io::Result<Self> {
-        Self::spawn_inner(token, command, None, TestJobProfile::DesktopRelaxed, &[])
+        Self::spawn_inner(token, command, None, profile, Some(observation), &[])
     }
 
     fn spawn_inner(
         token: &ActionToken,
         command: &RestrictedCommand,
         #[cfg(test)] failure: Option<SpawnFailure>,
-        #[cfg(test)] job_profile: TestJobProfile,
+        #[cfg(test)] creation_profile: TestCreationProfile,
+        #[cfg(test)] observation: Option<&mut tests::Session0DiagnosticRun>,
         inherited_handles: &[HANDLE],
     ) -> io::Result<Self> {
         let mut prepared = prepare_command(command)?;
-        let job = Arc::new({
-            #[cfg(test)]
-            {
-                match job_profile {
-                    TestJobProfile::Production => JobObject::new_kill_on_close()?,
-                    TestJobProfile::DesktopRelaxed => {
-                        JobObject::new_kill_on_close_without_desktop_limit_for_test()?
-                    }
-                }
-            }
-            #[cfg(not(test))]
-            {
-                JobObject::new_kill_on_close()?
-            }
-        });
+        let job = Arc::new(JobObject::new_kill_on_close()?);
         let (stdin, stdin_parent) = stdio_pipe(true)?;
         let (stdout, stdout_parent) = stdio_pipe(false)?;
         let (stderr, stderr_parent) = stdio_pipe(false)?;
@@ -1246,11 +2080,21 @@ impl RestrictedProcess {
         startup.StartupInfo.hStdInput = inherited[0];
         startup.StartupInfo.hStdOutput = inherited[1];
         startup.StartupInfo.hStdError = inherited[2];
+        // 作成時に明示した保護 DACL のデスクトップを、station 名とともに指定する。
+        let desktop = ActionDesktop::create(token)?;
+        startup.StartupInfo.lpDesktop = desktop.lp_desktop();
         startup.lpAttributeList = attributes.ptr();
         let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: all UTF-16 buffers are NUL-terminated and live; command_line is mutable;
-        // only the three inheritable stdio handles in the attribute list can cross the boundary.
-        if unsafe {
+        let creation_flags =
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        #[cfg(test)]
+        let creation_flags = creation_profile.creation_flags(creation_flags);
+        #[cfg(test)]
+        if let Some(observed) = observation {
+            observed.capture(token, &desktop, creation_flags);
+        }
+        // SAFETY: UTF-16 buffers are NUL-terminated and live; only the handle list may cross.
+        let started = unsafe {
             CreateProcessAsUserW(
                 token.handle(),
                 prepared.application.as_ptr(),
@@ -1258,23 +2102,28 @@ impl RestrictedProcess {
                 null(),
                 null(),
                 1,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
+                creation_flags,
                 prepared.environment.as_ptr().cast(),
                 prepared.cwd.as_ptr(),
                 &startup.StartupInfo,
                 &mut info,
             )
-        } == 0
-        {
+        };
+        if started == 0 {
             return Err(io::Error::other(format!(
                 "create_process: OS error {}",
                 io::Error::last_os_error().raw_os_error().unwrap_or(0)
             )));
         }
-        // SAFETY: CreateProcessAsUserW returned unique live process/thread handles.
-        let guardian = SuspendedGuardian(Some(unsafe {
-            OwnedHandle::from_raw_handle(info.hProcess as RawHandle)
-        }));
+        // SAFETY: CreateProcessAsUserW が返した一意のハンドルを、失敗経路も含む所有者へ渡す。
+        let process = Self {
+            process: Some(unsafe { OwnedHandle::from_raw_handle(info.hProcess as RawHandle) }),
+            stdout: Some(stdout_parent),
+            stderr: Some(stderr_parent),
+            job,
+            desktop: Some(desktop),
+            tree_finished: false,
+        };
         let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread as RawHandle) };
         #[cfg(test)]
         if failure == Some(SpawnFailure::AfterCreate) {
@@ -1285,7 +2134,7 @@ impl RestrictedProcess {
             return Err(io::Error::other("child_token_open: injected failure"));
         }
         let child_token = process_token(
-            guardian.0.as_ref().unwrap().as_raw_handle() as HANDLE,
+            process.process.as_ref().unwrap().as_raw_handle() as HANDLE,
             TOKEN_QUERY,
         )?;
         #[cfg(test)]
@@ -1302,26 +2151,23 @@ impl RestrictedProcess {
                 "suspended child token is not restricted",
             ));
         }
-        job.assign_verified(guardian.0.as_ref().unwrap().as_raw_handle())?;
+        process
+            .job
+            .assign_verified(process.process.as_ref().unwrap().as_raw_handle())?;
         #[cfg(test)]
         if failure == Some(SpawnFailure::BeforeResume) {
             return Err(io::Error::other("before_resume: injected failure"));
         }
         drop(attributes);
         drop((stdin, stdout, stderr));
-        // This is deliberately the final fallible setup step: no child instruction ran earlier.
+        // 再開を最後の失敗可能な手順にし、それまでは子の命令を実行させない。
         let prior = unsafe { ResumeThread(thread.as_raw_handle() as HANDLE) };
         if prior != 1 {
             return Err(io::Error::other(format!(
                 "resume_thread: unexpected count {prior}"
             )));
         }
-        Ok(Self {
-            process: Some(guardian.disarm()),
-            stdout: Some(stdout_parent),
-            stderr: Some(stderr_parent),
-            job,
-        })
+        Ok(process)
     }
 
     #[allow(
@@ -1360,10 +2206,8 @@ impl RestrictedProcess {
         ))
     }
 
-    /// Waits using an independently-owned process handle. Cancelling this future does not kill
-    /// the action or invalidate the detached blocking waiter; the caller must call
-    /// [`terminate`](Self::terminate) and then `wait` again on abort/timeout. Normal completion
-    /// terminates any descendants still alive in the Job after the top process exits.
+    /// 独立したハンドルで直下プロセスを待ち、その後 Job 全体の終了を確認する。
+    /// future のキャンセルだけでは終了しない。再度 wait するか、所有者の Drop が回収する。
     pub(crate) async fn wait(&mut self) -> io::Result<u32> {
         let source = self
             .process
@@ -1371,8 +2215,8 @@ impl RestrictedProcess {
             .ok_or_else(|| io::Error::other("process already reaped"))?;
         let duplicate = {
             let mut duplicate = null_mut();
-            // SAFETY: source and both pseudo-process handles are live. Success transfers one
-            // process-handle reference into `duplicate`, which becomes OwnedHandle below.
+            // SAFETY: source と両方の疑似プロセスハンドルは有効で、複製された参照を
+            // 呼出後に OwnedHandle へ移す。
             if unsafe {
                 DuplicateHandle(
                     GetCurrentProcess(),
@@ -1387,10 +2231,11 @@ impl RestrictedProcess {
             {
                 return Err(io::Error::last_os_error());
             }
-            // SAFETY: DuplicateHandle returned a unique owned handle. Keep the raw pointer
-            // inside this synchronous scope so the async future remains `Send`.
+            // SAFETY: DuplicateHandle の一意な返却ハンドルを所有する。生ポインターは
+            // 同期区間内に留め、future を Send に保つ。
             unsafe { OwnedHandle::from_raw_handle(duplicate as RawHandle) }
         };
+        let job = Arc::clone(&self.job);
         let code = tokio::task::spawn_blocking(move || {
             let handle = duplicate.as_raw_handle() as HANDLE;
             if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
@@ -1400,21 +2245,22 @@ impl RestrictedProcess {
             if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
                 return Err(io::Error::last_os_error());
             }
+            drop(duplicate);
+            job.terminate_and_wait()?;
             Ok(code)
         })
         .await
         .map_err(|_| io::Error::other("process waiter failed"))??;
-        self.job.terminate();
+        self.tree_finished = true;
         self.process.take();
         Ok(code)
     }
 
-    /// Terminates the complete Job tree and the direct process as a fail-safe.
+    /// Job 全体へ終了を要求する。割当て前の失敗に備えて直下プロセスにも要求する。
     pub(crate) fn terminate(&self) {
         self.job.terminate();
         if let Some(process) = &self.process {
-            // SAFETY: the handle remains owned by self; this is a fail-safe if Job
-            // termination could not reach the direct process during teardown.
+            // SAFETY: 自分が所有するプロセスハンドルへ終了を要求する。
             unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, 1) };
         }
     }
@@ -1440,12 +2286,27 @@ impl RestrictedProcess {
 
 impl Drop for RestrictedProcess {
     fn drop(&mut self) {
+        if self.tree_finished {
+            return;
+        }
         self.terminate();
-        if let Some(process) = self.process.take() {
-            // SAFETY: process is owned here; direct terminate covers pre/post-job teardown.
-            unsafe {
-                TerminateProcess(process.as_raw_handle() as HANDLE, 1);
-                WaitForSingleObject(process.as_raw_handle() as HANDLE, INFINITE);
+        let result = (|| {
+            if let Some(process) = &self.process {
+                // SAFETY: 割当て前の子も、所有ハンドルによって終了を確認する。
+                if unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 30_000) }
+                    != WAIT_OBJECT_0
+                {
+                    return Err(io::Error::other("直下プロセスの終了を確認できない"));
+                }
+            }
+            self.job.terminate_and_wait()
+        })();
+        if let Err(error) = result {
+            eprintln!("sembazuru-worker: ツリーの終了を確認できないため隔離資源を保持: {error}");
+            // 確認不能なツリーから desktop / station の許可を先に取り上げない。
+            // worker のプロセス終了まで保持し、通常の資源解放として扱わない。
+            if let Some(desktop) = self.desktop.take() {
+                std::mem::forget(desktop);
             }
         }
     }
@@ -1477,12 +2338,14 @@ mod tests {
     };
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
-        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetUserObjectSecurity,
-        ImpersonateLoggedOnUser, LookupPrivilegeValueW, OBJECT_INHERIT_ACE,
-        OWNER_SECURITY_INFORMATION, RevertToSelf, SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED,
-        SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, TOKEN_APPCONTAINER_INFORMATION, TOKEN_GROUPS,
-        TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid, TokenCapabilities, TokenGroups,
-        TokenIsAppContainer, TokenPrivileges, TokenRestrictedSids, TokenSessionId, TokenUser,
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl,
+        GetUserObjectSecurity, ImpersonateLoggedOnUser, LABEL_SECURITY_INFORMATION,
+        LookupPrivilegeValueW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, RevertToSelf,
+        SE_CHANGE_NOTIFY_NAME, SE_DACL_PROTECTED, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
+        SYSTEM_MANDATORY_LABEL_ACE, TOKEN_APPCONTAINER_INFORMATION, TOKEN_DEFAULT_DACL,
+        TOKEN_GROUPS, TOKEN_MANDATORY_POLICY, TOKEN_PRIVILEGES, TOKEN_USER, TokenAppContainerSid,
+        TokenCapabilities, TokenDefaultDacl, TokenGroups, TokenIsAppContainer,
+        TokenMandatoryPolicy, TokenPrivileges, TokenRestrictedSids, TokenSessionId, TokenUser,
         WinCreatorOwnerRightsSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1490,13 +2353,20 @@ mod tests {
         FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
         FILE_SHARE_READ, OPEN_EXISTING, READ_CONTROL, WRITE_DAC, WRITE_OWNER,
     };
-    use windows_sys::Win32::System::JobObjects::{IsProcessInJob, JOB_OBJECT_UILIMIT_HANDLES};
-    use windows_sys::Win32::System::StationsAndDesktops::{
-        CloseDesktop, CloseWindowStation, CreateWindowStationW, GetProcessWindowStation,
-        GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW, OpenWindowStationW,
-        SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
+        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
+        JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     };
-    use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED};
+    use windows_sys::Win32::System::StationsAndDesktops::{
+        CloseDesktop, CloseWindowStation, CreateWindowStationW, DESKTOP_READOBJECTS,
+        GetProcessWindowStation, GetThreadDesktop, GetUserObjectInformationW, OpenDesktopW,
+        OpenWindowStationW, SetProcessWindowStation, UOI_NAME, UOI_TYPE,
+    };
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, MAXIMUM_ALLOWED, SYSTEM_MANDATORY_LABEL_ACE_TYPE,
+    };
     use windows_sys::Win32::System::Threading::{
         CreateEventW, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE, SetEvent,
     };
@@ -1514,11 +2384,13 @@ mod tests {
     const WINDOW_STATION_SCM_SMOKE_SERVICE: &str = "SembazuruWindowStationProbeSmoke";
     const WINDOW_STATION_SCM_SMOKE_SELECTOR: &str =
         "sandbox::tests::window_station_scm_dispatcher_smoke_role";
-    const WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL: u32 = 0x5342_5a31;
-    const WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT: u32 = 0x5342_5a32;
-    const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5a33;
+    const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL: u32 = 0x5342_5b31;
+    const WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT: u32 = 0x5342_5b32;
+    const WINDOW_STATION_SCM_SMOKE_INDETERMINATE: u32 = 0x5342_5b33;
+    const WINDOW_STATION_SCM_SMOKE_ACTION_STARTS: u32 = 0x5342_5b34;
     const WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE: u32 = 0x5342_5aff;
     const WINDOW_STATION_SCM_SMOKE_DIAGNOSTIC_FAILURE: u32 = 0x5342_5afe;
+    const ACTION_STATION_PROBE_RIGHTS: u32 = 0x0002_037f;
 
     #[derive(Clone, Debug)]
     struct Session0DiagnosticConfig {
@@ -1528,32 +2400,38 @@ mod tests {
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
-    const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4432;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 3;
+    const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 7;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
     enum Session0DiagnosticOutcome {
-        DesktopCausal = 1,
-        DesktopNotSufficient = 2,
+        NoWindowCausal = 1,
+        NoWindowNotSufficient = 2,
         Indeterminate = 3,
+        /// どちらの腕の子も起動した。0xC0000142 が消えたことを表す。A/B の問い
+        /// （CREATE_NO_WINDOW が原因か）は、ベースラインが落ちないと成り立たないので、
+        /// この結果はその問いへの答えではなく、起動失敗そのものが解消した記録になる。
+        ActionStarts = 4,
     }
 
     impl Session0DiagnosticOutcome {
         fn decode(value: u8) -> Result<Self, String> {
             match value {
-                1 => Ok(Self::DesktopCausal),
-                2 => Ok(Self::DesktopNotSufficient),
+                1 => Ok(Self::NoWindowCausal),
+                2 => Ok(Self::NoWindowNotSufficient),
                 3 => Ok(Self::Indeterminate),
+                4 => Ok(Self::ActionStarts),
                 _ => Err("diagnostic classification".into()),
             }
         }
 
         fn service_magic(self) -> u32 {
             match self {
-                Self::DesktopCausal => WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
-                Self::DesktopNotSufficient => WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT,
+                Self::NoWindowCausal => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL,
+                Self::NoWindowNotSufficient => WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT,
                 Self::Indeterminate => WINDOW_STATION_SCM_SMOKE_INDETERMINATE,
+                Self::ActionStarts => WINDOW_STATION_SCM_SMOKE_ACTION_STARTS,
             }
         }
     }
@@ -1561,18 +2439,27 @@ mod tests {
     fn classify_session0_diagnostic_ab(
         baseline_spawn_succeeded: bool,
         baseline_exit: Option<u32>,
-        desktop_relaxed_spawn_succeeded: bool,
-        desktop_relaxed_exit: Option<u32>,
+        no_window_spawn_succeeded: bool,
+        no_window_exit: Option<u32>,
     ) -> Session0DiagnosticOutcome {
+        // 両方の腕が起動して正常終了したなら、起動失敗は消えている。ベースラインの
+        // 失敗を前提とする A/B 分類より先に判定し、成功を「判定不能」として赤にしない。
+        if baseline_spawn_succeeded
+            && baseline_exit == Some(0)
+            && no_window_spawn_succeeded
+            && no_window_exit == Some(0)
+        {
+            return Session0DiagnosticOutcome::ActionStarts;
+        }
         if !baseline_spawn_succeeded || baseline_exit != Some(0xc000_0142) {
             return Session0DiagnosticOutcome::Indeterminate;
         }
-        if !desktop_relaxed_spawn_succeeded {
+        if !no_window_spawn_succeeded {
             return Session0DiagnosticOutcome::Indeterminate;
         }
-        match desktop_relaxed_exit {
-            Some(0) => Session0DiagnosticOutcome::DesktopCausal,
-            Some(0xc000_0142) => Session0DiagnosticOutcome::DesktopNotSufficient,
+        match no_window_exit {
+            Some(0) => Session0DiagnosticOutcome::NoWindowCausal,
+            Some(0xc000_0142) => Session0DiagnosticOutcome::NoWindowNotSufficient,
             _ => Session0DiagnosticOutcome::Indeterminate,
         }
     }
@@ -1647,7 +2534,7 @@ mod tests {
     #[test]
     fn window_station_scm_contract_rejects_aliases_and_extra_arguments() {
         assert_ne!(
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL,
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL,
             WINDOW_STATION_SCM_SMOKE_CONTRACT_FAILURE
         );
         let valid_process: Vec<OsString> = [
@@ -1729,54 +2616,847 @@ mod tests {
         }
     }
 
+    fn diagnostic_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn diagnostic_properties(record: &Session0DiagnosticRecord) -> String {
+        let mut fields = vec![
+            diagnostic_hex(record.nonce.as_bytes()),
+            record.markers.to_string(),
+            (record.classification as u8).to_string(),
+            record.session_id.to_string(),
+        ];
+        for text in [
+            &record.broker,
+            &record.action,
+            &record.station,
+            &record.desktop,
+            &record.station_dacl,
+            &record.station_sacl,
+            &record.desktop_dacl,
+            &record.desktop_sacl,
+            &record.station_access,
+            &record.desktop_access,
+            &record.ui_probe,
+            &record.action_desktop,
+            &record.cwd,
+            &record.environment_hash,
+        ] {
+            fields.push(diagnostic_hex(text.as_bytes()));
+        }
+        for run in [&record.baseline, &record.no_window] {
+            fields.extend([
+                run.job_ui_restrictions.to_string(),
+                diagnostic_hex(run.job_ui_limits.as_bytes()),
+                run.creation_flags.to_string(),
+                if run.spawn_succeeded { "True" } else { "False" }.into(),
+                diagnostic_hex(run.spawn_error.as_bytes()),
+                run.child_exit
+                    .map_or_else(|| "none".into(), |value| value.to_string()),
+                diagnostic_hex(run.stdout.as_bytes()),
+                diagnostic_hex(run.stderr.as_bytes()),
+                diagnostic_hex(run.target_desktop.as_bytes()),
+                diagnostic_hex(run.target_dacl.as_bytes()),
+                diagnostic_hex(run.target_sacl.as_bytes()),
+                diagnostic_hex(run.target_access.as_bytes()),
+                diagnostic_hex(run.isolation.as_bytes()),
+                run.lifecycle.to_string(),
+            ]);
+        }
+        for value in [
+            &record.worker_actions_sid,
+            &record.station_ace,
+            &record.station_cleanup,
+        ] {
+            fields.push(diagnostic_hex(value.as_bytes()));
+        }
+        fields.join("\t")
+    }
+
+    struct Session0DiagnosticCase {
+        name: &'static str,
+        bytes: Vec<u8>,
+        nonce: String,
+        expected: Option<Session0DiagnosticRecord>,
+    }
+
+    fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
+        let record = Session0DiagnosticRecord::fixture();
+        let bytes = record.encode().unwrap();
+        let mut cases = Vec::new();
+        let mut accept = |name, record: Session0DiagnosticRecord| {
+            cases.push(Session0DiagnosticCase {
+                name,
+                bytes: record.encode().unwrap(),
+                nonce: record.nonce.clone(),
+                expected: Some(record),
+            });
+        };
+        accept("v7", record.clone());
+        let mut not_sufficient = record.clone();
+        not_sufficient.no_window.child_exit = Some(0xc000_0142);
+        not_sufficient.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
+        accept("no-window-not-sufficient", not_sufficient);
+        let mut both_start = record.clone();
+        both_start.baseline.child_exit = Some(0);
+        both_start.no_window.child_exit = Some(0);
+        both_start.classification = Session0DiagnosticOutcome::ActionStarts;
+        accept("action-starts", both_start);
+        let mut labelled = record.clone();
+        labelled.baseline.target_sacl =
+            "label_aces=[type=17;flags=16;mask=0x00000001;sid=S-1-16-8192]".into();
+        accept("target-explicit-label", labelled);
+        // 起動が正常でも、実測の欠落を成功に変換してはいけない。
+        for (name, lifecycle) in [
+            ("missing-isolation", 13),
+            ("missing-tree-exit", 11),
+            ("missing-desktop-cleanup", 7),
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.baseline.child_exit = Some(0);
+            incomplete.baseline.lifecycle = lifecycle;
+            incomplete.classification = Session0DiagnosticOutcome::Indeterminate;
+            accept(name, incomplete);
+        }
+        for name in [
+            "station-inherited-ace",
+            "station-wider-mask",
+            "missing-station-cleanup",
+            "broker-default-target",
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.baseline.child_exit = Some(0);
+            match name {
+                "station-inherited-ace" => {
+                    incomplete.station_ace = "count=1;flags=2;mask=0x00000002".into()
+                }
+                "station-wider-mask" => {
+                    incomplete.station_ace = "count=1;flags=0;mask=0x00000022".into()
+                }
+                "missing-station-cleanup" => incomplete.station_cleanup = "unconfirmed".into(),
+                _ => {
+                    incomplete.baseline.target_desktop = format!("{}\\Default", incomplete.station)
+                }
+            }
+            incomplete.classification = Session0DiagnosticOutcome::Indeterminate;
+            accept(name, incomplete);
+        }
+        for name in [
+            "target-dacl-unavailable",
+            "target-sacl-empty",
+            "target-access-denied",
+            "isolation-contradiction",
+            "target-dacl-unprotected",
+            "target-sacl-error",
+        ] {
+            let mut incomplete = record.clone();
+            incomplete.baseline.child_exit = Some(0);
+            incomplete.baseline.lifecycle = 13;
+            match name {
+                "target-dacl-unavailable" => {
+                    incomplete.baseline.target_dacl = "unavailable:gle=5".into()
+                }
+                "target-sacl-empty" => incomplete.baseline.target_sacl.clear(),
+                "target-access-denied" => {
+                    incomplete.baseline.target_access =
+                        VERIFIED_TARGET_ACCESS.replace("allowed=true", "allowed=false")
+                }
+                "isolation-contradiction" => {
+                    incomplete.baseline.isolation = VERIFIED_TARGET_ISOLATION
+                        .replace("other_maximum=Err(5)", "other_maximum=Ok(true)")
+                }
+                "target-dacl-unprotected" => {
+                    incomplete.baseline.target_dacl =
+                        incomplete.baseline.target_dacl.replace("0x1004", "0x0004")
+                }
+                _ => {
+                    incomplete.baseline.target_sacl =
+                        "label_aces=[type=17;flags=0;mask=0x00000001;sid=sid-error=5]".into()
+                }
+            }
+            incomplete.classification = Session0DiagnosticOutcome::Indeterminate;
+            accept(name, incomplete);
+        }
+        let mut partial = record.clone();
+        partial.markers = Session0DiagnosticRecord::ENTRY;
+        partial.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("partial", partial);
+        let mut outside_session0 = record.clone();
+        outside_session0.session_id = 1;
+        outside_session0.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("nonzero-session", outside_session0);
+        let mut failed = record.clone();
+        failed.no_window = Session0DiagnosticRun::empty();
+        failed.no_window.spawn_error = "unobserved".into();
+        failed.classification = Session0DiagnosticOutcome::Indeterminate;
+        accept("spawn-failed-unobserved", failed);
+        let mut bounded = record.clone();
+        bounded.broker = "b".repeat(32768);
+        let remaining =
+            Session0DiagnosticRecord::MAX_BYTES - (bounded.encode().unwrap().len() - 44);
+        bounded.action.push_str(&"a".repeat(remaining));
+        accept("payload-65536", bounded);
+
+        let mut reject = |name, bytes| {
+            cases.push(Session0DiagnosticCase {
+                name,
+                bytes,
+                nonce: record.nonce.clone(),
+                expected: None,
+            });
+        };
+        let u32_patch = |offset: usize, value: u32| {
+            let mut changed = bytes.clone();
+            changed[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            changed
+        };
+        reject("old-magic", u32_patch(0, 0x5342_4432));
+        reject("old-version", u32_patch(4, 3));
+        let mut nonce = bytes.clone();
+        nonce[8] = b'1';
+        reject("nonce-mismatch", nonce);
+        let mut nonhex = bytes.clone();
+        nonhex[8] = b'g';
+        reject("nonce-nonhex", nonhex);
+        let mut truncated = bytes[..bytes.len() - 1].to_vec();
+        let truncated_length = (truncated.len() - 44) as u32;
+        truncated[40..44].copy_from_slice(&truncated_length.to_le_bytes());
+        reject("truncated", truncated);
+        reject("payload-length", u32_patch(40, (bytes.len() - 43) as u32));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        let trailing_length = (trailing.len() - 44) as u32;
+        trailing[40..44].copy_from_slice(&trailing_length.to_le_bytes());
+        reject("trailing", trailing);
+        let mut invalid_utf8 = bytes.clone();
+        invalid_utf8[54] = 0xff;
+        reject("invalid-utf8", invalid_utf8);
+        let mut baseline_offset = 50;
+        for _ in 0..14 {
+            let length = u32::from_le_bytes(
+                bytes[baseline_offset..baseline_offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            baseline_offset += 4 + length as usize;
+        }
+        // The baseline run is the UI mask, the names of that mask, the creation flags, and then
+        // the spawn-succeeded flag; the names are variable length, so the rest is measured here.
+        let baseline_names_offset = baseline_offset + 4;
+        let baseline_names_length = u32::from_le_bytes(
+            bytes[baseline_names_offset..baseline_names_offset + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let baseline_flags_offset = baseline_names_offset + 4 + baseline_names_length;
+        let mut run_payload = Writer::new();
+        record.baseline.encode_into(&mut run_payload).unwrap();
+        let lifecycle_offset = baseline_offset + run_payload.into_bytes().len() - 1;
+        let mut invalid_lifecycle = bytes.clone();
+        invalid_lifecycle[lifecycle_offset] = 0x80;
+        reject("unknown-lifecycle", invalid_lifecycle);
+        let mut invalid_bool = bytes.clone();
+        invalid_bool[baseline_flags_offset + 4] = 2;
+        reject("invalid-bool", invalid_bool);
+        let mut renamed_job_ui = bytes.clone();
+        renamed_job_ui[baseline_names_offset + 4] = b'X';
+        reject("job-ui-limit-names", renamed_job_ui);
+        let mut unknown_marker = bytes.clone();
+        unknown_marker[44] |= 8;
+        reject("unknown-marker", unknown_marker);
+        let mut missing_entry = bytes.clone();
+        missing_entry[44] &= !Session0DiagnosticRecord::ENTRY;
+        reject("missing-entry", missing_entry);
+        let mut unknown_classification = bytes.clone();
+        unknown_classification[45] = 5;
+        reject("unknown-classification", unknown_classification);
+        let mut false_classification = bytes.clone();
+        false_classification[45] = 2;
+        reject("false-classification", false_classification);
+        let mut partial_causal = bytes.clone();
+        partial_causal[44] = Session0DiagnosticRecord::ENTRY;
+        reject("partial-causal", partial_causal);
+        reject("nonzero-session-causal", u32_patch(46, 1));
+        reject(
+            "extra-creation-bit",
+            u32_patch(baseline_flags_offset, 0x0008_0405),
+        );
+        let mut relaxed_job_ui = u32_patch(baseline_offset, 0xbe);
+        let relaxed_names = describe_job_ui_limits(0xbe);
+        // Every name is fixed width, so the record stays internally consistent and the rejection
+        // still has to come from the A/B Job UI constraint rather than from the names check.
+        assert_eq!(relaxed_names.len(), baseline_names_length);
+        relaxed_job_ui
+            [baseline_names_offset + 4..baseline_names_offset + 4 + baseline_names_length]
+            .copy_from_slice(relaxed_names.as_bytes());
+        reject("relaxed-job-ui", relaxed_job_ui);
+        let mut invalid_hash = bytes.clone();
+        invalid_hash[baseline_offset - 64] = b'g';
+        reject("environment-hash-nonhex", invalid_hash);
+        cases
+            .iter_mut()
+            .find(|case| case.name == "nonce-nonhex")
+            .unwrap()
+            .nonce = "g123456789abcdef0123456789abcdef".into();
+        let mut oversized = cases
+            .iter()
+            .find(|case| case.name == "payload-65536")
+            .unwrap()
+            .bytes
+            .clone();
+        let action_offset = 54 + 32768;
+        let action_length = u32::from_le_bytes(
+            oversized[action_offset..action_offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        oversized.insert(action_offset + 4, b'a');
+        oversized[action_offset..action_offset + 4]
+            .copy_from_slice(&(action_length + 1).to_le_bytes());
+        oversized[40..44].copy_from_slice(&65537u32.to_le_bytes());
+        cases.push(Session0DiagnosticCase {
+            name: "payload-65537",
+            bytes: oversized,
+            nonce: record.nonce.clone(),
+            expected: None,
+        });
+        let forged: Vec<_> = cases
+            .iter()
+            .filter(|case| {
+                matches!(
+                    case.name,
+                    "missing-isolation"
+                        | "missing-tree-exit"
+                        | "missing-desktop-cleanup"
+                        | "station-inherited-ace"
+                        | "station-wider-mask"
+                        | "missing-station-cleanup"
+                        | "broker-default-target"
+                )
+            })
+            .map(|case| {
+                let mut bytes = case.bytes.clone();
+                bytes[45] = Session0DiagnosticOutcome::ActionStarts as u8;
+                Session0DiagnosticCase {
+                    name: case.name,
+                    bytes,
+                    nonce: case.nonce.clone(),
+                    expected: None,
+                }
+            })
+            .collect();
+        cases.extend(forged);
+        // 観測が欠けた記録の隔離ビットと分類を両方改ざんしても拒否する。
+        let forged: Vec<_> = cases
+            .iter()
+            .filter(|case| {
+                case.expected.is_some()
+                    && (case.name.starts_with("target-") || case.name == "isolation-contradiction")
+                    && case.name != "target-explicit-label"
+            })
+            .map(|case| {
+                let mut bytes = case.bytes.clone();
+                let mut offset = 50;
+                for _ in 0..14 {
+                    let len =
+                        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4 + len;
+                }
+                let mut run = Writer::new();
+                case.expected
+                    .as_ref()
+                    .unwrap()
+                    .baseline
+                    .encode_into(&mut run)
+                    .unwrap();
+                bytes[offset + run.into_bytes().len() - 1] = 15;
+                bytes[45] = Session0DiagnosticOutcome::ActionStarts as u8;
+                Session0DiagnosticCase {
+                    name: case.name,
+                    bytes,
+                    nonce: case.nonce.clone(),
+                    expected: None,
+                }
+            })
+            .collect();
+        cases.extend(forged);
+        cases
+    }
+
+    #[test]
+    fn session0_diagnostic_observes_spawn_target_and_cleanup_with_reused_lease() {
+        let station = unsafe { GetProcessWindowStation() };
+        let before = station_dacl(station).unwrap();
+        let lease = Arc::new(ActionStationLease::acquire().unwrap());
+        // この単体テストは対話 station の DACL を変更しない経路だけで走る。
+        assert_eq!(lease.station_name, "WinSta0");
+        let sid = sid_string(lease.worker_actions_sid.sid()).unwrap();
+        let weak = Arc::downgrade(&lease);
+        let mut names = Vec::new();
+        // lease の再利用は製品フラグで確認する。NO_WINDOW の成立性は別の測定対象。
+        for _ in 0..2 {
+            let token = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
+            assert!(
+                token_sid_list(token.handle(), TokenRestrictedSids)
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.sid == sid)
+            );
+            let root = private_scratch_root();
+            let scratch = PrivateScratch::create(&root, "diagnostic", &token).unwrap();
+            let (command, _) = session0_diagnostic_command(scratch.path()).unwrap();
+            let run =
+                run_session0_diagnostic_child(&token, &command, TestCreationProfile::Production)
+                    .unwrap();
+            assert!(run.spawn_succeeded, "{run:?}");
+            assert_eq!(run.child_exit, Some(0), "{run:?}");
+            assert_eq!(run.lifecycle & 13, 13, "{run:?}");
+            assert!(run.target_desktop.starts_with("WinSta0\\sbz-"));
+            assert!(
+                run.target_dacl
+                    .contains(&sid_string(token.action_sid.0).unwrap())
+            );
+            assert!(!run.target_dacl.contains(&sid));
+            assert!(run.isolation.contains("other_maximum=Err(5)"), "{run:?}");
+            assert!(
+                run.isolation
+                    .contains("write_dac=Err(5);write_owner=Err(5)"),
+                "{run:?}"
+            );
+            assert!(
+                run.isolation
+                    .contains("default_dacl_safe=true;tcb_absent=true"),
+                "{run:?}"
+            );
+            names.push(run.target_desktop);
+            drop(scratch);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        assert_ne!(names[0], names[1]);
+        drop(lease);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(station_dacl(station).unwrap(), before);
+        assert_eq!(unsafe { GetProcessWindowStation() }, station);
+    }
+
     #[test]
     fn session0_diagnostic_record_codec_rejects_tampering() {
-        let record = Session0DiagnosticRecord::fixture();
-        let bytes = record.encode().expect("diagnostic record encode");
-        assert_eq!(
-            Session0DiagnosticRecord::decode(&bytes, &record.nonce).expect("diagnostic decode"),
-            record
-        );
-        for malformed in [
-            Vec::new(),
-            bytes[..bytes.len() - 1].to_vec(),
-            {
-                let mut value = bytes.clone();
-                value[0] ^= 1;
-                value
-            },
-            {
-                let mut value = bytes.clone();
-                value.extend_from_slice(&[0]);
-                value
-            },
-        ] {
-            assert!(Session0DiagnosticRecord::decode(&malformed, &record.nonce).is_err());
+        for case in session0_diagnostic_corpus() {
+            let decoded = Session0DiagnosticRecord::decode(&case.bytes, &case.nonce);
+            match case.expected {
+                Some(expected) => assert_eq!(decoded.unwrap(), expected, "{}", case.name),
+                None => assert!(decoded.is_err(), "accepted {}", case.name),
+            }
         }
-        assert!(Session0DiagnosticRecord::decode(&bytes, "0").is_err());
-        let mut inconsistent = record;
-        inconsistent.classification = Session0DiagnosticOutcome::DesktopNotSufficient;
+        let mut inconsistent = Session0DiagnosticRecord::fixture();
+        inconsistent.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
         assert!(inconsistent.encode().is_err());
+    }
+
+    #[test]
+    fn session0_diagnostic_creation_flags_differ_only_by_no_window() {
+        let production =
+            CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT;
+        let baseline = TestCreationProfile::Production.creation_flags(production);
+        let no_window = TestCreationProfile::NoWindow.creation_flags(production);
+        assert_eq!(baseline, 0x0008_0404);
+        assert_eq!(no_window, 0x0808_0404);
+        assert_eq!(
+            baseline ^ no_window,
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+        );
+    }
+
+    #[test]
+    fn session0_diagnostic_record_matches_powershell_contract() {
+        use std::process::{Command, Stdio};
+
+        let script = r#"
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromHexString([Console]::In.ReadLine()))
+$tokens = $null
+$errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+if ($errors.Count -ne 0) { throw 'Probe PowerShell syntax error.' }
+foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+    $definitions = @($ast.FindAll({ param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
+    }, $true))
+    if ($definitions.Count -ne 1) { throw "Expected one parser function: $name" }
+    . ([ScriptBlock]::Create($definitions[0].Extent.Text))
+}
+$count = 0
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+    $parts = $line.Split("`t", 5)
+    $bytes = [Convert]::FromHexString($parts[2])
+    $record = $null
+    $rejected = $false
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] }
+    catch { $rejected = $true }
+    if ($parts[3] -ceq 'reject') {
+        if (-not $rejected) { throw "Accepted malformed case $($parts[0])" }
+    } else {
+        if ($rejected -or $null -eq $record) { throw "Rejected valid case $($parts[0])" }
+        if (@($record.PSObject.Properties).Count -ne 23) { throw 'レコードのプロパティ数が一致しません。' }
+        $values = [Collections.Generic.List[string]]::new()
+        $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
+        foreach ($property in @('Markers', 'Classification', 'SessionId')) { $values.Add([string]$record.$property) }
+        foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
+        }
+        foreach ($run in @($record.Baseline, $record.NoWindow)) {
+            if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
+            $values.Add([string]$run.JobUi)
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.JobUiLimits)).ToLowerInvariant())
+            foreach ($property in @('CreationFlags', 'SpawnSucceeded')) { $values.Add([string]$run.$property) }
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.SpawnError)).ToLowerInvariant())
+            $values.Add($(if ($null -eq $run.ChildExit) { 'none' } else { [string]$run.ChildExit }))
+            foreach ($property in @('Stdout', 'Stderr', 'TargetDesktop', 'TargetDacl', 'TargetSacl', 'TargetAccess', 'Isolation')) {
+                $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.$property)).ToLowerInvariant())
+            }
+            $values.Add([string]$run.Lifecycle)
+        }
+        foreach ($property in @('WorkerActionsSid', 'StationAce', 'StationCleanup')) {
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
+        }
+        if (($values -join "`t") -cne $parts[4]) { throw "Property mismatch: $($parts[0])" }
+    }
+    $count++
+}
+[Console]::WriteLine("PASS $count")
+"#;
+        let cases = session0_diagnostic_corpus();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../hooks/test/m6_worker_window_station_probe.ps1");
+        let mut input = format!("{}\n", diagnostic_hex(path.to_str().unwrap().as_bytes()));
+        for case in &cases {
+            let expected = case.expected.as_ref().map(diagnostic_properties);
+            input.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                case.name,
+                case.nonce,
+                diagnostic_hex(&case.bytes),
+                if expected.is_some() {
+                    "accept"
+                } else {
+                    "reject"
+                },
+                expected.unwrap_or_default(),
+            ));
+        }
+        let mut child = Command::new("pwsh")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("pwsh is required for the record contract");
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || stdin.write_all(input.as_bytes()));
+        let output = child
+            .wait_with_output()
+            .expect("PowerShell contract process wait");
+        let written = writer.join().expect("PowerShell input writer");
+        assert!(
+            output.status.success(),
+            "PowerShell contract failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        written.expect("PowerShell corpus input");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            format!("PASS {}", cases.len())
+        );
+    }
+
+    /// Opens a named desktop on this process's current station under one action token, the way a
+    /// started action's own access check would run against it.
+    fn action_desktop_open(token: &ActionToken, desktop: &str, mask: u32) -> Result<bool, u32> {
+        let wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
+        token
+            .impersonated(|| {
+                // SAFETY: the name is NUL-terminated and live for the call.
+                let handle = unsafe { OpenDesktopW(wide.as_ptr(), 0, 0, mask) };
+                if handle.is_null() {
+                    // SAFETY: GetLastError is read immediately after the failing open.
+                    return Ok(Err(unsafe { GetLastError() }));
+                }
+                // SAFETY: OpenDesktopW returned this owned user-object handle.
+                unsafe { CloseDesktop(handle) };
+                Ok(Ok(true))
+            })
+            .expect("impersonation is available to the broker")
+    }
+
+    #[test]
+    fn action_desktop_creation_uses_an_explicit_station_and_desktop_pair() {
+        let token = ActionToken::create().expect("action token");
+        let desktop = ActionDesktop::create(&token).expect("action desktop");
+        let value =
+            String::from_utf16(&desktop.lp_desktop[..desktop.lp_desktop.len().saturating_sub(1)])
+                .expect("UTF-16 desktop path");
+        assert!(value.starts_with(&format!("{}\\sbz-", token.station_name)));
+        assert!(desktop._station_lease.is_none());
+    }
+
+    #[test]
+    fn action_desktop_creation_refuses_a_station_mismatch_without_fallback() {
+        let mut token = ActionToken::create().expect("action token");
+        token.station_name.push_str("-unexpected");
+        let result = ActionDesktop::create(&token);
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+    }
+
+    #[test]
+    fn a_per_action_user_object_admits_its_own_action_and_refuses_another() {
+        // 制限 SID 列に対応する ACE があるアクションだけが自分のデスクトップを開ける。
+        let lease = Arc::new(ActionStationLease::acquire().unwrap());
+        let mine = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
+        let theirs = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
+        let (name, _desktop) = ActionDesktop::desktop_on_current_station_for_test(&mine)
+            .expect("a desktop can be created on the current station");
+
+        assert_eq!(
+            action_desktop_open(&mine, &name, ACTION_DESKTOP_RIGHTS),
+            Ok(true),
+            "the owning action must reach its own desktop"
+        );
+        match action_desktop_open(&mine, &name, WRITE_DAC) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("an action changed its desktop DACL: {other:?}"),
+        }
+        match action_desktop_open(&theirs, &name, ACTION_DESKTOP_RIGHTS) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("another action reached this desktop: {other:?}"),
+        }
+        // 共有 SID が同じでも、他アクションには権限を1ビットも与えない。
+        match action_desktop_open(&theirs, &name, MAXIMUM_ALLOWED) {
+            Err(ERROR_ACCESS_DENIED) => {}
+            other => panic!("another action was granted something: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_per_action_user_object_names_only_the_broker_and_that_action() {
+        let token = ActionToken::create().expect("action token");
+        let (_name, desktop) = ActionDesktop::desktop_on_current_station_for_test(&token)
+            .expect("a desktop can be created on the current station");
+        let broker = sid_string(token.broker_sid()).expect("broker sid");
+        let action = sid_string(token.action_sid.0).expect("action sid");
+
+        let dacl = diagnostic_user_object_dacl(desktop.0);
+        assert!(
+            dacl.contains(&format!("sid={broker}")),
+            "the broker has to stay able to manage the object: {dacl}"
+        );
+        assert!(
+            dacl.contains(&format!("mask=0x{ACTION_DESKTOP_RIGHTS:08x};sid={action}")),
+            "the action needs exactly its own rights: {dacl}"
+        );
+        // Everyone, Authenticated Users, Users and RESTRICTED are in every action's restricted
+        // list, so an entry for any of them would open this object to all actions at once.
+        for forbidden in [
+            "S-1-1-0",
+            "S-1-5-11",
+            "S-1-5-32-545",
+            "S-1-5-12",
+            "S-1-5-32-544",
+        ] {
+            assert!(
+                !dacl.contains(&format!("sid={forbidden}")),
+                "{forbidden} must not be an allow entry: {dacl}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_action_descriptor_withholds_the_rights_that_would_reopen_it() {
+        let token = ActionToken::create().expect("action token");
+        let rights = ACTION_DESKTOP_RIGHTS;
+        // 自分の DACL を変更できる権限をアクションへ渡さない。
+        assert_eq!(
+            rights & (DELETE | WRITE_DAC | WRITE_OWNER),
+            0,
+            "{rights:#x}"
+        );
+        assert_ne!(rights & READ_CONTROL, 0, "{rights:#x}");
+        let sddl = action_object_sddl(&token, rights).expect("DACL を構成できる");
+        assert!(security_descriptor(&sddl).is_ok(), "{sddl}");
+        assert!(sddl.contains("D:P"), "保護 DACL が必要: {sddl}");
+    }
+
+    /// Records that an interactive session cannot create a window station. Run it under the
+    /// service in Session 0, where the product needs the same call to succeed.
+    #[test]
+    #[ignore = "environment probe; meaningful only under the service in Session 0"]
+    fn probe_window_station_creation_variants() {
+        let token = ActionToken::create().expect("action token");
+        let broker_only = format!(
+            "D:P(A;;GA;;;{})",
+            sid_string(token.broker_sid()).expect("broker sid")
+        );
+        let with_action = action_object_sddl(&token, ACTION_STATION_PROBE_RIGHTS).expect("sddl");
+        for (label, sddl, access) in [
+            ("null sd, all access", None, 0x0000_037fu32),
+            ("null sd, maximum allowed", None, MAXIMUM_ALLOWED),
+            (
+                "broker only, all access",
+                Some(broker_only.clone()),
+                0x0000_037f,
+            ),
+            ("broker only, +standard", Some(broker_only), 0x0006_037f),
+            (
+                "with action, all access",
+                Some(with_action.clone()),
+                0x0000_037f,
+            ),
+            // 旧案のステーション作成プローブに使う要求マスク。
+            (
+                "with action, production request",
+                Some(with_action),
+                ACTION_STATION_PROBE_RIGHTS | WRITE_DAC | DELETE,
+            ),
+        ] {
+            let name = format!("sbz-probe-{}", secure_random_hex().expect("nonce"));
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            let descriptor = sddl
+                .as_deref()
+                .map(|text| security_descriptor(text).expect("the probe's own SDDL parses"));
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor
+                    .as_ref()
+                    .map_or(null_mut(), |allocation| allocation.0),
+                bInheritHandle: 0,
+            };
+            // SAFETY: the name and any descriptor are live for the call.
+            let handle = unsafe {
+                CreateWindowStationW(
+                    wide.as_ptr(),
+                    CWF_CREATE_ONLY,
+                    access,
+                    if descriptor.is_some() {
+                        &attributes
+                    } else {
+                        null()
+                    },
+                )
+            };
+            if handle.is_null() {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                println!("{label}: DENIED gle={}", unsafe { GetLastError() });
+            } else {
+                println!("{label}: created");
+                // SAFETY: the call returned an owned handle, closed once here.
+                unsafe { CloseWindowStation(handle) };
+            }
+        }
+    }
+
+    #[test]
+    fn session0_diagnostic_job_ui_limit_names_cover_every_documented_bit() {
+        assert_eq!(
+            describe_job_ui_limits(0x0000_00fe),
+            "handles=0;readclipboard=1;writeclipboard=1;systemparameters=1;displaysettings=1;\
+globalatoms=1;desktop=1;exitwindows=1;unknown=0x00000000"
+        );
+        assert_eq!(
+            describe_job_ui_limits(0),
+            "handles=0;readclipboard=0;writeclipboard=0;systemparameters=0;displaysettings=0;\
+globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
+        );
+        assert!(describe_job_ui_limits(0x0000_00ff).starts_with("handles=1;"));
+        // A bit outside the documented set stays visible instead of being dropped silently.
+        assert!(describe_job_ui_limits(0x0000_01fe).ends_with("unknown=0x00000100"));
+    }
+
+    #[test]
+    fn session0_diagnostic_user_object_label_describes_the_current_station() {
+        // SAFETY: the process window station handle is owned by this process and stays valid.
+        let label = diagnostic_user_object_label(unsafe { GetProcessWindowStation() });
+        println!("station label: {label}");
+        assert!(
+            label.starts_with("unavailable:gle=")
+                || label
+                    == format!("label=absent;implied_integrity={SECURITY_MANDATORY_MEDIUM_RID}")
+                || (label.starts_with("label_aces=[") && label.ends_with(']')),
+            "unexpected label shape: {label}"
+        );
+    }
+
+    #[test]
+    fn session0_diagnostic_ui_probe_names_its_first_refusal() {
+        let token = ActionToken::create().expect("action token");
+        // SAFETY: both user-object handles are owned by this process for its lifetime.
+        let (station, desktop) = unsafe {
+            (
+                GetProcessWindowStation(),
+                GetThreadDesktop(GetCurrentThreadId()),
+            )
+        };
+        let station = user_object_identity(station)
+            .map(|(_, name)| name)
+            .expect("station name");
+        let desktop = user_object_identity(desktop)
+            .map(|(_, name)| name)
+            .expect("desktop name");
+        let probe = diagnostic_ui_probe(&token, &station, &desktop);
+        println!("ui probe: {probe}");
+        if probe.starts_with("unavailable:gle=") {
+            return;
+        }
+        let (head, tail) = probe.split_once(";steps=[").expect("probe steps");
+        let steps: Vec<&str> = tail.trim_end_matches(']').split(',').collect();
+        assert_eq!(steps.len(), 6, "probe steps: {probe}");
+        let reported = head
+            .split_once("first_failure=")
+            .expect("probe first failure")
+            .1;
+        // The named failure has to be the first refused step, not any later one.
+        match steps.iter().find(|step| step.contains(";allowed=false;")) {
+            Some(step) => {
+                let name = step.split_once(":mask=").expect("step name").0;
+                let error = step.rsplit_once("gle=").expect("step error").1;
+                assert_eq!(reported, format!("{name};gle={error}"));
+            }
+            None => assert_eq!(reported, "none"),
+        }
     }
 
     #[test]
     fn session0_diagnostic_maps_only_the_ab_outcomes_to_service_magics() {
         assert_eq!(
-            Session0DiagnosticOutcome::DesktopCausal.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL
+            Session0DiagnosticOutcome::NoWindowCausal.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL
         );
         assert_eq!(
-            Session0DiagnosticOutcome::DesktopNotSufficient.service_magic(),
-            WINDOW_STATION_SCM_SMOKE_DESKTOP_NOT_SUFFICIENT
+            Session0DiagnosticOutcome::NoWindowNotSufficient.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_NO_WINDOW_NOT_SUFFICIENT
         );
         assert_eq!(
             Session0DiagnosticOutcome::Indeterminate.service_magic(),
             WINDOW_STATION_SCM_SMOKE_INDETERMINATE
         );
+        assert_eq!(
+            Session0DiagnosticOutcome::ActionStarts.service_magic(),
+            WINDOW_STATION_SCM_SMOKE_ACTION_STARTS
+        );
         for outcome in [
-            Session0DiagnosticOutcome::DesktopCausal,
-            Session0DiagnosticOutcome::DesktopNotSufficient,
+            Session0DiagnosticOutcome::NoWindowCausal,
+            Session0DiagnosticOutcome::NoWindowNotSufficient,
             Session0DiagnosticOutcome::Indeterminate,
+            Session0DiagnosticOutcome::ActionStarts,
         ] {
             assert_eq!(
                 Session0DiagnosticOutcome::decode(outcome as u8).unwrap(),
@@ -1784,17 +3464,18 @@ mod tests {
             );
         }
         assert!(Session0DiagnosticOutcome::decode(0).is_err());
+        assert!(Session0DiagnosticOutcome::decode(5).is_err());
     }
 
     #[test]
     fn session0_diagnostic_ab_classifier_requires_the_baseline_signature() {
         assert_eq!(
             classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0)),
-            Session0DiagnosticOutcome::DesktopCausal
+            Session0DiagnosticOutcome::NoWindowCausal
         );
         assert_eq!(
             classify_session0_diagnostic_ab(true, Some(0xc000_0142), true, Some(0xc000_0142)),
-            Session0DiagnosticOutcome::DesktopNotSufficient
+            Session0DiagnosticOutcome::NoWindowNotSufficient
         );
         for variant in [None, Some(1), Some(0xc000_0142)] {
             assert_eq!(
@@ -1806,6 +3487,28 @@ mod tests {
             classify_session0_diagnostic_ab(false, Some(0xc000_0142), true, Some(0)),
             Session0DiagnosticOutcome::Indeterminate
         );
+        // 起動失敗が消えた記録は、両方の腕が起動して正常終了したときだけ出る。
+        assert_eq!(
+            classify_session0_diagnostic_ab(true, Some(0), true, Some(0)),
+            Session0DiagnosticOutcome::ActionStarts
+        );
+        for (baseline_spawn, baseline_exit, no_window_spawn, no_window_exit) in [
+            (true, Some(0), true, Some(0xc000_0142)),
+            (true, Some(0), false, None),
+            (true, Some(0), true, None),
+            (false, Some(0), true, Some(0)),
+        ] {
+            assert_eq!(
+                classify_session0_diagnostic_ab(
+                    baseline_spawn,
+                    baseline_exit,
+                    no_window_spawn,
+                    no_window_exit
+                ),
+                Session0DiagnosticOutcome::Indeterminate,
+                "only both arms starting cleanly counts as the failure being gone"
+            );
+        }
     }
 
     #[test]
@@ -1833,9 +3536,10 @@ mod tests {
             "OpenAclMutation(string path, bool directory)",
             "0x001301bf",
             "0x000000fe",
-            "0x000000be",
-            "DESKTOP_CAUSAL",
-            "DESKTOP_NOT_SUFFICIENT",
+            "0x00080404",
+            "0x08080404",
+            "NO_WINDOW_CAUSAL",
+            "NO_WINDOW_NOT_SUFFICIENT",
             "held throwaway process reap timed out",
             "cleanup forced termination did not stop the throwaway service",
         ] {
@@ -1846,30 +3550,226 @@ mod tests {
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    struct Session0DiagnosticRun {
+    const VERIFIED_TARGET_ACCESS: &str = concat!(
+        "scope=broker-impersonated;first_failure=none;steps=[",
+        "station:maximum_allowed:mask=0x02000000;allowed=true;gle=0,",
+        "station:read_attributes:mask=0x00000002;allowed=true;gle=0,",
+        "station:action_mask:mask=0x00000002;allowed=true;gle=0,",
+        "desktop:maximum_allowed:mask=0x02000000;allowed=true;gle=0,",
+        "desktop:read_objects:mask=0x00000001;allowed=true;gle=0,",
+        "desktop:action_mask:mask=0x000201ff;allowed=true;gle=0]"
+    );
+    const VERIFIED_TARGET_ISOLATION: &str = concat!(
+        "own=Ok(true);other_maximum=Err(5);default_maximum=Err(5);",
+        "write_dac=Err(5);write_owner=Err(5);default_dacl_safe=true;tcb_absent=true"
+    );
+
+    fn diagnostic_target_dacl_complete(value: &str) -> bool {
+        let Some((control, aces)) = value
+            .strip_prefix("control=0x")
+            .and_then(|v| v.split_once(";aces=["))
+        else {
+            return false;
+        };
+        if control.len() != 4
+            || !control.bytes().all(|v| v.is_ascii_hexdigit())
+            || u16::from_str_radix(control, 16).unwrap() & SE_DACL_PROTECTED == 0
+        {
+            return false;
+        }
+        let Some(aces) = aces.strip_suffix(']') else {
+            return false;
+        };
+        let parts: Vec<_> = aces.split(',').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+        let mut sids = Vec::new();
+        for (ace, prefix) in parts.iter().zip([
+            "type=0;flags=0;mask=0x000f01ff;sid=",
+            "type=0;flags=0;mask=0x000201ff;sid=",
+        ]) {
+            let Some(sid) = ace.strip_prefix(prefix) else {
+                return false;
+            };
+            let Some(numbers) = sid.strip_prefix("S-1-") else {
+                return false;
+            };
+            if numbers.split('-').count() < 2
+                || !numbers
+                    .split('-')
+                    .all(|part| !part.is_empty() && part.bytes().all(|v| v.is_ascii_digit()))
+            {
+                return false;
+            }
+            sids.push(sid);
+        }
+        sids[0] != sids[1]
+    }
+
+    fn diagnostic_target_label_complete(value: &str) -> bool {
+        if value == "label=absent;implied_integrity=8192" {
+            return true;
+        }
+        let Some(aces) = value
+            .strip_prefix("label_aces=[")
+            .and_then(|v| v.strip_suffix(']'))
+        else {
+            return false;
+        };
+        aces.split(',').all(|ace| {
+            let Some((flags, rest)) = ace
+                .strip_prefix("type=17;flags=")
+                .and_then(|v| v.split_once(";mask=0x"))
+            else {
+                return false;
+            };
+            let Some((mask, integrity)) = rest.split_once(";sid=S-1-16-") else {
+                return false;
+            };
+            !flags.is_empty()
+                && flags.bytes().all(|v| v.is_ascii_digit())
+                && flags.parse::<u8>().is_ok()
+                && mask.len() == 8
+                && mask.bytes().all(|v| v.is_ascii_hexdigit())
+                && !integrity.is_empty()
+                && integrity.bytes().all(|v| v.is_ascii_digit())
+                && integrity.parse::<u32>().is_ok()
+        })
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(super) struct Session0DiagnosticRun {
         job_ui_restrictions: u32,
+        job_ui_limits: String,
+        creation_flags: u32,
         spawn_succeeded: bool,
         spawn_error: String,
         child_exit: Option<u32>,
         stdout: String,
         stderr: String,
+        target_desktop: String,
+        target_dacl: String,
+        target_sacl: String,
+        target_access: String,
+        isolation: String,
+        // 作成、隔離確認、全子孫終了、デスクトップ消滅の実測ビット。
+        lifecycle: u8,
     }
 
     impl Session0DiagnosticRun {
+        fn observations_verified(&self) -> bool {
+            diagnostic_target_dacl_complete(&self.target_dacl)
+                && diagnostic_target_label_complete(&self.target_sacl)
+                && self.target_access == VERIFIED_TARGET_ACCESS
+                && self.isolation == VERIFIED_TARGET_ISOLATION
+        }
+
         fn empty() -> Self {
             Self {
                 job_ui_restrictions: 0,
+                job_ui_limits: describe_job_ui_limits(0),
+                creation_flags: 0,
                 spawn_succeeded: false,
                 spawn_error: String::new(),
                 child_exit: None,
                 stdout: String::new(),
                 stderr: String::new(),
+                target_desktop: String::new(),
+                target_dacl: String::new(),
+                target_sacl: String::new(),
+                target_access: String::new(),
+                isolation: String::new(),
+                lifecycle: 0,
+            }
+        }
+
+        pub(super) fn capture(
+            &mut self,
+            action: &ActionToken,
+            desktop: &ActionDesktop,
+            flags: u32,
+        ) {
+            self.creation_flags = flags;
+            self.lifecycle = 1;
+            self.target_desktop =
+                String::from_utf16_lossy(&desktop.lp_desktop[..desktop.lp_desktop.len() - 1]);
+            self.target_dacl = diagnostic_user_object_dacl(desktop._desktop.0);
+            self.target_sacl = diagnostic_user_object_label(desktop._desktop.0);
+            let name = self.target_desktop.rsplit('\\').next().unwrap();
+            self.target_access = diagnostic_ui_probe(action, &action.station_name, name);
+            let result = (|| -> Result<bool, String> {
+                let lease = action
+                    .station_lease
+                    .as_ref()
+                    .ok_or("station_lease_missing")?;
+                let other =
+                    ActionToken::create_for_worker(Arc::clone(lease)).map_err(|e| e.to_string())?;
+                let own = action_desktop_open(action, name, ACTION_DESKTOP_RIGHTS);
+                let foreign = action_desktop_open(&other, name, MAXIMUM_ALLOWED);
+                let default = action_desktop_open(action, "Default", MAXIMUM_ALLOWED);
+                let write_dac = action_desktop_open(action, name, WRITE_DAC);
+                let write_owner = action_desktop_open(action, name, WRITE_OWNER);
+                let sid = sid_string(lease.worker_actions_sid.sid()).map_err(|e| e.to_string())?;
+                let default_dacl_safe = !token_default_dacl_sids(action.handle())
+                    .map_err(|e| e.to_string())?
+                    .contains(&sid);
+                let tcb_absent = diagnostic_tcb_absent(action.handle())?;
+                self.isolation = format!(
+                    "own={own:?};other_maximum={foreign:?};default_maximum={default:?};write_dac={write_dac:?};write_owner={write_owner:?};default_dacl_safe={default_dacl_safe};tcb_absent={tcb_absent}"
+                );
+                Ok(own == Ok(true)
+                    && foreign == Err(ERROR_ACCESS_DENIED)
+                    && default == Err(ERROR_ACCESS_DENIED)
+                    && write_dac == Err(ERROR_ACCESS_DENIED)
+                    && write_owner == Err(ERROR_ACCESS_DENIED)
+                    && default_dacl_safe
+                    && tcb_absent)
+            })();
+            match result {
+                Ok(true) if self.observations_verified() => self.lifecycle |= 2,
+                Ok(_) => {}
+                Err(error) => self.isolation = format!("unavailable:{error}"),
+            }
+        }
+
+        fn observe_desktop_release(&mut self) {
+            if self.lifecycle & 1 == 0 {
+                return;
+            }
+            let name = self.target_desktop.rsplit('\\').next().unwrap();
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            // SAFETY: broker が所有した名前を現在の station で照会する。拒否を消滅と扱わない。
+            let handle = unsafe { OpenDesktopW(wide.as_ptr(), 0, 0, READ_CONTROL) };
+            if handle.is_null() {
+                let error = unsafe { GetLastError() };
+                if error == ERROR_FILE_NOT_FOUND {
+                    self.lifecycle |= 8;
+                } else {
+                    self.spawn_error
+                        .push_str(&format!(";desktop_cleanup:gle={error}"));
+                }
+            } else {
+                unsafe { CloseDesktop(handle) };
+                self.spawn_error.push_str(";desktop_cleanup:still-present");
             }
         }
 
         fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
+            // 名称は mask の展開表。照会した mask と一致しない記録を拒否する。
+            if self.lifecycle & !15 != 0
+                || (self.lifecycle & 14 != 0 && self.lifecycle & 1 == 0)
+                || (self.lifecycle & 4 != 0 && !self.spawn_succeeded)
+                || (self.lifecycle & 2 != 0 && !self.observations_verified())
+            {
+                return Err("diagnostic lifecycle".into());
+            }
+            if self.job_ui_limits != describe_job_ui_limits(self.job_ui_restrictions) {
+                return Err("diagnostic run UI limit names".into());
+            }
             payload.u32(self.job_ui_restrictions);
+            write_text(payload, &self.job_ui_limits)?;
+            payload.u32(self.creation_flags);
             payload.bool(self.spawn_succeeded);
             write_text(payload, &self.spawn_error)?;
             payload.bool(self.child_exit.is_some());
@@ -1877,11 +3777,24 @@ mod tests {
                 payload.u32(exit);
             }
             write_text(payload, &self.stdout)?;
-            write_text(payload, &self.stderr)
+            write_text(payload, &self.stderr)?;
+            for value in [
+                &self.target_desktop,
+                &self.target_dacl,
+                &self.target_sacl,
+                &self.target_access,
+                &self.isolation,
+            ] {
+                write_text(payload, value)?;
+            }
+            payload.u8(self.lifecycle);
+            Ok(())
         }
 
         fn decode_from(reader: &mut Reader<'_>) -> Result<Self, String> {
             let job_ui_restrictions = reader.u32().map_err(|_| "diagnostic run UI")?;
+            let job_ui_limits = read_text(reader)?;
+            let creation_flags = reader.u32().map_err(|_| "diagnostic creation flags")?;
             let spawn_succeeded = read_strict_bool(reader)?;
             let spawn_error = read_text(reader)?;
             let child_exit = if read_strict_bool(reader)? {
@@ -1891,16 +3804,24 @@ mod tests {
             };
             Ok(Self {
                 job_ui_restrictions,
+                job_ui_limits,
+                creation_flags,
                 spawn_succeeded,
                 spawn_error,
                 child_exit,
                 stdout: read_text(reader)?,
                 stderr: read_text(reader)?,
+                target_desktop: read_text(reader)?,
+                target_dacl: read_text(reader)?,
+                target_sacl: read_text(reader)?,
+                target_access: read_text(reader)?,
+                isolation: read_text(reader)?,
+                lifecycle: reader.u8().map_err(|_| "diagnostic lifecycle")?,
             })
         }
     }
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     struct Session0DiagnosticRecord {
         nonce: String,
         markers: u8,
@@ -1911,13 +3832,20 @@ mod tests {
         station: String,
         desktop: String,
         station_dacl: String,
+        station_sacl: String,
         desktop_dacl: String,
+        desktop_sacl: String,
         station_access: String,
         desktop_access: String,
+        ui_probe: String,
+        action_desktop: String,
         cwd: String,
         environment_hash: String,
         baseline: Session0DiagnosticRun,
-        desktop_relaxed: Session0DiagnosticRun,
+        no_window: Session0DiagnosticRun,
+        worker_actions_sid: String,
+        station_ace: String,
+        station_cleanup: String,
     }
 
     impl Session0DiagnosticRecord {
@@ -1930,36 +3858,101 @@ mod tests {
             Self {
                 nonce: "0123456789abcdef0123456789abcdef".into(),
                 markers: Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED,
-                classification: Session0DiagnosticOutcome::DesktopCausal,
+                classification: Session0DiagnosticOutcome::NoWindowCausal,
                 session_id: 0,
-                broker: "user=S-1-5-80-1;integrity=8192;groups=[];privileges=[]".into(),
-                action: "user=S-1-5-80-1;integrity=8192;restricted=[];groups=[];privileges=[]"
+                broker: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
+groups=[];privileges=[]"
                     .into(),
-                station: "Service-0x0-3e7$".into(),
+                action: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
+restricted=[];groups=[];privileges=[]"
+                    .into(),
+                station: "Service-0x0-1234$".into(),
                 desktop: "Default".into(),
                 station_dacl: "unavailable:gle=5".into(),
+                station_sacl: "label=absent;implied_integrity=8192".into(),
                 desktop_dacl: "unavailable:gle=5".into(),
+                desktop_sacl: "label_aces=[type=17;flags=0;mask=0x00000001;sid=S-1-16-8192]".into(),
                 station_access: "mask=0x0000006e;allowed=false;gle=5".into(),
                 desktop_access: "mask=0x000000cf;allowed=false;gle=5".into(),
-                cwd: "C:\\Sembazuru".into(),
+                ui_probe: "scope=broker-impersonated;first_failure=station:maximum_allowed;gle=5;\
+steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
+                    .into(),
+                action_desktop: "created".into(),
+                cwd: "C:\\Sembazuru\\診断".into(),
                 environment_hash: "0".repeat(64),
                 baseline: Session0DiagnosticRun {
                     job_ui_restrictions: 0x0000_00fe,
+                    job_ui_limits: describe_job_ui_limits(0x0000_00fe),
+                    creation_flags: 0x0008_0404,
                     spawn_succeeded: true,
                     spawn_error: String::new(),
                     child_exit: Some(0xc000_0142),
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: "baseline-stdout-診断".into(),
+                    stderr: "baseline-stderr".into(),
+                    target_desktop: "Service-0x0-1234$\\sbz-baseline".into(),
+                    target_dacl: "control=0x1004;aces=[type=0;flags=0;mask=0x000f01ff;sid=S-1-5-80-1,type=0;flags=0;mask=0x000201ff;sid=S-1-9-1]".into(),
+                    target_sacl: "label=absent;implied_integrity=8192".into(),
+                    target_access: VERIFIED_TARGET_ACCESS.into(),
+                    isolation: VERIFIED_TARGET_ISOLATION.into(),
+                    lifecycle: 15,
                 },
-                desktop_relaxed: Session0DiagnosticRun {
-                    job_ui_restrictions: 0x0000_00be,
+                no_window: Session0DiagnosticRun {
+                    job_ui_restrictions: 0x0000_00fe,
+                    job_ui_limits: describe_job_ui_limits(0x0000_00fe),
+                    creation_flags: 0x0808_0404,
                     spawn_succeeded: true,
                     spawn_error: String::new(),
                     child_exit: Some(0),
-                    stdout: String::new(),
-                    stderr: String::new(),
+                    stdout: "no-window-stdout".into(),
+                    stderr: "no-window-stderr-観測".into(),
+                    target_desktop: "Service-0x0-1234$\\sbz-no-window".into(),
+                    target_dacl: "control=0x1004;aces=[type=0;flags=0;mask=0x000f01ff;sid=S-1-5-80-1,type=0;flags=0;mask=0x000201ff;sid=S-1-9-1]".into(),
+                    target_sacl: "label=absent;implied_integrity=8192".into(),
+                    target_access: VERIFIED_TARGET_ACCESS.into(),
+                    isolation: VERIFIED_TARGET_ISOLATION.into(),
+                    lifecycle: 15,
                 },
+                worker_actions_sid: "S-1-5-100-1-2-3-4".into(),
+                station_ace: "count=1;flags=0;mask=0x00000002".into(),
+                station_cleanup: "removed".into(),
             }
+        }
+
+        fn expected_classification(&self) -> Session0DiagnosticOutcome {
+            if self.markers != Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED
+                || self.session_id != 0
+                || !self.baseline.spawn_succeeded
+                || !self.no_window.spawn_succeeded
+                || self.baseline.job_ui_restrictions != 0xfe
+                || self.no_window.job_ui_restrictions != 0xfe
+                || self.baseline.creation_flags != 0x0008_0404
+                || self.no_window.creation_flags != 0x0808_0404
+                || self.worker_actions_sid.is_empty()
+                || self.station_ace != "count=1;flags=0;mask=0x00000002"
+                || self.station_cleanup != "removed"
+                || self.baseline.lifecycle != 15
+                || self.no_window.lifecycle != 15
+                || !self.baseline.observations_verified()
+                || !self.no_window.observations_verified()
+                || !self.baseline.spawn_error.is_empty()
+                || !self.no_window.spawn_error.is_empty()
+                || !self
+                    .baseline
+                    .target_desktop
+                    .starts_with(&format!("{}\\sbz-", self.station))
+                || !self
+                    .no_window
+                    .target_desktop
+                    .starts_with(&format!("{}\\sbz-", self.station))
+            {
+                return Session0DiagnosticOutcome::Indeterminate;
+            }
+            classify_session0_diagnostic_ab(
+                self.baseline.spawn_succeeded,
+                self.baseline.child_exit,
+                self.no_window.spawn_succeeded,
+                self.no_window.child_exit,
+            )
         }
 
         fn encode(&self) -> Result<Vec<u8>, String> {
@@ -1975,15 +3968,17 @@ mod tests {
             {
                 return Err("environment hash".into());
             }
-            if self.markers & Self::SPAWN_RETURNED != 0
-                && self.classification
-                    != classify_session0_diagnostic_ab(
-                        self.baseline.spawn_succeeded,
-                        self.baseline.child_exit,
-                        self.desktop_relaxed.spawn_succeeded,
-                        self.desktop_relaxed.child_exit,
-                    )
-            {
+            for (run, expected_flags) in [
+                (&self.baseline, 0x0008_0404),
+                (&self.no_window, 0x0808_0404),
+            ] {
+                if run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe || run.creation_flags != expected_flags)
+                {
+                    return Err("diagnostic A/B flags or Job UI".into());
+                }
+            }
+            if self.classification != self.expected_classification() {
                 return Err("diagnostic A/B classification".into());
             }
             let mut payload = Writer::new();
@@ -1996,21 +3991,32 @@ mod tests {
                 &self.station,
                 &self.desktop,
                 &self.station_dacl,
+                &self.station_sacl,
                 &self.desktop_dacl,
+                &self.desktop_sacl,
                 &self.station_access,
                 &self.desktop_access,
+                &self.ui_probe,
+                &self.action_desktop,
                 &self.cwd,
                 &self.environment_hash,
             ] {
                 write_text(&mut payload, value)?;
             }
             self.baseline.encode_into(&mut payload)?;
-            self.desktop_relaxed.encode_into(&mut payload)?;
+            self.no_window.encode_into(&mut payload)?;
+            for value in [
+                &self.worker_actions_sid,
+                &self.station_ace,
+                &self.station_cleanup,
+            ] {
+                write_text(&mut payload, value)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
-            let mut bytes = Vec::with_capacity(48 + payload.len());
+            let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_VERSION.to_le_bytes());
             bytes.extend_from_slice(self.nonce.as_bytes());
@@ -2047,11 +4053,14 @@ mod tests {
             )?;
             let session_id = reader.u32().map_err(|_| "diagnostic session")?;
             let mut fields = Vec::new();
-            for _ in 0..10 {
+            for _ in 0..14 {
                 fields.push(read_text(&mut reader)?);
             }
             let baseline = Session0DiagnosticRun::decode_from(&mut reader)?;
-            let desktop_relaxed = Session0DiagnosticRun::decode_from(&mut reader)?;
+            let no_window = Session0DiagnosticRun::decode_from(&mut reader)?;
+            let worker_actions_sid = read_text(&mut reader)?;
+            let station_ace = read_text(&mut reader)?;
+            let station_cleanup = read_text(&mut reader)?;
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -2063,13 +4072,20 @@ mod tests {
                 station: fields.remove(0),
                 desktop: fields.remove(0),
                 station_dacl: fields.remove(0),
+                station_sacl: fields.remove(0),
                 desktop_dacl: fields.remove(0),
+                desktop_sacl: fields.remove(0),
                 station_access: fields.remove(0),
                 desktop_access: fields.remove(0),
+                ui_probe: fields.remove(0),
+                action_desktop: fields.remove(0),
                 cwd: fields.remove(0),
                 environment_hash: fields.remove(0),
                 baseline,
-                desktop_relaxed,
+                no_window,
+                worker_actions_sid,
+                station_ace,
+                station_cleanup,
             };
             record.encode().map(|_| record)
         }
@@ -2154,7 +4170,7 @@ mod tests {
             ServiceExitCode::Win32(0),
             std::time::Duration::from_secs(10),
         )?;
-        if exit_code == WINDOW_STATION_SCM_SMOKE_DESKTOP_CAUSAL {
+        if exit_code == WINDOW_STATION_SCM_SMOKE_NO_WINDOW_CAUSAL {
             set(
                 ServiceState::Running,
                 ServiceExitCode::Win32(0),
@@ -2213,10 +4229,19 @@ mod tests {
         } else {
             String::new()
         };
+        let policy = token_info(handle, TokenMandatoryPolicy)
+            .map_err(|error| error.to_string())
+            // SAFETY: TokenMandatoryPolicy returns exactly a TOKEN_MANDATORY_POLICY.
+            .map(|info| unsafe { (*info.as_ptr().cast::<TOKEN_MANDATORY_POLICY>()).Policy });
         Ok(format!(
-            "user={};integrity={};groups={groups:?};privileges={privileges:?}{restricted}",
+            "user={};integrity={};mandatory_policy={};groups={groups:?};\
+privileges={privileges:?}{restricted}",
             sid_string(user.User.Sid).map_err(|error| error.to_string())?,
             integrity_rid(handle).map_err(|error| error.to_string())?,
+            policy.map_or_else(
+                |error| format!("unavailable:{error}"),
+                |value| format!("0x{value:08x}")
+            ),
         ))
     }
 
@@ -2285,6 +4310,166 @@ mod tests {
             ));
         }
         format!("control=0x{control:04x};aces=[{}]", aces.join(","))
+    }
+
+    /// The mandatory label of a user object. `LABEL_SECURITY_INFORMATION` reads the label ACE
+    /// without `SE_SECURITY_NAME`, so the service can record it. Integrity is evaluated before the
+    /// DACL, which is why an access denial cannot be attributed to the DACL without this.
+    fn diagnostic_user_object_label(handle: HANDLE) -> String {
+        let request = LABEL_SECURITY_INFORMATION;
+        let mut needed = 0;
+        // SAFETY: the sizing probe has a valid request and writable length output.
+        if unsafe { GetUserObjectSecurity(handle, &request, null_mut(), 0, &mut needed) } == 0 {
+            // SAFETY: GetLastError is read immediately after the failing sizing probe.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
+                return format!("unavailable:gle={error}");
+            }
+        }
+        let mut storage = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+        // SAFETY: storage has the reported byte capacity; all pointers remain live through the call.
+        if unsafe {
+            GetUserObjectSecurity(
+                handle,
+                &request,
+                storage.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            )
+        } == 0
+        {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        let descriptor = storage.as_mut_ptr().cast();
+        let (mut present, mut defaulted, mut sacl) = (0, 0, null_mut());
+        // SAFETY: descriptor points to the returned self-relative descriptor; outputs are valid.
+        if unsafe { GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted) }
+            == 0
+        {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            return format!("unavailable:gle={}", unsafe { GetLastError() });
+        }
+        if present == 0 || sacl.is_null() {
+            // No label ACE. Windows then treats the object as Medium, so a refusal of a Medium
+            // action cannot be explained by no-write-up. That does not leave the DACL as the only
+            // candidate: the Job UI restrictions refuse in a layer of their own.
+            return format!("label=absent;implied_integrity={SECURITY_MANDATORY_MEDIUM_RID}");
+        }
+        let mut aces = Vec::new();
+        // SAFETY: the SACL is owned by the live descriptor and AceCount bounds the iteration.
+        for index in 0..unsafe { (*sacl).AceCount } as u32 {
+            let mut raw = null_mut();
+            // SAFETY: index is within AceCount and `raw` receives the descriptor-owned ACE.
+            if unsafe { GetAce(sacl, index, &mut raw) } == 0 {
+                // SAFETY: GetLastError is read immediately after the failing call.
+                return format!("unavailable:gle={}", unsafe { GetLastError() });
+            }
+            // SAFETY: `raw` points at a descriptor-owned ACE whose header is always readable.
+            let ace = unsafe { &*(raw.cast::<SYSTEM_MANDATORY_LABEL_ACE>()) };
+            if u32::from(ace.Header.AceType) != SYSTEM_MANDATORY_LABEL_ACE_TYPE {
+                // Only the label ACE has this body; record the type and read no further.
+                aces.push(format!("type={};not-a-label", ace.Header.AceType));
+                continue;
+            }
+            let sid = sid_string((&ace.SidStart as *const u32).cast_mut().cast())
+                .unwrap_or_else(|error| format!("sid-error={error}"));
+            aces.push(format!(
+                "type={};flags={};mask=0x{:08x};sid={sid}",
+                ace.Header.AceType, ace.Header.AceFlags, ace.Mask
+            ));
+        }
+        format!("label_aces=[{}]", aces.join(","))
+    }
+
+    /// Every `JOB_OBJECT_UILIMIT_*` bit of a measured mask, named and stated as set or clear. The
+    /// Job UI limits refuse window-station and desktop APIs in a layer of their own, above the
+    /// DACL, so the record has to say which ones are in force without an external decode table.
+    fn describe_job_ui_limits(mask: u32) -> String {
+        const NAMED: [(u32, &str); 8] = [
+            (JOB_OBJECT_UILIMIT_HANDLES, "handles"),
+            (JOB_OBJECT_UILIMIT_READCLIPBOARD, "readclipboard"),
+            (JOB_OBJECT_UILIMIT_WRITECLIPBOARD, "writeclipboard"),
+            (JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, "systemparameters"),
+            (JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, "displaysettings"),
+            (JOB_OBJECT_UILIMIT_GLOBALATOMS, "globalatoms"),
+            (JOB_OBJECT_UILIMIT_DESKTOP, "desktop"),
+            (JOB_OBJECT_UILIMIT_EXITWINDOWS, "exitwindows"),
+        ];
+        let mut parts = Vec::with_capacity(NAMED.len() + 1);
+        let mut covered = 0;
+        for (bit, name) in NAMED {
+            covered |= bit;
+            parts.push(format!("{name}={}", u32::from(mask & bit != 0)));
+        }
+        parts.push(format!("unknown=0x{:08x}", mask & !covered));
+        parts.join(";")
+    }
+
+    /// The ordered user-object opens that process initialisation needs, attempted under the action
+    /// token, naming the first one that is refused and its Win32 error. The child dies inside
+    /// `user32` initialisation before any code of ours runs, so this is a broker-side stand-in and
+    /// not an in-child API trace: it says which open a token like this one is refused, not which
+    /// call the dead child made last.
+    fn diagnostic_ui_probe(token: &ActionToken, station: &str, desktop: &str) -> String {
+        let station_wide: Vec<u16> = OsStr::new(station).encode_wide().chain(Some(0)).collect();
+        let desktop_wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
+        token
+            .impersonated(|| {
+                let mut steps = Vec::new();
+                let mut first_failure = None;
+                for (name, mask) in [
+                    ("station:maximum_allowed", MAXIMUM_ALLOWED),
+                    ("station:read_attributes", WINSTA_READATTRIBUTES as u32),
+                    ("station:action_mask", 0x0002),
+                    ("desktop:maximum_allowed", MAXIMUM_ALLOWED),
+                    ("desktop:read_objects", DESKTOP_READOBJECTS),
+                    ("desktop:action_mask", ACTION_DESKTOP_RIGHTS),
+                ] {
+                    let opened = if name.starts_with("station:") {
+                        // SAFETY: the station name is NUL-terminated and live through the call.
+                        let handle = unsafe { OpenWindowStationW(station_wide.as_ptr(), 0, mask) };
+                        if handle.is_null() {
+                            None
+                        } else {
+                            // SAFETY: OpenWindowStationW returned this owned user-object handle.
+                            unsafe { CloseWindowStation(handle) };
+                            Some(())
+                        }
+                    } else {
+                        // SAFETY: the desktop name is valid and the process station is unchanged.
+                        let handle = unsafe { OpenDesktopW(desktop_wide.as_ptr(), 0, 0, mask) };
+                        if handle.is_null() {
+                            None
+                        } else {
+                            // SAFETY: OpenDesktopW returned this owned user-object handle.
+                            unsafe { CloseDesktop(handle) };
+                            Some(())
+                        }
+                    };
+                    // SAFETY: GetLastError is read immediately after the open above.
+                    let error = if opened.is_some() {
+                        0
+                    } else {
+                        unsafe { GetLastError() }
+                    };
+                    steps.push(format!(
+                        "{name}:mask=0x{mask:08x};allowed={};gle={error}",
+                        opened.is_some()
+                    ));
+                    if opened.is_none() && first_failure.is_none() {
+                        first_failure = Some(format!("{name};gle={error}"));
+                    }
+                }
+                Ok(format!(
+                    "scope=broker-impersonated;first_failure={};steps=[{}]",
+                    first_failure.unwrap_or_else(|| "none".into()),
+                    steps.join(",")
+                ))
+            })
+            .unwrap_or_else(|error| {
+                format!("unavailable:gle={}", error.raw_os_error().unwrap_or(0))
+            })
     }
 
     fn diagnostic_open_access(
@@ -2423,18 +4608,16 @@ mod tests {
     fn run_session0_diagnostic_child(
         action: &ActionToken,
         command: &RestrictedCommand,
-        desktop_relaxed: bool,
+        profile: TestCreationProfile,
     ) -> Result<Session0DiagnosticRun, String> {
         let mut record = Session0DiagnosticRun::empty();
-        let process = if desktop_relaxed {
-            RestrictedProcess::spawn_without_desktop_limit_for_test(action, command)
-        } else {
-            RestrictedProcess::spawn(action, command)
-        };
+        let process =
+            RestrictedProcess::spawn_for_session0_diagnostic(action, command, profile, &mut record);
         let mut process = match process {
             Ok(process) => process,
             Err(error) => {
                 record.spawn_error = format!("spawn: {error}");
+                record.observe_desktop_release();
                 return Ok(record);
             }
         };
@@ -2443,11 +4626,8 @@ mod tests {
             .job()
             .ui_restrictions_for_test()
             .map_err(|error| format!("job UI query: {error}"))?;
-        let expected_ui = if desktop_relaxed {
-            0x0000_00be
-        } else {
-            0x0000_00fe
-        };
+        record.job_ui_limits = describe_job_ui_limits(record.job_ui_restrictions);
+        let expected_ui = 0x0000_00fe;
         if record.job_ui_restrictions != expected_ui {
             drop(process);
             return Err(format!(
@@ -2471,8 +4651,8 @@ mod tests {
                 Ok(Err(error)) => Err(format!("wait: {error}")),
                 Err(_) => {
                     process.terminate();
-                    let _ = process.wait().await;
-                    Err("wait: deadline exceeded; terminated and reaped".into())
+                    let cleanup = process.wait().await;
+                    Err(format!("wait: deadline-exceeded;cleanup={cleanup:?}"))
                 }
             }
         });
@@ -2480,7 +4660,10 @@ mod tests {
             Ok(exit) => record.child_exit = Some(exit),
             Err(error) => record.spawn_error = error,
         }
-        if let Ok((mut stdout, mut stderr)) = process.take_output() {
+        // 全子孫が終了していないとパイプの EOF は保証できない。
+        if process.tree_finished
+            && let Ok((mut stdout, mut stderr)) = process.take_output()
+        {
             use tokio::io::AsyncReadExt;
             let (stdout, stderr) = runtime.block_on(async {
                 let (mut left, mut right) = (Vec::new(), Vec::new());
@@ -2493,6 +4676,11 @@ mod tests {
             record.stdout = String::from_utf8_lossy(&stdout[..stdout.len().min(4096)]).into_owned();
             record.stderr = String::from_utf8_lossy(&stderr[..stderr.len().min(4096)]).into_owned();
         }
+        if process.tree_finished {
+            record.lifecycle |= 4;
+        }
+        drop(process);
+        record.observe_desktop_release();
         Ok(record)
     }
 
@@ -2525,30 +4713,99 @@ mod tests {
             station,
             desktop,
             station_dacl: diagnostic_user_object_dacl(station_handle),
+            station_sacl: diagnostic_user_object_label(station_handle),
             desktop_dacl: diagnostic_user_object_dacl(desktop_handle),
+            desktop_sacl: diagnostic_user_object_label(desktop_handle),
             station_access: "unavailable:action-not-created".into(),
             desktop_access: "unavailable:action-not-created".into(),
+            ui_probe: "unavailable:action-not-created".into(),
+            action_desktop: "unavailable:action-not-created".into(),
             cwd: config.fixture_root.display().to_string(),
             environment_hash: "0".repeat(64),
             baseline: Session0DiagnosticRun::empty(),
-            desktop_relaxed: Session0DiagnosticRun::empty(),
+            no_window: Session0DiagnosticRun::empty(),
+            worker_actions_sid: String::new(),
+            station_ace: "unavailable:not-acquired".into(),
+            station_cleanup: "unavailable:not-acquired".into(),
         };
-        let action = match ActionToken::create() {
+        let lease = match ActionStationLease::acquire() {
+            Ok(lease) => Arc::new(lease),
+            Err(error) => {
+                record.action_desktop = format!("station_lease: {error}");
+                return publish_session0_diagnostic(&record, config, None, None);
+            }
+        };
+        record.worker_actions_sid = sid_string(lease.worker_actions_sid.sid()).unwrap_or_default();
+        record.station_dacl = diagnostic_user_object_dacl(station_handle);
+        record.station_ace = diagnostic_station_ace(station_handle, &record.worker_actions_sid);
+        let stage = collect_session0_action(&mut record, config, Arc::clone(&lease)).err();
+        let weak = Arc::downgrade(&lease);
+        drop(lease);
+        record.station_cleanup = if weak.upgrade().is_none()
+            && diagnostic_station_ace(station_handle, &record.worker_actions_sid) == "count=0"
+        {
+            "removed".into()
+        } else {
+            format!(
+                "unconfirmed;retained={};ace={}",
+                weak.upgrade().is_some(),
+                diagnostic_station_ace(station_handle, &record.worker_actions_sid)
+            )
+        };
+        record.classification = record.expected_classification();
+        publish_session0_diagnostic(&record, config, None, stage)
+    }
+
+    fn diagnostic_station_ace(station: HWINSTA, sid: &str) -> String {
+        match station_dacl(station) {
+            Ok((_, _, aces)) => {
+                let matches: Vec<_> = aces
+                    .iter()
+                    .filter_map(AceBlob::simple_allow)
+                    .filter(|(value, _, _)| value == sid)
+                    .collect();
+                match matches.as_slice() {
+                    [] => "count=0".into(),
+                    [(_, flags, mask)] => format!("count=1;flags={flags};mask=0x{mask:08x}"),
+                    _ => format!("count={}", matches.len()),
+                }
+            }
+            Err(error) => format!("unavailable:{error}"),
+        }
+    }
+
+    fn diagnostic_tcb_absent(token: HANDLE) -> Result<bool, String> {
+        let name: Vec<u16> = "SeTcbPrivilege".encode_utf16().chain(Some(0)).collect();
+        let mut luid = unsafe { std::mem::zeroed() };
+        // SAFETY: 定数名と LUID 出力は呼び出し中に有効。
+        if unsafe { LookupPrivilegeValueW(null(), name.as_ptr(), &mut luid) } == 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        Ok(!token_privileges(token)?
+            .iter()
+            .any(|(low, high, _)| *low == luid.LowPart && *high == luid.HighPart))
+    }
+
+    fn collect_session0_action(
+        record: &mut Session0DiagnosticRecord,
+        config: &Session0DiagnosticConfig,
+        lease: Arc<ActionStationLease>,
+    ) -> Result<(), Session0DiagnosticFailureStage> {
+        let action = match ActionToken::create_for_worker(lease) {
             Ok(token) => token,
             Err(error) => {
-                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
                 record.baseline.spawn_error = format!("action_token: {error}");
-                return publish_session0_diagnostic(&record, config, None, None);
+                return Ok(());
             }
         };
         record.action = diagnostic_token_summary(action.handle(), true)
             .unwrap_or_else(|error| format!("unavailable:{error}"));
-        if !record.station.starts_with("unavailable:")
-            && !record.desktop.starts_with("unavailable:")
-        {
-            (record.station_access, record.desktop_access) =
-                diagnostic_open_access(&action, &record.station, &record.desktop);
-        }
+        // ここは broker の Default。対象の測定は各 run の Target* に保存する。
+        (record.station_access, record.desktop_access) =
+            diagnostic_open_access(&action, &record.station, &record.desktop);
+        record.ui_probe = diagnostic_ui_probe(&action, &record.station, &record.desktop);
+        record.action_desktop =
+            "scope=per-run;see=TargetDesktop,TargetDacl,TargetAccess,Lifecycle".into();
         let scratch = match PrivateScratch::create(
             &config.record_directory,
             &format!("action-{}", config.nonce),
@@ -2556,61 +4813,43 @@ mod tests {
         ) {
             Ok(scratch) => scratch,
             Err(error) => {
-                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
                 record.baseline.spawn_error = format!("private_scratch: {error}");
-                return publish_session0_diagnostic(&record, config, None, None);
+                return Ok(());
             }
         };
-        let (command, environment_hash) = match session0_diagnostic_command(scratch.path()) {
-            Ok(value) => value,
-            Err(error) => {
-                record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-                record.baseline.spawn_error = format!("command: {error}");
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    None,
-                );
+        let result = (|| {
+            let (command, environment_hash) = match session0_diagnostic_command(scratch.path()) {
+                Ok(value) => value,
+                Err(error) => {
+                    record.baseline.spawn_error = format!("command: {error}");
+                    return Ok(());
+                }
+            };
+            record.cwd = scratch.path().display().to_string();
+            record.environment_hash = environment_hash;
+            record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
+            // 両方とも製品の Job と共有 SID を使い、作成フラグだけを比較する。
+            for (run, profile) in [
+                (&mut record.baseline, TestCreationProfile::Production),
+                (&mut record.no_window, TestCreationProfile::NoWindow),
+            ] {
+                *run =
+                    run_session0_diagnostic_child(&action, &command, profile).map_err(|error| {
+                        run.spawn_error = error;
+                        Session0DiagnosticFailureStage::Runtime
+                    })?;
             }
-        };
-        record.cwd = scratch.path().display().to_string();
-        record.environment_hash = environment_hash;
-        record.markers |= Session0DiagnosticRecord::PRE_SPAWN;
-        // Both runs share the production command, CWD, BASELINE_ENV, TEMP/TMP, and action token.
-        // The test-only Job constructor is the sole variable in the A/B comparison.
-        record.baseline = match run_session0_diagnostic_child(&action, &command, false) {
-            Ok(run) => run,
-            Err(error) => {
-                record.baseline.spawn_error = error;
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    Some(Session0DiagnosticFailureStage::Runtime),
-                );
-            }
-        };
-        record.desktop_relaxed = match run_session0_diagnostic_child(&action, &command, true) {
-            Ok(run) => run,
-            Err(error) => {
-                record.desktop_relaxed.spawn_error = error;
-                return publish_session0_diagnostic(
-                    &record,
-                    config,
-                    Some((scratch.path(), &action)),
-                    Some(Session0DiagnosticFailureStage::Runtime),
-                );
-            }
-        };
-        record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
-        record.classification = classify_session0_diagnostic_ab(
-            record.baseline.spawn_succeeded,
-            record.baseline.child_exit,
-            record.desktop_relaxed.spawn_succeeded,
-            record.desktop_relaxed.child_exit,
-        );
-        publish_session0_diagnostic(&record, config, Some((scratch.path(), &action)), None)
+            record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
+            Ok(())
+        })();
+        cleanup_session0_diagnostic_scratch(
+            scratch.path(),
+            &config.record_directory,
+            &action,
+            &config.nonce,
+        )
+        .map_err(|_| Session0DiagnosticFailureStage::ScratchCleanup)?;
+        result
     }
 
     #[derive(Clone, Debug)]
@@ -4116,28 +6355,30 @@ mod tests {
     }
 
     #[test]
-    fn private_station_unnamed_create_rejects_connected_logon_station() {
+    fn private_station_unnamed_create_cannot_allocate_per_action_station() {
         let token = ActionToken::create().expect("action token");
         let broker = sid_string(token.broker_sid()).expect("broker SID");
         let current = unsafe { GetProcessWindowStation() };
         let before = user_object_identity(current).expect("current identity before create");
         let sddl = format!("O:{broker}D:P(D;;WD;;;OW)(A;;0x00020002;;;{broker})");
-        let created = ActionPipeSecurity(sddl).with_attributes(|attributes| {
-            // SAFETY: attributes points to the live protected descriptor for this synchronous call.
-            let handle = unsafe {
-                CreateWindowStationW(
-                    null(),
-                    CWF_CREATE_ONLY,
-                    READ_CONTROL | WINSTA_READATTRIBUTES as u32,
-                    attributes.cast(),
-                )
-            };
-            if handle.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(AuditWindowStation(Some(handle)))
-        });
-        match created {
+        let create = || {
+            ActionPipeSecurity(sddl.clone()).with_attributes(|attributes| {
+                // SAFETY: attributes points to the live protected descriptor for this synchronous call.
+                let handle = unsafe {
+                    CreateWindowStationW(
+                        null(),
+                        CWF_CREATE_ONLY,
+                        READ_CONTROL | WINSTA_READATTRIBUTES as u32,
+                        attributes.cast(),
+                    )
+                };
+                if handle.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(AuditWindowStation(Some(handle)))
+            })
+        };
+        match create() {
             Err(error) => {
                 let after = user_object_identity(unsafe { GetProcessWindowStation() })
                     .expect("current identity after failed create");
@@ -4155,15 +6396,20 @@ mod tests {
                 }
             }
             Ok(station) => {
+                // A NULL name uses the process logon session, not an action identity.
+                // Keep the first station alive so a second CREATE_ONLY must collide.
+                let second = create();
+                let second_error = second.as_ref().err().and_then(io::Error::raw_os_error);
                 // SAFETY: current is the original live process window-station handle.
                 let restore_ok = unsafe { SetProcessWindowStation(current) } != 0;
                 let restore_error = (!restore_ok).then(io::Error::last_os_error);
                 let restored =
                     restore_ok.then(|| user_object_identity(unsafe { GetProcessWindowStation() }));
                 let identity = user_object_identity(station.handle());
+                let second_close = second.ok().map(AuditWindowStation::close);
                 let close = station.close();
                 eprintln!(
-                    "unnamed station cleanup: restore_ok={restore_ok} restore_error={:?} close_error={:?}",
+                    "unnamed station cleanup: restore_ok={restore_ok} restore_error={:?} second_create_error={second_error:?} second_close={second_close:?} close_error={:?}",
                     restore_error.as_ref().and_then(io::Error::raw_os_error),
                     close.as_ref().err().and_then(io::Error::raw_os_error),
                 );
@@ -4178,10 +6424,19 @@ mod tests {
                 );
                 let identity = identity.expect("created identity");
                 assert!(close.is_ok(), "created station close failed: {close:?}");
-                if identity != before {
-                    panic!("fresh unnamed station supported; design review required: {identity:?}");
+                if let Some(second_close) = second_close {
+                    assert!(
+                        second_close.is_ok(),
+                        "second station close failed: {second_close:?}"
+                    );
+                    panic!("second unnamed CREATE_ONLY unexpectedly succeeded: {identity:?}");
                 }
-                eprintln!("unsupported unnamed station aliases current: {identity:?}");
+                assert_eq!(
+                    second_error,
+                    Some(183),
+                    "indeterminate second unnamed create: {identity:?}"
+                );
+                eprintln!("unnamed station is logon-bound, not action-private: {identity:?}");
             }
         }
     }
@@ -4320,6 +6575,9 @@ mod tests {
         let mut duplicate_env = SandboxProbeRecord::fixture();
         duplicate_env.environment = vec![("Path".into(), "a".into()), ("PATH".into(), "b".into())];
         assert!(duplicate_env.encode().is_err());
+        let mut invalid_env_name = SandboxProbeRecord::fixture();
+        invalid_env_name.environment = vec![("=C:".into(), "C:\\fixture".into())];
+        assert!(invalid_env_name.encode().is_err());
         let mut unsorted_sids = SandboxProbeRecord::fixture();
         unsorted_sids.groups = vec![
             ProbeSid {
@@ -4506,6 +6764,14 @@ mod tests {
         }
 
         fn collect(nonce: String) -> Result<Self, String> {
+            let mut record = Self::collect_process_security(nonce)?;
+            record.environment = normalized_environment()?;
+            Ok(record)
+        }
+
+        // Parent comparisons use security fields only, so they must not collect inherited
+        // environment entries such as cmd.exe's hidden drive variables.
+        fn collect_process_security(nonce: String) -> Result<Self, String> {
             validate_nonce(&nonce)?;
             let token = current_token(TOKEN_QUERY).map_err(|error| error.to_string())?;
             let handle = token.as_raw_handle() as HANDLE;
@@ -4537,7 +6803,7 @@ mod tests {
                 capabilities: token_sid_list(handle, TokenCapabilities)?,
                 integrity_rid: integrity_rid(handle).map_err(|error| error.to_string())?,
                 privileges: token_privileges(handle)?,
-                environment: normalized_environment()?,
+                environment: Vec::new(),
                 in_job: in_job != 0,
             };
             // The record is a canonical comparison surface, so Windows group duplication is
@@ -4555,9 +6821,6 @@ mod tests {
                 });
             }
             record.privileges.sort_unstable();
-            record
-                .environment
-                .sort_by_key(|(name, _)| name.to_ascii_lowercase());
             Ok(record)
         }
     }
@@ -4738,7 +7001,7 @@ mod tests {
             "status={status}"
         );
         let record = SandboxProbeRecord::decode(&std::fs::read(&path).unwrap(), &nonce).unwrap();
-        let expected = SandboxProbeRecord::collect(nonce.clone()).unwrap();
+        let expected = SandboxProbeRecord::collect_process_security(nonce.clone()).unwrap();
         assert_eq!(record.is_appcontainer, expected.is_appcontainer);
         assert_eq!(record.appcontainer_sid, expected.appcontainer_sid);
         assert_eq!(record.restricted_sids, expected.restricted_sids);
@@ -5153,6 +7416,260 @@ mod tests {
         assert!(a.only_change_notify_enabled().unwrap());
         assert!(integrity_rid(a.handle()).unwrap() <= 0x2000);
         set_medium_integrity(a.handle()).unwrap();
+    }
+
+    fn token_default_dacl_sids(token: HANDLE) -> io::Result<Vec<String>> {
+        let info = token_info(token, TokenDefaultDacl)?;
+        // SAFETY: TokenDefaultDacl は所有バッファ内の TOKEN_DEFAULT_DACL を返す。
+        let default_dacl = unsafe { &*(info.as_ptr().cast::<TOKEN_DEFAULT_DACL>()) };
+        if default_dacl.DefaultDacl.is_null() {
+            return Err(io::Error::other("トークンの既定 DACL がありません"));
+        }
+        let (_, aces) = acl_aces(default_dacl.DefaultDacl)?;
+        Ok(aces
+            .iter()
+            .filter_map(AceBlob::simple_allow)
+            .map(|(sid, _, _)| sid)
+            .collect())
+    }
+
+    #[test]
+    fn worker_actions_sid_is_shared_restricted_only_and_not_in_default_dacl() {
+        let worker_sid = Arc::new(WorkerActionsSid::random().unwrap());
+        let station_name = current_window_station_name().unwrap();
+        let source = current_token(
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ADJUST_DEFAULT | TOKEN_ASSIGN_PRIMARY,
+        )
+        .unwrap();
+        let a = ActionToken::create_from_token_with_station(
+            source.as_raw_handle() as HANDLE,
+            Arc::clone(&worker_sid),
+            station_name.clone(),
+            None,
+        )
+        .unwrap();
+        let b = ActionToken::create_from_token_with_station(
+            source.as_raw_handle() as HANDLE,
+            Arc::clone(&worker_sid),
+            station_name,
+            None,
+        )
+        .unwrap();
+        let shared_sid = sid_string(worker_sid.sid()).unwrap();
+        for token in [&a, &b] {
+            assert!(!token_groups_contain(token.handle(), TokenGroups, worker_sid.sid()).unwrap());
+            let restricted = token_sid_list(token.handle(), TokenRestrictedSids).unwrap();
+            assert!(restricted.iter().any(|entry| entry.sid == shared_sid));
+            assert!(
+                restricted
+                    .iter()
+                    .any(|entry| { entry.sid == sid_string(token.action_sid.0).unwrap() })
+            );
+            assert!(
+                !token_default_dacl_sids(token.handle())
+                    .unwrap()
+                    .contains(&shared_sid)
+            );
+            assert!(diagnostic_tcb_absent(token.handle()).unwrap());
+        }
+        // 共通 SID は共有し、各 action_sid は個別に生成する。
+        assert_eq!(unsafe { EqualSid(a.action_sid.0, b.action_sid.0) }, 0);
+    }
+
+    fn test_mutex_name() -> String {
+        format!(
+            "Local\\Sembazuru.Test.StationMutex.{}",
+            secure_random_hex().unwrap()
+        )
+    }
+
+    fn create_test_mutex(name: &str, sddl: &str) -> OwnedHandle {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        with_sddl_attributes(sddl, |attributes| {
+            // SAFETY: 一意なテスト名と記述子は呼出中に有効。返されたハンドルを所有する。
+            let raw = unsafe { CreateMutexExW(attributes, wide.as_ptr(), 0, STATION_MUTEX_ACCESS) };
+            if raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) })
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn station_mutex_rejects_precreated_wrong_owner_acl_and_rights() {
+        let broker = current_user_sid_string().unwrap();
+        for sddl in [
+            format!("O:{broker}D:P(A;;GA;;;{broker})"),
+            format!("O:{broker}D:P(A;;0x{STATION_MUTEX_ACCESS:08x};;;{broker})(A;;GA;;;WD)"),
+            format!("O:{broker}D:(A;;0x{STATION_MUTEX_ACCESS:08x};;;{broker})"),
+            format!("O:{broker}D:P(A;;0x00100000;;;{broker})"),
+        ] {
+            let name = test_mutex_name();
+            let fake = create_test_mutex(&name, &sddl);
+            // 占有された偽オブジェクトも、待機に入る前に拒否する。
+            assert_eq!(
+                unsafe { WaitForSingleObject(fake.as_raw_handle() as HANDLE, 0) },
+                WAIT_OBJECT_0
+            );
+            let rejected = std::thread::spawn(move || {
+                StationUpdateMutex::open(&name, &broker_for_test()).is_err()
+            });
+            assert!(rejected.join().unwrap());
+            assert_ne!(unsafe { ReleaseMutex(fake.as_raw_handle() as HANDLE) }, 0);
+        }
+        let name = test_mutex_name();
+        let mutex = StationUpdateMutex::open(&name, &broker).unwrap();
+        // 同じ DACL でも、期待する所有者が異なれば採用しない。
+        assert!(mutex.validate("S-1-5-18").is_err());
+    }
+
+    fn broker_for_test() -> String {
+        current_user_sid_string().unwrap()
+    }
+
+    #[test]
+    fn station_mutex_adopts_existing_holds_name_and_bounds_wait() {
+        let broker = current_user_sid_string().unwrap();
+        let name = test_mutex_name();
+        let original = StationUpdateMutex::open(&name, &broker).unwrap();
+        drop(original.lock().unwrap());
+        let adopted = StationUpdateMutex::open(&name, &broker).unwrap();
+        drop(original);
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let raw = unsafe {
+            windows_sys::Win32::System::Threading::OpenMutexW(
+                STATION_MUTEX_ACCESS,
+                0,
+                wide.as_ptr(),
+            )
+        };
+        assert!(!raw.is_null(), "更新間も名前を保持する");
+        drop(unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) });
+        let held = adopted.lock().unwrap();
+        let contender = std::thread::spawn(move || {
+            let other = StationUpdateMutex::open(&name, &broker).unwrap();
+            assert!(
+                matches!(other.lock_for(20), Err(error) if error.kind() == io::ErrorKind::TimedOut)
+            );
+            other
+        })
+        .join()
+        .unwrap();
+        drop(held);
+        drop(contender.lock().unwrap());
+    }
+
+    #[test]
+    fn station_lease_concurrent_updates_preserve_foreign_aces_and_mutex() {
+        let token = ActionToken::create().unwrap();
+        let desktop = ActionDesktop::create(&token).unwrap();
+        // テスト所有の desktop も SE_WINDOW_OBJECT。製品と同じ ACL API を使い、
+        // 現在の station / WinSta0 の DACL は読み書きしない。
+        let object = desktop._desktop.0 as usize;
+        let before = station_dacl(object as HWINSTA).unwrap();
+        let name = secure_random_hex().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut threads = Vec::new();
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let name = name.clone();
+            let ready = ready_tx.clone();
+            let (release, released) = std::sync::mpsc::channel();
+            releases.push(release);
+            threads.push(std::thread::spawn(move || {
+                let mut lease = ActionStationLease {
+                    station: object as HWINSTA,
+                    station_name: name,
+                    worker_actions_sid: Arc::new(WorkerActionsSid::random().unwrap()),
+                    active_marker: None,
+                    update_mutex: None,
+                };
+                ready
+                    .send(lease.install_station_acl(&broker_for_test()))
+                    .unwrap();
+                released
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(lease);
+            }));
+        }
+        for _ in 0..2 {
+            ready_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        }
+        let during = station_dacl(object as HWINSTA).unwrap();
+        assert_eq!(during.2.len(), before.2.len() + 2);
+        assert_eq!(&during.2[..before.2.len()], before.2.as_slice());
+        let mutex_name = format!("Local\\Sembazuru.WindowStationUpdate.{name}");
+        let keeper = StationUpdateMutex::open(&mutex_name, &broker_for_test()).unwrap();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(station_dacl(object as HWINSTA).unwrap(), before);
+        drop(keeper.lock().unwrap());
+    }
+
+    #[test]
+    fn station_acl_add_remove_and_stale_cleanup_preserve_other_aces() {
+        let broker_sid = current_user_sid_string().unwrap();
+        let descriptor =
+            security_descriptor(&format!("D:P(A;;GA;;;{broker_sid})(A;;GR;;;WD)")).unwrap();
+        let (mut present, mut dacl, mut defaulted) = (0, null_mut(), 0);
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted)
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        let (revision, before) = acl_aces(dacl).unwrap();
+        let worker_a = WorkerActionsSid::random().unwrap();
+        let worker_b = WorkerActionsSid::random().unwrap();
+        let with_a = rewrite_station_aces(&before, Some(worker_a.sid()), None, &[]).unwrap();
+        let with_a_and_b = rewrite_station_aces(&with_a, Some(worker_b.sid()), None, &[]).unwrap();
+        assert_eq!(with_a_and_b.len(), before.len() + 2);
+        assert_eq!(&with_a_and_b[..before.len()], before.as_slice());
+        assert_eq!(
+            with_a_and_b[before.len()].simple_allow(),
+            Some((sid_string(worker_a.sid()).unwrap(), 0, 0x0002))
+        );
+        assert_eq!(
+            with_a_and_b[before.len() + 1].simple_allow(),
+            Some((sid_string(worker_b.sid()).unwrap(), 0, 0x0002))
+        );
+
+        let stale = vec![sid_string(worker_a.sid()).unwrap()];
+        let after_stale_cleanup = rewrite_station_aces(&with_a_and_b, None, None, &stale).unwrap();
+        assert_eq!(after_stale_cleanup.len(), before.len() + 1);
+        assert_eq!(&after_stale_cleanup[..before.len()], before.as_slice());
+        assert_eq!(
+            after_stale_cleanup.last().unwrap().simple_allow(),
+            Some((sid_string(worker_b.sid()).unwrap(), 0, 0x0002))
+        );
+
+        let after_a_release =
+            rewrite_station_aces(&with_a_and_b, None, Some(worker_a.sid()), &[]).unwrap();
+        assert_eq!(after_a_release.len(), before.len() + 1);
+        assert_eq!(&after_a_release[..before.len()], before.as_slice());
+        let stale_worker_b = sid_string(worker_b.sid()).unwrap();
+        let after_a_release_with_stale_candidate = rewrite_station_aces(
+            &with_a_and_b,
+            None,
+            Some(worker_a.sid()),
+            std::slice::from_ref(&stale_worker_b),
+        )
+        .unwrap();
+        assert_eq!(after_a_release_with_stale_candidate, after_a_release);
+        let after_b_release =
+            rewrite_station_aces(&after_a_release, None, Some(worker_b.sid()), &[]).unwrap();
+        assert_eq!(after_b_release, before);
+        assert_ne!(revision, 0);
     }
 
     #[test]
@@ -5834,6 +8351,205 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    #[ignore]
+    fn restricted_process_detached_stdio_probe() {
+        if std::env::var_os("SBZ_TREE_CHILD").is_some() {
+            std::fs::write("descendant-ready.tmp", std::process::id().to_string()).unwrap();
+            std::fs::rename("descendant-ready.tmp", "descendant-ready").unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            return;
+        }
+        // 子孫は標準入出力を引き継がず、親の終了後も Job 内に残る。
+        for kind in [
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+        ] {
+            let handle = unsafe { windows_sys::Win32::System::Console::GetStdHandle(kind) };
+            assert_ne!(
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) },
+                0
+            );
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "sandbox::tests::restricted_process_detached_stdio_probe",
+            ])
+            .env("SBZ_TREE_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while !Path::new("release-parent").exists() {
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("親の解放指示がない");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Job の所有者が残存子孫を回収するまで、ここでは待たない。
+        drop(child);
+    }
+
+    async fn detached_stdio_tree() -> (
+        RestrictedProcess,
+        Arc<JobObject>,
+        std::sync::Weak<ActionStationLease>,
+        OwnedHandle,
+        PrivateScratch,
+        PathBuf,
+    ) {
+        let lease = Arc::new(ActionStationLease::acquire().unwrap());
+        let weak = Arc::downgrade(&lease);
+        let token = ActionToken::create_for_worker(lease).unwrap();
+        let root = private_scratch_root();
+        let scratch = PrivateScratch::create(&root, "detached-stdio", &token).unwrap();
+        let probe = scratch.path().join("tree-probe.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+        let command = RestrictedCommand::new(probe, scratch.path())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("sandbox::tests::restricted_process_detached_stdio_probe")
+            .env("SystemRoot", std::env::var_os("SystemRoot").unwrap());
+        let process = RestrictedProcess::spawn(&token, &command).unwrap();
+        drop(token);
+        let job = process.job();
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(scratch.path().join("descendant-ready"))
+                    && let Ok(pid) = text.parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("子孫の準備期限");
+        let raw = unsafe {
+            OpenProcess(
+                PROCESS_SYNCHRONIZE
+                    | windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            )
+        };
+        assert!(!raw.is_null());
+        let descendant = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
+        assert!(job.contains(descendant.as_raw_handle()).unwrap());
+        assert_eq!(job.active_processes().unwrap(), 2);
+        assert!(weak.upgrade().is_some());
+        (process, job, weak, descendant, scratch, root)
+    }
+
+    #[tokio::test]
+    async fn restricted_process_normal_exit_reaps_descendant_after_stdio_eof() {
+        use tokio::io::AsyncReadExt;
+        let (mut process, job, weak, descendant, scratch, root) = detached_stdio_tree().await;
+        let (mut stdout, mut stderr) = process.take_output().unwrap();
+        std::fs::write(scratch.path().join("release-parent"), b"go").unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        // EOF と直下プロセス終了が揃っても、子孫はまだ実行中で lease も生存する。
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+            WAIT_TIMEOUT
+        );
+        assert!(job.active_processes().unwrap() >= 1);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(process.wait().await.unwrap(), 0);
+        assert_eq!(job.active_processes().unwrap(), 0);
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+            WAIT_OBJECT_0
+        );
+        assert!(weak.upgrade().is_some());
+        drop(process);
+        assert!(weak.upgrade().is_none());
+        drop(scratch);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_process_cancel_and_drop_reap_before_last_lease() {
+        for explicit_abort in [true, false] {
+            let (mut process, job, weak, descendant, scratch, root) = detached_stdio_tree().await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), process.wait())
+                    .await
+                    .is_err()
+            );
+            assert!(weak.upgrade().is_some());
+            if explicit_abort {
+                // aborts マップと同じ Job の共有参照から終了を要求する。
+                job.terminate();
+                assert_ne!(process.wait().await.unwrap(), 0);
+            }
+            drop(process);
+            assert_eq!(job.active_processes().unwrap(), 0);
+            assert_eq!(
+                unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+                WAIT_OBJECT_0
+            );
+            assert!(weak.upgrade().is_none());
+            drop(scratch);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn restricted_process_runtime_shutdown_reaps_before_last_lease() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (process, job, weak, descendant, scratch, root) =
+            runtime.block_on(detached_stdio_tree());
+        runtime.spawn(async move {
+            let mut process = process;
+            let _ = process.wait().await;
+        });
+        // worker 停止時と同じ runtime の破棄で、所有する future の Drop を通す。
+        drop(runtime);
+        assert_eq!(job.active_processes().unwrap(), 0);
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw_handle() as HANDLE, 0) },
+            WAIT_OBJECT_0
+        );
+        assert!(weak.upgrade().is_none());
+        drop(scratch);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_process_cleanup_failure_keeps_desktop_and_station_lease() {
+        use windows_sys::Win32::System::SystemServices::{JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE};
+        for access in [JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE] {
+            let (mut process, job, weak, _descendant, scratch, root) = detached_stdio_tree().await;
+            // 実ハンドルの権限を絞り、終了要求失敗と照会失敗をそれぞれ発生させる。
+            process.job = Arc::new(job.duplicate_with_access_for_test(access));
+            let desktop = process.desktop.as_ref().unwrap()._desktop.0;
+            process.terminate();
+            assert!(process.wait().await.is_err());
+            assert!(!process.tree_finished);
+            drop(process);
+            assert!(weak.upgrade().is_some());
+            assert!(user_object_name(desktop as HANDLE).is_ok());
+            // テスト側の正規ハンドルで子孫を回収する。保持された隔離資源はテスト終了時に OS が回収する。
+            job.terminate_and_wait().unwrap();
+            drop(scratch);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn restricted_process_terminate_can_be_reaped() {
         let token = ActionToken::create().unwrap();
@@ -5977,7 +8693,8 @@ mod tests {
                     &token,
                     &command,
                     Some(failure),
-                    TestJobProfile::Production,
+                    TestCreationProfile::Production,
+                    None,
                     &[]
                 )
                 .is_err()

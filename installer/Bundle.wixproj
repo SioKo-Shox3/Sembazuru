@@ -1,0 +1,56 @@
+<Project Sdk="WixToolset.Sdk/5.0.2">
+
+  <PropertyGroup>
+    <OutputName>Sembazuru-Setup</OutputName>
+    <OutputType>Bundle</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU'">x64</Platform>
+
+    <SbzVersion Condition="'$(SbzVersion)' == ''">0.0.3</SbzVersion>
+    <SbzMsi Condition="'$(SbzMsi)' == ''">$(MSBuildProjectDirectory)\bin\x64\Release\Sembazuru.msi</SbzMsi>
+    <SbzRedistRoot Condition="'$(SbzRedistRoot)' == ''">$(MSBuildProjectDirectory)\..\target\installer\redist</SbzRedistRoot>
+    <SbzRedistProps Condition="'$(SbzRedistProps)' == ''">$(SbzRedistRoot)\Sembazuru.Redist.props</SbzRedistProps>
+    <SbzMsiIsRooted>$([System.IO.Path]::IsPathRooted('$(SbzMsi)'))</SbzMsiIsRooted>
+    <SbzMsiFullPath Condition="'$(SbzMsiIsRooted)' == 'True'">$(SbzMsi)</SbzMsiFullPath>
+    <SbzMsiFullPath Condition="'$(SbzMsiIsRooted)' != 'True'">$(MSBuildProjectDirectory)\..\$(SbzMsi)</SbzMsiFullPath>
+  </PropertyGroup>
+
+  <!-- prepare_redist.ps1 writes the verified paths and four-part versions here. -->
+  <Import Project="$(SbzRedistProps)" Condition="Exists('$(SbzRedistProps)')" />
+
+  <PropertyGroup>
+    <DefineConstants>ProductVersion=$(SbzVersion);MsiSource=$(SbzMsiFullPath);VCRedistX64=$(SbzVCRedistX64);VCRedistX86=$(SbzVCRedistX86);VCRedistX64Version=$(SbzVCRedistX64Version);VCRedistX86Version=$(SbzVCRedistX86Version)</DefineConstants>
+    <SbzSignScript>$(MSBuildProjectDirectory)\sign_release.ps1</SbzSignScript>
+  </PropertyGroup>
+
+  <Target Name="ValidateRedistInputs" BeforeTargets="CoreCompile">
+    <Error Condition="!Exists('$(SbzRedistProps)')"
+           Text="Missing verified VC++ inputs. Run installer/prepare_redist.ps1 first: $(SbzRedistProps)" />
+    <Error Condition="'$(SbzVCRedistX64)' == '' Or !Exists('$(SbzVCRedistX64)')"
+           Text="Missing verified x64 VC++ redistributable: $(SbzVCRedistX64)" />
+    <Error Condition="'$(SbzVCRedistX86)' == '' Or !Exists('$(SbzVCRedistX86)')"
+           Text="Missing verified x86 VC++ redistributable: $(SbzVCRedistX86)" />
+    <Error Condition="'$(SbzVCRedistX64Version)' == '' Or '$(SbzVCRedistX86Version)' == ''"
+           Text="Missing verified VC++ product versions. Run installer/prepare_redist.ps1 first." />
+  </Target>
+
+  <ItemGroup>
+    <!-- Compile only the Burn source; sembazuru.wxs belongs to Package.wixproj. -->
+    <Compile Remove="**/*.wxs" />
+    <Compile Include="bundle.wxs" />
+    <PackageReference Include="WixToolset.Bal.wixext" Version="5.0.2" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="5.0.2" />
+  </ItemGroup>
+
+  <!-- WiX's standard signing pipeline detaches the Burn engine, signs it, then
+       reattaches it before signing the outer bundle. The release workflow sets
+       SignOutput=true and supplies the signing values only through the process env. -->
+  <Target Name="SignBundleEngine">
+    <Exec Command="pwsh -NoProfile -Command &quot;&amp; '$(SbzSignScript)' -Files '%(SignBundleEngine.Identity)' -PfxBase64 $env:SBZ_SIGNING_PFX_BASE64 -Password $env:SBZ_SIGNING_PASSWORD -TimestampServer $env:SBZ_TIMESTAMP_URL&quot;" />
+  </Target>
+
+  <Target Name="SignBundle">
+    <Exec Command="pwsh -NoProfile -Command &quot;&amp; '$(SbzSignScript)' -Files '%(SignBundle.Identity)' -PfxBase64 $env:SBZ_SIGNING_PFX_BASE64 -Password $env:SBZ_SIGNING_PASSWORD -TimestampServer $env:SBZ_TIMESTAMP_URL&quot;" />
+  </Target>
+
+</Project>
