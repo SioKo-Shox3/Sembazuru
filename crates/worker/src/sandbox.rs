@@ -7457,6 +7457,7 @@ privileges={privileges:?}{restricted}",
         .unwrap();
         let shared_sid = sid_string(worker_sid.sid()).unwrap();
         for token in [&a, &b] {
+            assert!(!token_groups_contain(token.handle(), TokenGroups, worker_sid.sid()).unwrap());
             let restricted = token_sid_list(token.handle(), TokenRestrictedSids).unwrap();
             assert!(restricted.iter().any(|entry| entry.sid == shared_sid));
             assert!(
