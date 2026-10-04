@@ -2441,6 +2441,7 @@ mod tests {
         record_directory: PathBuf,
         nonce: String,
         station_profile: StationAccessProfile,
+        init_probe_sha256: Option<String>,
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
@@ -2537,7 +2538,7 @@ mod tests {
 
     fn validate_window_station_scm_process_argv(
         argv: &[OsString],
-    ) -> Result<StationAccessProfile, &'static str> {
+    ) -> Result<Session0DiagnosticConfig, &'static str> {
         let expected = [
             "--ignored",
             "--exact",
@@ -2545,7 +2546,7 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ];
-        if argv.len() != expected.len() + 6 {
+        if argv.len() != 11 && argv.len() != 12 {
             return Err("process argv cardinality");
         }
         if Path::new(&argv[0]).file_name() != Some(OsStr::new(WINDOW_STATION_SCM_SMOKE_BASENAME)) {
@@ -2572,11 +2573,59 @@ mod tests {
             return Err("process diagnostic paths");
         }
         validate_nonce(&nonce).map_err(|_| "process diagnostic nonce")?;
-        match argv[expected.len() + 5].to_str() {
-            Some("0x0002") => Ok(StationAccessProfile::ReadAttributes),
-            Some("0x0022") => Ok(StationAccessProfile::ReadAttributesAndGlobalAtoms),
-            _ => Err("診断の station mask の表記が一致しません"),
-        }
+        let station_profile = match argv[10].to_str() {
+            Some("0x0002") => StationAccessProfile::ReadAttributes,
+            Some("0x0022") => StationAccessProfile::ReadAttributesAndGlobalAtoms,
+            _ => return Err("診断の station mask の表記が一致しません"),
+        };
+        let init_probe_sha256 = if let Some(value) = argv.get(11) {
+            let hash = value
+                .to_str()
+                .ok_or("診断 EXE の hash は UTF-8 が必要です")?;
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("診断 EXE の hash は小文字16進64桁が必要です");
+            }
+            let root = fixture_root
+                .to_str()
+                .ok_or("診断 root は UTF-8 が必要です")?;
+            if !session0_local_fixture_root(root)
+                || argv[8] != argv[7]
+                || argv[0]
+                    != fixture_root
+                        .join(WINDOW_STATION_SCM_SMOKE_BASENAME)
+                        .as_os_str()
+            {
+                return Err("追加診断の固定配置が一致しません");
+            }
+            Some(hash.to_owned())
+        } else {
+            None
+        };
+        Ok(Session0DiagnosticConfig {
+            fixture_root,
+            record_directory,
+            nonce,
+            station_profile,
+            init_probe_sha256,
+        })
+    }
+
+    fn session0_local_fixture_root(root: &str) -> bool {
+        let bytes = root.as_bytes();
+        bytes.len() > 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1..3] == *b":\\"
+            && root[3..].split('\\').all(|part| {
+                !part.is_empty()
+                    && !part.ends_with(['.', ' '])
+                    && !part
+                        .chars()
+                        .any(|ch| ch.is_control() || "\"<>|?*:/".contains(ch))
+            })
     }
 
     fn validate_window_station_scm_main_args(args: &[OsString]) -> Result<(), &'static str> {
@@ -2641,6 +2690,67 @@ mod tests {
             argv[index] = value.into();
             cases.push((argv, false));
         }
+        let mut extended = valid.clone();
+        extended[0] = "C:\\fixture\\SbzWindowStationScmSmoke.exe".into();
+        extended[8] = extended[7].clone();
+        extended.push("abcdef0123456789".repeat(4).into());
+        cases.push((extended.clone(), true));
+        let mut atoms = extended.clone();
+        atoms[10] = "0x0022".into();
+        cases.push((atoms, true));
+        for hash in [
+            "",
+            "0",
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &"G".repeat(64),
+            &"A".repeat(64),
+            "C:\\other.exe",
+            &format!("{} ", "a".repeat(64)),
+        ] {
+            let mut argv = extended.clone();
+            argv[11] = hash.into();
+            cases.push((argv, false));
+        }
+        for (index, value) in [
+            (0, "C:\\other\\SbzWindowStationScmSmoke.exe"),
+            (0, WINDOW_STATION_SCM_SMOKE_BASENAME),
+            (7, "C:\\fixture\\..\\other"),
+            (7, "C:\\fixture\\"),
+            (7, "C:\\fixture."),
+            (7, "C:\\fixture\""),
+            (7, "\\\\server\\share"),
+            (7, "C:/fixture"),
+            (7, "C:\\fixture:stream"),
+            (8, "C:\\record"),
+        ] {
+            let mut argv = extended.clone();
+            argv[index] = value.into();
+            cases.push((argv, false));
+        }
+        for root in [
+            "C:\\fixture\\..\\other",
+            "C:\\fixture\\",
+            "C:\\fixture.",
+            "C:\\fixture\"",
+            "\\\\server\\share",
+            "C:/fixture",
+            "C:\\fixture:stream",
+            "C:\\fixture\u{85}",
+            "C:\\fixture\u{7f}",
+        ] {
+            let mut argv = extended.clone();
+            argv[0] = format!("{root}\\{WINDOW_STATION_SCM_SMOKE_BASENAME}").into();
+            argv[7] = root.into();
+            argv[8] = root.into();
+            cases.push((argv, false));
+        }
+        for directory in ["C:\\fixture\\", "C:\\fixture\\.", "C:\\fixture\\\\"] {
+            let mut argv = extended.clone();
+            argv[8] = directory.into();
+            cases.push((argv, false));
+        }
+        cases.push(([extended, vec!["C:\\other.exe".into()]].concat(), false));
         cases
     }
 
@@ -2667,6 +2777,19 @@ mod tests {
         .map(OsString::from)
         .collect();
         assert!(validate_window_station_scm_process_argv(&valid_process).is_ok());
+        for (argv, accepted) in session0_argv_corpus() {
+            let parsed = validate_window_station_scm_process_argv(&argv);
+            assert_eq!(parsed.is_ok(), accepted, "{argv:?}");
+            if let Ok(config) = parsed {
+                assert_eq!(
+                    config.init_probe_sha256.as_deref(),
+                    argv.get(11).and_then(|v| v.to_str())
+                );
+                assert_eq!(config.nonce, argv[9].to_str().unwrap());
+                assert_eq!(config.fixture_root, PathBuf::from(&argv[7]));
+                assert_eq!(config.record_directory, PathBuf::from(&argv[8]));
+            }
+        }
         assert!(
             validate_window_station_scm_main_args(&[OsString::from(
                 WINDOW_STATION_SCM_SMOKE_SERVICE
@@ -3604,7 +3727,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -3715,6 +3838,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 assert_eq!(
                     validate_window_station_scm_process_argv(argv)
                         .unwrap()
+                        .station_profile
                         .mask(),
                     if argv[10] == "0x0002" { 0x0002 } else { 0x0022 }
                 );
@@ -4973,17 +5097,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
     #[ignore]
     fn window_station_scm_dispatcher_smoke_role() {
         let argv: Vec<_> = std::env::args_os().collect();
-        let station_profile =
-            validate_window_station_scm_process_argv(&argv).expect("SCM 診断の引数契約");
-        let config = Session0DiagnosticConfig {
-            station_profile,
-            fixture_root: PathBuf::from(&argv[7]),
-            record_directory: PathBuf::from(&argv[8]),
-            nonce: argv[9]
-                .to_str()
-                .expect("SCM 診断の nonce は UTF-8")
-                .to_owned(),
-        };
+        let config = validate_window_station_scm_process_argv(&argv).expect("SCM 診断の引数契約");
         SESSION0_DIAGNOSTIC_CONFIG
             .set(config)
             .expect("SCM 診断の設定は一度だけ設定する");

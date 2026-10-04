@@ -1,7 +1,9 @@
 param(
     [string]$ArtifactPath,
     [string]$ExpectedSha256,
-    [string]$StationMask = '0x0002'
+    [string]$StationMask = '0x0002',
+    [string]$InitProbePath,
+    [string]$InitProbeSha256
 )
 
 function ConvertFrom-Session0StationMask([string]$Value) {
@@ -13,7 +15,7 @@ function ConvertFrom-Session0StationMask([string]$Value) {
 }
 
 function Assert-Session0FixtureArguments([string[]]$Arguments) {
-    if ($Arguments.Count -ne 11) { throw 'SCM 診断の引数数が一致しません。' }
+    if ($Arguments.Count -ne 11 -and $Arguments.Count -ne 12) { throw 'SCM 診断の引数数が一致しません。' }
     $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
         '--nocapture', '--test-threads=1', '--')
     if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
@@ -28,6 +30,17 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
         throw 'SCM 診断のパスまたは nonce が不正です。'
     }
     $null = ConvertFrom-Session0StationMask $Arguments[10]
+    if ($Arguments.Count -eq 12) {
+        Assert-Session0InitProbeHash $Arguments[11]
+        $root = $Arguments[7]
+        if ($root -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+            @($root.Substring(3).Split('\') | Where-Object {
+                $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+            }).Count -ne 0 -or $Arguments[8] -cne $root -or
+            $Arguments[0] -cne ($root + '\SbzWindowStationScmSmoke.exe')) {
+            throw '追加診断の固定配置が一致しません。'
+        }
+    }
 }
 
 $requestedStationMask = ConvertFrom-Session0StationMask $StationMask
@@ -53,7 +66,7 @@ Set-StrictMode -Version Latest
 if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
     throw 'Elevated direct -File execution is forbidden; use the verified in-memory bootstrap.'
 }
-if ($args.Count -ne 0) { throw '指定できる引数は ArtifactPath、ExpectedSha256、StationMask だけです。' }
+if ($args.Count -ne 0) { throw '指定できる引数は ArtifactPath、ExpectedSha256、StationMask、InitProbePath、InitProbeSha256 だけです。' }
 if ([string]::IsNullOrWhiteSpace($ArtifactPath) -or
     [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
     throw 'ArtifactPath and ExpectedSha256 are required after elevation.'
@@ -62,6 +75,9 @@ if ($ExpectedSha256 -notmatch '\A[0-9a-fA-F]{64}\z') {
     throw 'ExpectedSha256 must be exactly 64 hexadecimal characters.'
 }
 $ExpectedSha256 = $ExpectedSha256.ToLowerInvariant()
+if ([string]::IsNullOrEmpty($InitProbePath) -ne [string]::IsNullOrEmpty($InitProbeSha256)) {
+    throw '追加診断 EXE のパスと SHA-256 は組で指定してください。'
+}
 
 $serviceName = 'SembazuruWindowStationProbeSmoke'
 $workerServiceName = 'SembazuruWorker'
@@ -90,6 +106,7 @@ $leaseIdentity = $null
 $cleanupHandle = $null
 $targetStream = $null
 $sourceStream = $null
+$initProbe = @{ Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $serviceHandle = [IntPtr]::Zero
 $ownedRoot = $false
 $ownedService = $false
@@ -1007,6 +1024,129 @@ function Get-StreamSha256([IO.Stream]$Stream) {
     finally { $sha.Dispose() }
 }
 
+function Assert-Session0InitProbeHash([string]$Hash) {
+    if ($Hash -cnotmatch '\A[0-9a-f]{64}\z') {
+        throw '追加診断 EXE の SHA-256 は小文字16進64桁が必要です。'
+    }
+}
+
+function Assert-Session0InitProbeSecurity($Identity, [string]$ServiceSid) {
+    if ([string]::IsNullOrEmpty($ServiceSid)) { Assert-ExactFileSecurity $Identity; return }
+    if (-not $Identity.DaclPresent -or -not $Identity.DaclNonNull) {
+        throw '追加診断 EXE の DACL がありません。'
+    }
+    $descriptor = Get-RawDescriptor $Identity.SecuritySddl
+    $aces = @($descriptor.DiscretionaryAcl)
+    if ($descriptor.Owner.Value -ne 'S-1-5-18' -or $aces.Count -ne 3 -or
+        ($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0) {
+        throw '追加診断 EXE の所有者・保護 DACL・ACE 数が一致しません。'
+    }
+    foreach ($entry in @(@('S-1-5-18', [uint32]0x001f01ff),
+        @('S-1-5-32-544', [uint32]0x001f01ff), @($ServiceSid, [uint32]0x001200a9))) {
+        $matching = @($aces | Where-Object {
+            $_ -is [Security.AccessControl.CommonAce] -and
+            $_.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+            $_.SecurityIdentifier.Value -eq $entry[0] -and
+            (Convert-AccessMaskToUInt32 $_.AccessMask) -eq $entry[1] -and
+            $_.AceFlags -eq [Security.AccessControl.AceFlags]::None
+        })
+        if ($matching.Count -ne 1) { throw '追加診断 EXE の許可権限が一致しません。' }
+    }
+}
+
+function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]$Hash) {
+    Assert-Session0InitProbeHash $Hash
+    Assert-LocalAbsolutePath $Path '追加診断の source'
+    $canonical = [IO.Path]::GetFullPath($Path)
+    if ([IO.Path]::GetFileName($canonical) -cne 'session0_init_probe.exe') {
+        throw '追加診断 EXE の source 名が一致しません。'
+    }
+    $State.Hash = $Hash
+    $State.Source = [IO.FileStream]::new(
+        $canonical, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
+    )
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
+        $State.Source.SafeFileHandle.DangerousGetHandle()
+    )
+    Assert-RegularIdentity $identity $canonical '追加診断の source'
+    if ((Get-StreamSha256 $State.Source) -cne $Hash) { throw '追加診断 source の SHA-256 が一致しません。' }
+    $State.Source.Position = 0
+}
+
+function Copy-Session0InitProbe([hashtable]$State, [string]$Root) {
+    $State.Path = Join-Path $Root 'SbzSession0InitProbe.exe'
+    $State.Target = [Sembazuru.WindowStationProbeNative]::CreateProtectedFile(
+        $State.Path, 'O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+    )
+    $State.Identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Target.Handle)
+    Assert-RegularIdentity $State.Identity $State.Path '追加診断の target'
+    Assert-Session0InitProbeSecurity $State.Identity ''
+    $stream = [IO.FileStream]::new(
+        [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($State.Target.Handle, $false),
+        [IO.FileAccess]::ReadWrite
+    )
+    try {
+        $State.Source.CopyTo($stream)
+        $stream.Flush($true)
+        $stream.Position = 0
+        if ((Get-StreamSha256 $stream) -cne $State.Hash) { throw '追加診断 target の SHA-256 が一致しません。' }
+    }
+    finally { $stream.Dispose() }
+    $State.Lease = [Sembazuru.WindowStationProbeNative]::OpenLease($State.Path)
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Lease.Handle)
+    Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の lease'
+    $State.Target.Dispose()
+    $State.Target = $null
+    # 書込みハンドルを閉じた後も、実体と hash を再照合した読取りハンドルで変更・削除を拒む。
+    $State.ReadHold = [IO.FileStream]::new(
+        $State.Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
+    )
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
+        $State.ReadHold.SafeFileHandle.DangerousGetHandle()
+    )
+    Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の read hold'
+    if ((Get-StreamSha256 $State.ReadHold) -cne $State.Hash) { throw '追加診断の保持中 hash が一致しません。' }
+}
+
+function Grant-Session0InitProbeRead([hashtable]$State, [string]$ServiceSid) {
+    $mutation = [Sembazuru.WindowStationProbeNative]::OpenAclMutation($State.Path, $false)
+    try {
+        $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($mutation.Handle)
+        Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の ACL 更新'
+        [Sembazuru.WindowStationProbeNative]::SetProtectedDacl($mutation.Handle,
+            ('O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x001200a9;;;{0})' -f $ServiceSid))
+    }
+    finally { $mutation.Dispose() }
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Lease.Handle)
+    Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の service lease' -AllowSecuritySddlChange
+    Assert-Session0InitProbeSecurity $identity $ServiceSid
+    $State.ServiceSid = $ServiceSid
+}
+
+function Remove-Session0InitProbe([hashtable]$State) {
+    # 呼出元がサービスの停止と不在を確認してから、保持中の実体だけを削除する。
+    if ($null -ne $State.ReadHold) { $State.ReadHold.Dispose(); $State.ReadHold = $null }
+    if ($null -ne $State.Target) {
+        [Sembazuru.WindowStationProbeNative]::MarkDelete($State.Target.Handle)
+        $State.Target.Dispose()
+        $State.Target = $null
+    }
+    elseif ($null -ne $State.Lease) {
+        $held = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Lease.Handle)
+        Assert-EquivalentFileIdentity $State.Identity $held $State.Path '追加診断の削除 lease' -AllowSecuritySddlChange
+        Assert-Session0InitProbeSecurity $held $State.ServiceSid
+        $cleanup = [Sembazuru.WindowStationProbeNative]::OpenCleanupDelete($State.Path)
+        try {
+            $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($cleanup.Handle)
+            Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の削除 target' -AllowSecuritySddlChange
+            Assert-Session0InitProbeSecurity $identity $State.ServiceSid
+            [Sembazuru.WindowStationProbeNative]::MarkDelete($cleanup.Handle)
+        }
+        finally { $cleanup.Dispose() }
+    }
+    if ($null -ne $State.Lease) { $State.Lease.Dispose(); $State.Lease = $null }
+}
+
 function Read-Session0InitProbeOutput([byte[]]$Stdout, [byte[]]$Stderr, [Nullable[uint32]]$ChildExit) {
     if ($Stdout.Length -gt 1024 -or $Stderr.Length -gt 1024 -or $Stderr.Length -ne 0) {
         throw '到達点診断の出力上限または stderr が不正です。'
@@ -1325,6 +1465,7 @@ try {
     $sourceHash = Get-StreamSha256 $sourceStream
     if ($sourceHash -ne $ExpectedSha256) { throw 'artifact SHA-256 mismatch' }
     $sourceStream.Position = 0
+    if ($InitProbePath) { Open-Session0InitProbeSource $initProbe $InitProbePath $InitProbeSha256 }
 
     $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
     if ([string]::IsNullOrWhiteSpace($programFiles)) { throw 'Program Files known folder is empty.' }
@@ -1365,6 +1506,7 @@ try {
         $targetHandle = [Sembazuru.WindowStationProbeNative]::CreateProtectedFile(
             $fixtureExe, 'O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
         )
+        if ($InitProbePath) { Copy-Session0InitProbe $initProbe $root }
     }
     finally { $restore.Dispose() }
 
@@ -1404,11 +1546,14 @@ try {
     $sourceStream = $null
 
     $diagnosticRecordPath = Join-Path $root ($diagnosticNonce + '.session0.rec')
-    Assert-Session0FixtureArguments @($fixtureExe, '--ignored', '--exact', $selector,
+    $fixtureArguments = @($fixtureExe, '--ignored', '--exact', $selector,
         '--nocapture', '--test-threads=1', '--', $root, $root, $diagnosticNonce, $StationMask)
+    if ($InitProbePath) { $fixtureArguments += $initProbe.Hash }
+    Assert-Session0FixtureArguments $fixtureArguments
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
         $diagnosticNonce + ' ' + $StationMask
+    if ($InitProbePath) { $imagePath += ' ' + $initProbe.Hash }
     $serviceAccount = 'NT SERVICE\' + $serviceName
     $serviceHandle = [Sembazuru.WindowStationProbeNative]::CreateProbeService(
         $serviceName, $imagePath, $serviceAccount
@@ -1420,8 +1565,8 @@ try {
     }
     $serviceSid = [Sembazuru.WindowStationProbeNative]::ServiceAccountSid($serviceName)
     if ([string]::IsNullOrWhiteSpace($serviceSid)) { throw 'throwaway service SID is unavailable.' }
-    # The long-lived identity handles intentionally lack WRITE_DAC. Mutate only through
-    # short-lived handles opened with that exact right after final-path/file-ID verification.
+    # 長期保持ハンドルには WRITE_DAC を付けず、最終 path と file ID を照合した
+    # 短命のハンドルだけで DACL を更新する。
     $rootAclHandle = [Sembazuru.WindowStationProbeNative]::OpenAclMutation($root, $true)
     try {
         $rootAclIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
@@ -1448,6 +1593,7 @@ try {
         )
     }
     finally { $targetAclHandle.Dispose() }
+    if ($InitProbePath) { Grant-Session0InitProbeRead $initProbe $serviceSid }
     $serviceRootIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($rootHandle.Handle)
     $serviceExeIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($targetLease.Handle)
     $leaseIdentity = $serviceExeIdentity
@@ -1677,6 +1823,7 @@ finally {
                     try { [Sembazuru.WindowStationProbeNative]::MarkDelete($recordCleanup.Handle) }
                     finally { $recordCleanup.Dispose() }
                 }
+                Remove-Session0InitProbe $initProbe
                 if ($null -ne $targetLease) {
                     if ($null -eq $targetIdentity -or $null -eq $leaseIdentity) {
                         throw 'fixture executable lease identity is unavailable'
@@ -1714,6 +1861,13 @@ finally {
                 $rootHandle = $null
             }
             catch { $cleanupErrors.Add("fixture cleanup: $($_.Exception.Message)") }
+        }
+    }
+    foreach ($name in @('Source', 'Target', 'Lease', 'ReadHold')) {
+        if ($null -ne $initProbe[$name]) {
+            try { $initProbe[$name].Dispose() }
+            catch { $cleanupErrors.Add("追加診断 $name のハンドル解放: $($_.Exception.Message)") }
+            $initProbe[$name] = $null
         }
     }
     if ($null -ne $targetHandle) {
