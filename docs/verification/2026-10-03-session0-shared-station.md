@@ -4,6 +4,8 @@
 
 2026-10-04 の SHA `e834c4ab6849c9764c1f7e739e2b707e0e25e28b` では、`0x0002` と `0x0022` の比較測定が完了した。両候補の Baseline / NO_WINDOW はすべて `0xc0000142`、分類は `NO_WINDOW_NOT_SUFFICIENT` で、正常起動と最小性は未達。同じ head SHA の installed worker も plain control が `0xC0000142` で失敗した。対象 run / job、隔離・後始末、観測の限界は[ステーション権限候補の実測](2026-10-04-session0-station-access-comparison.md)を参照。
 
+到達点診断EXEを追加した SHA `a540987cbe93103b6b632f89166e584870a5399e` の Release run `37180347955` でも、`0x0002` の cmd 両 arm と追加EXEはすべて `0xc0000142` だった。追加EXEは出力が空で entry 未観測のため、USER32 のロード失敗とは確定できない。同じ head SHA の installed worker も plain control が失敗した。正常起動・最小性・worker経由決定性は未実証。対象ログ、隔離・後始末、installer ACL の結果は[初期化到達点の実測](2026-10-04-session0-initialization-boundary.md)を参照。
+
 ## 対象
 
 - 対象 SHA: `2590e08777c24fbe4573fb33372f1cd1008d8540`（`chore/two-pc-preparation`）
