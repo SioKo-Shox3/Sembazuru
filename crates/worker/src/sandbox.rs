@@ -3370,6 +3370,228 @@ mod tests {
         );
     }
 
+    struct InitProbeCase {
+        name: String,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        child_exit: Option<u32>,
+        expected: Option<String>,
+    }
+
+    fn init_probe_properties(value: &InitProbeEvidence) -> String {
+        format!(
+            "{},{},{},{},{}",
+            value.stage as u8,
+            value
+                .preloaded
+                .map_or("none".into(), |v| u8::from(v).to_string()),
+            value
+                .load_result
+                .map_or("none".into(), |v| u8::from(v).to_string()),
+            value.gle.map_or("none".into(), |v| v.to_string()),
+            value.outcome as u8,
+        )
+    }
+
+    fn session0_init_probe_corpus() -> Vec<InitProbeCase> {
+        let mut cases = Vec::new();
+        let entry = "SBZ_INIT_PROBE_V1 entry\n";
+        let unloaded = "SBZ_INIT_PROBE_V1 user32_preloaded=0\n";
+        let begin = "SBZ_INIT_PROBE_V1 user32_load_begin\n";
+        let complete = "SBZ_INIT_PROBE_V1 complete\n";
+        let success = [
+            entry,
+            unloaded,
+            begin,
+            "SBZ_INIT_PROBE_V1 user32_load_result=1 gle=0x000036b7\n",
+            complete,
+        ]
+        .concat();
+        let failure = success.replace("result=1 gle=0x000036b7", "result=0 gle=0x0000045a");
+        let preloaded = [entry, "SBZ_INIT_PROBE_V1 user32_preloaded=1\n", complete].concat();
+        // 期待値は各行が約束する観測を列挙する。解析器から期待値を逆算しない。
+        for (name, text, exit, states, outcome) in [
+            (
+                "loaded",
+                success.clone(),
+                0,
+                vec![
+                    "1,none,none,none,0",
+                    "2,0,none,none,0",
+                    "3,0,none,none,0",
+                    "4,0,1,14007,0",
+                    "5,0,1,14007,0",
+                ],
+                "5,0,1,14007,3",
+            ),
+            (
+                "failed",
+                failure,
+                11,
+                vec![
+                    "1,none,none,none,0",
+                    "2,0,none,none,0",
+                    "3,0,none,none,0",
+                    "4,0,0,1114,0",
+                    "5,0,0,1114,0",
+                ],
+                "5,0,0,1114,2",
+            ),
+            (
+                "preloaded",
+                preloaded,
+                12,
+                vec!["1,none,none,none,0", "2,1,none,none,0", "5,1,none,none,0"],
+                "5,1,none,none,1",
+            ),
+        ] {
+            let mut prefix = Vec::new();
+            let mut previous = "0,none,none,none,0";
+            for (line, after) in text.split_inclusive('\n').zip(&states) {
+                // WriteFile は任意のバイト境界で途切れ得る。途中の行を観測完了にしない。
+                for length in 0..line.len() {
+                    let stdout = [prefix.as_slice(), &line.as_bytes()[..length]].concat();
+                    cases.push(InitProbeCase {
+                        name: format!("{name}-write-cut-{}", stdout.len()),
+                        stdout,
+                        stderr: vec![],
+                        child_exit: Some(13),
+                        expected: Some(previous.into()),
+                    });
+                }
+                for code in [None, Some(0xc000_0142), Some(0), Some(11), Some(12)] {
+                    cases.push(InitProbeCase {
+                        name: format!("{name}-prefix-{}-{code:?}", prefix.len()),
+                        stdout: prefix.clone(),
+                        stderr: vec![],
+                        child_exit: code,
+                        expected: if matches!(code, Some(0 | 11 | 12)) {
+                            None
+                        } else {
+                            Some(previous.into())
+                        },
+                    });
+                }
+                prefix.extend_from_slice(line.as_bytes());
+                previous = after;
+            }
+            for code in [
+                None,
+                Some(0),
+                Some(11),
+                Some(12),
+                Some(13),
+                Some(1),
+                Some(0xc000_0005),
+                Some(0xc000_0142),
+            ] {
+                cases.push(InitProbeCase {
+                    name: format!("{name}-complete-{code:?}"),
+                    stdout: text.as_bytes().to_vec(),
+                    stderr: vec![],
+                    child_exit: code,
+                    expected: match code {
+                        Some(value) if value == exit => Some(outcome.into()),
+                        Some(0 | 11 | 12) => None,
+                        _ => Some(previous.into()),
+                    },
+                });
+            }
+        }
+        for (hex, decimal) in [("00000000", 0_u32), ("ffffffff", u32::MAX)] {
+            cases.push(InitProbeCase {
+                name: format!("success-gle-{hex}"),
+                stdout: success.replace("000036b7", hex).into_bytes(),
+                stderr: vec![],
+                child_exit: Some(0),
+                expected: Some(format!("5,0,1,{decimal},3")),
+            });
+        }
+        let lines: Vec<_> = success.split_inclusive('\n').collect();
+        let mut invalid = vec![
+            (
+                "unknown-version".into(),
+                success.replace("_V1", "_V2").into_bytes(),
+            ),
+            ("non-ascii".into(), vec![0xff]),
+            ("nul".into(), [success.as_bytes(), &[0]].concat()),
+            ("crlf".into(), success.replace('\n', "\r\n").into_bytes()),
+            (
+                "uppercase-gle".into(),
+                success.replace("000036b7", "000036B7").into_bytes(),
+            ),
+            (
+                "short-gle".into(),
+                success.replace("000036b7", "00036b7").into_bytes(),
+            ),
+            (
+                "long-gle".into(),
+                success.replace("000036b7", "0000036b7").into_bytes(),
+            ),
+            (
+                "unknown-result".into(),
+                success.replace("result=1", "result=2").into_bytes(),
+            ),
+            (
+                "preloaded-then-load".into(),
+                success.replace("preloaded=0", "preloaded=1").into_bytes(),
+            ),
+            (
+                "extra-line".into(),
+                format!("{success}{complete}").into_bytes(),
+            ),
+            ("output-limit".into(), vec![b'x'; 1025]),
+            (
+                "invalid-partial-line".into(),
+                format!("{entry}SBZ_INIT_PROBE_V2").into_bytes(),
+            ),
+        ];
+        for index in 0..lines.len() {
+            let mut missing = lines.clone();
+            missing.remove(index);
+            // 最終行の欠落は有効prefixであり、exit0とだけ矛盾する。
+            if index != lines.len() - 1 {
+                invalid.push((
+                    format!("missing-stage-{index}"),
+                    missing.concat().into_bytes(),
+                ));
+            }
+            let mut duplicate = lines.clone();
+            duplicate.insert(index, lines[index]);
+            invalid.push((
+                format!("duplicate-stage-{index}"),
+                duplicate.concat().into_bytes(),
+            ));
+            if index + 1 < lines.len() {
+                let mut reversed = lines.clone();
+                reversed.swap(index, index + 1);
+                invalid.push((
+                    format!("reversed-stage-{index}"),
+                    reversed.concat().into_bytes(),
+                ));
+            }
+        }
+        for (name, stdout) in invalid {
+            cases.push(InitProbeCase {
+                name,
+                stdout,
+                stderr: vec![],
+                child_exit: Some(13),
+                expected: None,
+            });
+        }
+        for stderr in [vec![b'x'], vec![b'x'; 1025]] {
+            cases.push(InitProbeCase {
+                name: format!("unexpected-stderr-{}", stderr.len()),
+                stdout: success.as_bytes().to_vec(),
+                stderr,
+                child_exit: Some(0),
+                expected: None,
+            });
+        }
+        cases
+    }
+
     #[test]
     fn session0_diagnostic_record_matches_powershell_contract() {
         use std::process::{Command, Stdio};
@@ -3382,7 +3604,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0FixtureArguments', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -3391,8 +3613,28 @@ foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0FixtureAr
 }
 $count = 0
 $argvCount = 0
+$initCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
     $parts = $line.Split("`t", 6)
+    if ($parts[0] -ceq 'init') {
+        $exit = if ($parts[3] -ceq 'none') { $null } else { [uint32]$parts[3] }
+        $record = $null
+        $rejected = $false
+        try { $record = Read-Session0InitProbeOutput ([Convert]::FromHexString($parts[1])) ([Convert]::FromHexString($parts[2])) $exit }
+        catch { $rejected = $true }
+        if ($parts[4] -ceq 'reject') {
+            if (-not $rejected) { throw "不正な到達点を受理しました: $($parts[5])" }
+        } else {
+            if ($rejected -or $null -eq $record) { throw "正常な到達点を拒否しました: $($parts[5])" }
+            if (@($record.PSObject.Properties).Count -ne 5) { throw '到達点のプロパティ数が一致しません。' }
+            $values = foreach ($property in @('Stage', 'Preloaded', 'LoadResult', 'Gle', 'Outcome')) {
+                if ($null -eq $record.$property) { 'none' } else { [string]$record.$property }
+            }
+            if (($values -join ',') -cne $parts[4]) { throw "到達点のプロパティが一致しません: $($parts[5])" }
+        }
+        $initCount++
+        continue
+    }
     if ($parts[0] -ceq 'argv') {
         $arguments = @($parts[2].Split(',') | ForEach-Object {
             [Text.Encoding]::UTF8.GetString([Convert]::FromHexString($_))
@@ -3438,12 +3680,30 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     }
     $count++
 }
-[Console]::WriteLine("PASS records=$count argv=$argvCount")
+[Console]::WriteLine("PASS records=$count argv=$argvCount init=$initCount")
 "#;
         let cases = session0_diagnostic_corpus();
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../hooks/test/m6_worker_window_station_probe.ps1");
         let mut input = format!("{}\n", diagnostic_hex(path.to_str().unwrap().as_bytes()));
+        let init_cases = session0_init_probe_corpus();
+        for case in &init_cases {
+            let actual = parse_init_probe_output(&case.stdout, &case.stderr, case.child_exit);
+            assert_eq!(
+                actual.as_ref().ok().map(init_probe_properties),
+                case.expected,
+                "{}: {actual:?}",
+                case.name,
+            );
+            input.push_str(&format!(
+                "init\t{}\t{}\t{}\t{}\t{}\n",
+                diagnostic_hex(&case.stdout),
+                diagnostic_hex(&case.stderr),
+                case.child_exit.map_or("none".into(), |v| v.to_string()),
+                case.expected.as_deref().unwrap_or("reject"),
+                case.name,
+            ));
+        }
         let argv_cases = session0_argv_corpus();
         for (argv, accepted) in &argv_cases {
             assert_eq!(
@@ -3512,7 +3772,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert_eq!(
             stdout.trim(),
-            format!("PASS records={} argv={}", cases.len(), argv_cases.len())
+            format!(
+                "PASS records={} argv={} init={}",
+                cases.len(),
+                argv_cases.len(),
+                init_cases.len()
+            )
         );
         eprintln!("PowerShell 共通 corpus: {}", stdout.trim());
     }
@@ -3982,6 +4247,138 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 && !integrity.is_empty()
                 && integrity.bytes().all(|v| v.is_ascii_digit())
                 && integrity.parse::<u32>().is_ok()
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InitProbeStage {
+        EntryUnobserved,
+        Entry,
+        Preloaded,
+        LoadBegin,
+        LoadResult,
+        Complete,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum InitProbeOutcome {
+        Indeterminate,
+        AlreadyLoaded,
+        LoadFailed,
+        LoadComplete,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct InitProbeEvidence {
+        stage: InitProbeStage,
+        preloaded: Option<bool>,
+        load_result: Option<bool>,
+        gle: Option<u32>,
+        outcome: InitProbeOutcome,
+    }
+
+    // 完全な行だけを到達点とする。LoadBegin での中断は、DLL の失敗とは断定できない。
+    fn parse_init_probe_output(
+        stdout: &[u8],
+        stderr: &[u8],
+        child_exit: Option<u32>,
+    ) -> Result<InitProbeEvidence, String> {
+        if stdout.len() > 1024 || stderr.len() > 1024 || !stderr.is_empty() {
+            return Err("到達点診断の出力上限または stderr が不正です".into());
+        }
+        // '?' は GLE の小文字16進数字1桁だけに一致する。任意の末尾文字列は許可しない。
+        let templates = [
+            (
+                false,
+                true,
+                0,
+                concat!(
+                    "SBZ_INIT_PROBE_V1 entry\n",
+                    "SBZ_INIT_PROBE_V1 user32_preloaded=0\n",
+                    "SBZ_INIT_PROBE_V1 user32_load_begin\n",
+                    "SBZ_INIT_PROBE_V1 user32_load_result=1 gle=0x????????\n",
+                    "SBZ_INIT_PROBE_V1 complete\n",
+                ),
+            ),
+            (
+                false,
+                false,
+                11,
+                concat!(
+                    "SBZ_INIT_PROBE_V1 entry\n",
+                    "SBZ_INIT_PROBE_V1 user32_preloaded=0\n",
+                    "SBZ_INIT_PROBE_V1 user32_load_begin\n",
+                    "SBZ_INIT_PROBE_V1 user32_load_result=0 gle=0x????????\n",
+                    "SBZ_INIT_PROBE_V1 complete\n",
+                ),
+            ),
+            (
+                true,
+                false,
+                12,
+                concat!(
+                    "SBZ_INIT_PROBE_V1 entry\n",
+                    "SBZ_INIT_PROBE_V1 user32_preloaded=1\n",
+                    "SBZ_INIT_PROBE_V1 complete\n",
+                ),
+            ),
+        ];
+        let (preloaded, result, expected_exit, template) = templates
+            .into_iter()
+            .find(|(_, _, _, template)| {
+                stdout.len() <= template.len()
+                    && stdout
+                        .iter()
+                        .zip(template.bytes())
+                        .all(|(&actual, expected)| {
+                            if expected == b'?' {
+                                actual.is_ascii_digit() || (b'a'..=b'f').contains(&actual)
+                            } else {
+                                actual == expected
+                            }
+                        })
+            })
+            .ok_or("到達点診断の版、段階、順序または文字が不正です")?;
+        let complete = stdout.len() == template.len();
+        // 出力完了と終了は別の観測。契約上の終了値だけを列と照合し、異常終了は証拠を残す。
+        if let Some(exit) = child_exit
+            && matches!(exit, 0 | 11 | 12)
+            && (!complete || exit != expected_exit)
+        {
+            return Err("到達点診断の段階列と終了値が一致しません".into());
+        }
+        let lines = stdout.iter().filter(|&&value| value == b'\n').count();
+        let stage = match lines {
+            0 => InitProbeStage::EntryUnobserved,
+            1 => InitProbeStage::Entry,
+            2 => InitProbeStage::Preloaded,
+            3 if !preloaded => InitProbeStage::LoadBegin,
+            4 => InitProbeStage::LoadResult,
+            _ => InitProbeStage::Complete,
+        };
+        let load_observed = !preloaded && lines >= 4;
+        let gle = if load_observed {
+            // 上の固定列照合で ASCII、行数と8桁を確認済み。
+            let line = stdout.split(|&value| value == b'\n').nth(3).unwrap();
+            let hex = std::str::from_utf8(&line[line.len() - 8..]).unwrap();
+            Some(u32::from_str_radix(hex, 16).unwrap())
+        } else {
+            None
+        };
+        Ok(InitProbeEvidence {
+            stage,
+            preloaded: (lines >= 2).then_some(preloaded),
+            load_result: load_observed.then_some(result),
+            gle,
+            outcome: if !complete || child_exit != Some(expected_exit) {
+                InitProbeOutcome::Indeterminate
+            } else if preloaded {
+                InitProbeOutcome::AlreadyLoaded
+            } else if result {
+                InitProbeOutcome::LoadComplete
+            } else {
+                InitProbeOutcome::LoadFailed
+            },
         })
     }
 

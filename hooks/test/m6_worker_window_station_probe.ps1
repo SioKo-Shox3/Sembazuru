@@ -1007,6 +1007,73 @@ function Get-StreamSha256([IO.Stream]$Stream) {
     finally { $sha.Dispose() }
 }
 
+function Read-Session0InitProbeOutput([byte[]]$Stdout, [byte[]]$Stderr, [Nullable[uint32]]$ChildExit) {
+    if ($Stdout.Length -gt 1024 -or $Stderr.Length -gt 1024 -or $Stderr.Length -ne 0) {
+        throw '到達点診断の出力上限または stderr が不正です。'
+    }
+    # '?' は GLE の小文字16進数字1桁だけに一致する。行末も含め固定列と照合する。
+    $prefix = "SBZ_INIT_PROBE_V1 entry`nSBZ_INIT_PROBE_V1 user32_preloaded="
+    $load = "0`nSBZ_INIT_PROBE_V1 user32_load_begin`nSBZ_INIT_PROBE_V1 user32_load_result="
+    $tail = " gle=0x????????`nSBZ_INIT_PROBE_V1 complete`n"
+    $templates = @(
+        [pscustomobject]@{ Text = $prefix + $load + '1' + $tail; Preloaded = $false; Result = $true; Exit = 0 },
+        [pscustomobject]@{ Text = $prefix + $load + '0' + $tail; Preloaded = $false; Result = $false; Exit = 11 },
+        [pscustomobject]@{ Text = $prefix + "1`nSBZ_INIT_PROBE_V1 complete`n"; Preloaded = $true; Result = $false; Exit = 12 }
+    )
+    $matched = $null
+    foreach ($candidate in $templates) {
+        if ($Stdout.Length -gt $candidate.Text.Length) { continue }
+        $valid = $true
+        for ($i = 0; $i -lt $Stdout.Length; $i++) {
+            $expected = [int][char]$candidate.Text[$i]
+            $actual = [int]$Stdout[$i]
+            if ($expected -eq 63) {
+                if (-not (($actual -ge 48 -and $actual -le 57) -or ($actual -ge 97 -and $actual -le 102))) {
+                    $valid = $false
+                    break
+                }
+            } elseif ($actual -ne $expected) {
+                $valid = $false
+                break
+            }
+        }
+        if ($valid) { $matched = $candidate; break }
+    }
+    if ($null -eq $matched) { throw '到達点診断の版、段階、順序または文字が不正です。' }
+    $complete = $Stdout.Length -eq $matched.Text.Length
+    # 出力完了と終了は別の観測。契約上の終了値だけを列と照合し、異常終了は証拠を残す。
+    if ($null -ne $ChildExit -and $ChildExit -in @(0, 11, 12) -and
+        (-not $complete -or $ChildExit -ne $matched.Exit)) {
+        throw '到達点診断の段階列と終了値が一致しません。'
+    }
+    # ASCII の固定列照合後に変換し、LF まで観測できた行だけを数える。
+    $text = [Text.Encoding]::ASCII.GetString($Stdout)
+    $lines = $text.Split("`n")
+    $count = $lines.Length - 1
+    $stage = switch ($count) {
+        0 { 0 }
+        1 { 1 }
+        2 { 2 }
+        3 { if ($matched.Preloaded) { 5 } else { 3 } }
+        4 { 4 }
+        default { 5 }
+    }
+    $preloaded = $null
+    if ($count -ge 2) { $preloaded = [int]$matched.Preloaded }
+    $result = $null
+    $gle = $null
+    if (-not $matched.Preloaded -and $count -ge 4) {
+        $result = [int]$matched.Result
+        $gle = [Convert]::ToUInt32($lines[3].Substring($lines[3].Length - 8), 16)
+    }
+    # 開始後の列の中断は観測不足であり、DLL の失敗と断定しない。
+    $outcome = 0
+    if ($complete -and $null -ne $ChildExit -and $ChildExit -eq $matched.Exit) {
+        $outcome = if ($matched.Preloaded) { 1 } elseif ($matched.Result) { 3 } else { 2 }
+    }
+    return [pscustomobject]@{ Stage = $stage; Preloaded = $preloaded; LoadResult = $result; Gle = $gle; Outcome = $outcome }
+}
+
 function Read-Session0U32([byte[]]$Bytes, [ref]$Offset) {
     if ($Offset.Value -gt $Bytes.Length - 4) { throw 'Session 0 diagnostic record is truncated.' }
     $value = [BitConverter]::ToUInt32($Bytes, $Offset.Value)
