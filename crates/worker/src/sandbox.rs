@@ -2444,6 +2444,8 @@ mod tests {
         init_probe_sha256: Option<String>,
         entry_probe_sha256: Option<String>,
         terminate_probe_sha256: Option<String>,
+        console_probe_sha256: Option<String>,
+        windows_probe_sha256: Option<String>,
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
@@ -2552,7 +2554,7 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ];
-        if !matches!(argv.len(), 11..=14) {
+        if !matches!(argv.len(), 11..=14 | 16) {
             return Err("process argv cardinality");
         }
         if Path::new(&argv[0]).file_name() != Some(OsStr::new(WINDOW_STATION_SCM_SMOKE_BASENAME)) {
@@ -2641,6 +2643,23 @@ mod tests {
         } else {
             None
         };
+        let mut subsystem_hashes = [None, None];
+        if argv.len() == 16 {
+            for (index, slot) in subsystem_hashes.iter_mut().enumerate() {
+                let hash = argv[14 + index]
+                    .to_str()
+                    .ok_or("subsystem対照のhashはUTF-8が必要です")?;
+                if hash.len() != 64
+                    || !hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err("subsystem対照のhashは小文字16進64桁が必要です");
+                }
+                *slot = Some(hash.to_owned());
+            }
+        }
+        let [console_probe_sha256, windows_probe_sha256] = subsystem_hashes;
         Ok(Session0DiagnosticConfig {
             fixture_root,
             record_directory,
@@ -2649,6 +2668,8 @@ mod tests {
             init_probe_sha256,
             entry_probe_sha256,
             terminate_probe_sha256,
+            console_probe_sha256,
+            windows_probe_sha256,
         })
     }
 
@@ -2858,7 +2879,40 @@ mod tests {
             argv.swap(index, 13);
             cases.push((argv, false));
         }
-        cases.push(([terminate, vec!["extra".into()]].concat(), false));
+        cases.push(([terminate.clone(), vec!["extra".into()]].concat(), false));
+        // 固定14形式の反例を16形式へ引き継ぐ。役割はconsole、windowsの順で固定する。
+        for (mut argv, accepted) in cases
+            .clone()
+            .into_iter()
+            .filter(|(argv, _)| argv.len() == 14)
+        {
+            argv.extend(["3".repeat(64).into(), "4".repeat(64).into()]);
+            cases.push((argv, accepted));
+        }
+        let mut subsystem = terminate;
+        subsystem.extend(["3".repeat(64).into(), "4".repeat(64).into()]);
+        for index in 11..16 {
+            for hash in [
+                String::new(),
+                "a".repeat(63),
+                "a".repeat(65),
+                "A".repeat(64),
+                "g".repeat(64),
+                "C:\\other.exe".into(),
+                format!("{} ", "a".repeat(64)),
+            ] {
+                let mut argv = subsystem.clone();
+                argv[index] = hash.into();
+                cases.push((argv, false));
+            }
+        }
+        for index in 1..11 {
+            let mut argv = subsystem.clone();
+            argv.swap(index, 15);
+            cases.push((argv, false));
+        }
+        cases.push((subsystem[..15].to_vec(), false));
+        cases.push(([subsystem, vec!["extra".into()]].concat(), false));
         cases
     }
 
@@ -2900,6 +2954,14 @@ mod tests {
                 assert_eq!(
                     config.terminate_probe_sha256.as_deref(),
                     argv.get(13).and_then(|v| v.to_str())
+                );
+                assert_eq!(
+                    config.console_probe_sha256.as_deref(),
+                    argv.get(14).and_then(|v| v.to_str())
+                );
+                assert_eq!(
+                    config.windows_probe_sha256.as_deref(),
+                    argv.get(15).and_then(|v| v.to_str())
                 );
                 assert_eq!(config.nonce, argv[9].to_str().unwrap());
                 assert_eq!(config.fixture_root, PathBuf::from(&argv[7]));
@@ -4655,7 +4717,10 @@ mod tests {
         for (argv, accepted) in session0_argv_corpus() {
             if accepted {
                 let config = validate_window_station_scm_process_argv(&argv).unwrap();
-                assert!(require_connected_session0_request(&config).is_ok());
+                assert_eq!(
+                    require_connected_session0_request(&config).is_ok(),
+                    argv.len() != 16
+                );
             }
         }
         eprintln!("EntryProbe: 独立終了値/肯定bit/空出力/隔離/cleanup/cmd分類 PASS");
@@ -4680,6 +4745,8 @@ mod tests {
             station_profile: StationAccessProfile::ReadAttributes,
             entry_probe_sha256: None,
             terminate_probe_sha256: None,
+            console_probe_sha256: None,
+            windows_probe_sha256: None,
             init_probe_sha256: Some(
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             ),
@@ -4725,6 +4792,8 @@ mod tests {
             init_probe_sha256: Some("0".repeat(64)),
             entry_probe_sha256: Some(hash.into()),
             terminate_probe_sha256: None,
+            console_probe_sha256: None,
+            windows_probe_sha256: None,
         };
         // InitProbeが同じ内容でも、別名の実体からEntryProbeの証拠を得ない。
         std::fs::write(root.join(SESSION0_INIT_BASENAME), b"abc").unwrap();
@@ -4764,7 +4833,10 @@ mod tests {
                 continue;
             }
             let mut config = validate_window_station_scm_process_argv(&argv).unwrap();
-            assert!(require_connected_session0_request(&config).is_ok());
+            assert_eq!(
+                require_connected_session0_request(&config).is_ok(),
+                argv.len() != 16
+            );
             if argv.len() == 14 {
                 for init in [None, config.init_probe_sha256.clone()] {
                     for entry in [None, config.entry_probe_sha256.clone()] {
@@ -4805,6 +4877,8 @@ mod tests {
             init_probe_sha256: Some("0".repeat(64)),
             entry_probe_sha256: Some("1".repeat(64)),
             terminate_probe_sha256: Some(hash.into()),
+            console_probe_sha256: None,
+            windows_probe_sha256: None,
         };
         // 旧2種類とsource名が存在しても、固定した保護先以外は採用しない。
         let other_names = [
@@ -4851,6 +4925,129 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
         eprintln!(
             "固定自己終了の保持: 種別/path/hash取り違え、書換え/削除/rename、最終path、複数link、空/過大/改変内容を拒否"
+        );
+    }
+
+    #[test]
+    fn session0_subsystem_request_is_rejected_before_registration() {
+        let argv = session0_argv_corpus()
+            .into_iter()
+            .find(|(argv, accepted)| argv.len() == 16 && *accepted)
+            .unwrap()
+            .0;
+        let config = validate_window_station_scm_process_argv(&argv).unwrap();
+        for bits in 0..32 {
+            let mut candidate = config.clone();
+            if bits & 1 == 0 {
+                candidate.init_probe_sha256 = None;
+            }
+            if bits & 2 == 0 {
+                candidate.entry_probe_sha256 = None;
+            }
+            if bits & 4 == 0 {
+                candidate.terminate_probe_sha256 = None;
+            }
+            if bits & 8 == 0 {
+                candidate.console_probe_sha256 = None;
+            }
+            if bits & 16 == 0 {
+                candidate.windows_probe_sha256 = None;
+            }
+            assert_eq!(
+                require_connected_session0_request(&candidate).is_ok(),
+                matches!(bits, 0 | 1 | 3 | 7)
+            );
+        }
+        assert!(SESSION0_DIAGNOSTIC_CONFIG.get().is_none());
+        eprintln!("subsystem要求32組: 旧形式だけ受理、片側/前提欠落/完全な新形式は登録前拒否");
+    }
+
+    #[test]
+    fn session0_subsystem_holds_reject_swapped_candidates_and_cleanup() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.harness/T-011-N12-files")
+            .join(format!(
+                "rust-{}-{}",
+                std::process::id(),
+                NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = PathBuf::from(
+            std::fs::canonicalize(root)
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\"),
+        );
+        let hashes = [
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "88d4266fd4e6338d13b845fcf289579d209c897823b9217da3e161936f031589",
+        ];
+        let bytes: [&[u8]; 2] = [b"abc", b"abcd"];
+        let mut config = Session0DiagnosticConfig {
+            fixture_root: root.clone(),
+            record_directory: root.clone(),
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            station_profile: StationAccessProfile::ReadAttributes,
+            init_probe_sha256: Some("0".repeat(64)),
+            entry_probe_sha256: Some("1".repeat(64)),
+            terminate_probe_sha256: Some("2".repeat(64)),
+            console_probe_sha256: Some(hashes[0].into()),
+            windows_probe_sha256: Some(hashes[1].into()),
+        };
+        let kinds = [Session0ProbeKind::Console, Session0ProbeKind::Windows];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(
+                kind.basename(),
+                ["SbzSession0ConsoleProbe.exe", "SbzSession0WindowsProbe.exe"][index]
+            );
+            let path = root.join(kind.basename());
+            let source = root.join("session0_subsystem_probe.exe");
+            std::fs::write(&source, bytes[index]).unwrap();
+            assert!(hold_session0_probe(&config, kind).is_err());
+            std::fs::write(&path, bytes[index]).unwrap();
+            let (held, actual) = hold_session0_probe(&config, kind).unwrap();
+            assert_eq!(actual, hashes[index]);
+            assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+            assert!(std::fs::remove_file(&path).is_err());
+            assert!(std::fs::rename(&path, root.join("replacement.exe")).is_err());
+            for expected in [
+                None,
+                Some(hashes[1 - index].into()),
+                Some(hashes[index].to_uppercase()),
+            ] {
+                let mut changed = config.clone();
+                match kind {
+                    Session0ProbeKind::Console => changed.console_probe_sha256 = expected,
+                    Session0ProbeKind::Windows => changed.windows_probe_sha256 = expected,
+                    _ => unreachable!(),
+                }
+                assert!(hold_session0_probe(&changed, kind).is_err());
+            }
+            config.fixture_root = root.join(".");
+            assert!(hold_session0_probe(&config, kind).is_err());
+            config.fixture_root = root.clone();
+            drop(held);
+            let alias = root.join("alias.exe");
+            std::fs::hard_link(&path, &alias).unwrap();
+            assert!(hold_session0_probe(&config, kind).is_err());
+            std::fs::remove_file(alias).unwrap();
+            for content in [
+                Vec::new(),
+                vec![0; 1024 * 1024 + 1],
+                bytes[1 - index].to_vec(),
+                b"tampered".to_vec(),
+            ] {
+                std::fs::write(&path, content).unwrap();
+                assert!(hold_session0_probe(&config, kind).is_err());
+            }
+            std::fs::remove_file(&path).unwrap();
+            std::fs::remove_file(source).unwrap();
+            assert!(!path.exists());
+        }
+        std::fs::remove_dir(&root).unwrap();
+        assert!(!root.exists());
+        eprintln!(
+            "subsystem保持2候補: 固定path/hash、入替/改変/書換え/削除/rename/複数linkを拒否、解放後cleanup完了"
         );
     }
 
@@ -4906,6 +5103,8 @@ mod tests {
             station_profile: StationAccessProfile::ReadAttributes,
             entry_probe_sha256: None,
             terminate_probe_sha256: None,
+            console_probe_sha256: None,
+            windows_probe_sha256: None,
             init_probe_sha256: Some(
                 std::env::var("SEMBAZURU_TEST_INIT_SHA256").expect("ビルド済みEXEの独立hash"),
             ),
@@ -6649,6 +6848,8 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         Init,
         Entry,
         Terminate,
+        Console,
+        Windows,
     }
 
     impl Session0ProbeKind {
@@ -6657,6 +6858,8 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 Self::Init => SESSION0_INIT_BASENAME,
                 Self::Entry => "SbzSession0EntryProbe.exe",
                 Self::Terminate => "SbzSession0TerminateProbe.exe",
+                Self::Console => "SbzSession0ConsoleProbe.exe",
+                Self::Windows => "SbzSession0WindowsProbe.exe",
             }
         }
 
@@ -6665,6 +6868,8 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 Self::Init => config.init_probe_sha256.as_deref(),
                 Self::Entry => config.entry_probe_sha256.as_deref(),
                 Self::Terminate => config.terminate_probe_sha256.as_deref(),
+                Self::Console => config.console_probe_sha256.as_deref(),
+                Self::Windows => config.windows_probe_sha256.as_deref(),
             }
         }
     }
@@ -7238,6 +7443,10 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
     fn require_connected_session0_request(
         config: &Session0DiagnosticConfig,
     ) -> Result<(), &'static str> {
+        // 実行と独立記録・回収が揃うまで、片側だけの要求も設定登録前に拒否する。
+        if config.console_probe_sha256.is_some() || config.windows_probe_sha256.is_some() {
+            return Err("subsystem対照の実行・独立記録・回収は未接続です");
+        }
         if config.terminate_probe_sha256.is_some()
             && (config.init_probe_sha256.is_none() || config.entry_probe_sha256.is_none())
         {

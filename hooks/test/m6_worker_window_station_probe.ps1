@@ -7,19 +7,36 @@ param(
     [string]$EntryProbePath,
     [string]$EntryProbeSha256,
     [string]$TerminateProbePath,
-    [string]$TerminateProbeSha256
+    [string]$TerminateProbeSha256,
+    [string]$ConsoleProbePath,
+    [string]$ConsoleProbeSha256,
+    [string]$WindowsProbePath,
+    [string]$WindowsProbeSha256
 )
 
 function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [string]$EntryPath, [string]$EntryHash,
-    [string]$TerminatePath, [string]$TerminateHash) {
+    [string]$TerminatePath, [string]$TerminateHash,
+    [string]$ConsolePath, [string]$ConsoleHash, [string]$WindowsPath, [string]$WindowsHash) {
     if ([string]::IsNullOrEmpty($InitPath) -ne [string]::IsNullOrEmpty($InitHash) -or
         [string]::IsNullOrEmpty($EntryPath) -ne [string]::IsNullOrEmpty($EntryHash) -or
-        [string]::IsNullOrEmpty($TerminatePath) -ne [string]::IsNullOrEmpty($TerminateHash)) {
+        [string]::IsNullOrEmpty($TerminatePath) -ne [string]::IsNullOrEmpty($TerminateHash) -or
+        [string]::IsNullOrEmpty($ConsolePath) -ne [string]::IsNullOrEmpty($ConsoleHash) -or
+        [string]::IsNullOrEmpty($WindowsPath) -ne [string]::IsNullOrEmpty($WindowsHash)) {
         throw '診断EXEのパスとSHA-256は組で指定してください。'
     }
     if ($EntryPath -and -not $InitPath) { throw '固定終了値診断にはInitProbeの指定が必要です。' }
     if ($TerminatePath -and (-not $InitPath -or -not $EntryPath)) {
         throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。'
+    }
+    if (($ConsolePath -or $WindowsPath) -and
+        (-not $ConsolePath -or -not $WindowsPath -or -not $InitPath -or -not $EntryPath -or -not $TerminatePath)) {
+        throw 'subsystem対照には両候補とInitProbe・EntryProbe・TerminateProbeの指定が必要です。'
+    }
+}
+
+function Assert-Session0ConnectedRequest([bool]$SubsystemRequested) {
+    if ($SubsystemRequested) {
+        throw 'subsystem対照の実行・独立記録・回収は未接続です。'
     }
 }
 
@@ -47,7 +64,7 @@ function ConvertFrom-Session0StationMask([string]$Value) {
 }
 
 function Assert-Session0FixtureArguments([string[]]$Arguments) {
-    if ($Arguments.Count -lt 11 -or $Arguments.Count -gt 14) { throw 'SCM 診断の引数数が一致しません。' }
+    if ($Arguments.Count -notin @(11, 12, 13, 14, 16)) { throw 'SCM 診断の引数数が一致しません。' }
     $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
         '--nocapture', '--test-threads=1', '--')
     if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
@@ -63,7 +80,11 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
     }
     $null = ConvertFrom-Session0StationMask $Arguments[10]
     if ($Arguments.Count -ge 12) {
-        if ($Arguments.Count -eq 14) { Assert-Session0InitProbeHash $Arguments[13] }
+        if ($Arguments.Count -eq 16) {
+            Assert-Session0InitProbeHash $Arguments[14]
+            Assert-Session0InitProbeHash $Arguments[15]
+        }
+        if ($Arguments.Count -ge 14) { Assert-Session0InitProbeHash $Arguments[13] }
         if ($Arguments.Count -ge 13) { Assert-Session0InitProbeHash $Arguments[12] }
         Assert-Session0InitProbeHash $Arguments[11]
         $root = $Arguments[7]
@@ -76,6 +97,10 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
         }
     }
 }
+
+# 独立記録と回収が未接続の要求は、環境変更や保護配置より前に拒否する。
+Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256 $ConsoleProbePath $ConsoleProbeSha256 $WindowsProbePath $WindowsProbeSha256
+Assert-Session0ConnectedRequest ([bool]($ConsoleProbePath -or $WindowsProbePath))
 
 $record = $null
 $requestedStationMask = ConvertFrom-Session0StationMask $StationMask
@@ -101,7 +126,7 @@ Set-StrictMode -Version Latest
 if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
     throw 'Elevated direct -File execution is forbidden; use the verified in-memory bootstrap.'
 }
-if ($args.Count -ne 0) { throw '指定できる引数は ArtifactPath、ExpectedSha256、StationMask、InitProbePath、InitProbeSha256、EntryProbePath、EntryProbeSha256、TerminateProbePath、TerminateProbeSha256 だけです。' }
+if ($args.Count -ne 0) { throw '指定できる引数はArtifactPath、ExpectedSha256、StationMaskとInit/Entry/Terminate/Console/WindowsのProbePath・ProbeSha256だけです。' }
 if ([string]::IsNullOrWhiteSpace($ArtifactPath) -or
     [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
     throw 'ArtifactPath and ExpectedSha256 are required after elevation.'
@@ -110,7 +135,6 @@ if ($ExpectedSha256 -notmatch '\A[0-9a-fA-F]{64}\z') {
     throw 'ExpectedSha256 must be exactly 64 hexadecimal characters.'
 }
 $ExpectedSha256 = $ExpectedSha256.ToLowerInvariant()
-Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256
 
 $serviceName = 'SembazuruWindowStationProbeSmoke'
 $workerServiceName = 'SembazuruWorker'
@@ -1101,6 +1125,8 @@ function Get-Session0ProbeBasename([string]$Kind, [bool]$Source) {
         'Init' { if ($Source) { return 'session0_init_probe.exe' }; return 'SbzSession0InitProbe.exe' }
         'Entry' { if ($Source) { return 'session0_entry_probe.exe' }; return 'SbzSession0EntryProbe.exe' }
         'Terminate' { if ($Source) { return 'session0_terminate_probe.exe' }; return 'SbzSession0TerminateProbe.exe' }
+        'Console' { if ($Source) { return 'session0_subsystem_probe.exe' }; return 'SbzSession0ConsoleProbe.exe' }
+        'Windows' { if ($Source) { return 'session0_subsystem_probe.exe' }; return 'SbzSession0WindowsProbe.exe' }
         default { throw '追加診断 EXE の種別が不正です。' }
     }
 }
@@ -1111,6 +1137,12 @@ function Get-Session0ProbeSourcePath([string]$Path, [string]$Kind) {
     $canonical = [IO.Path]::GetFullPath($Path)
     if ([IO.Path]::GetFileName($canonical) -cne $basename) {
         throw '追加診断 EXE の source 名が一致しません。'
+    }
+    if ($Kind -cin @('Console', 'Windows')) {
+        $directory = [IO.Path]::GetDirectoryName($canonical)
+        if ($Path -cne $canonical -or [IO.Path]::GetFileName($directory) -cne $Kind.ToLowerInvariant()) {
+            throw 'subsystem対照のsourceサブディレクトリが一致しません。'
+        }
     }
     return $canonical
 }
@@ -1809,6 +1841,7 @@ try {
     if ($EntryProbePath) { $fixtureArguments += $entryProbe.Hash }
     if ($TerminateProbePath) { $fixtureArguments += $terminateProbe.Hash }
     Assert-Session0FixtureArguments $fixtureArguments
+    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 16)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
         $diagnosticNonce + ' ' + $StationMask
