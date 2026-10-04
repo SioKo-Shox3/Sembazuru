@@ -5,10 +5,10 @@
 - 対象 SHA: `e834c4ab6849c9764c1f7e739e2b707e0e25e28b`（`chore/two-pc-preparation`）。
 - Release: [run 37172192286](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/37172192286)、イベントは `workflow_dispatch`、終端は `success`（更新時刻 02:58:32 UTC）。
 - 0x0002: [job 111347254543](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/37172192286/job/111347254543)、終端は `success`。
-- 0x0022: [job 111347254337](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/37172192286/job/111347254337)、終端は `success`。この記録では実子プロセスの結果を未判定とする。
+- 0x0022: [job 111347254337](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/37172192286/job/111347254337)、終端は `success`。
 - 同じ head SHA の PR CI: [run 37172179258](https://github.com/SioKo-Shox3/Sembazuru/actions/runs/37172179258)、イベントは `pull_request`、終端は `failure`（更新時刻 03:00:56 UTC）。
 
-0x0002 の診断 job は `success` だが、実子プロセスは両 arm とも `0xc0000142` で終了した。分類は `NO_WINDOW_NOT_SUFFICIENT`。正常起動と権限の最小性は実証されていない。
+両候補の診断 job は `success` だが、実子プロセスは計4 arm すべて `0xc0000142` で終了した。分類はどちらも `NO_WINDOW_NOT_SUFFICIENT`。`0x0020` の追加による正常起動は観測されず、権限の最小性も実証されていない。
 
 ## 0x0002 の観測
 
@@ -42,6 +42,52 @@ write_dac=Err(5);write_owner=Err(5);default_dacl_safe=true;tcb_absent=true
 両 arm で tree の終了と desktop の除去が記録され、共有 station の追加 ACE は `StationCleanup=removed`。診断 script はサービス・fixture の後始末と `SembazuruWorker` の前後 snapshot 一致を確認してから分類を出力しており、今回その検査を通過した。snapshot の比較対象はサービスの存在・削除待ち、設定、依存関係、状態、PID等。個々の前後値はログに出ないため、具体的な PID やサービス状態そのものは未確認である。
 
 実行した script の SHA-256 は `82659E66E3A5AC08271CA1ACE1D750D4AA00DA854BDF977BBEECE8A745655838`、fixture の期待 SHA-256 は `D2A52ED487AF567BA9042F300E9F2CBE6018021C45058A0BB37B0644BC78F4F6`。実ログは `.harness/T-011-D4-job-111347254543.log`（識別情報は200行、hashは506行、測定値は508行）。
+
+## 0x0022 の観測
+
+実測時刻は 2026-10-04 02:51:28 UTC。0x0002 と同じ run / SHA / `run_attempt=1` で、別の Windows Server 2025 runner による測定である。イメージは `windows-2025-vs2026` / `20260925.250.1`、OS build は `10.0.26100.0`。`session=0`、`markers=0x07`、SCM の分類値は `0x53425b32` だった。
+
+job の期待値 `0x0022`、`RequestedStationMask=0x00000022`、共有 SID の `StationAce=count=1;flags=0;mask=0x00000022`、両 arm の `TargetAccess` 内の `station:action_mask:mask=0x00000022;allowed=true;gle=0` はすべて一致した。
+
+| 観測 | Baseline | NO_WINDOW |
+|---|---|---|
+| Creation flags | `0x00080404` | `0x08080404` |
+| Job UI | `0x000000fe` | `0x000000fe` |
+| SpawnSucceeded | `True` | `True` |
+| ChildExit | `0xc0000142` | `0xc0000142` |
+| Initialization | `dll-init-failed` | `dll-init-failed` |
+| DesktopCreated / IsolationVerified | `True / True` | `True / True` |
+| TreeFinished / DesktopRemoved | `True / True` | `True / True` |
+| TargetAccess first_failure | `none` | `none` |
+| stdout / stderr / SpawnError | 空 | 空 |
+
+起動先は `Service-0x0-2b3bc4$` 内の `sbz-c2231de9fc48572a39071cf0942f9087` と `sbz-1568433dfe709dfedfca21678e89536b`。両 desktop の保護 DACL は `control=0x9004`、broker の ACE は `0x000f01ff`、個別 action SID の ACE は `0x000201ff`、どちらも `flags=0`。SACL は `label=absent;implied_integrity=8192`。broker の整合性レベルは `12288`、action は `8192` である。
+
+両 arm の隔離記録は `own=Ok(true);other_maximum=Err(5);default_maximum=Err(5);write_dac=Err(5);write_owner=Err(5);default_dacl_safe=true;tcb_absent=true`。自分の desktop は許可され、別 action token から当該 desktop を開く試行、当該 action token から Default を開く試行、自分の desktop の ACL / 所有者変更は拒否された。
+
+専用 desktop に対する `TargetAccess` は全6段が許可された。一方、broker の Default を対象とする `BrokerUiProbe` は `desktop:maximum_allowed;gle=5`。広い station mask `0x0000006e` の `StationAccess` と、Default に対する `BrokerDesktopAccess=mask=0x000000cf` も拒否されている。これらは broker の impersonation による測定であり、実子プロセスの到達点や、その権限を初期化が要求した証拠ではない。
+
+両 arm の tree 終了・desktop 除去と、`StationCleanup=removed` を確認した。サービス・fixture の cleanup と worker snapshot 比較は、script の分類出力前のゲートを通過した。0x0002 と同様に snapshot 個別値は非出力であり、具体的な前後 PID 等の実値は未確認である。
+
+script の SHA-256 は `82659E66E3A5AC08271CA1ACE1D750D4AA00DA854BDF977BBEECE8A745655838`、fixture の期待 SHA-256 は `AE8F61857C81E0715B0C434F23040608FCDD5B7184CD8F116BCF060890FEB0A6`。実ログ `.harness/T-011-D4-job-111347254337.log` の識別情報は200行、hashは506行、測定値は508行にある。
+
+## 候補の比較と観測の限界
+
+| 比較項目 | 0x0002 | 0x0022 |
+|---|---|---|
+| job ID | `111347254543` | `111347254337` |
+| 要求 / ACE / TargetAccess の mask | `0x00000002` で一致 | `0x00000022` で一致 |
+| Baseline / NO_WINDOW の実 exit | ともに `0xc0000142` | ともに `0xc0000142` |
+| 分類 | `NO_WINDOW_NOT_SUFFICIENT` | `NO_WINDOW_NOT_SUFFICIENT` |
+| own 許可、other / Default / ACL 制御権拒否 | 通過 | 通過 |
+| tree / desktop / station ACE cleanup | 確認済み | 確認済み |
+| worker snapshot 比較 | 通過、個別値は非出力 | 通過、個別値は非出力 |
+
+子のコマンドは両候補とも `System32\cmd.exe /d /c "exit /b 0"`。`SpawnSucceeded=True` はプロセス作成が返ったことを示すが、正常終了には至っていない。`WINSTA_ACCESSGLOBALATOMS` の追加だけでこの条件の初期化失敗が解消するという仮説は、この測定では支持されない。必要な権限が確定したことや、最小性を示す結果ではない。
+
+同じソース SHA、OS イメージ、script hash での比較だが、fixture EXE は各 runner で独立にビルドされ、記録された hash は異なる。同一バイナリを使った比較や決定性の証明ではない。ログオンセッション、SID、desktop 名も各 job で異なる。
+
+両候補で専用 desktop の作成とアクセス検査は通過したが、子の stdout / stderr は空で、失敗した DLL / API や entry 到達の有無は観測されていない。Default・別 action・ACL 制御権が初期化に必要という証拠もない。権限追加の根拠と、実子プロセス内の失敗点は未確定である。
 
 ## CI と installer
 
@@ -84,10 +130,13 @@ C++ の M6.1b では、両 OS で hosted `/GL` が `exit=-1`、plain direct `/GL
 - `.harness/T-011-D4-run-37172192286-final.json` と `T-011-D4-run-37172192286-full.log`：Release。
 - `.harness/T-011-D4-run-37172179258-final.json` と `T-011-D4-run-37172179258-full.log`：PR CI。
 - `.harness/T-011-D4-job-111347254543.log`：0x0002 の実ログ。
-- `.harness/T-011-D4-job-111347254337.log`：0x0022 の保存ログ。
+- `.harness/T-011-D4-job-111347254337.log`：0x0022 の実ログ。
 - `.harness/T-011-D4-job-111347211383.log`：PR installer。ACL等は1196〜1227行、plain control / uninstallは1228〜1237行。
 - `.harness/T-011-D4-job-111347254102.log` と `T-011-D4-release-artifacts.json`：生成と保存物。
 - `.harness/T-011-D4-job-111347211505.log`、`T-011-D4-job-111347211506.log`、`T-011-D4-job-111347211523.log`：Rust と C++。
 - `.harness/T-011-D4-commit-<SHA>.json`：対象 HEAD と PR merge commit の tree 同一性。
+- `.harness/T-011-D5-observations.json` と `T-011-D5-comparison.txt`：両候補の照合結果と元の測定行。
 
-0x0002 の負の測定は完了しているが、T-011 の正常起動条件は未達。0x0022との実子プロセス比較、権限の最小性、installed worker の正常終了は、この0x0002の観測やRelease成功からは結論できない。
+両 job ログ、Release metadata、全ログの SHA-256 は D4 保存時の一覧と一致し、両 job の測定行は Release 全ログにも一致した。0x0022 job ログの SHA-256 は `E1828C70B349B7BCC7EB3008F876A517AD23B44F0570996A6524EABF494CD4F0`。
+
+0x0002 / 0x0022 の負の比較測定は完了したが、T-011 の正常起動条件は未達。権限の最小性、installed worker の正常終了、worker 経路の決定性は、この診断や Release 成功からは結論できない。
