@@ -1,5 +1,9 @@
 # 共有ウィンドウステーション経路の Session 0 実測
 
+本記録の対象は 2026-10-03 の固定 run `37105578000` と SHA `2590e08777c24fbe4573fb33372f1cd1008d8540`。未測定の記述はこの run の範囲を示す。
+
+2026-10-04 の SHA `e834c4ab6849c9764c1f7e739e2b707e0e25e28b` では、`0x0002` と `0x0022` の比較測定が完了した。両候補の Baseline / NO_WINDOW はすべて `0xc0000142`、分類は `NO_WINDOW_NOT_SUFFICIENT` で、正常起動と最小性は未達。同じ head SHA の installed worker も plain control が `0xC0000142` で失敗した。対象 run / job、隔離・後始末、観測の限界は[ステーション権限候補の実測](2026-10-04-session0-station-access-comparison.md)を参照。
+
 ## 対象
 
 - 対象 SHA: `2590e08777c24fbe4573fb33372f1cd1008d8540`（`chore/two-pc-preparation`）
@@ -42,4 +46,4 @@ PR CI ではこのほか Rust Clippy と Windows 2022 / 2025 の C++ M6.1b job �
 
 ## 判定
 
-I1 / I2 を含む同一 SHA の Session 0 実測は得られたが、制限付き Medium action が `0xc0000142` にならず正常終了する条件を満たさなかった。実測分類は `NO_WINDOW_NOT_SUFFICIENT` であり、T-011-M1 は未完了。installer の plain control も同じ SHA で失敗した。最小 mask、`0x0022`、成功 mask のビット除去は未測定のままとする。
+I1 / I2 を含む同一 SHA の Session 0 実測は得られたが、制限付き Medium action が `0xc0000142` にならず正常終了する条件を満たさなかった。実測分類は `NO_WINDOW_NOT_SUFFICIENT` であり、T-011-M1 は未完了。installer の plain control も同じ SHA で失敗した。この run では最小 mask、`0x0022`、成功 mask のビット除去は未測定だった。
