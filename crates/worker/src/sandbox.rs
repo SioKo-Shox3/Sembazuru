@@ -2440,11 +2440,12 @@ mod tests {
         fixture_root: PathBuf,
         record_directory: PathBuf,
         nonce: String,
+        station_profile: StationAccessProfile,
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
     const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 7;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 8;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
@@ -2526,7 +2527,17 @@ mod tests {
         }
     }
 
-    fn validate_window_station_scm_process_argv(argv: &[OsString]) -> Result<(), &'static str> {
+    fn diagnostic_station_profile(mask: u32) -> Result<StationAccessProfile, &'static str> {
+        match mask {
+            0x0002 => Ok(StationAccessProfile::ReadAttributes),
+            0x0022 => Ok(StationAccessProfile::ReadAttributesAndGlobalAtoms),
+            _ => Err("診断の station mask が許容範囲外です"),
+        }
+    }
+
+    fn validate_window_station_scm_process_argv(
+        argv: &[OsString],
+    ) -> Result<StationAccessProfile, &'static str> {
         let expected = [
             "--ignored",
             "--exact",
@@ -2534,7 +2545,7 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ];
-        if argv.len() != expected.len() + 5 {
+        if argv.len() != expected.len() + 6 {
             return Err("process argv cardinality");
         }
         if Path::new(&argv[0]).file_name() != Some(OsStr::new(WINDOW_STATION_SCM_SMOKE_BASENAME)) {
@@ -2561,7 +2572,11 @@ mod tests {
             return Err("process diagnostic paths");
         }
         validate_nonce(&nonce).map_err(|_| "process diagnostic nonce")?;
-        Ok(())
+        match argv[expected.len() + 5].to_str() {
+            Some("0x0002") => Ok(StationAccessProfile::ReadAttributes),
+            Some("0x0022") => Ok(StationAccessProfile::ReadAttributesAndGlobalAtoms),
+            _ => Err("診断の station mask の表記が一致しません"),
+        }
     }
 
     fn validate_window_station_scm_main_args(args: &[OsString]) -> Result<(), &'static str> {
@@ -2572,6 +2587,61 @@ mod tests {
             return Err("ServiceMain service name");
         }
         Ok(())
+    }
+
+    fn session0_argv_corpus() -> Vec<(Vec<OsString>, bool)> {
+        let valid: Vec<_> = [
+            WINDOW_STATION_SCM_SMOKE_BASENAME,
+            "--ignored",
+            "--exact",
+            WINDOW_STATION_SCM_SMOKE_SELECTOR,
+            "--nocapture",
+            "--test-threads=1",
+            "--",
+            "C:\\fixture",
+            "C:\\record",
+            "0123456789abcdef0123456789abcdef",
+            "0x0002",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let mut cases = vec![(valid.clone(), true)];
+        for mask in [
+            "0x0022",
+            "0x0000",
+            "0x0020",
+            "0x0023",
+            "2",
+            "34",
+            "0x2",
+            "0X0002",
+            "0x00000002",
+            "0x0022 ",
+        ] {
+            let mut argv = valid.clone();
+            argv[10] = mask.into();
+            cases.push((argv, mask == "0x0022"));
+        }
+        cases.push((valid[..10].to_vec(), false));
+        cases.push(([valid.clone(), vec!["extra".into()]].concat(), false));
+        for (index, value) in [
+            (0, "SbzWindowStationScmSmoke-copy.exe"),
+            (1, "--ignored-alias"),
+            (2, "--exact-alias"),
+            (3, "sandbox::tests::other"),
+            (4, "--nocapture-alias"),
+            (5, "--test-threads=2"),
+            (6, "not-a-separator"),
+            (7, "relative"),
+            (8, "relative"),
+            (9, "not-a-nonce"),
+        ] {
+            let mut argv = valid.clone();
+            argv[index] = value.into();
+            cases.push((argv, false));
+        }
+        cases
     }
 
     #[test]
@@ -2591,6 +2661,7 @@ mod tests {
             "C:\\fixture",
             "C:\\record",
             "0123456789abcdef0123456789abcdef",
+            "0x0002",
         ]
         .into_iter()
         .map(OsString::from)
@@ -2669,6 +2740,7 @@ mod tests {
             record.markers.to_string(),
             (record.classification as u8).to_string(),
             record.session_id.to_string(),
+            record.requested_station_mask.to_string(),
         ];
         for text in [
             &record.broker,
@@ -2722,6 +2794,7 @@ mod tests {
         bytes: Vec<u8>,
         nonce: String,
         expected: Option<Session0DiagnosticRecord>,
+        expected_mask: u32,
     }
 
     fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
@@ -2733,10 +2806,20 @@ mod tests {
                 name,
                 bytes: record.encode().unwrap(),
                 nonce: record.nonce.clone(),
+                expected_mask: record.requested_station_mask,
                 expected: Some(record),
             });
         };
-        accept("v7", record.clone());
+        accept("v8-mask-0002", record.clone());
+        let mut global_atoms = record.clone();
+        global_atoms.requested_station_mask = 0x0022;
+        global_atoms.station_ace = "count=1;flags=0;mask=0x00000022".into();
+        global_atoms.baseline.target_access = verified_target_access(0x0022);
+        global_atoms.no_window.target_access = verified_target_access(0x0022);
+        accept("v8-mask-0022", global_atoms.clone());
+        global_atoms.baseline.child_exit = Some(0);
+        global_atoms.classification = Session0DiagnosticOutcome::ActionStarts;
+        accept("action-starts-0022", global_atoms.clone());
         let mut not_sufficient = record.clone();
         not_sufficient.no_window.child_exit = Some(0xc000_0142);
         not_sufficient.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
@@ -2764,7 +2847,6 @@ mod tests {
         }
         for name in [
             "station-inherited-ace",
-            "station-wider-mask",
             "missing-station-cleanup",
             "broker-default-target",
         ] {
@@ -2773,9 +2855,6 @@ mod tests {
             match name {
                 "station-inherited-ace" => {
                     incomplete.station_ace = "count=1;flags=2;mask=0x00000002".into()
-                }
-                "station-wider-mask" => {
-                    incomplete.station_ace = "count=1;flags=0;mask=0x00000022".into()
                 }
                 "missing-station-cleanup" => incomplete.station_cleanup = "unconfirmed".into(),
                 _ => {
@@ -2847,6 +2926,7 @@ mod tests {
                 bytes,
                 nonce: record.nonce.clone(),
                 expected: None,
+                expected_mask: record.requested_station_mask,
             });
         };
         let u32_patch = |offset: usize, value: u32| {
@@ -2855,7 +2935,69 @@ mod tests {
             changed
         };
         reject("old-magic", u32_patch(0, 0x5342_4432));
-        reject("old-version", u32_patch(4, 3));
+        reject("old-version", u32_patch(4, 7));
+        reject("unknown-request-mask", u32_patch(50, 0x0020));
+        reject("request-observation-mismatch", u32_patch(50, 0x0022));
+        let mut simultaneous = bytes.clone();
+        // 両腕の action-mask と ACE を同時に変えても、独立した要求値は変わらない。
+        for (from, to) in [
+            (
+                "station:action_mask:mask=0x00000002",
+                "station:action_mask:mask=0x00000022",
+            ),
+            (
+                "count=1;flags=0;mask=0x00000002",
+                "count=1;flags=0;mask=0x00000022",
+            ),
+        ] {
+            let positions: Vec<_> = simultaneous
+                .windows(from.len())
+                .enumerate()
+                .filter_map(|(i, v)| (v == from.as_bytes()).then_some(i))
+                .collect();
+            for i in positions {
+                simultaneous[i..i + to.len()].copy_from_slice(to.as_bytes());
+            }
+        }
+        simultaneous[45] = Session0DiagnosticOutcome::Indeterminate as u8;
+        reject("ace-access-classification-forged", simultaneous);
+        reject("caller-mask-mismatch", global_atoms.encode().unwrap());
+        for (name, from, to) in [
+            ("station-ace-absent", "count=1;flags=0", "count=0;flags=0"),
+            (
+                "station-ace-duplicate",
+                "count=1;flags=0",
+                "count=2;flags=0",
+            ),
+            (
+                "station-ace-inherited",
+                "count=1;flags=0",
+                "count=1;flags=2",
+            ),
+            (
+                "station-ace-unknown-mask",
+                "count=1;flags=0;mask=0x00000002",
+                "count=1;flags=0;mask=0x00000020",
+            ),
+            (
+                "target-action-mask-mismatch",
+                "station:action_mask:mask=0x00000002",
+                "station:action_mask:mask=0x00000022",
+            ),
+            ("station-cleanup-not-removed", "removed", "unknown"),
+        ] {
+            let mut changed = bytes.clone();
+            let positions: Vec<_> = changed
+                .windows(from.len())
+                .enumerate()
+                .filter_map(|(i, v)| (v == from.as_bytes()).then_some(i))
+                .collect();
+            assert!(!positions.is_empty());
+            for i in positions {
+                changed[i..i + to.len()].copy_from_slice(to.as_bytes());
+            }
+            reject(name, changed);
+        }
         let mut nonce = bytes.clone();
         nonce[8] = b'1';
         reject("nonce-mismatch", nonce);
@@ -2873,9 +3015,9 @@ mod tests {
         trailing[40..44].copy_from_slice(&trailing_length.to_le_bytes());
         reject("trailing", trailing);
         let mut invalid_utf8 = bytes.clone();
-        invalid_utf8[54] = 0xff;
+        invalid_utf8[58] = 0xff;
         reject("invalid-utf8", invalid_utf8);
-        let mut baseline_offset = 50;
+        let mut baseline_offset = 54;
         for _ in 0..14 {
             let length = u32::from_le_bytes(
                 bytes[baseline_offset..baseline_offset + 4]
@@ -2884,8 +3026,8 @@ mod tests {
             );
             baseline_offset += 4 + length as usize;
         }
-        // The baseline run is the UI mask, the names of that mask, the creation flags, and then
-        // the spawn-succeeded flag; the names are variable length, so the rest is measured here.
+        // baseline は UI mask、可変長の名称、作成フラグ、起動成功フラグの順に格納する。
+        // 名称の長さを読み、後続の位置を求める。
         let baseline_names_offset = baseline_offset + 4;
         let baseline_names_length = u32::from_le_bytes(
             bytes[baseline_names_offset..baseline_names_offset + 4]
@@ -2894,7 +3036,10 @@ mod tests {
         ) as usize;
         let baseline_flags_offset = baseline_names_offset + 4 + baseline_names_length;
         let mut run_payload = Writer::new();
-        record.baseline.encode_into(&mut run_payload).unwrap();
+        record
+            .baseline
+            .encode_into(&mut run_payload, record.requested_station_mask)
+            .unwrap();
         let lifecycle_offset = baseline_offset + run_payload.into_bytes().len() - 1;
         let mut invalid_lifecycle = bytes.clone();
         invalid_lifecycle[lifecycle_offset] = 0x80;
@@ -2927,8 +3072,7 @@ mod tests {
         );
         let mut relaxed_job_ui = u32_patch(baseline_offset, 0xbe);
         let relaxed_names = describe_job_ui_limits(0xbe);
-        // Every name is fixed width, so the record stays internally consistent and the rejection
-        // still has to come from the A/B Job UI constraint rather than from the names check.
+        // 各名称の幅は固定なので記録内部の整合性を保ち、A/B の Job UI 制約で拒否させる。
         assert_eq!(relaxed_names.len(), baseline_names_length);
         relaxed_job_ui
             [baseline_names_offset + 4..baseline_names_offset + 4 + baseline_names_length]
@@ -2948,7 +3092,7 @@ mod tests {
             .unwrap()
             .bytes
             .clone();
-        let action_offset = 54 + 32768;
+        let action_offset = 58 + 32768;
         let action_length = u32::from_le_bytes(
             oversized[action_offset..action_offset + 4]
                 .try_into()
@@ -2963,6 +3107,7 @@ mod tests {
             bytes: oversized,
             nonce: record.nonce.clone(),
             expected: None,
+            expected_mask: record.requested_station_mask,
         });
         let forged: Vec<_> = cases
             .iter()
@@ -2986,6 +3131,7 @@ mod tests {
                     bytes,
                     nonce: case.nonce.clone(),
                     expected: None,
+                    expected_mask: case.expected_mask,
                 }
             })
             .collect();
@@ -3000,7 +3146,7 @@ mod tests {
             })
             .map(|case| {
                 let mut bytes = case.bytes.clone();
-                let mut offset = 50;
+                let mut offset = 54;
                 for _ in 0..14 {
                     let len =
                         u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
@@ -3011,7 +3157,7 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .baseline
-                    .encode_into(&mut run)
+                    .encode_into(&mut run, case.expected_mask)
                     .unwrap();
                 bytes[offset + run.into_bytes().len() - 1] = 15;
                 bytes[45] = Session0DiagnosticOutcome::ActionStarts as u8;
@@ -3020,10 +3166,70 @@ mod tests {
                     bytes,
                     nonce: case.nonce.clone(),
                     expected: None,
+                    expected_mask: case.expected_mask,
                 }
             })
             .collect();
         cases.extend(forged);
+        // 呼出側との比較だけでなく、要求と実測の照合そのものも検査する。
+        for (name, mask) in [
+            ("request-observation-mismatch", 0x0022),
+            ("unknown-request-mask", 0x0020),
+        ] {
+            let case = cases.iter_mut().find(|case| case.name == name).unwrap();
+            case.expected_mask = mask;
+        }
+        // 不一致を「観測未確認」に偽装しても拒否する。両候補・両腕へ同じ反例を適用する。
+        for fixture_name in ["v8-mask-0002", "v8-mask-0022"] {
+            let fixture = cases
+                .iter()
+                .find(|case| case.name == fixture_name)
+                .unwrap()
+                .expected
+                .as_ref()
+                .unwrap()
+                .clone();
+            for baseline in [true, false] {
+                let mut incomplete = fixture.clone();
+                incomplete.classification = Session0DiagnosticOutcome::Indeterminate;
+                let run = if baseline {
+                    &mut incomplete.baseline
+                } else {
+                    &mut incomplete.no_window
+                };
+                run.lifecycle = 13;
+                // 要求と一致する記録を先に符号化し、測定値だけを改ざんする。
+                let mut forged = incomplete.encode().unwrap();
+                let original = format!(
+                    "station:action_mask:mask=0x{:08x}",
+                    fixture.requested_station_mask
+                );
+                let position = forged
+                    .windows(original.len())
+                    .enumerate()
+                    .filter_map(|(i, value)| (value == original.as_bytes()).then_some(i))
+                    .nth(if baseline { 0 } else { 1 })
+                    .unwrap();
+                for mask in [
+                    if fixture.requested_station_mask == 2 {
+                        0x0022
+                    } else {
+                        0x0002
+                    },
+                    0x0020,
+                ] {
+                    let altered = format!("station:action_mask:mask=0x{mask:08x}");
+                    forged[position..position + altered.len()].copy_from_slice(altered.as_bytes());
+                    cases.push(Session0DiagnosticCase {
+                        name: "target-mask-mismatch-unverified-indeterminate",
+                        bytes: forged.clone(),
+                        nonce: fixture.nonce.clone(),
+                        expected: None,
+                        expected_mask: fixture.requested_station_mask,
+                    });
+                }
+            }
+        }
         cases
     }
 
@@ -3031,62 +3237,112 @@ mod tests {
     fn session0_diagnostic_observes_spawn_target_and_cleanup_with_reused_lease() {
         let station = unsafe { GetProcessWindowStation() };
         let before = station_dacl(station).unwrap();
-        let lease = Arc::new(ActionStationLease::acquire().unwrap());
-        // この単体テストは対話 station の DACL を変更しない経路だけで走る。
-        assert_eq!(lease.station_name, "WinSta0");
-        let sid = sid_string(lease.worker_actions_sid.sid()).unwrap();
-        let weak = Arc::downgrade(&lease);
-        let mut names = Vec::new();
-        // lease の再利用は製品フラグで確認する。NO_WINDOW の成立性は別の測定対象。
-        for _ in 0..2 {
-            let token = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
-            assert!(
-                token_sid_list(token.handle(), TokenRestrictedSids)
+        for profile in [
+            StationAccessProfile::ReadAttributes,
+            StationAccessProfile::ReadAttributesAndGlobalAtoms,
+        ] {
+            let lease = Arc::new(ActionStationLease::acquire_for_diagnostic(profile).unwrap());
+            // この単体テストは対話 station の DACL を変更しない経路だけで走る。
+            assert_eq!(lease.station_name, "WinSta0");
+            let sid = sid_string(lease.worker_actions_sid.sid()).unwrap();
+            let weak = Arc::downgrade(&lease);
+            let mut names = Vec::new();
+            // lease の再利用は製品フラグで確認する。NO_WINDOW の成立性は別の測定対象。
+            for _ in 0..2 {
+                let token = ActionToken::create_for_worker(Arc::clone(&lease)).unwrap();
+                assert!(
+                    token_sid_list(token.handle(), TokenRestrictedSids)
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry.sid == sid)
+                );
+                assert!(
+                    !token_groups_contain(
+                        token.handle(),
+                        TokenGroups,
+                        lease.worker_actions_sid.sid()
+                    )
                     .unwrap()
-                    .iter()
-                    .any(|entry| entry.sid == sid)
+                );
+                assert!(
+                    token_groups_contain(token.handle(), TokenRestrictedSids, token.action_sid.0)
+                        .unwrap()
+                );
+                assert!(
+                    !token_default_dacl_sids(token.handle())
+                        .unwrap()
+                        .contains(&sid)
+                );
+                assert!(diagnostic_tcb_absent(token.handle()).unwrap());
+                // サービスの Default と同じ broker 専用 ACL をテスト所有オブジェクトへ設定する。
+                // 対話セッションの実 Default は変更せず、拒否の成否をその既存 ACL に依存させない。
+                let (default_control_name, default_control) =
+                    ActionDesktop::desktop_on_current_station_for_test(&token).unwrap();
+                let (control, revision, aces) = station_dacl(default_control.0).unwrap();
+                assert_eq!(aces.len(), 2);
+                assert_eq!(
+                    aces[0].simple_allow().unwrap().0,
+                    sid_string(token.broker_sid()).unwrap()
+                );
+                set_station_dacl(default_control.0, control, revision, &aces[..1]).unwrap();
+                assert_eq!(
+                    action_desktop_open(&token, &default_control_name, MAXIMUM_ALLOWED),
+                    Err(ERROR_ACCESS_DENIED)
+                );
+                let root = private_scratch_root();
+                let scratch = PrivateScratch::create(&root, "diagnostic", &token).unwrap();
+                let (command, _) = session0_diagnostic_command(scratch.path()).unwrap();
+                let run = run_session0_diagnostic_child(
+                    &token,
+                    &command,
+                    TestCreationProfile::Production,
+                )
+                .unwrap();
+                assert!(run.spawn_succeeded, "{run:?}");
+                assert_eq!(run.child_exit, Some(0), "{run:?}");
+                assert_eq!(run.lifecycle & 13, 13, "{run:?}");
+                assert!(run.target_desktop.starts_with("WinSta0\\sbz-"));
+                assert_eq!(run.target_access, verified_target_access(profile.mask()));
+                assert!(
+                    run.target_dacl
+                        .contains(&sid_string(token.action_sid.0).unwrap())
+                );
+                assert!(!run.target_dacl.contains(&sid));
+                assert!(
+                    run.isolation.contains("own=Ok(true);other_maximum=Err(5)"),
+                    "{run:?}"
+                );
+                assert!(
+                    run.isolation
+                        .contains("write_dac=Err(5);write_owner=Err(5)"),
+                    "{run:?}"
+                );
+                assert!(
+                    run.isolation
+                        .contains("default_dacl_safe=true;tcb_absent=true"),
+                    "{run:?}"
+                );
+                names.push(run.target_desktop);
+                drop(scratch);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+            assert_ne!(names[0], names[1]);
+            drop(lease);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(station_dacl(station).unwrap(), before);
+            assert_eq!(unsafe { GetProcessWindowStation() }, station);
+            eprintln!(
+                "候補 mask=0x{:04x}: own 許可、other/Default 相当のテスト所有 USER オブジェクト/WRITE_DAC/WRITE_OWNER 拒否、SID/Tcb と cleanup を確認",
+                profile.mask()
             );
-            let root = private_scratch_root();
-            let scratch = PrivateScratch::create(&root, "diagnostic", &token).unwrap();
-            let (command, _) = session0_diagnostic_command(scratch.path()).unwrap();
-            let run =
-                run_session0_diagnostic_child(&token, &command, TestCreationProfile::Production)
-                    .unwrap();
-            assert!(run.spawn_succeeded, "{run:?}");
-            assert_eq!(run.child_exit, Some(0), "{run:?}");
-            assert_eq!(run.lifecycle & 13, 13, "{run:?}");
-            assert!(run.target_desktop.starts_with("WinSta0\\sbz-"));
-            assert!(
-                run.target_dacl
-                    .contains(&sid_string(token.action_sid.0).unwrap())
-            );
-            assert!(!run.target_dacl.contains(&sid));
-            assert!(run.isolation.contains("other_maximum=Err(5)"), "{run:?}");
-            assert!(
-                run.isolation
-                    .contains("write_dac=Err(5);write_owner=Err(5)"),
-                "{run:?}"
-            );
-            assert!(
-                run.isolation
-                    .contains("default_dacl_safe=true;tcb_absent=true"),
-                "{run:?}"
-            );
-            names.push(run.target_desktop);
-            drop(scratch);
-            std::fs::remove_dir_all(root).unwrap();
         }
-        assert_ne!(names[0], names[1]);
-        drop(lease);
-        assert!(weak.upgrade().is_none());
-        assert_eq!(station_dacl(station).unwrap(), before);
-        assert_eq!(unsafe { GetProcessWindowStation() }, station);
     }
 
     #[test]
     fn session0_diagnostic_record_codec_rejects_tampering() {
         for case in session0_diagnostic_corpus() {
-            let decoded = Session0DiagnosticRecord::decode(&case.bytes, &case.nonce);
+            let decoded =
+                Session0DiagnosticRecord::decode(&case.bytes, &case.nonce, case.expected_mask);
             match case.expected {
                 Some(expected) => assert_eq!(decoded.unwrap(), expected, "{}", case.name),
                 None => assert!(decoded.is_err(), "accepted {}", case.name),
@@ -3094,6 +3350,9 @@ mod tests {
         }
         let mut inconsistent = Session0DiagnosticRecord::fixture();
         inconsistent.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
+        assert!(inconsistent.encode().is_err());
+        inconsistent = Session0DiagnosticRecord::fixture();
+        inconsistent.requested_station_mask = 0x0020;
         assert!(inconsistent.encode().is_err());
     }
 
@@ -3122,30 +3381,41 @@ $path = [Text.Encoding]::UTF8.GetString([Convert]::FromHexString([Console]::In.R
 $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
-if ($errors.Count -ne 0) { throw 'Probe PowerShell syntax error.' }
-foreach ($name in @('Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
+foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0FixtureArguments', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
-    if ($definitions.Count -ne 1) { throw "Expected one parser function: $name" }
+    if ($definitions.Count -ne 1) { throw "関数の定義数が一致しません: $name" }
     . ([ScriptBlock]::Create($definitions[0].Extent.Text))
 }
 $count = 0
+$argvCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
-    $parts = $line.Split("`t", 5)
+    $parts = $line.Split("`t", 6)
+    if ($parts[0] -ceq 'argv') {
+        $arguments = @($parts[2].Split(',') | ForEach-Object {
+            [Text.Encoding]::UTF8.GetString([Convert]::FromHexString($_))
+        })
+        $rejected = $false
+        try { Assert-Session0FixtureArguments $arguments } catch { $rejected = $true }
+        if ($rejected -eq ($parts[1] -ceq 'accept')) { throw 'SCM 引数の判定が一致しません。' }
+        $argvCount++
+        continue
+    }
     $bytes = [Convert]::FromHexString($parts[2])
     $record = $null
     $rejected = $false
-    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] }
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) }
     catch { $rejected = $true }
     if ($parts[3] -ceq 'reject') {
-        if (-not $rejected) { throw "Accepted malformed case $($parts[0])" }
+        if (-not $rejected) { throw "不正な記録を受理しました: $($parts[0])" }
     } else {
-        if ($rejected -or $null -eq $record) { throw "Rejected valid case $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne 23) { throw 'レコードのプロパティ数が一致しません。' }
+        if ($rejected -or $null -eq $record) { throw "正常な記録を拒否しました: $($parts[0])" }
+        if (@($record.PSObject.Properties).Count -ne 24) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
-        foreach ($property in @('Markers', 'Classification', 'SessionId')) { $values.Add([string]$record.$property) }
+        foreach ($property in @('Markers', 'Classification', 'SessionId', 'RequestedStationMask')) { $values.Add([string]$record.$property) }
         foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
@@ -3164,20 +3434,44 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         foreach ($property in @('WorkerActionsSid', 'StationAce', 'StationCleanup')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        if (($values -join "`t") -cne $parts[4]) { throw "Property mismatch: $($parts[0])" }
+        if (($values -join "`t") -cne $parts[5]) { throw "記録のプロパティが一致しません: $($parts[0])" }
     }
     $count++
 }
-[Console]::WriteLine("PASS $count")
+[Console]::WriteLine("PASS records=$count argv=$argvCount")
 "#;
         let cases = session0_diagnostic_corpus();
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../hooks/test/m6_worker_window_station_probe.ps1");
         let mut input = format!("{}\n", diagnostic_hex(path.to_str().unwrap().as_bytes()));
+        let argv_cases = session0_argv_corpus();
+        for (argv, accepted) in &argv_cases {
+            assert_eq!(
+                validate_window_station_scm_process_argv(argv).is_ok(),
+                *accepted,
+                "{argv:?}"
+            );
+            if *accepted {
+                assert_eq!(
+                    validate_window_station_scm_process_argv(argv)
+                        .unwrap()
+                        .mask(),
+                    if argv[10] == "0x0002" { 0x0002 } else { 0x0022 }
+                );
+            }
+            input.push_str(&format!(
+                "argv\t{}\t{}\n",
+                if *accepted { "accept" } else { "reject" },
+                argv.iter()
+                    .map(|v| diagnostic_hex(v.to_str().unwrap().as_bytes()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+        }
         for case in &cases {
             let expected = case.expected.as_ref().map(diagnostic_properties);
             input.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.name,
                 case.nonce,
                 diagnostic_hex(&case.bytes),
@@ -3186,6 +3480,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 } else {
                     "reject"
                 },
+                case.expected_mask,
                 expected.unwrap_or_default(),
             ));
         }
@@ -3214,10 +3509,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             String::from_utf8_lossy(&output.stderr)
         );
         written.expect("PowerShell corpus input");
+        let stdout = String::from_utf8(output.stdout).unwrap();
         assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            format!("PASS {}", cases.len())
+            stdout.trim(),
+            format!("PASS records={} argv={}", cases.len(), argv_cases.len())
         );
+        eprintln!("PowerShell 共通 corpus: {}", stdout.trim());
     }
 
     /// Opens a named desktop on this process's current station under one action token, the way a
@@ -3593,6 +3890,13 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         }
     }
 
+    fn verified_target_access(mask: u32) -> String {
+        VERIFIED_TARGET_ACCESS.replace(
+            "station:action_mask:mask=0x00000002",
+            &format!("station:action_mask:mask=0x{mask:08x}"),
+        )
+    }
+
     const VERIFIED_TARGET_ACCESS: &str = concat!(
         "scope=broker-impersonated;first_failure=none;steps=[",
         "station:maximum_allowed:mask=0x02000000;allowed=true;gle=0,",
@@ -3701,10 +4005,10 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
     }
 
     impl Session0DiagnosticRun {
-        fn observations_verified(&self) -> bool {
+        fn observations_verified(&self, requested_mask: u32) -> bool {
             diagnostic_target_dacl_complete(&self.target_dacl)
                 && diagnostic_target_label_complete(&self.target_sacl)
-                && self.target_access == VERIFIED_TARGET_ACCESS
+                && self.target_access == verified_target_access(requested_mask)
                 && self.isolation == VERIFIED_TARGET_ISOLATION
         }
 
@@ -3770,7 +4074,13 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     && tcb_absent)
             })();
             match result {
-                Ok(true) if self.observations_verified() => self.lifecycle |= 2,
+                Ok(true)
+                    if self.observations_verified(
+                        action.station_lease.as_ref().unwrap().profile.mask(),
+                    ) =>
+                {
+                    self.lifecycle |= 2
+                }
                 Ok(_) => {}
                 Err(error) => self.isolation = format!("unavailable:{error}"),
             }
@@ -3798,12 +4108,22 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
             }
         }
 
-        fn encode_into(&self, payload: &mut Writer) -> Result<(), String> {
+        fn encode_into(&self, payload: &mut Writer, requested_mask: u32) -> Result<(), String> {
+            // 明示された測定 mask の不一致は、未確認ビットや失敗分類で隠せない。
+            for step in self
+                .target_access
+                .split("station:action_mask:mask=0x")
+                .skip(1)
+            {
+                if step.split(';').next() != Some(format!("{requested_mask:08x}").as_str()) {
+                    return Err("TargetAccess の station mask が要求と一致しません".into());
+                }
+            }
             // 名称は mask の展開表。照会した mask と一致しない記録を拒否する。
             if self.lifecycle & !15 != 0
                 || (self.lifecycle & 14 != 0 && self.lifecycle & 1 == 0)
                 || (self.lifecycle & 4 != 0 && !self.spawn_succeeded)
-                || (self.lifecycle & 2 != 0 && !self.observations_verified())
+                || (self.lifecycle & 2 != 0 && !self.observations_verified(requested_mask))
             {
                 return Err("diagnostic lifecycle".into());
             }
@@ -3870,6 +4190,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         markers: u8,
         classification: Session0DiagnosticOutcome,
         session_id: u32,
+        requested_station_mask: u32,
         broker: String,
         action: String,
         station: String,
@@ -3903,6 +4224,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 markers: Self::ENTRY | Self::PRE_SPAWN | Self::SPAWN_RETURNED,
                 classification: Session0DiagnosticOutcome::NoWindowCausal,
                 session_id: 0,
+                requested_station_mask: 0x0002,
                 broker: "user=S-1-5-80-1;integrity=8192;mandatory_policy=0x00000001;\
 groups=[];privileges=[]"
                     .into(),
@@ -3971,12 +4293,17 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 || self.baseline.creation_flags != 0x0008_0404
                 || self.no_window.creation_flags != 0x0808_0404
                 || self.worker_actions_sid.is_empty()
-                || self.station_ace != "count=1;flags=0;mask=0x00000002"
+                || self.station_ace
+                    != format!("count=1;flags=0;mask=0x{:08x}", self.requested_station_mask)
                 || self.station_cleanup != "removed"
                 || self.baseline.lifecycle != 15
                 || self.no_window.lifecycle != 15
-                || !self.baseline.observations_verified()
-                || !self.no_window.observations_verified()
+                || !self
+                    .baseline
+                    .observations_verified(self.requested_station_mask)
+                || !self
+                    .no_window
+                    .observations_verified(self.requested_station_mask)
                 || !self.baseline.spawn_error.is_empty()
                 || !self.no_window.spawn_error.is_empty()
                 || !self
@@ -4000,6 +4327,13 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
 
         fn encode(&self) -> Result<Vec<u8>, String> {
             validate_nonce(&self.nonce)?;
+            diagnostic_station_profile(self.requested_station_mask)?;
+            // ACE の実測値から要求を逆算しない。観測済みの mask は分類によらず要求と一致する。
+            if let Some((_, mask)) = self.station_ace.rsplit_once(";mask=0x")
+                && mask != format!("{:08x}", self.requested_station_mask)
+            {
+                return Err("実測した station ACE の mask が要求と一致しません".into());
+            }
             if self.markers & !0x07 != 0 || self.markers & Self::ENTRY == 0 {
                 return Err("diagnostic markers".into());
             }
@@ -4028,6 +4362,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             payload.u8(self.markers);
             payload.u8(self.classification as u8);
             payload.u32(self.session_id);
+            payload.u32(self.requested_station_mask);
             for value in [
                 &self.broker,
                 &self.action,
@@ -4046,8 +4381,10 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             ] {
                 write_text(&mut payload, value)?;
             }
-            self.baseline.encode_into(&mut payload)?;
-            self.no_window.encode_into(&mut payload)?;
+            self.baseline
+                .encode_into(&mut payload, self.requested_station_mask)?;
+            self.no_window
+                .encode_into(&mut payload, self.requested_station_mask)?;
             for value in [
                 &self.worker_actions_sid,
                 &self.station_ace,
@@ -4068,8 +4405,9 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             Ok(bytes)
         }
 
-        fn decode(bytes: &[u8], expected_nonce: &str) -> Result<Self, String> {
+        fn decode(bytes: &[u8], expected_nonce: &str, expected_mask: u32) -> Result<Self, String> {
             validate_nonce(expected_nonce)?;
+            diagnostic_station_profile(expected_mask)?;
             if bytes.len() < 44 || bytes.len() > 44 + Self::MAX_BYTES {
                 return Err("diagnostic record length".into());
             }
@@ -4095,6 +4433,12 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 reader.u8().map_err(|_| "diagnostic classification")?,
             )?;
             let session_id = reader.u32().map_err(|_| "diagnostic session")?;
+            let requested_station_mask = reader
+                .u32()
+                .map_err(|_| "診断の station mask がありません")?;
+            if requested_station_mask != expected_mask {
+                return Err("要求 station mask が呼出側の期待値と一致しません".into());
+            }
             let mut fields = Vec::new();
             for _ in 0..14 {
                 fields.push(read_text(&mut reader)?);
@@ -4110,6 +4454,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 markers,
                 classification,
                 session_id,
+                requested_station_mask,
                 broker: fields.remove(0),
                 action: fields.remove(0),
                 station: fields.remove(0),
@@ -4231,23 +4576,25 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
     #[ignore]
     fn window_station_scm_dispatcher_smoke_role() {
         let argv: Vec<_> = std::env::args_os().collect();
-        validate_window_station_scm_process_argv(&argv).expect("SCM smoke process argv contract");
+        let station_profile =
+            validate_window_station_scm_process_argv(&argv).expect("SCM 診断の引数契約");
         let config = Session0DiagnosticConfig {
+            station_profile,
             fixture_root: PathBuf::from(&argv[7]),
             record_directory: PathBuf::from(&argv[8]),
             nonce: argv[9]
                 .to_str()
-                .expect("SCM diagnostic nonce utf8")
+                .expect("SCM 診断の nonce は UTF-8")
                 .to_owned(),
         };
         SESSION0_DIAGNOSTIC_CONFIG
             .set(config)
-            .expect("SCM diagnostic config set once");
+            .expect("SCM 診断の設定は一度だけ設定する");
         windows_service::service_dispatcher::start(
             WINDOW_STATION_SCM_SMOKE_SERVICE,
             ffi_window_station_scm_smoke_main,
         )
-        .expect("SCM dispatcher smoke");
+        .expect("SCM 診断の dispatcher 起動");
     }
 
     fn diagnostic_token_summary(
@@ -4449,11 +4796,9 @@ privileges={privileges:?}{restricted}",
         parts.join(";")
     }
 
-    /// The ordered user-object opens that process initialisation needs, attempted under the action
-    /// token, naming the first one that is refused and its Win32 error. The child dies inside
-    /// `user32` initialisation before any code of ours runs, so this is a broker-side stand-in and
-    /// not an in-child API trace: it says which open a token like this one is refused, not which
-    /// call the dead child made last.
+    /// 初期化に必要な USER オブジェクトを action トークンで順に開き、最初の拒否を記録する。
+    /// 子の user32 初期化より前にはコードを実行できないため、broker 側でアクセスを測る。
+    /// 子が実際に最後に呼んだ API を示すトレースではない。
     fn diagnostic_ui_probe(token: &ActionToken, station: &str, desktop: &str) -> String {
         let station_wide: Vec<u16> = OsStr::new(station).encode_wide().chain(Some(0)).collect();
         let desktop_wide: Vec<u16> = OsStr::new(desktop).encode_wide().chain(Some(0)).collect();
@@ -4464,33 +4809,39 @@ privileges={privileges:?}{restricted}",
                 for (name, mask) in [
                     ("station:maximum_allowed", MAXIMUM_ALLOWED),
                     ("station:read_attributes", WINSTA_READATTRIBUTES as u32),
-                    ("station:action_mask", 0x0002),
+                    (
+                        "station:action_mask",
+                        token
+                            .station_lease
+                            .as_ref()
+                            .map_or(0x0002, |lease| lease.profile.mask()),
+                    ),
                     ("desktop:maximum_allowed", MAXIMUM_ALLOWED),
                     ("desktop:read_objects", DESKTOP_READOBJECTS),
                     ("desktop:action_mask", ACTION_DESKTOP_RIGHTS),
                 ] {
                     let opened = if name.starts_with("station:") {
-                        // SAFETY: the station name is NUL-terminated and live through the call.
+                        // SAFETY: station 名は NUL 終端され、呼び出し中に有効。
                         let handle = unsafe { OpenWindowStationW(station_wide.as_ptr(), 0, mask) };
                         if handle.is_null() {
                             None
                         } else {
-                            // SAFETY: OpenWindowStationW returned this owned user-object handle.
+                            // SAFETY: OpenWindowStationW が返した所有ハンドルを一度だけ閉じる。
                             unsafe { CloseWindowStation(handle) };
                             Some(())
                         }
                     } else {
-                        // SAFETY: the desktop name is valid and the process station is unchanged.
+                        // SAFETY: desktop 名は有効で、プロセスの station は変更されていない。
                         let handle = unsafe { OpenDesktopW(desktop_wide.as_ptr(), 0, 0, mask) };
                         if handle.is_null() {
                             None
                         } else {
-                            // SAFETY: OpenDesktopW returned this owned user-object handle.
+                            // SAFETY: OpenDesktopW が返した所有ハンドルを一度だけ閉じる。
                             unsafe { CloseDesktop(handle) };
                             Some(())
                         }
                     };
-                    // SAFETY: GetLastError is read immediately after the open above.
+                    // SAFETY: 失敗した open の直後に GetLastError を読む。
                     let error = if opened.is_some() {
                         0
                     } else {
@@ -4750,6 +5101,7 @@ privileges={privileges:?}{restricted}",
             markers: Session0DiagnosticRecord::ENTRY,
             classification: Session0DiagnosticOutcome::Indeterminate,
             session_id: diagnostic_session_id(broker_handle).unwrap_or(u32::MAX),
+            requested_station_mask: config.station_profile.mask(),
             broker: diagnostic_token_summary(broker_handle, true)
                 .unwrap_or_else(|error| format!("unavailable:{error}")),
             action: "unavailable:not-created".into(),
@@ -4771,7 +5123,7 @@ privileges={privileges:?}{restricted}",
             station_ace: "unavailable:not-acquired".into(),
             station_cleanup: "unavailable:not-acquired".into(),
         };
-        let lease = match ActionStationLease::acquire() {
+        let lease = match ActionStationLease::acquire_for_diagnostic(config.station_profile) {
             Ok(lease) => Arc::new(lease),
             Err(error) => {
                 record.action_desktop = format!("station_lease: {error}");

@@ -1,7 +1,36 @@
 param(
     [string]$ArtifactPath,
-    [string]$ExpectedSha256
+    [string]$ExpectedSha256,
+    [string]$StationMask = '0x0002'
 )
+
+function ConvertFrom-Session0StationMask([string]$Value) {
+    switch -CaseSensitive ($Value) {
+        '0x0002' { return [uint32]0x0002 }
+        '0x0022' { return [uint32]0x0022 }
+        default { throw '診断の station mask は 0x0002 または 0x0022 が必要です。' }
+    }
+}
+
+function Assert-Session0FixtureArguments([string[]]$Arguments) {
+    if ($Arguments.Count -ne 11) { throw 'SCM 診断の引数数が一致しません。' }
+    $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
+        '--nocapture', '--test-threads=1', '--')
+    if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
+        throw 'SCM 診断の実行ファイル名が一致しません。'
+    }
+    for ($i = 0; $i -lt $fixed.Count; $i++) {
+        if ($Arguments[$i + 1] -cne $fixed[$i]) { throw 'SCM 診断の固定引数が一致しません。' }
+    }
+    if (-not [IO.Path]::IsPathFullyQualified($Arguments[7]) -or
+        -not [IO.Path]::IsPathFullyQualified($Arguments[8]) -or
+        $Arguments[9] -cnotmatch '\A[0-9a-fA-F]{32}\z') {
+        throw 'SCM 診断のパスまたは nonce が不正です。'
+    }
+    $null = ConvertFrom-Session0StationMask $Arguments[10]
+}
+
+$requestedStationMask = ConvertFrom-Session0StationMask $StationMask
 
 $env:PSModulePath = "$PSHOME\Modules"
 $principal = [Security.Principal.WindowsPrincipal]::new(
@@ -24,7 +53,7 @@ Set-StrictMode -Version Latest
 if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
     throw 'Elevated direct -File execution is forbidden; use the verified in-memory bootstrap.'
 }
-if ($args.Count -ne 0) { throw 'This probe accepts only ArtifactPath and ExpectedSha256.' }
+if ($args.Count -ne 0) { throw '指定できる引数は ArtifactPath、ExpectedSha256、StationMask だけです。' }
 if ([string]::IsNullOrWhiteSpace($ArtifactPath) -or
     [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
     throw 'ArtifactPath and ExpectedSha256 are required after elevation.'
@@ -1012,7 +1041,7 @@ function Expand-Session0JobUi([uint32]$Mask) {
     return $parts -join ';'
 }
 
-function Test-Session0TargetEvidence([string]$Dacl, [string]$Sacl, [string]$Access, [string]$Isolation) {
+function Test-Session0TargetEvidence([string]$Dacl, [string]$Sacl, [string]$Access, [string]$Isolation, [uint32]$RequestedMask) {
     # 保護 DACL の2主体、完全な label、アクセスと隔離の実測が全て必要。
     $sid = 'S-1-[0-9]+(?:-[0-9]+)+'
     $pattern = '\Acontrol=0x([0-9a-fA-F]{4});aces=\[type=0;flags=0;mask=0x000f01ff;sid=(' +
@@ -1037,7 +1066,7 @@ function Test-Session0TargetEvidence([string]$Dacl, [string]$Sacl, [string]$Acce
     $expectedAccess = 'scope=broker-impersonated;first_failure=none;steps=[' +
         'station:maximum_allowed:mask=0x02000000;allowed=true;gle=0,' +
         'station:read_attributes:mask=0x00000002;allowed=true;gle=0,' +
-        'station:action_mask:mask=0x00000002;allowed=true;gle=0,' +
+        ('station:action_mask:mask=0x{0:x8};allowed=true;gle=0,' -f $RequestedMask) +
         'desktop:maximum_allowed:mask=0x02000000;allowed=true;gle=0,' +
         'desktop:read_objects:mask=0x00000001;allowed=true;gle=0,' +
         'desktop:action_mask:mask=0x000201ff;allowed=true;gle=0]'
@@ -1046,7 +1075,7 @@ function Test-Session0TargetEvidence([string]$Dacl, [string]$Sacl, [string]$Acce
     return $Access -ceq $expectedAccess -and $Isolation -ceq $expectedIsolation
 }
 
-function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
+function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset, [uint32]$RequestedMask) {
     $jobUi = Read-Session0U32 $Bytes $Offset
     $jobUiLimits = Read-Session0Text $Bytes $Offset
     if ($jobUiLimits -cne (Expand-Session0JobUi $jobUi)) {
@@ -1072,6 +1101,13 @@ function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
     $targetDacl = Read-Session0Text $Bytes $Offset
     $targetSacl = Read-Session0Text $Bytes $Offset
     $targetAccess = Read-Session0Text $Bytes $Offset
+    # 明示された測定 mask は、分類や隔離確認ビットと独立して照合する。
+    $maskSteps = $targetAccess.Split([string[]]@('station:action_mask:mask=0x'), [StringSplitOptions]::None)
+    for ($i = 1; $i -lt $maskSteps.Count; $i++) {
+        if ($maskSteps[$i].Split(';')[0] -cne ('{0:x8}' -f $RequestedMask)) {
+            throw 'TargetAccess の station mask が要求と一致しません。'
+        }
+    }
     $isolation = Read-Session0Text $Bytes $Offset
     if ($Offset.Value -ge $Bytes.Length) { throw '診断の終了処理情報がありません。' }
     $lifecycle = $Bytes[$Offset.Value]
@@ -1079,7 +1115,7 @@ function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
     if (($lifecycle -band 0xf0) -ne 0 -or
         (($lifecycle -band 14) -ne 0 -and ($lifecycle -band 1) -eq 0) -or
         (($lifecycle -band 4) -ne 0 -and -not $spawnSucceeded) -or
-        (($lifecycle -band 2) -ne 0 -and -not (Test-Session0TargetEvidence $targetDacl $targetSacl $targetAccess $isolation))) {
+        (($lifecycle -band 2) -ne 0 -and -not (Test-Session0TargetEvidence $targetDacl $targetSacl $targetAccess $isolation $RequestedMask))) {
         throw '診断の作成・終了処理情報が矛盾しています。'
     }
     return [PSCustomObject]@{
@@ -1091,12 +1127,15 @@ function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
     }
 }
 
-function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
+function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$ExpectedMask) {
+    if ($ExpectedMask -ne 0x0002 -and $ExpectedMask -ne 0x0022) {
+        throw '呼出側の station mask が許容範囲外です。'
+    }
     if ($Bytes.Length -lt 44 -or $Bytes.Length -gt 65580) {
         throw '診断レコードの長さが許容範囲外です。'
     }
     if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
-        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]7) {
+        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]8) {
         throw '診断レコードの magic または version が一致しません。'
     }
     if ($Nonce -cnotmatch '\A[0-9a-fA-F]{32}\z') { throw '診断の nonce の形式が不正です。' }
@@ -1119,13 +1158,21 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     $classification = $Bytes[$offset.Value]
     $offset.Value++
     $sessionId = Read-Session0U32 $Bytes $offset
+    $requestedMask = Read-Session0U32 $Bytes $offset
+    if ($requestedMask -ne $ExpectedMask) {
+        throw '要求 station mask が呼出側の期待値と一致しません。'
+    }
     $fields = [Collections.Generic.List[string]]::new()
     for ($index = 0; $index -lt 14; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
-    $baseline = Read-Session0DiagnosticRun $Bytes $offset
-    $noWindow = Read-Session0DiagnosticRun $Bytes $offset
+    $baseline = Read-Session0DiagnosticRun $Bytes $offset $requestedMask
+    $noWindow = Read-Session0DiagnosticRun $Bytes $offset $requestedMask
     $workerActionsSid = Read-Session0Text $Bytes $offset
     $stationAce = Read-Session0Text $Bytes $offset
     $stationCleanup = Read-Session0Text $Bytes $offset
+    $maskSeparator = $stationAce.LastIndexOf(';mask=0x', [StringComparison]::Ordinal)
+    if ($maskSeparator -ge 0 -and $stationAce.Substring($maskSeparator + 8) -cne ('{0:x8}' -f $requestedMask)) {
+        throw '実測した station ACE の mask が要求と一致しません。'
+    }
     if ($offset.Value -ne $Bytes.Length) { throw '診断レコードに余分な末尾データがあります。' }
     if (($markers -band 0xf8) -ne 0 -or ($markers -band 1) -eq 0) {
         throw '診断の進行マーカーが不正です。'
@@ -1144,10 +1191,10 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     }
     $expectedClassification = 3
     $isolationVerified = $workerActionsSid.Length -gt 0 -and
-        $stationAce -ceq 'count=1;flags=0;mask=0x00000002' -and $stationCleanup -ceq 'removed' -and
+        $stationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $requestedMask) -and $stationCleanup -ceq 'removed' -and
         $baseline.Lifecycle -eq 15 -and $noWindow.Lifecycle -eq 15 -and
-        (Test-Session0TargetEvidence $baseline.TargetDacl $baseline.TargetSacl $baseline.TargetAccess $baseline.Isolation) -and
-        (Test-Session0TargetEvidence $noWindow.TargetDacl $noWindow.TargetSacl $noWindow.TargetAccess $noWindow.Isolation) -and
+        (Test-Session0TargetEvidence $baseline.TargetDacl $baseline.TargetSacl $baseline.TargetAccess $baseline.Isolation $requestedMask) -and
+        (Test-Session0TargetEvidence $noWindow.TargetDacl $noWindow.TargetSacl $noWindow.TargetAccess $noWindow.Isolation $requestedMask) -and
         $baseline.SpawnError.Length -eq 0 -and $noWindow.SpawnError.Length -eq 0 -and
         $baseline.TargetDesktop.StartsWith(($fields[2] + '\sbz-'), [StringComparison]::Ordinal) -and
         $noWindow.TargetDesktop.StartsWith(($fields[2] + '\sbz-'), [StringComparison]::Ordinal)
@@ -1177,6 +1224,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
     }
     return [PSCustomObject]@{
         Nonce = $Nonce; Markers = $markers; Classification = $classification; SessionId = $sessionId
+        RequestedStationMask = $requestedMask
         Broker = $fields[0]; Action = $fields[1]; Station = $fields[2]; Desktop = $fields[3]
         StationDacl = $fields[4]; StationSacl = $fields[5]; DesktopDacl = $fields[6]
         DesktopSacl = $fields[7]; StationAccess = $fields[8]; DesktopAccess = $fields[9]
@@ -1289,9 +1337,11 @@ try {
     $sourceStream = $null
 
     $diagnosticRecordPath = Join-Path $root ($diagnosticNonce + '.session0.rec')
+    Assert-Session0FixtureArguments @($fixtureExe, '--ignored', '--exact', $selector,
+        '--nocapture', '--test-threads=1', '--', $root, $root, $diagnosticNonce, $StationMask)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
-        $diagnosticNonce
+        $diagnosticNonce + ' ' + $StationMask
     $serviceAccount = 'NT SERVICE\' + $serviceName
     $serviceHandle = [Sembazuru.WindowStationProbeNative]::CreateProbeService(
         $serviceName, $imagePath, $serviceAccount
@@ -1417,7 +1467,7 @@ try {
         throw 'Session 0 diagnostic record is missing.'
     }
     $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
-        $diagnosticNonce
+        $diagnosticNonce $requestedStationMask
     $classificationMap = @{
         1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
         2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
@@ -1433,6 +1483,7 @@ try {
     }
     $diagnosticClassification = $classification.Name
     $detail = [Collections.Generic.List[string]]::new()
+    $detail.Add(('RequestedStationMask=0x{0:x8}' -f $record.RequestedStationMask))
     $detail.Add(('service=0x{0:x8} session={1} markers=0x{2:x2}' -f
         $status.ServiceSpecificExitCode, $record.SessionId, $record.Markers))
     foreach ($property in @(
