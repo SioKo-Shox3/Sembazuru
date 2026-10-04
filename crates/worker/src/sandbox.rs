@@ -619,12 +619,31 @@ impl ActionToken {
     }
 }
 
+/// ステーションへの付与候補を閉じた集合にし、診断候補はテストビルドに限定する。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StationAccessProfile {
+    ReadAttributes,
+    #[cfg(test)]
+    ReadAttributesAndGlobalAtoms,
+}
+
+impl StationAccessProfile {
+    fn mask(self) -> u32 {
+        match self {
+            Self::ReadAttributes => 0x0002,
+            #[cfg(test)]
+            Self::ReadAttributesAndGlobalAtoms => 0x0022,
+        }
+    }
+}
+
 /// worker が現在使っているサービスステーションを借用し、共有 SID の許可を管理する。
 /// `station` は `GetProcessWindowStation` の戻り値であり、この構造体は閉じない。
 pub(crate) struct ActionStationLease {
     station: HWINSTA,
     station_name: String,
     worker_actions_sid: Arc<WorkerActionsSid>,
+    profile: StationAccessProfile,
     active_marker: Option<OwnedHandle>,
     update_mutex: Option<StationUpdateMutex>,
 }
@@ -636,6 +655,15 @@ unsafe impl Sync for ActionStationLease {}
 impl ActionStationLease {
     /// 実行中の worker と競合しないように DACL 更新を直列化してから lease を返す。
     pub(crate) fn acquire() -> io::Result<Self> {
+        Self::acquire_inner(StationAccessProfile::ReadAttributes)
+    }
+
+    #[cfg(test)]
+    fn acquire_for_diagnostic(profile: StationAccessProfile) -> io::Result<Self> {
+        Self::acquire_inner(profile)
+    }
+
+    fn acquire_inner(profile: StationAccessProfile) -> io::Result<Self> {
         let station = unsafe { GetProcessWindowStation() };
         if station.is_null() {
             return Err(io::Error::last_os_error());
@@ -673,6 +701,7 @@ impl ActionStationLease {
             station,
             station_name,
             worker_actions_sid,
+            profile,
             update_mutex: None,
             active_marker: None,
         };
@@ -688,12 +717,18 @@ impl ActionStationLease {
         self.update_mutex = Some(StationUpdateMutex::open(&mutex_name, broker_sid)?);
         let _update = self.update_mutex.as_ref().unwrap().lock()?;
         let marker = create_active_marker(&marker_name, broker_sid)?;
-        if let Err(error) =
-            update_station_acl(self.station, Some(self.worker_actions_sid.sid()), None)
-        {
-            if let Err(cleanup) =
-                update_station_acl(self.station, None, Some(self.worker_actions_sid.sid()))
-            {
+        if let Err(error) = update_station_acl(
+            self.station,
+            self.profile,
+            Some(self.worker_actions_sid.sid()),
+            None,
+        ) {
+            if let Err(cleanup) = update_station_acl(
+                self.station,
+                self.profile,
+                None,
+                Some(self.worker_actions_sid.sid()),
+            ) {
                 eprintln!("sembazuru-worker: 起動失敗後のステーション ACL 後始末に失敗: {cleanup}");
             }
             return Err(error);
@@ -713,7 +748,12 @@ impl Drop for ActionStationLease {
         }
         let result = (|| {
             let _update = mutex.lock()?;
-            update_station_acl(self.station, None, Some(self.worker_actions_sid.sid()))
+            update_station_acl(
+                self.station,
+                self.profile,
+                None,
+                Some(self.worker_actions_sid.sid()),
+            )
         })();
         if let Err(error) = result {
             eprintln!("sembazuru-worker: ステーション ACL の lease 解放に失敗: {error}");
@@ -874,7 +914,8 @@ impl AceBlob {
 
     fn worker_actions_sid(&self) -> Option<String> {
         let (sid_text, flags, mask) = self.simple_allow()?;
-        if flags != 0 || mask != 0x0002 {
+        // 診断が残した ACE も回収するが、これは製品での付与候補を増やさない。
+        if flags != 0 || !matches!(mask, 0x0002 | 0x0022) {
             return None;
         }
         let sid = unsafe { self.bytes().as_ptr().add(8).cast_mut().cast::<c_void>() };
@@ -1086,6 +1127,7 @@ fn stale_worker_action_sids(aces: &[AceBlob]) -> io::Result<Vec<String>> {
 
 fn rewrite_station_aces(
     aces: &[AceBlob],
+    profile: StationAccessProfile,
     add_sid: Option<*mut c_void>,
     remove_sid: Option<*mut c_void>,
     stale_sid_strings: &[String],
@@ -1097,15 +1139,15 @@ fn rewrite_station_aces(
         let matches_remove = remove_sid.is_some_and(|sid| {
             info.as_ref().is_some_and(|(text, flags, mask)| {
                 *flags == 0
-                    && *mask == 0x0002
+                    && *mask == profile.mask()
                     && sid_string(sid).is_ok_and(|expected| expected == *text)
             })
         });
         // lease 解放時は自分の ACE だけを外し、他の worker の ACE は保存する。
         let matches_stale = remove_sid.is_none()
-            && info.as_ref().is_some_and(|(sid, flags, mask)| {
-                *flags == 0 && *mask == 0x0002 && stale_sid_strings.iter().any(|stale| stale == sid)
-            });
+            && ace
+                .worker_actions_sid()
+                .is_some_and(|sid| stale_sid_strings.contains(&sid));
         if matches_remove || matches_stale {
             removed += 1;
         } else {
@@ -1129,12 +1171,12 @@ fn rewrite_station_aces(
                 "worker SID の ACE が既に存在する",
             ));
         }
-        rewritten.push(allow_ace(sid)?);
+        rewritten.push(allow_ace(sid, profile)?);
     }
     Ok(rewritten)
 }
 
-fn allow_ace(sid: *mut c_void) -> io::Result<AceBlob> {
+fn allow_ace(sid: *mut c_void, profile: StationAccessProfile) -> io::Result<AceBlob> {
     let sid_len = unsafe { GetLengthSid(sid) } as usize;
     let byte_len = 8usize
         .checked_add(sid_len)
@@ -1146,8 +1188,8 @@ fn allow_ace(sid: *mut c_void) -> io::Result<AceBlob> {
     bytes[0] = ACCESS_ALLOWED_ACE_TYPE as u8;
     bytes[1] = 0;
     bytes[2..4].copy_from_slice(&(byte_len as u16).to_ne_bytes());
-    bytes[4..8].copy_from_slice(&0x0002u32.to_ne_bytes());
-    // SAFETY: destination は整列済みで書き込み可能な ACE バッファ内の SID 分の領域である。
+    bytes[4..8].copy_from_slice(&profile.mask().to_ne_bytes());
+    // SAFETY: 書き込み先は整列済みで書き込み可能な ACE バッファ内の SID 分の領域である。
     unsafe { std::ptr::copy_nonoverlapping(sid.cast::<u8>(), bytes.as_mut_ptr().add(8), sid_len) };
     Ok(AceBlob { words, byte_len })
 }
@@ -1218,6 +1260,7 @@ fn set_station_dacl(
 
 fn update_station_acl(
     station: HWINSTA,
+    profile: StationAccessProfile,
     add_sid: Option<*mut c_void>,
     remove_sid: Option<*mut c_void>,
 ) -> io::Result<()> {
@@ -1227,7 +1270,7 @@ fn update_station_acl(
     } else {
         Vec::new()
     };
-    let expected = rewrite_station_aces(&before, add_sid, remove_sid, &stale)?;
+    let expected = rewrite_station_aces(&before, profile, add_sid, remove_sid, &stale)?;
     if expected == before {
         return Ok(());
     }
@@ -7561,6 +7604,35 @@ privileges={privileges:?}{restricted}",
     }
 
     #[test]
+    fn station_profiles_preserve_interactive_station_and_product_default() {
+        if !current_window_station_name()
+            .unwrap()
+            .eq_ignore_ascii_case("WinSta0")
+        {
+            eprintln!("WinSta0 以外では、テスト所有オブジェクトで ACL を検査する");
+            return;
+        }
+        let station = unsafe { GetProcessWindowStation() };
+        let before = station_dacl(station).unwrap();
+        let product = ActionStationLease::acquire().unwrap();
+        assert_eq!(product.profile, StationAccessProfile::ReadAttributes);
+        assert_eq!(product.profile.mask(), 0x0002);
+        let diagnostic = ActionStationLease::acquire_for_diagnostic(
+            StationAccessProfile::ReadAttributesAndGlobalAtoms,
+        )
+        .unwrap();
+        assert_eq!(diagnostic.profile.mask(), 0x0022);
+        for lease in [&product, &diagnostic] {
+            assert!(lease.active_marker.is_none());
+            assert!(lease.update_mutex.is_none());
+        }
+        assert_eq!(station_dacl(station).unwrap(), before);
+        drop(diagnostic);
+        drop(product);
+        assert_eq!(station_dacl(station).unwrap(), before);
+    }
+
+    #[test]
     fn station_lease_concurrent_updates_preserve_foreign_aces_and_mutex() {
         let token = ActionToken::create().unwrap();
         let desktop = ActionDesktop::create(&token).unwrap();
@@ -7572,7 +7644,10 @@ privileges={privileges:?}{restricted}",
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let mut threads = Vec::new();
         let mut releases = Vec::new();
-        for _ in 0..2 {
+        for profile in [
+            StationAccessProfile::ReadAttributes,
+            StationAccessProfile::ReadAttributesAndGlobalAtoms,
+        ] {
             let name = name.clone();
             let ready = ready_tx.clone();
             let (release, released) = std::sync::mpsc::channel();
@@ -7582,6 +7657,7 @@ privileges={privileges:?}{restricted}",
                     station: object as HWINSTA,
                     station_name: name,
                     worker_actions_sid: Arc::new(WorkerActionsSid::random().unwrap()),
+                    profile,
                     active_marker: None,
                     update_mutex: None,
                 };
@@ -7603,15 +7679,33 @@ privileges={privileges:?}{restricted}",
         let during = station_dacl(object as HWINSTA).unwrap();
         assert_eq!(during.2.len(), before.2.len() + 2);
         assert_eq!(&during.2[..before.2.len()], before.2.as_slice());
+        let mut installed_masks: Vec<_> = during.2[before.2.len()..]
+            .iter()
+            .map(|ace| ace.simple_allow().unwrap().2)
+            .collect();
+        installed_masks.sort_unstable();
+        assert_eq!(installed_masks, [0x0002, 0x0022]);
+        assert!(stale_worker_action_sids(&during.2).unwrap().is_empty());
         let mutex_name = format!("Local\\Sembazuru.WindowStationUpdate.{name}");
         let keeper = StationUpdateMutex::open(&mutex_name, &broker_for_test()).unwrap();
+        // lease 取得後の別主体による正当な変更も、解放時に保存する。
+        let foreign = ActionSid::random().unwrap();
+        let mut expected = before.clone();
+        let foreign_ace = allow_ace(foreign.0, StationAccessProfile::ReadAttributes).unwrap();
+        expected.2.push(foreign_ace.clone());
+        {
+            let _update = keeper.lock().unwrap();
+            let mut changed = during.2.clone();
+            changed.push(foreign_ace);
+            set_station_dacl(object as HWINSTA, during.0, during.1, &changed).unwrap();
+        }
         for release in releases {
             release.send(()).unwrap();
         }
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(station_dacl(object as HWINSTA).unwrap(), before);
+        assert_eq!(station_dacl(object as HWINSTA).unwrap(), expected);
         drop(keeper.lock().unwrap());
     }
 
@@ -7631,45 +7725,157 @@ privileges={privileges:?}{restricted}",
         let (revision, before) = acl_aces(dacl).unwrap();
         let worker_a = WorkerActionsSid::random().unwrap();
         let worker_b = WorkerActionsSid::random().unwrap();
-        let with_a = rewrite_station_aces(&before, Some(worker_a.sid()), None, &[]).unwrap();
-        let with_a_and_b = rewrite_station_aces(&with_a, Some(worker_b.sid()), None, &[]).unwrap();
-        assert_eq!(with_a_and_b.len(), before.len() + 2);
-        assert_eq!(&with_a_and_b[..before.len()], before.as_slice());
-        assert_eq!(
-            with_a_and_b[before.len()].simple_allow(),
-            Some((sid_string(worker_a.sid()).unwrap(), 0, 0x0002))
-        );
-        assert_eq!(
-            with_a_and_b[before.len() + 1].simple_allow(),
-            Some((sid_string(worker_b.sid()).unwrap(), 0, 0x0002))
-        );
+        for (profile, other_profile) in [
+            (
+                StationAccessProfile::ReadAttributes,
+                StationAccessProfile::ReadAttributesAndGlobalAtoms,
+            ),
+            (
+                StationAccessProfile::ReadAttributesAndGlobalAtoms,
+                StationAccessProfile::ReadAttributes,
+            ),
+        ] {
+            let with_a =
+                rewrite_station_aces(&before, profile, Some(worker_a.sid()), None, &[]).unwrap();
+            let with_a_and_b =
+                rewrite_station_aces(&with_a, other_profile, Some(worker_b.sid()), None, &[])
+                    .unwrap();
+            assert_eq!(with_a_and_b.len(), before.len() + 2);
+            assert_eq!(&with_a_and_b[..before.len()], before.as_slice());
+            assert_eq!(
+                with_a_and_b[before.len()].simple_allow(),
+                Some((sid_string(worker_a.sid()).unwrap(), 0, profile.mask()))
+            );
+            assert_eq!(
+                with_a_and_b[before.len() + 1].simple_allow(),
+                Some((sid_string(worker_b.sid()).unwrap(), 0, other_profile.mask()))
+            );
 
-        let stale = vec![sid_string(worker_a.sid()).unwrap()];
-        let after_stale_cleanup = rewrite_station_aces(&with_a_and_b, None, None, &stale).unwrap();
-        assert_eq!(after_stale_cleanup.len(), before.len() + 1);
-        assert_eq!(&after_stale_cleanup[..before.len()], before.as_slice());
-        assert_eq!(
-            after_stale_cleanup.last().unwrap().simple_allow(),
-            Some((sid_string(worker_b.sid()).unwrap(), 0, 0x0002))
-        );
+            let marker = create_active_marker(
+                &worker_actions_marker_name(worker_b.sid()).unwrap(),
+                &broker_sid,
+            )
+            .unwrap();
+            let stale = stale_worker_action_sids(&with_a_and_b).unwrap();
+            assert_eq!(stale, [sid_string(worker_a.sid()).unwrap()]);
+            let after_stale_cleanup =
+                rewrite_station_aces(&with_a_and_b, profile, None, None, &stale).unwrap();
+            assert_eq!(after_stale_cleanup.len(), before.len() + 1);
+            assert_eq!(&after_stale_cleanup[..before.len()], before.as_slice());
+            assert_eq!(
+                after_stale_cleanup.last().unwrap().simple_allow(),
+                Some((sid_string(worker_b.sid()).unwrap(), 0, other_profile.mask()))
+            );
+            drop(marker);
+            let all_stale = stale_worker_action_sids(&with_a_and_b).unwrap();
+            assert_eq!(all_stale.len(), 2);
+            assert_eq!(
+                rewrite_station_aces(&with_a_and_b, profile, None, None, &all_stale).unwrap(),
+                before
+            );
 
-        let after_a_release =
-            rewrite_station_aces(&with_a_and_b, None, Some(worker_a.sid()), &[]).unwrap();
-        assert_eq!(after_a_release.len(), before.len() + 1);
-        assert_eq!(&after_a_release[..before.len()], before.as_slice());
-        let stale_worker_b = sid_string(worker_b.sid()).unwrap();
-        let after_a_release_with_stale_candidate = rewrite_station_aces(
-            &with_a_and_b,
-            None,
-            Some(worker_a.sid()),
-            std::slice::from_ref(&stale_worker_b),
-        )
-        .unwrap();
-        assert_eq!(after_a_release_with_stale_candidate, after_a_release);
-        let after_b_release =
-            rewrite_station_aces(&after_a_release, None, Some(worker_b.sid()), &[]).unwrap();
-        assert_eq!(after_b_release, before);
+            let after_a_release =
+                rewrite_station_aces(&with_a_and_b, profile, None, Some(worker_a.sid()), &[])
+                    .unwrap();
+            assert_eq!(after_a_release, after_stale_cleanup);
+            // 解放は stale 候補が渡されても他の worker に触れない。
+            assert_eq!(
+                rewrite_station_aces(
+                    &with_a_and_b,
+                    profile,
+                    None,
+                    Some(worker_a.sid()),
+                    &all_stale,
+                )
+                .unwrap(),
+                after_a_release
+            );
+            assert_eq!(
+                rewrite_station_aces(
+                    &after_a_release,
+                    other_profile,
+                    None,
+                    Some(worker_b.sid()),
+                    &[],
+                )
+                .unwrap(),
+                before
+            );
+            // 選択 mask の不一致、二重追加、重複 ACE の解放は拒否する。
+            assert!(
+                rewrite_station_aces(&with_a, other_profile, None, Some(worker_a.sid()), &[])
+                    .is_err()
+            );
+            assert!(
+                rewrite_station_aces(&with_a, other_profile, Some(worker_a.sid()), None, &[])
+                    .is_err()
+            );
+            let mut duplicate = with_a.clone();
+            duplicate.push(with_a.last().unwrap().clone());
+            assert!(
+                rewrite_station_aces(&duplicate, profile, None, Some(worker_a.sid()), &[]).is_err()
+            );
+        }
         assert_ne!(revision, 0);
+    }
+
+    #[test]
+    fn station_acl_cleanup_preserves_unknown_inherited_and_foreign_aces() {
+        let worker = WorkerActionsSid::random().unwrap();
+        let foreign = ActionSid::random().unwrap();
+        for profile in [
+            StationAccessProfile::ReadAttributes,
+            StationAccessProfile::ReadAttributesAndGlobalAtoms,
+        ] {
+            let own = allow_ace(worker.sid(), profile).unwrap();
+            let mut preserved = vec![allow_ace(foreign.0, profile).unwrap()];
+            // テストだけで mask/flags/type を改変し、未知の ACE を回収しないことを反証する。
+            for mask in [0x0000, 0x0020, 0x0023, 0x0002_0002] {
+                let mut unknown = own.clone();
+                unknown.words[1] = mask;
+                preserved.push(unknown);
+            }
+            for flags in [0x01, 0x02, 0x08, 0x10] {
+                let mut inherited = own.clone();
+                inherited.words[0] |= flags << 8;
+                preserved.push(inherited);
+            }
+            let mut deny = own.clone();
+            deny.words[0] |= 1;
+            preserved.push(deny);
+            for ace in &preserved {
+                assert!(ace.worker_actions_sid().is_none());
+                assert!(
+                    rewrite_station_aces(
+                        std::slice::from_ref(ace),
+                        profile,
+                        None,
+                        Some(worker.sid()),
+                        &[],
+                    )
+                    .is_err()
+                );
+            }
+            assert!(stale_worker_action_sids(&preserved).unwrap().is_empty());
+            let mut mixed = preserved.clone();
+            mixed.push(own.clone());
+            mixed.push(own);
+            let stale = stale_worker_action_sids(&mixed).unwrap();
+            assert_eq!(stale, [sid_string(worker.sid()).unwrap()]);
+            assert_eq!(
+                rewrite_station_aces(&mixed, profile, None, None, &stale).unwrap(),
+                preserved
+            );
+            // 呼出側の一覧に別主体が紛れても、worker-actions の名前空間を必須にする。
+            let foreign_stale = [
+                sid_string(foreign.0).unwrap(),
+                sid_string(worker.sid()).unwrap(),
+            ];
+            assert_eq!(
+                rewrite_station_aces(&mixed, profile, None, None, &foreign_stale).unwrap(),
+                preserved
+            );
+        }
     }
 
     #[test]
