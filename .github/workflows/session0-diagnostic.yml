@@ -1,4 +1,4 @@
-name: Session 0 creation flags diagnostic
+name: Session 0 ステーション権限・起動フラグ診断
 
 on:
   workflow_dispatch:
@@ -9,14 +9,21 @@ permissions:
 
 jobs:
   session0:
+    name: Session 0 診断 (station mask ${{ matrix.station-mask }})
     runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        station-mask: ['0x0002', '0x0022']
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Measure CREATE_NO_WINDOW in Session 0
+      - name: Session 0 のステーション権限と CREATE_NO_WINDOW を測定する
         shell: pwsh -NoProfile -NonInteractive -Command ". '{0}'"
+        env:
+          SBZ_DIAGNOSTIC_STATION_MASK: ${{ matrix.station-mask }}
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
@@ -27,8 +34,9 @@ jobs:
           if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
               throw 'The diagnostic requires an already-elevated runner.'
           }
-          Write-Host ('commit={0} runner_os={1} os_build={2}' -f
-              $env:GITHUB_SHA, $env:RUNNER_OS, [Environment]::OSVersion.Version)
+          Write-Host ('commit={0} runner_os={1} os_build={2} requested_station_mask={3} run_id={4} run_attempt={5}' -f
+              $env:GITHUB_SHA, $env:RUNNER_OS, [Environment]::OSVersion.Version,
+              $env:SBZ_DIAGNOSTIC_STATION_MASK, $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT)
           $probePath = [IO.Path]::GetFullPath(
               (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/m6_worker_window_station_probe.ps1')
           )
@@ -90,6 +98,6 @@ jobs:
                   $actualSha256, $expectedArtifactSha256)
               $probeText = [Text.UTF8Encoding]::new($false, $true).GetString($probeBytes)
               & ([ScriptBlock]::Create($probeText)) -ArtifactPath $artifactPath `
-                  -ExpectedSha256 $expectedArtifactSha256
+                  -ExpectedSha256 $expectedArtifactSha256 -StationMask $env:SBZ_DIAGNOSTIC_STATION_MASK
               if ($LASTEXITCODE -ne 0) { throw 'Session 0 diagnostic failed.' }
           } finally { $probeStream.Dispose() }
