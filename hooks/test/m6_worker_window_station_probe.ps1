@@ -34,13 +34,13 @@ function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [s
     }
 }
 
-function Assert-Session0ConnectedRequest([bool]$SubsystemRequested) {
+function Get-Session0ServiceDeadline([bool]$InitRequested, [bool]$EntryRequested, [bool]$TerminateRequested = $false,
+    [bool]$SubsystemRequested = $false) {
     if ($SubsystemRequested) {
-        throw 'subsystem対照の実行・独立記録・回収は未接続です。'
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested) { throw 'subsystem対照には先行3診断が必要です。' }
+        # 旧4runと自己終了3runの実行/再wait/EOF/Drop/runtime停止に余裕30秒を加える。
+        return 4 * (10 + 35 + 30 + 30 + 1) + 3 * (10 + 35 + 1 + 30 + 30 + 1) + 30
     }
-}
-
-function Get-Session0ServiceDeadline([bool]$InitRequested, [bool]$EntryRequested, [bool]$TerminateRequested = $false) {
     if ($TerminateRequested) {
         if (-not $InitRequested -or -not $EntryRequested) { throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。' }
         # 旧4runに新runの終了10秒/回収35秒/EOF1秒/Drop30+30秒/runtime停止1秒と余裕30秒を加える。
@@ -98,9 +98,8 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
     }
 }
 
-# 独立記録と回収が未接続の要求は、環境変更や保護配置より前に拒否する。
+# 組と先行診断の不足は、環境変更や保護配置より前に拒否する。
 Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256 $ConsoleProbePath $ConsoleProbeSha256 $WindowsProbePath $WindowsProbeSha256
-Assert-Session0ConnectedRequest ([bool]($ConsoleProbePath -or $WindowsProbePath))
 
 $record = $null
 $requestedStationMask = ConvertFrom-Session0StationMask $StationMask
@@ -166,6 +165,8 @@ $sourceStream = $null
 $initProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $entryProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $terminateProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$consoleProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$windowsProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $serviceHandle = [IntPtr]::Zero
 $ownedRoot = $false
 $ownedService = $false
@@ -1492,21 +1493,39 @@ function Test-Session0TerminateTreeSafe([bool]$Requested, [bool]$StartAttempted,
         ($Record.TerminateProbe.Run.Lifecycle -band 12) -eq 12)
 }
 
+function Test-Session0SubsystemTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    if (-not $Requested -or -not $StartAttempted) { return $true }
+    if ($null -eq $Record) { return $false }
+    foreach ($name in @('ConsoleProbe', 'WindowsProbe')) {
+        if ($null -eq $Record.$name -or ($Record.$name.Run.Lifecycle -band 12) -ne 12) { return $false }
+    }
+    return $true
+}
+
+function Test-Session0SubsystemGates($Record, [string]$Kind) {
+    if ($Kind -cnotin @('Console', 'Windows')) { throw 'subsystem対照の役割が不正です。' }
+    return Test-Session0TerminateGates $Record $Record.($Kind + 'Probe')
+}
+
+function Assert-Session0SubsystemGates($Record, [string]$Kind, [string]$Detail = '') {
+    if (-not (Test-Session0SubsystemGates $Record $Kind)) { throw "subsystem対照の空出力・隔離・終了確認ゲートが未達です: $Kind $Detail" }
+}
+
 function Get-Session0TerminateObserved($Run) {
     # 取得済み終了値の観測を、後続の出力・desktop回収エラーから独立させる。
     return $Run.SpawnSucceeded -and $null -ne $Run.ChildExit -and
         $Run.ChildExit -eq [uint32]0x53425a54
 }
 
-function Test-Session0TerminateGates($Record) {
-    if ($null -eq $Record.TerminateProbe) { return $false }
-    $run = $Record.TerminateProbe.Run
+function Test-Session0TerminateGates($Record, $Probe = $Record.TerminateProbe) {
+    if ($null -eq $Probe) { return $false }
+    $run = $Probe.Run
     return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
         $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
         $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
         (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
         $run.Stdout.Length -eq 0 -and $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and
-        $Record.TerminateProbe.OutputEof -and $Record.TerminateProbe.DeadlineMet -and $null -ne $run.ChildExit
+        $Probe.OutputEof -and $Probe.DeadlineMet -and $null -ne $run.ChildExit
 }
 
 function Assert-Session0TerminateGates($Record, [string]$Detail = '') {
@@ -1557,6 +1576,53 @@ function Read-Session0TerminateRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mas
     return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; EntryObserved=$observed; OutputEof=$outputEof; DeadlineMet=$deadlineMet }
 }
 
+function Read-Session0SubsystemRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $Init, $Entry, $Baseline, $NoWindow, $Terminate, $Other, [string]$Kind) {
+    if ($Kind -cnotin @('Console', 'Windows')) { throw 'subsystem対照の役割が不正です。' }
+    if ($null -eq $Terminate) { throw 'subsystem対照には自己終了診断が必要です。' }
+    $basename = Get-Session0ProbeBasename $Kind $false
+    if ($null -eq $Init) { throw 'subsystem対照にはInitProbeの記録が必要です。' }
+    if ($null -eq $Entry) { throw 'subsystem対照にはEntryProbeの記録が必要です。' }
+    $path = Read-Session0Text $Bytes $Offset
+    $hash = Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or
+        -not $path.EndsWith(('\' + $basename), [StringComparison]::Ordinal) -or
+        $path -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+        @($path.Substring(3).Split('\') | Where-Object {
+            $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+        }).Count -ne 0 -or
+        $Init.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0InitProbe.exe') -or
+        $Entry.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0EntryProbe.exe') -or
+        $Terminate.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0TerminateProbe.exe')) {
+        throw 'subsystem対照のpath・hashが呼出側の期待値と一致しません。'
+    }
+    $run = Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and $null -ne $run.ChildExit) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station + '\sbz-'), [StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -ne 0 -and ($run.TargetDesktop -ceq $Baseline.TargetDesktop -or
+            $run.TargetDesktop -ceq $NoWindow.TargetDesktop -or $run.TargetDesktop -ceq $Init.Run.TargetDesktop -or $run.TargetDesktop -ceq $Entry.Run.TargetDesktop -or
+            $run.TargetDesktop -ceq $Terminate.Run.TargetDesktop -or ($null -ne $Other -and $run.TargetDesktop -ceq $Other.Run.TargetDesktop)))) {
+        throw 'subsystem対照のJob・製品flags・専用desktopが一致しません。'
+    }
+    if ($Offset.Value -ge $Bytes.Length -or $Bytes[$Offset.Value] -gt 1) { throw 'subsystem対照の肯定bitが不正です。' }
+    $observed = $Bytes[$Offset.Value] -eq 1
+    $Offset.Value++
+    if ($observed -ne (Get-Session0TerminateObserved $run)) { throw 'subsystem対照の肯定bitと子の終了値が一致しません。' }
+    if ($Offset.Value + 2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value + 1] -gt 1) {
+        throw 'subsystem対照のEOF・期限bitが不正です。'
+    }
+    $outputEof = $Bytes[$Offset.Value] -eq 1
+    $deadlineMet = $Bytes[$Offset.Value + 1] -eq 1
+    $Offset.Value += 2
+    if (($outputEof -and (-not $run.SpawnSucceeded -or ($run.Lifecycle -band 4) -eq 0)) -or
+        ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) {
+        throw 'subsystem対照の終了値・EOF・期限が実行記録と矛盾しています。'
+    }
+    return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; EntryObserved=$observed; OutputEof=$outputEof; DeadlineMet=$deadlineMet }
+}
+
 function Get-Session0InitRunEvidence($Run) {
     if (-not $Run.SpawnSucceeded -and ($null -ne $Run.ChildExit -or $Run.Stdout.Length -ne 0 -or $Run.Stderr.Length -ne 0)) {
         throw '追加診断の spawn と終了・出力が矛盾しています。'
@@ -1602,15 +1668,17 @@ function Read-Session0InitRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [s
 function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$ExpectedMask,
     [string]$ExpectedInitPath = '', [string]$ExpectedInitHash = '',
     [string]$ExpectedEntryPath = '', [string]$ExpectedEntryHash = '',
-    [string]$ExpectedTerminatePath = '', [string]$ExpectedTerminateHash = '') {
-    Assert-Session0ProbeParameters $ExpectedInitPath $ExpectedInitHash $ExpectedEntryPath $ExpectedEntryHash $ExpectedTerminatePath $ExpectedTerminateHash
+    [string]$ExpectedTerminatePath = '', [string]$ExpectedTerminateHash = '',
+    [string]$ExpectedConsolePath = '', [string]$ExpectedConsoleHash = '',
+    [string]$ExpectedWindowsPath = '', [string]$ExpectedWindowsHash = '') {
+    Assert-Session0ProbeParameters $ExpectedInitPath $ExpectedInitHash $ExpectedEntryPath $ExpectedEntryHash $ExpectedTerminatePath $ExpectedTerminateHash $ExpectedConsolePath $ExpectedConsoleHash $ExpectedWindowsPath $ExpectedWindowsHash
     if ($ExpectedMask -ne 0x0002 -and $ExpectedMask -ne 0x0022) {
         throw '呼出側の station mask が許容範囲外です。'
     }
     if ($Bytes.Length -lt 44 -or $Bytes.Length -gt 65580) {
         throw '診断レコードの長さが許容範囲外です。'
     }
-    $expectedVersion = if ($ExpectedTerminatePath) { [uint32]11 } elseif ($ExpectedEntryPath) { [uint32]10 } else { [uint32]9 }
+    $expectedVersion = if ($ExpectedConsolePath) { [uint32]12 } elseif ($ExpectedTerminatePath) { [uint32]11 } elseif ($ExpectedEntryPath) { [uint32]10 } else { [uint32]9 }
     if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
         [BitConverter]::ToUInt32($Bytes, 4) -ne $expectedVersion) {
         throw '診断レコードの magic または version が一致しません。'
@@ -1656,6 +1724,14 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
     if ($ExpectedTerminatePath) {
         $terminateProbeRecord = Read-Session0TerminateRecord $Bytes $offset $requestedMask $fields[2] `
             $ExpectedTerminatePath $ExpectedTerminateHash $initProbeRecord $entryProbeRecord $baseline $noWindow
+    }
+    $consoleProbeRecord = $null
+    $windowsProbeRecord = $null
+    if ($ExpectedConsolePath) {
+        $consoleProbeRecord = Read-Session0SubsystemRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedConsolePath $ExpectedConsoleHash $initProbeRecord $entryProbeRecord $baseline $noWindow $terminateProbeRecord $null 'Console'
+        $windowsProbeRecord = Read-Session0SubsystemRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedWindowsPath $ExpectedWindowsHash $initProbeRecord $entryProbeRecord $baseline $noWindow $terminateProbeRecord $consoleProbeRecord 'Windows'
     }
     if ($null -ne $initProbeRecord -and $initProbeRecord.Run.TargetDesktop.Length -ne 0 -and
         ($initProbeRecord.Run.TargetDesktop -ceq $baseline.TargetDesktop -or $initProbeRecord.Run.TargetDesktop -ceq $noWindow.TargetDesktop)) {
@@ -1723,6 +1799,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
         UiProbe = $fields[10]; ActionDesktop = $fields[11]; Cwd = $fields[12]
         EnvironmentHash = $fields[13]
         Baseline = $baseline; NoWindow = $noWindow; InitProbe = $initProbeRecord; EntryProbe = $entryProbeRecord; TerminateProbe = $terminateProbeRecord
+        ConsoleProbe = $consoleProbeRecord; WindowsProbe = $windowsProbeRecord
         WorkerActionsSid = $workerActionsSid; StationAce = $stationAce; StationCleanup = $stationCleanup
     }
 }
@@ -1753,6 +1830,8 @@ try {
     if ($InitProbePath) { Open-Session0InitProbeSource $initProbe $InitProbePath $InitProbeSha256 }
     if ($EntryProbePath) { Open-Session0InitProbeSource $entryProbe $EntryProbePath $EntryProbeSha256 'Entry' }
     if ($TerminateProbePath) { Open-Session0InitProbeSource $terminateProbe $TerminateProbePath $TerminateProbeSha256 'Terminate' }
+    if ($ConsoleProbePath) { Open-Session0InitProbeSource $consoleProbe $ConsoleProbePath $ConsoleProbeSha256 'Console' }
+    if ($WindowsProbePath) { Open-Session0InitProbeSource $windowsProbe $WindowsProbePath $WindowsProbeSha256 'Windows' }
 
     $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
     if ([string]::IsNullOrWhiteSpace($programFiles)) { throw 'Program Files known folder is empty.' }
@@ -1796,6 +1875,8 @@ try {
         if ($InitProbePath) { Copy-Session0InitProbe $initProbe $root }
         if ($EntryProbePath) { Copy-Session0InitProbe $entryProbe $root }
         if ($TerminateProbePath) { Copy-Session0InitProbe $terminateProbe $root }
+        if ($ConsoleProbePath) { Copy-Session0InitProbe $consoleProbe $root }
+        if ($WindowsProbePath) { Copy-Session0InitProbe $windowsProbe $root }
     }
     finally { $restore.Dispose() }
 
@@ -1840,14 +1921,17 @@ try {
     if ($InitProbePath) { $fixtureArguments += $initProbe.Hash }
     if ($EntryProbePath) { $fixtureArguments += $entryProbe.Hash }
     if ($TerminateProbePath) { $fixtureArguments += $terminateProbe.Hash }
+    if ($ConsoleProbePath) { $fixtureArguments += $consoleProbe.Hash }
+    if ($WindowsProbePath) { $fixtureArguments += $windowsProbe.Hash }
     Assert-Session0FixtureArguments $fixtureArguments
-    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 16)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
         $diagnosticNonce + ' ' + $StationMask
     if ($InitProbePath) { $imagePath += ' ' + $initProbe.Hash }
     if ($EntryProbePath) { $imagePath += ' ' + $entryProbe.Hash }
     if ($TerminateProbePath) { $imagePath += ' ' + $terminateProbe.Hash }
+    if ($ConsoleProbePath) { $imagePath += ' ' + $consoleProbe.Hash }
+    if ($WindowsProbePath) { $imagePath += ' ' + $windowsProbe.Hash }
     $serviceAccount = 'NT SERVICE\' + $serviceName
     $serviceHandle = [Sembazuru.WindowStationProbeNative]::CreateProbeService(
         $serviceName, $imagePath, $serviceAccount
@@ -1890,6 +1974,8 @@ try {
     if ($InitProbePath) { Grant-Session0InitProbeRead $initProbe $serviceSid }
     if ($EntryProbePath) { Grant-Session0InitProbeRead $entryProbe $serviceSid }
     if ($TerminateProbePath) { Grant-Session0InitProbeRead $terminateProbe $serviceSid }
+    if ($ConsoleProbePath) { Grant-Session0InitProbeRead $consoleProbe $serviceSid }
+    if ($WindowsProbePath) { Grant-Session0InitProbeRead $windowsProbe $serviceSid }
     $serviceRootIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($rootHandle.Handle)
     $serviceExeIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($targetLease.Handle)
     $leaseIdentity = $serviceExeIdentity
@@ -1923,7 +2009,7 @@ try {
     }
 
     # 旧形式の期限を保ち、追加runごとの終了確認時間を割り当てる。
-    $serviceDeadlineSeconds = Get-Session0ServiceDeadline ([bool]$InitProbePath) ([bool]$EntryProbePath) ([bool]$TerminateProbePath)
+    $serviceDeadlineSeconds = Get-Session0ServiceDeadline ([bool]$InitProbePath) ([bool]$EntryProbePath) ([bool]$TerminateProbePath) ([bool]$ConsoleProbePath)
     $deadline = [DateTime]::UtcNow.AddSeconds($serviceDeadlineSeconds)
     $sawRunning = $false
     do {
@@ -1979,7 +2065,8 @@ try {
         throw 'Session 0 diagnostic record is missing.'
     }
     $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
-        $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash
+        $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash `
+        $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash
     $classificationMap = @{
         1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
         2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
@@ -2009,9 +2096,15 @@ try {
         } else { $property }
         $detail.Add(('{0}={1}' -f $label, (Format-BoundedDiagnosticText $record.$property)))
     }
-    foreach ($name in @('Baseline', 'NoWindow', 'InitProbe', 'EntryProbe', 'TerminateProbe')) {
-        if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe') -and $null -eq $record.$name) { continue }
-        $run = if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe')) { $record.$name.Run } else { $record.$name }
+    foreach ($name in @('Baseline', 'NoWindow', 'InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe')) {
+        if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe') -and $null -eq $record.$name) { continue }
+        $run = if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe')) { $record.$name.Run } else { $record.$name }
+        if ($name -in @('ConsoleProbe', 'WindowsProbe')) {
+            $probe = $record.$name
+            $kind = $name.Replace('Probe', '')
+            $detail.Add(('{0}Path={1} {0}Sha256={2} {0}EntryObserved={3} {0}OutputEof={4} {0}DeadlineMet={5} {0}GatesVerified={6}' -f
+                $name, $probe.Path, $probe.Sha256, $probe.EntryObserved, $probe.OutputEof, $probe.DeadlineMet, (Test-Session0SubsystemGates $record $kind)))
+        }
         if ($name -eq 'TerminateProbe') {
             $terminateOutcome = if ($record.TerminateProbe.EntryObserved) { 'entry-observed' } else { 'indeterminate' }
             $detail.Add(('TerminateProbePath={0} TerminateProbeSha256={1} TerminateEntryObserved={2} TerminateProbeOutcome={3} TerminateProbeGatesVerified={4} TerminateProbeOutputEof={5} TerminateProbeDeadlineMet={6}' -f
@@ -2049,6 +2142,7 @@ try {
     $diagnosticDetail = $detail -join ' '
     if ($EntryProbePath) { Assert-Session0EntryGates $record $diagnosticDetail }
     if ($TerminateProbePath) { Assert-Session0TerminateGates $record $diagnosticDetail }
+    if ($ConsoleProbePath) { Assert-Session0SubsystemGates $record 'Console' $diagnosticDetail; Assert-Session0SubsystemGates $record 'Windows' $diagnosticDetail }
 
 }
 catch { $primaryError = $_.Exception }
@@ -2127,7 +2221,9 @@ finally {
     $initTreeSafe = Test-Session0InitTreeSafe ([bool]$InitProbePath) $serviceStartAttempted $record
     $entryTreeSafe = Test-Session0EntryTreeSafe ([bool]$EntryProbePath) $serviceStartAttempted $record
     $terminateTreeSafe = Test-Session0TerminateTreeSafe ([bool]$TerminateProbePath) $serviceStartAttempted $record
-    $probesTreeSafe = $initTreeSafe -and $entryTreeSafe -and $terminateTreeSafe
+    $subsystemTreeSafe = Test-Session0SubsystemTreeSafe ([bool]$ConsoleProbePath) $serviceStartAttempted $record
+    $probesTreeSafe = $initTreeSafe -and $entryTreeSafe -and $terminateTreeSafe -and $subsystemTreeSafe
+    $retainSubsystem = [bool]$ConsoleProbePath -and (-not $probesTreeSafe -or -not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe)
     if ($ownedRoot) {
         if (-not $probesTreeSafe -or -not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe) {
             $cleanupErrors.Add('fixture root preserved because SCM cleanup was not proven safe')
@@ -2149,6 +2245,8 @@ finally {
                     try { [Sembazuru.WindowStationProbeNative]::MarkDelete($recordCleanup.Handle) }
                     finally { $recordCleanup.Dispose() }
                 }
+                Remove-Session0InitProbe $windowsProbe
+                Remove-Session0InitProbe $consoleProbe
                 Remove-Session0InitProbe $terminateProbe
                 Remove-Session0InitProbe $entryProbe
                 Remove-Session0InitProbe $initProbe
@@ -2191,9 +2289,9 @@ finally {
             catch { $cleanupErrors.Add("fixture cleanup: $($_.Exception.Message)") }
         }
     }
-    foreach ($probe in @($initProbe, $entryProbe, $terminateProbe)) {
+    foreach ($probe in @($initProbe, $entryProbe, $terminateProbe, $consoleProbe, $windowsProbe)) {
         foreach ($name in @('Source', 'Target', 'Lease', 'ReadHold')) {
-            if (-not $probesTreeSafe -and $name -ne 'Source') { continue }
+            if ($retainSubsystem -or (-not $probesTreeSafe -and $name -ne 'Source')) { continue }
             if ($null -ne $probe[$name]) {
                 try { $probe[$name].Dispose() }
                 catch { $cleanupErrors.Add("診断 $name のハンドル解放: $($_.Exception.Message)") }
@@ -2201,12 +2299,13 @@ finally {
             }
         }
     }
-    if (-not $probesTreeSafe) {
+    if (-not $probesTreeSafe -or $retainSubsystem) {
         # ホスト終了まで保持する。確認不能を通常cleanupへ読み替えない。
         $retained = Get-Variable -Name SembazuruSession0RetainedInitProbes -Scope Global -ErrorAction SilentlyContinue
         if ($null -eq $retained) { $global:SembazuruSession0RetainedInitProbes = [Collections.Generic.List[object]]::new() }
-        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; EntryProbe=$entryProbe; TerminateProbe=$terminateProbe; Root=$rootHandle })
+        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; EntryProbe=$entryProbe; TerminateProbe=$terminateProbe; ConsoleProbe=$consoleProbe; WindowsProbe=$windowsProbe; Root=$rootHandle; FixtureTarget=$(if ($retainSubsystem) { $targetHandle }); FixtureLease=$(if ($retainSubsystem) { $targetLease }) })
         $rootHandle = $null
+        if ($retainSubsystem) { $targetHandle = $null; $targetLease = $null }
     }
     if ($null -ne $targetHandle) {
         try { $targetHandle.Dispose() }
