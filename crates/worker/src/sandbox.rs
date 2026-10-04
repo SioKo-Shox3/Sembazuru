@@ -2451,6 +2451,8 @@ mod tests {
     const SESSION0_DIAGNOSTIC_VERSION: u32 = 9;
     const SESSION0_ENTRY_DIAGNOSTIC_VERSION: u32 = 10;
     const SESSION0_ENTRY_EXIT: u32 = 0x5342_5a45;
+    const SESSION0_TERMINATE_DIAGNOSTIC_VERSION: u32 = 11;
+    const SESSION0_TERMINATE_EXIT: u32 = 0x5342_5a54;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
@@ -3001,6 +3003,7 @@ mod tests {
             .into_iter()
             .chain(record.init_probe.iter().map(|v| &v.run))
             .chain(record.entry_probe.iter().map(|v| &v.run))
+            .chain(record.terminate_probe.iter().map(|v| &v.run))
         {
             fields.extend([
                 run.job_ui_restrictions.to_string(),
@@ -3038,6 +3041,14 @@ mod tests {
             fields.push(entry.entry_observed.to_string());
             fields.push(entry.gates_verified(record).to_string());
         }
+        if let Some(probe) = &record.terminate_probe {
+            fields.push(diagnostic_hex(probe.path.as_bytes()));
+            fields.push(probe.sha256.clone());
+            fields.push(probe.entry_observed.to_string());
+            fields.push(probe.output_eof.to_string());
+            fields.push(probe.deadline_met.to_string());
+            fields.push(probe.gates_verified(record).to_string());
+        }
         fields.join("\t")
     }
 
@@ -3049,6 +3060,7 @@ mod tests {
         expected_mask: u32,
         expected_init: Option<(String, String)>,
         expected_entry: Option<(String, String)>,
+        expected_terminate: Option<(String, String)>,
     }
 
     fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
@@ -3063,6 +3075,7 @@ mod tests {
                 expected_mask: record.requested_station_mask,
                 expected_init: None,
                 expected_entry: None,
+                expected_terminate: None,
                 expected: Some(record),
             });
         };
@@ -3185,6 +3198,7 @@ mod tests {
                 expected_mask: record.requested_station_mask,
                 expected_init: None,
                 expected_entry: None,
+                expected_terminate: None,
             });
         };
         let u32_patch = |offset: usize, value: u32| {
@@ -3368,6 +3382,7 @@ mod tests {
             expected_mask: record.requested_station_mask,
             expected_init: None,
             expected_entry: None,
+            expected_terminate: None,
         });
         let forged: Vec<_> = cases
             .iter()
@@ -3394,6 +3409,7 @@ mod tests {
                     expected_mask: case.expected_mask,
                     expected_init: None,
                     expected_entry: None,
+                    expected_terminate: None,
                 }
             })
             .collect();
@@ -3431,6 +3447,7 @@ mod tests {
                     expected_mask: case.expected_mask,
                     expected_init: None,
                     expected_entry: None,
+                    expected_terminate: None,
                 }
             })
             .collect();
@@ -3492,12 +3509,14 @@ mod tests {
                         expected_mask: fixture.requested_station_mask,
                         expected_init: None,
                         expected_entry: None,
+                        expected_terminate: None,
                     });
                 }
             }
         }
         cases.extend(session0_init_record_corpus());
         cases.extend(session0_entry_record_corpus());
+        cases.extend(session0_terminate_record_corpus());
         cases
     }
 
@@ -3565,6 +3584,7 @@ mod tests {
                     expected_mask: mask,
                     expected_init: Some((path.clone(), hash.clone())),
                     expected_entry: None,
+                    expected_terminate: None,
                     expected: input.expected.map(|_| expected),
                 });
             }
@@ -3579,6 +3599,7 @@ mod tests {
                     expected_mask: mask,
                     expected_init: Some((expected_path, expected_hash)),
                     expected_entry: None,
+                    expected_terminate: None,
                     expected,
                 });
             };
@@ -3717,6 +3738,7 @@ mod tests {
                     expected_mask: mask,
                     expected_init: Some((altered, hash.clone())),
                     expected_entry: None,
+                    expected_terminate: None,
                     expected: None,
                 });
             }
@@ -3753,6 +3775,7 @@ mod tests {
                     expected_mask: mask,
                     expected_init: Some((path.clone(), hash.clone())),
                     expected_entry: None,
+                    expected_terminate: None,
                     expected: None,
                 });
             }
@@ -3763,6 +3786,7 @@ mod tests {
                 expected_mask: mask,
                 expected_init: None,
                 expected_entry: None,
+                expected_terminate: None,
                 expected: None,
             });
         }
@@ -4077,6 +4101,7 @@ mod tests {
                     expected_mask,
                     expected_init: caller_init,
                     expected_entry: caller_entry,
+                    expected_terminate: None,
                 });
             }
         }
@@ -4111,6 +4136,479 @@ mod tests {
             cases.push(case);
         }
         cases
+    }
+
+    fn session0_terminate_record_corpus() -> Vec<Session0DiagnosticCase> {
+        let mut cases = Vec::new();
+        for base_case in session0_entry_record_corpus()
+            .into_iter()
+            .filter(|v| v.name == "entry-observed")
+        {
+            let base = base_case.expected.unwrap();
+            let mask = base.requested_station_mask;
+            let mut run = base.entry_probe.as_ref().unwrap().run.clone();
+            run.target_desktop = format!("{}\\sbz-terminate", base.station);
+            run.child_exit = Some(SESSION0_TERMINATE_EXIT);
+            let probe = Session0TerminateProbeRecord {
+                path: "C:\\fixture\\SbzSession0TerminateProbe.exe".into(),
+                sha256: "3".repeat(64),
+                run,
+                entry_observed: true,
+                output_eof: true,
+                deadline_met: true,
+            };
+            for name in [
+                "terminate-observed",
+                "terminate-old-exit",
+                "terminate-zero-exit",
+                "terminate-dll-init",
+                "terminate-max-u32",
+                "terminate-no-exit",
+                "terminate-timeout",
+                "terminate-timeout-fixed-exit",
+                "terminate-timeout-fixed-exit-tree-error",
+                "terminate-timeout-fixed-exit-tree-timeout",
+                "terminate-timeout-killed-exit",
+                "terminate-spawn-failed",
+                "terminate-output-error",
+                "terminate-tree-error",
+                "terminate-desktop-error",
+                "terminate-station-error",
+                "terminate-stdout",
+                "terminate-stderr",
+                "terminate-no-eof",
+                "terminate-no-deadline",
+                "terminate-no-isolation",
+                "terminate-no-tree",
+                "terminate-no-desktop",
+                "terminate-wrong-nonce",
+                "terminate-wrong-mask",
+                "terminate-wrong-path",
+                "terminate-wrong-hash",
+                "terminate-wrong-exe",
+                "terminate-parent",
+                "terminate-hash-uppercase",
+                "terminate-hash-short",
+                "terminate-hash-long",
+                "terminate-bit-forged",
+                "terminate-bit-cleared",
+                "terminate-bit-invalid",
+                "terminate-bit-missing",
+                "terminate-eof-invalid",
+                "terminate-deadline-invalid",
+                "terminate-eof-contradiction",
+                "terminate-deadline-contradiction",
+                "terminate-spawn-contradiction",
+                "terminate-default",
+                "terminate-duplicate-cmd",
+                "terminate-duplicate-init",
+                "terminate-duplicate-entry",
+                "terminate-flags",
+                "terminate-job",
+                "terminate-entry-missing",
+                "terminate-init-missing",
+                "terminate-unsolicited",
+                "terminate-missing",
+                "terminate-version-v9",
+                "terminate-version-v10",
+                "terminate-trailing",
+                "terminate-length",
+                "terminate-target-mask",
+                "terminate-lifecycle-invalid",
+            ] {
+                let mut parent = base.clone();
+                let mut changed = probe.clone();
+                let mut nonce = base.nonce.clone();
+                let mut expected_mask = mask;
+                let mut expected_init = base_case.expected_init.clone();
+                let mut expected_entry = base_case.expected_entry.clone();
+                let mut expected_terminate = Some((probe.path.clone(), probe.sha256.clone()));
+                let accepted = match name {
+                    "terminate-observed" => true,
+                    "terminate-old-exit"
+                    | "terminate-zero-exit"
+                    | "terminate-dll-init"
+                    | "terminate-max-u32" => {
+                        changed.run.child_exit = Some(match name {
+                            "terminate-old-exit" => SESSION0_ENTRY_EXIT,
+                            "terminate-zero-exit" => 0,
+                            "terminate-dll-init" => 0xc000_0142,
+                            _ => u32::MAX,
+                        });
+                        changed.entry_observed = false;
+                        true
+                    }
+                    "terminate-no-exit" | "terminate-timeout" => {
+                        changed.run.child_exit = None;
+                        changed.deadline_met = false;
+                        changed.entry_observed = false;
+                        changed.run.spawn_error = if name == "terminate-timeout" {
+                            "wait: deadline-exceeded"
+                        } else {
+                            "exit_query: failure"
+                        }
+                        .into();
+                        true
+                    }
+                    "terminate-timeout-fixed-exit" | "terminate-timeout-killed-exit" => {
+                        changed.deadline_met = false;
+                        changed.run.spawn_error = "wait: deadline-exceeded".into();
+                        if name == "terminate-timeout-killed-exit" {
+                            changed.run.child_exit = Some(1);
+                            changed.entry_observed = false;
+                        }
+                        true
+                    }
+                    "terminate-timeout-fixed-exit-tree-error"
+                    | "terminate-timeout-fixed-exit-tree-timeout" => {
+                        changed.deadline_met = false;
+                        changed.output_eof = false;
+                        changed.run.lifecycle = 3;
+                        changed.run.spawn_error = if name.ends_with("tree-timeout") {
+                            "wait: deadline-exceeded;tree_cleanup:deadline-exceeded"
+                        } else {
+                            "wait: deadline-exceeded;tree_cleanup:failure"
+                        }
+                        .into();
+                        true
+                    }
+                    "terminate-spawn-failed" => {
+                        changed.run = Session0DiagnosticRun::empty();
+                        changed.entry_observed = false;
+                        changed.output_eof = false;
+                        changed.deadline_met = false;
+                        true
+                    }
+                    "terminate-output-error" => {
+                        changed.run.spawn_error = ";output_read_failed".into();
+                        changed.output_eof = false;
+                        true
+                    }
+                    "terminate-tree-error" | "terminate-no-tree" => {
+                        changed.run.lifecycle = 3;
+                        changed.output_eof = false;
+                        changed.run.spawn_error = ";tree_cleanup:failure".into();
+                        true
+                    }
+                    "terminate-desktop-error" | "terminate-no-desktop" => {
+                        changed.run.lifecycle = 7;
+                        changed.run.spawn_error = ";desktop_cleanup:gle=5".into();
+                        true
+                    }
+                    "terminate-station-error" => {
+                        parent.station_cleanup = "unconfirmed".into();
+                        parent.classification = Session0DiagnosticOutcome::Indeterminate;
+                        true
+                    }
+                    "terminate-stdout" => {
+                        changed.run.stdout = "x".into();
+                        true
+                    }
+                    "terminate-stderr" => {
+                        changed.run.stderr = "x".into();
+                        true
+                    }
+                    "terminate-no-eof" => {
+                        changed.output_eof = false;
+                        true
+                    }
+                    "terminate-no-deadline" => {
+                        changed.deadline_met = false;
+                        true
+                    }
+                    "terminate-no-isolation" => {
+                        changed.run.lifecycle = 13;
+                        true
+                    }
+                    "terminate-wrong-nonce" => {
+                        nonce = "f".repeat(32);
+                        false
+                    }
+                    "terminate-wrong-mask" => {
+                        expected_mask = if mask == 2 { 0x22 } else { 2 };
+                        false
+                    }
+                    "terminate-wrong-path" => {
+                        expected_terminate.as_mut().unwrap().0 = changed.path.to_uppercase();
+                        false
+                    }
+                    "terminate-wrong-hash" => {
+                        expected_terminate.as_mut().unwrap().1 = "4".repeat(64);
+                        false
+                    }
+                    "terminate-wrong-exe" | "terminate-parent" => {
+                        changed.path = if name == "terminate-wrong-exe" {
+                            base.entry_probe.as_ref().unwrap().path.clone()
+                        } else {
+                            changed.path.replace("fixture", "other")
+                        };
+                        expected_terminate.as_mut().unwrap().0 = changed.path.clone();
+                        false
+                    }
+                    "terminate-hash-uppercase" | "terminate-hash-short" | "terminate-hash-long" => {
+                        changed.sha256 = match name {
+                            "terminate-hash-uppercase" => "A".repeat(64),
+                            "terminate-hash-short" => "a".repeat(63),
+                            _ => "a".repeat(65),
+                        };
+                        expected_terminate.as_mut().unwrap().1 = changed.sha256.clone();
+                        false
+                    }
+                    "terminate-bit-forged" => {
+                        changed.run.child_exit = Some(SESSION0_ENTRY_EXIT);
+                        false
+                    }
+                    "terminate-bit-cleared" => {
+                        changed.entry_observed = false;
+                        false
+                    }
+                    "terminate-eof-contradiction" => {
+                        changed.run.lifecycle = 3;
+                        false
+                    }
+                    "terminate-deadline-contradiction" => {
+                        changed.run.child_exit = None;
+                        changed.entry_observed = false;
+                        false
+                    }
+                    "terminate-spawn-contradiction" => {
+                        changed.run.spawn_succeeded = false;
+                        changed.run.lifecycle = 1;
+                        false
+                    }
+                    "terminate-default" => {
+                        changed.run.target_desktop = format!("{}\\Default", base.station);
+                        false
+                    }
+                    "terminate-duplicate-cmd" => {
+                        changed.run.target_desktop = base.no_window.target_desktop.clone();
+                        false
+                    }
+                    "terminate-duplicate-init" => {
+                        changed.run.target_desktop =
+                            base.init_probe.as_ref().unwrap().run.target_desktop.clone();
+                        false
+                    }
+                    "terminate-duplicate-entry" => {
+                        changed.run.target_desktop = base
+                            .entry_probe
+                            .as_ref()
+                            .unwrap()
+                            .run
+                            .target_desktop
+                            .clone();
+                        false
+                    }
+                    "terminate-flags" => {
+                        changed.run.creation_flags = 0x0808_0404;
+                        false
+                    }
+                    "terminate-job" => {
+                        changed.run.job_ui_restrictions = 0;
+                        changed.run.job_ui_limits = describe_job_ui_limits(0);
+                        false
+                    }
+                    "terminate-entry-missing" => {
+                        parent.entry_probe = None;
+                        expected_entry = None;
+                        false
+                    }
+                    "terminate-init-missing" => {
+                        parent.entry_probe = None;
+                        parent.init_probe = None;
+                        expected_entry = None;
+                        expected_init = None;
+                        false
+                    }
+                    "terminate-unsolicited" => {
+                        expected_terminate = None;
+                        false
+                    }
+                    _ => false,
+                };
+                let mut bytes = parent.encode().unwrap();
+                let mut payload = Writer::new();
+                changed.encode_into(&mut payload, mask).unwrap();
+                if name != "terminate-missing" {
+                    bytes.extend(payload.into_bytes());
+                }
+                bytes[4..8].copy_from_slice(&11u32.to_le_bytes());
+                let len = (bytes.len() - 44) as u32;
+                bytes[40..44].copy_from_slice(&len.to_le_bytes());
+                let end = bytes.len();
+                match name {
+                    "terminate-bit-invalid" => bytes[end - 3] = 2,
+                    "terminate-eof-invalid" => bytes[end - 2] = 2,
+                    "terminate-deadline-invalid" => bytes[end - 1] = 2,
+                    "terminate-bit-missing" => {
+                        bytes.truncate(end - 3);
+                    }
+                    "terminate-version-v9" => bytes[4..8].copy_from_slice(&9u32.to_le_bytes()),
+                    "terminate-version-v10" => bytes[4..8].copy_from_slice(&10u32.to_le_bytes()),
+                    "terminate-trailing" => bytes.push(0),
+                    "terminate-length" => bytes[40] ^= 1,
+                    "terminate-lifecycle-invalid" => bytes[end - 4] = 0x80,
+                    "terminate-target-mask" => {
+                        let before = format!("station:action_mask:mask=0x{mask:08x}");
+                        let pos = bytes
+                            .windows(before.len())
+                            .rposition(|v| v == before.as_bytes())
+                            .unwrap();
+                        let after = format!(
+                            "station:action_mask:mask=0x{:08x}",
+                            if mask == 2 { 0x22 } else { 2 }
+                        );
+                        bytes[pos..pos + after.len()].copy_from_slice(after.as_bytes());
+                    }
+                    _ => {}
+                }
+                if matches!(name, "terminate-bit-missing" | "terminate-trailing") {
+                    let len = (bytes.len() - 44) as u32;
+                    bytes[40..44].copy_from_slice(&len.to_le_bytes());
+                }
+                parent.terminate_probe = Some(changed);
+                cases.push(Session0DiagnosticCase {
+                    name,
+                    bytes,
+                    nonce,
+                    expected_mask,
+                    expected_init,
+                    expected_entry,
+                    expected_terminate,
+                    expected: accepted.then_some(parent),
+                });
+            }
+        }
+        // cmd両armの全終了組合せを、追加EXEの肯定値から独立して分類する。
+        for base in cases
+            .iter()
+            .filter(|v| v.name == "terminate-observed")
+            .filter_map(|v| v.expected.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            for left in [None, Some(0), Some(0xc000_0142)] {
+                for right in [None, Some(0), Some(0xc000_0142)] {
+                    let mut record = base.clone();
+                    record.baseline.child_exit = left;
+                    record.no_window.child_exit = right;
+                    record.classification =
+                        classify_session0_diagnostic_ab(true, left, true, right);
+                    cases.push(Session0DiagnosticCase {
+                        name: "cmd-arms-terminate",
+                        bytes: record.encode().unwrap(),
+                        nonce: record.nonce.clone(),
+                        expected_mask: record.requested_station_mask,
+                        expected_init: record
+                            .init_probe
+                            .as_ref()
+                            .map(|v| (v.path.clone(), v.sha256.clone())),
+                        expected_entry: record
+                            .entry_probe
+                            .as_ref()
+                            .map(|v| (v.path.clone(), v.sha256.clone())),
+                        expected_terminate: record
+                            .terminate_probe
+                            .as_ref()
+                            .map(|v| (v.path.clone(), v.sha256.clone())),
+                        expected: Some(record),
+                    });
+                }
+            }
+        }
+        // 既存v9/v10の全到達点・改変反例も、独立した末尾領域と組み合わせる。
+        for mut case in session0_entry_record_corpus() {
+            let mut run = Session0DiagnosticRecord::fixture().baseline;
+            run.target_access = verified_target_access(case.expected_mask);
+            run.target_desktop = "Service-0x0-1234$\\sbz-terminate".into();
+            run.child_exit = Some(SESSION0_TERMINATE_EXIT);
+            run.stdout.clear();
+            run.stderr.clear();
+            let root = case
+                .expected_entry
+                .as_ref()
+                .and_then(|(p, _)| Path::new(p).parent())
+                .and_then(Path::to_str)
+                .unwrap_or("C:\\fixture");
+            let probe = Session0TerminateProbeRecord {
+                path: format!("{root}\\SbzSession0TerminateProbe.exe"),
+                sha256: "3".repeat(64),
+                run,
+                entry_observed: true,
+                output_eof: true,
+                deadline_met: true,
+            };
+            let mut payload = Writer::new();
+            probe.encode_into(&mut payload, case.expected_mask).unwrap();
+            let payload = payload.into_bytes();
+            let old_len = u32::from_le_bytes(case.bytes[40..44].try_into().unwrap());
+            case.bytes[40..44].copy_from_slice(&(old_len + payload.len() as u32).to_le_bytes());
+            if case.bytes[4..8] == 10u32.to_le_bytes() {
+                case.bytes[4..8].copy_from_slice(&11u32.to_le_bytes());
+            }
+            case.bytes.extend(payload);
+            case.expected_terminate = Some((probe.path.clone(), probe.sha256.clone()));
+            if let Some(record) = &mut case.expected {
+                record.terminate_probe = Some(probe);
+            }
+            cases.push(case);
+        }
+        cases
+    }
+
+    #[test]
+    fn session0_terminate_probe_contract() {
+        for case in session0_terminate_record_corpus()
+            .iter()
+            .filter(|v| v.name.starts_with("terminate-"))
+        {
+            if let Some(record) = &case.expected {
+                let probe = record.terminate_probe.as_ref().unwrap();
+                assert_eq!(
+                    probe.entry_observed,
+                    !matches!(
+                        case.name,
+                        "terminate-old-exit"
+                            | "terminate-zero-exit"
+                            | "terminate-dll-init"
+                            | "terminate-max-u32"
+                            | "terminate-no-exit"
+                            | "terminate-timeout"
+                            | "terminate-timeout-killed-exit"
+                            | "terminate-spawn-failed"
+                    ),
+                    "{}",
+                    case.name
+                );
+                assert_eq!(
+                    probe.gates_verified(record),
+                    matches!(
+                        case.name,
+                        "terminate-observed"
+                            | "terminate-old-exit"
+                            | "terminate-zero-exit"
+                            | "terminate-dll-init"
+                            | "terminate-max-u32"
+                    ),
+                    "{}",
+                    case.name
+                );
+                assert_ne!(
+                    record.classification,
+                    Session0DiagnosticOutcome::ActionStarts
+                );
+                eprintln!(
+                    "{} mask=0x{:04x} exit={:?} entry={} eof={} deadline={} gates={}",
+                    case.name,
+                    case.expected_mask,
+                    probe.run.child_exit,
+                    probe.entry_observed,
+                    probe.output_eof,
+                    probe.deadline_met,
+                    probe.gates_verified(record)
+                );
+            }
+        }
     }
 
     #[test]
@@ -4157,10 +4655,7 @@ mod tests {
         for (argv, accepted) in session0_argv_corpus() {
             if accepted {
                 let config = validate_window_station_scm_process_argv(&argv).unwrap();
-                assert_eq!(
-                    require_connected_session0_request(&config).is_ok(),
-                    argv.len() < 14
-                );
+                assert!(require_connected_session0_request(&config).is_ok());
             }
         }
         eprintln!("EntryProbe: 独立終了値/肯定bit/空出力/隔離/cleanup/cmd分類 PASS");
@@ -4262,23 +4757,23 @@ mod tests {
     }
 
     #[test]
-    fn session0_terminate_dispatcher_rejects_unconnected_request() {
+    fn session0_terminate_dispatcher_requires_both_previous_probes() {
         let mut checked = 0;
         for (argv, accepted) in session0_argv_corpus() {
             if !accepted {
                 continue;
             }
             let mut config = validate_window_station_scm_process_argv(&argv).unwrap();
-            assert_eq!(
-                require_connected_session0_request(&config).is_ok(),
-                argv.len() < 14
-            );
+            assert!(require_connected_session0_request(&config).is_ok());
             if argv.len() == 14 {
                 for init in [None, config.init_probe_sha256.clone()] {
                     for entry in [None, config.entry_probe_sha256.clone()] {
                         config.init_probe_sha256 = init.clone();
-                        config.entry_probe_sha256 = entry;
-                        assert!(require_connected_session0_request(&config).is_err());
+                        config.entry_probe_sha256 = entry.clone();
+                        assert_eq!(
+                            require_connected_session0_request(&config).is_ok(),
+                            init.is_some() && entry.is_some()
+                        );
                         checked += 1;
                     }
                 }
@@ -4286,7 +4781,7 @@ mod tests {
         }
         assert!(checked > 0);
         assert_eq!(SESSION0_ENTRY_EXIT, 0x5342_5a45);
-        eprintln!("固定自己終了の未接続要求: 登録前拒否 {checked}件、旧形式と旧終了値を保持");
+        eprintln!("固定自己終了の登録前検査: {checked}件、旧形式と旧終了値を保持");
     }
 
     #[test]
@@ -4562,6 +5057,9 @@ mod tests {
                 case.expected_entry
                     .as_ref()
                     .map(|(p, h)| (p.as_str(), h.as_str())),
+                case.expected_terminate
+                    .as_ref()
+                    .map(|(p, h)| (p.as_str(), h.as_str())),
             );
             match case.expected {
                 Some(expected) => assert_eq!(decoded.unwrap(), expected, "{}", case.name),
@@ -4824,7 +5322,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -4841,7 +5339,8 @@ foreach ($bits in 0..15) {
 }
 if ((Get-Session0ServiceDeadline $false $false) -ne 30 -or
     (Get-Session0ServiceDeadline $true $false) -ne 360 -or
-    (Get-Session0ServiceDeadline $true $true) -ne 454) { throw 'SCM期限が契約と一致しません。' }
+    (Get-Session0ServiceDeadline $true $true) -ne 454 -or
+    (Get-Session0ServiceDeadline $true $true $true) -ne 561) { throw 'SCM期限が契約と一致しません。' }
 foreach ($initPath in @('', 'init')) { foreach ($initHash in @('', 'hash')) {
     foreach ($entryPath in @('', 'entry')) { foreach ($entryHash in @('', 'hash')) {
         $accepted = ([bool]$initPath -eq [bool]$initHash) -and ([bool]$entryPath -eq [bool]$entryHash) -and (-not $entryPath -or [bool]$initPath)
@@ -4862,11 +5361,25 @@ foreach ($initBits in 0..15) { foreach ($entryBits in 0..15) {
         throw '両診断の全子孫・desktop回収条件が矛盾しています。'
     }
 } }
+if (-not (Test-Session0TerminateTreeSafe $false $true $null) -or -not (Test-Session0TerminateTreeSafe $true $false $null) -or
+    (Test-Session0TerminateTreeSafe $true $true $null)) { throw '自己終了診断の開始前保持条件が不正です。' }
+foreach ($initBits in 0..15) { foreach ($entryBits in 0..15) { foreach ($terminateBits in 0..15) {
+    $sample = [pscustomobject]@{
+        InitProbe = [pscustomobject]@{ Run = [pscustomobject]@{ Lifecycle = $initBits } }
+        EntryProbe = [pscustomobject]@{ Run = [pscustomobject]@{ Lifecycle = $entryBits } }
+        TerminateProbe = [pscustomobject]@{ Run = [pscustomobject]@{ Lifecycle = $terminateBits } }
+    }
+    $safe = (Test-Session0InitTreeSafe $true $true $sample) -and (Test-Session0EntryTreeSafe $true $true $sample) -and
+        (Test-Session0TerminateTreeSafe $true $true $sample)
+    if ($safe -ne (($initBits -band 12) -eq 12 -and ($entryBits -band 12) -eq 12 -and ($terminateBits -band 12) -eq 12)) {
+        throw '3診断の全子孫・desktop回収と保持条件が矛盾しています。'
+    }
+} } }
 $count = 0
 $argvCount = 0
 $initCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
-    $parts = $line.Split("`t", 10)
+    $parts = $line.Split("`t", 12)
     if ($parts[0] -ceq 'init') {
         $exit = if ($parts[3] -ceq 'none') { $null } else { [uint32]$parts[3] }
         $record = $null
@@ -4899,20 +5412,20 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $bytes = [Convert]::FromHexString($parts[2])
     $record = $null
     $rejected = $false
-    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] }
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] }
     catch { $rejected = $true }
     if ($parts[3] -ceq 'reject') {
         if (-not $rejected) { throw "不正な記録を受理しました: $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "正常な記録を拒否しました: $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne 26) { throw 'レコードのプロパティ数が一致しません。' }
+        if (@($record.PSObject.Properties).Count -ne 27) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId', 'RequestedStationMask')) { $values.Add([string]$record.$property) }
         foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }))) {
+        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }))) {
             if ($null -eq $run) { continue }
             if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
             $values.Add([string]$run.JobUi)
@@ -4943,7 +5456,19 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             if ($parentRejected -eq $gates) { throw '親の必須ゲート拒否が一致しません。' }
             $values.Add(([string]$gates).ToLowerInvariant())
         }
-        if (($values -join "`t") -cne $parts[9]) { throw "記録のプロパティが一致しません: $($parts[0])" }
+        if ($null -ne $record.TerminateProbe) {
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.TerminateProbe.Path)).ToLowerInvariant())
+            $values.Add($record.TerminateProbe.Sha256)
+            foreach ($property in @('EntryObserved', 'OutputEof', 'DeadlineMet')) {
+                $values.Add(([string]$record.TerminateProbe.$property).ToLowerInvariant())
+            }
+            $gates = Test-Session0TerminateGates $record
+            $parentRejected = $false
+            try { Assert-Session0TerminateGates $record } catch { $parentRejected = $true }
+            if ($parentRejected -eq $gates) { throw '親の自己終了診断ゲート拒否が一致しません。' }
+            $values.Add(([string]$gates).ToLowerInvariant())
+        }
+        if (($values -join "`t") -cne $parts[11]) { throw "記録のプロパティが一致しません: $($parts[0])" }
     }
     $count++
 }
@@ -4999,7 +5524,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         for case in &cases {
             let expected = case.expected.as_ref().map(diagnostic_properties);
             input.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.name,
                 case.nonce,
                 diagnostic_hex(&case.bytes),
@@ -5023,8 +5548,19 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                         .as_bytes()
                 ),
                 case.expected_entry.as_ref().map_or("", |(_, h)| h),
+                diagnostic_hex(
+                    case.expected_terminate
+                        .as_ref()
+                        .map_or("", |(p, _)| p)
+                        .as_bytes()
+                ),
+                case.expected_terminate.as_ref().map_or("", |(_, h)| h),
                 expected.unwrap_or_default(),
             ));
+        }
+        // 専用検査が指定した保存先へ、両codecに渡す実入力をそのまま残す。
+        if let Some(path) = std::env::var_os("SEMBAZURU_SESSION0_CORPUS_PATH") {
+            std::fs::write(path, &input).expect("共通corpusの保存");
         }
         let mut child = Command::new("pwsh")
             .args([
@@ -6010,6 +6546,104 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         }
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Session0TerminateProbeRecord {
+        path: String,
+        sha256: String,
+        run: Session0DiagnosticRun,
+        entry_observed: bool,
+        output_eof: bool,
+        deadline_met: bool,
+    }
+
+    fn terminate_run_observed(run: &Session0DiagnosticRun) -> bool {
+        // signal確認後の終了値を、後続の出力・Job・desktop回収失敗から独立させる。
+        run.spawn_succeeded && run.child_exit == Some(SESSION0_TERMINATE_EXIT)
+    }
+
+    impl Session0TerminateProbeRecord {
+        fn validate(&self, record: &Session0DiagnosticRecord) -> Result<(), String> {
+            let parent = Path::new(&self.path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            let run = &self.run;
+            let init = record
+                .init_probe
+                .as_ref()
+                .ok_or("固定自己終了診断にはInitProbeが必要です")?;
+            let entry = record
+                .entry_probe
+                .as_ref()
+                .ok_or("固定自己終了診断にはEntryProbeが必要です")?;
+            if self.path != format!("{parent}\\{}", Session0ProbeKind::Terminate.basename())
+                || !session0_local_fixture_root(parent)
+                || init.path != format!("{parent}\\{SESSION0_INIT_BASENAME}")
+                || entry.path != format!("{parent}\\{}", Session0ProbeKind::Entry.basename())
+                || (self.output_eof && (!run.spawn_succeeded || run.lifecycle & 4 == 0))
+                || (self.deadline_met && (!run.spawn_succeeded || run.child_exit.is_none()))
+                || self.sha256.len() != 64
+                || !self
+                    .sha256
+                    .bytes()
+                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+                || (!run.spawn_succeeded && run.child_exit.is_some())
+                || (run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe
+                        || run.creation_flags != 0x0008_0404
+                        || run.lifecycle & 1 == 0))
+                || (run.lifecycle & 1 != 0
+                    && !run
+                        .target_desktop
+                        .starts_with(&format!("{}\\sbz-", record.station)))
+                || (!run.target_desktop.is_empty()
+                    && [
+                        &record.baseline.target_desktop,
+                        &record.no_window.target_desktop,
+                        &init.run.target_desktop,
+                        &entry.run.target_desktop,
+                    ]
+                    .contains(&&run.target_desktop))
+                || self.entry_observed != terminate_run_observed(run)
+            {
+                return Err("固定自己終了診断のpath・hash・実行契約・肯定bitが一致しません".into());
+            }
+            Ok(())
+        }
+
+        // entry到達の観測とは別に、出力回収・隔離・全子孫とstationの終了を要求する。
+        fn gates_verified(&self, record: &Session0DiagnosticRecord) -> bool {
+            let run = &self.run;
+            record.session_id == 0
+                && !record.worker_actions_sid.is_empty()
+                && record.station_ace
+                    == format!(
+                        "count=1;flags=0;mask=0x{:08x}",
+                        record.requested_station_mask
+                    )
+                && record.station_cleanup == "removed"
+                && run.spawn_succeeded
+                && run.lifecycle == 15
+                && run.observations_verified(record.requested_station_mask)
+                && run.stdout.is_empty()
+                && run.stderr.is_empty()
+                && run.spawn_error.is_empty()
+                && self.output_eof
+                && self.deadline_met
+                && run.child_exit.is_some()
+        }
+
+        fn encode_into(&self, payload: &mut Writer, mask: u32) -> Result<(), String> {
+            write_text(payload, &self.path)?;
+            write_text(payload, &self.sha256)?;
+            self.run.encode_into(payload, mask)?;
+            payload.bool(self.entry_observed);
+            payload.bool(self.output_eof);
+            payload.bool(self.deadline_met);
+            Ok(())
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum Session0ProbeKind {
         Init,
@@ -6135,6 +6769,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         station_cleanup: String,
         init_probe: Option<Session0InitProbeRecord>,
         entry_probe: Option<Session0EntryProbeRecord>,
+        terminate_probe: Option<Session0TerminateProbeRecord>,
     }
 
     impl Session0DiagnosticRecord {
@@ -6207,6 +6842,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 station_cleanup: "removed".into(),
                 init_probe: None,
                 entry_probe: None,
+        terminate_probe: None,
             }
         }
 
@@ -6337,13 +6973,19 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 entry.validate(self)?;
                 entry.encode_into(&mut payload, self.requested_station_mask)?;
             }
+            if let Some(probe) = &self.terminate_probe {
+                probe.validate(self)?;
+                probe.encode_into(&mut payload, self.requested_station_mask)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
             let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
-            let version = if self.entry_probe.is_some() {
+            let version = if self.terminate_probe.is_some() {
+                SESSION0_TERMINATE_DIAGNOSTIC_VERSION
+            } else if self.entry_probe.is_some() {
                 SESSION0_ENTRY_DIAGNOSTIC_VERSION
             } else {
                 SESSION0_DIAGNOSTIC_VERSION
@@ -6361,6 +7003,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             expected_mask: u32,
             expected_init: Option<(&str, &str)>,
             expected_entry: Option<(&str, &str)>,
+            expected_terminate: Option<(&str, &str)>,
         ) -> Result<Self, String> {
             validate_nonce(expected_nonce)?;
             diagnostic_station_profile(expected_mask)?;
@@ -6372,7 +7015,9 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             };
             if u32_at(0) != SESSION0_DIAGNOSTIC_MAGIC
                 || u32_at(4)
-                    != if expected_entry.is_some() {
+                    != if expected_terminate.is_some() {
+                        SESSION0_TERMINATE_DIAGNOSTIC_VERSION
+                    } else if expected_entry.is_some() {
                         SESSION0_ENTRY_DIAGNOSTIC_VERSION
                     } else {
                         SESSION0_DIAGNOSTIC_VERSION
@@ -6446,6 +7091,23 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             } else {
                 None
             };
+            let terminate_probe = if let Some((expected_path, expected_hash)) = expected_terminate {
+                let path = read_text(&mut reader)?;
+                let sha256 = read_text(&mut reader)?;
+                if path != expected_path || sha256 != expected_hash {
+                    return Err("固定自己終了診断のpath・hashが呼出側の期待値と一致しません".into());
+                }
+                Some(Session0TerminateProbeRecord {
+                    path,
+                    sha256,
+                    run: Session0DiagnosticRun::decode_from(&mut reader)?,
+                    entry_observed: read_strict_bool(&mut reader)?,
+                    output_eof: read_strict_bool(&mut reader)?,
+                    deadline_met: read_strict_bool(&mut reader)?,
+                })
+            } else {
+                None
+            };
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -6474,6 +7136,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 station_cleanup,
                 init_probe,
                 entry_probe,
+                terminate_probe,
             };
             record.encode().map(|_| record)
         }
@@ -6575,8 +7238,10 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
     fn require_connected_session0_request(
         config: &Session0DiagnosticConfig,
     ) -> Result<(), &'static str> {
-        if config.terminate_probe_sha256.is_some() {
-            return Err("固定自己終了診断の実行と記録は未接続です");
+        if config.terminate_probe_sha256.is_some()
+            && (config.init_probe_sha256.is_none() || config.entry_probe_sha256.is_none())
+        {
+            return Err("固定自己終了診断にはInitProbeとEntryProbeが必要です");
         }
         if config.entry_probe_sha256.is_some() && config.init_probe_sha256.is_none() {
             return Err("固定終了値診断にはInitProbeが必要です");
@@ -7100,6 +7765,218 @@ privileges={privileges:?}{restricted}",
         Ok(record)
     }
 
+    async fn observe_session0_child_exit(process: &RestrictedProcess) -> io::Result<u32> {
+        loop {
+            let handle = process
+                .process
+                .as_ref()
+                .ok_or_else(|| io::Error::other("診断の子ハンドルがありません"))?
+                .as_raw_handle() as HANDLE;
+            // SAFETY: このrunが所有する直下子だけを非ブロッキングで照会する。
+            match unsafe { WaitForSingleObject(handle, 0) } {
+                WAIT_OBJECT_0 => {
+                    let mut exit = 0u32;
+                    // SAFETY: signal済みの所有ハンドルと有効なu32出力先を渡す。
+                    if unsafe { GetExitCodeProcess(handle, &mut exit) } == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    return Ok(exit);
+                }
+                WAIT_TIMEOUT => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
+    }
+
+    // 保存後の回収futureが失敗・キャンセルされても、取得済みの観測は残す。
+    async fn preserve_session0_exit_before_cleanup(
+        record: &mut Session0DiagnosticRun,
+        observation: impl std::future::Future<Output = io::Result<u32>>,
+        cleanup: impl std::future::Future<Output = io::Result<()>>,
+    ) -> io::Result<()> {
+        if record.child_exit.is_none() {
+            record.child_exit = Some(observation.await?);
+        }
+        cleanup.await
+    }
+
+    #[test]
+    fn session0_terminate_exit_survives_post_deadline_cleanup_failure() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for previously_observed in [false, true] {
+            for timeout in [false, true] {
+                let mut record = Session0DiagnosticRun::empty();
+                record.spawn_succeeded = true;
+                record.spawn_error = "wait: deadline-exceeded".into();
+                if previously_observed {
+                    record.child_exit = Some(SESSION0_TERMINATE_EXIT);
+                }
+                let result = runtime.block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(10),
+                        preserve_session0_exit_before_cleanup(
+                            &mut record,
+                            async {
+                                Ok(if previously_observed {
+                                    SESSION0_ENTRY_EXIT
+                                } else {
+                                    SESSION0_TERMINATE_EXIT
+                                })
+                            },
+                            async {
+                                if timeout {
+                                    std::future::pending::<()>().await;
+                                }
+                                Err(io::Error::other("Job回収失敗の反例"))
+                            },
+                        ),
+                    )
+                    .await
+                });
+                assert!(!matches!(result, Ok(Ok(()))));
+                assert_eq!(record.child_exit, Some(SESSION0_TERMINATE_EXIT));
+                assert!(terminate_run_observed(&record));
+                eprintln!(
+                    "POST_DEADLINE_EXIT_PRESERVED=True previously_observed={previously_observed} cleanup_timeout={timeout}"
+                );
+            }
+        }
+        let mut record = Session0DiagnosticRun::empty();
+        let result = runtime.block_on(preserve_session0_exit_before_cleanup(
+            &mut record,
+            async { Err(io::Error::other("終了値取得失敗の反例")) },
+            async {
+                panic!("終了未観測のまま回収成功を記録してはいけません")
+            },
+        ));
+        assert!(result.is_err());
+        assert_eq!(record.child_exit, None);
+        assert!(!terminate_run_observed(&record));
+    }
+
+    // 終了値をJob回収より先に固定し、回収・EOF・期限を独立した証拠として返す。
+    fn run_session0_terminate_child(
+        action: &ActionToken,
+        command: &RestrictedCommand,
+    ) -> Result<(Session0DiagnosticRun, bool, bool), String> {
+        let mut record = Session0DiagnosticRun::empty();
+        let mut process = match RestrictedProcess::spawn_for_session0_diagnostic(
+            action,
+            command,
+            TestCreationProfile::Production,
+            &mut record,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                record.spawn_error = format!("spawn: {error}");
+                record.observe_desktop_release();
+                return Ok((record, false, false));
+            }
+        };
+        record.spawn_succeeded = true;
+        record.job_ui_restrictions = process
+            .job()
+            .ui_restrictions_for_test()
+            .map_err(|error| format!("job UI query: {error}"))?;
+        record.job_ui_limits = describe_job_ui_limits(record.job_ui_restrictions);
+        if record.job_ui_restrictions != 0xfe {
+            return Err("固定自己終了診断のJob UI制限が一致しません".into());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("runtime: {error}"))?;
+        let observation_start = std::time::Instant::now();
+        let observed = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                observe_session0_child_exit(&process),
+            )
+            .await
+        });
+        let deadline_met = match observed {
+            Ok(Ok(exit)) => {
+                record.child_exit = Some(exit);
+                observation_start.elapsed() <= std::time::Duration::from_secs(10)
+            }
+            Ok(Err(error)) => {
+                record.spawn_error = format!("exit_query: {error}");
+                false
+            }
+            Err(_) => {
+                record.spawn_error = "wait: deadline-exceeded".into();
+                false
+            }
+        };
+        if !deadline_met {
+            if record.spawn_error.is_empty() {
+                record.spawn_error = "wait: deadline-exceeded".into();
+            }
+            process.terminate();
+        }
+        let job = Arc::clone(&process.job);
+        let cleanup = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                preserve_session0_exit_before_cleanup(
+                    &mut record,
+                    observe_session0_child_exit(&process),
+                    async move {
+                        tokio::task::spawn_blocking(move || job.terminate_and_wait())
+                            .await
+                            .map_err(|_| io::Error::other("診断のJob回収タスクが失敗しました"))?
+                    },
+                ),
+            )
+            .await
+        });
+        if matches!(cleanup, Ok(Ok(()))) {
+            // 直下子のsignalとJob全体の終了が両方確認できたときだけ所有状態を進める。
+            process.tree_finished = true;
+            process.process.take();
+        } else {
+            record
+                .spawn_error
+                .push_str(&format!(";tree_cleanup:{cleanup:?}"));
+        }
+        let mut output_eof = false;
+        if process.tree_finished {
+            record.lifecycle |= 4;
+            match process.take_output() {
+                Ok((stdout, stderr)) => {
+                    use tokio::io::AsyncReadExt;
+                    let (mut left, mut right) = (Vec::new(), Vec::new());
+                    let result = runtime.block_on(async {
+                        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                            let (mut stdout, mut stderr) = (stdout.take(4097), stderr.take(4097));
+                            tokio::join!(
+                                stdout.read_to_end(&mut left),
+                                stderr.read_to_end(&mut right)
+                            )
+                        })
+                        .await
+                    });
+                    output_eof = matches!(result, Ok((Ok(_), Ok(_))))
+                        && left.len() <= 4096
+                        && right.len() <= 4096;
+                    record.stdout = String::from_utf8_lossy(&left).into_owned();
+                    record.stderr = String::from_utf8_lossy(&right).into_owned();
+                }
+                Err(_) => record.spawn_error.push_str(";output_read_failed"),
+            }
+        }
+        if !output_eof {
+            record.spawn_error.push_str(";output_eof_unconfirmed");
+        }
+        drop(process);
+        record.observe_desktop_release();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        Ok((record, output_eof, deadline_met))
+    }
+
     fn run_session0_diagnostic(
         config: &Session0DiagnosticConfig,
     ) -> Result<Session0DiagnosticOutcome, Session0DiagnosticFailureStage> {
@@ -7146,6 +8023,7 @@ privileges={privileges:?}{restricted}",
             station_cleanup: "unavailable:not-acquired".into(),
             init_probe: None,
             entry_probe: None,
+            terminate_probe: None,
         };
         let lease = match ActionStationLease::acquire_for_diagnostic(config.station_profile) {
             Ok(lease) => Arc::new(lease),
@@ -7315,6 +8193,37 @@ privileges={privileges:?}{restricted}",
                     sha256,
                     entry_observed: entry_run_observed(&run),
                     run,
+                });
+            }
+            if config.terminate_probe_sha256.is_some() {
+                let (held, sha256) = hold_session0_probe(config, Session0ProbeKind::Terminate)
+                    .map_err(|_| Session0DiagnosticFailureStage::Runtime)?;
+                let path = config
+                    .fixture_root
+                    .join(Session0ProbeKind::Terminate.basename());
+                let command = RestrictedCommand {
+                    application: path.clone(),
+                    arguments: Vec::new(),
+                    cwd: command.cwd.clone(),
+                    environment: command.environment.clone(),
+                };
+                let result = run_session0_terminate_child(&action, &command);
+                if result
+                    .as_ref()
+                    .map_or(true, |(run, _, _)| run.lifecycle & 4 == 0)
+                {
+                    // 全子孫の終了が証明できなければ、worker終了までEXEの読取り保持を残す。
+                    std::mem::forget(held);
+                }
+                let (run, output_eof, deadline_met) =
+                    result.map_err(|_| Session0DiagnosticFailureStage::Runtime)?;
+                record.terminate_probe = Some(Session0TerminateProbeRecord {
+                    path: path.to_string_lossy().into_owned(),
+                    sha256,
+                    entry_observed: terminate_run_observed(&run),
+                    run,
+                    output_eof,
+                    deadline_met,
                 });
             }
             Ok(())

@@ -23,11 +23,12 @@ function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [s
     }
 }
 
-function Assert-Session0ConnectedRequest([bool]$TerminateRequested) {
-    if ($TerminateRequested) { throw '固定自己終了診断の実行と記録は未接続です。' }
-}
-
-function Get-Session0ServiceDeadline([bool]$InitRequested, [bool]$EntryRequested) {
+function Get-Session0ServiceDeadline([bool]$InitRequested, [bool]$EntryRequested, [bool]$TerminateRequested = $false) {
+    if ($TerminateRequested) {
+        if (-not $InitRequested -or -not $EntryRequested) { throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。' }
+        # 旧4runに新runの終了10秒/回収35秒/EOF1秒/Drop30+30秒/runtime停止1秒と余裕30秒を加える。
+        return 4 * (10 + 35 + 30 + 30 + 1) + (10 + 35 + 1 + 30 + 30 + 1) + 30
+    }
     if ($EntryRequested) {
         if (-not $InitRequested) { throw '固定終了値診断にはInitProbeの指定が必要です。' }
         # 4runの実行10秒+再wait35秒+Dropの直下子30秒/Job30秒+runtime停止1秒、外側余裕30秒。
@@ -110,8 +111,6 @@ if ($ExpectedSha256 -notmatch '\A[0-9a-fA-F]{64}\z') {
 }
 $ExpectedSha256 = $ExpectedSha256.ToLowerInvariant()
 Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256
-# 実行と独立記録が揃うまでは、ファイル配置やSCMの照会より前に拒否する。
-Assert-Session0ConnectedRequest ([bool]$TerminateProbePath)
 
 $serviceName = 'SembazuruWindowStationProbeSmoke'
 $workerServiceName = 'SembazuruWorker'
@@ -1456,6 +1455,76 @@ function Read-Session0EntryRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [
     return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; EntryObserved=$observed }
 }
 
+function Test-Session0TerminateTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.TerminateProbe -and
+        ($Record.TerminateProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Get-Session0TerminateObserved($Run) {
+    # 取得済み終了値の観測を、後続の出力・desktop回収エラーから独立させる。
+    return $Run.SpawnSucceeded -and $null -ne $Run.ChildExit -and
+        $Run.ChildExit -eq [uint32]0x53425a54
+}
+
+function Test-Session0TerminateGates($Record) {
+    if ($null -eq $Record.TerminateProbe) { return $false }
+    $run = $Record.TerminateProbe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stdout.Length -eq 0 -and $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and
+        $Record.TerminateProbe.OutputEof -and $Record.TerminateProbe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Assert-Session0TerminateGates($Record, [string]$Detail = '') {
+    if (-not (Test-Session0TerminateGates $Record)) {
+        throw "固定自己終了診断の空出力・隔離・終了確認ゲートが未達です: $Detail"
+    }
+}
+
+function Read-Session0TerminateRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $Init, $Entry, $Baseline, $NoWindow) {
+    if ($null -eq $Init) { throw '固定自己終了診断にはInitProbeの記録が必要です。' }
+    if ($null -eq $Entry) { throw '固定自己終了診断にはEntryProbeの記録が必要です。' }
+    $path = Read-Session0Text $Bytes $Offset
+    $hash = Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or
+        -not $path.EndsWith('\SbzSession0TerminateProbe.exe', [StringComparison]::Ordinal) -or
+        $path -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+        @($path.Substring(3).Split('\') | Where-Object {
+            $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+        }).Count -ne 0 -or
+        $Init.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0InitProbe.exe') -or
+        $Entry.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0EntryProbe.exe')) {
+        throw '固定自己終了診断のpath・hashが呼出側の期待値と一致しません。'
+    }
+    $run = Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and $null -ne $run.ChildExit) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station + '\sbz-'), [StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -ne 0 -and ($run.TargetDesktop -ceq $Baseline.TargetDesktop -or
+            $run.TargetDesktop -ceq $NoWindow.TargetDesktop -or $run.TargetDesktop -ceq $Init.Run.TargetDesktop -or $run.TargetDesktop -ceq $Entry.Run.TargetDesktop))) {
+        throw '固定自己終了診断のJob・製品flags・専用desktopが一致しません。'
+    }
+    if ($Offset.Value -ge $Bytes.Length -or $Bytes[$Offset.Value] -gt 1) { throw '固定自己終了診断の肯定bitが不正です。' }
+    $observed = $Bytes[$Offset.Value] -eq 1
+    $Offset.Value++
+    if ($observed -ne (Get-Session0TerminateObserved $run)) { throw '固定自己終了診断の肯定bitと子の終了値が一致しません。' }
+    if ($Offset.Value + 2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value + 1] -gt 1) {
+        throw '固定自己終了診断のEOF・期限bitが不正です。'
+    }
+    $outputEof = $Bytes[$Offset.Value] -eq 1
+    $deadlineMet = $Bytes[$Offset.Value + 1] -eq 1
+    $Offset.Value += 2
+    if (($outputEof -and (-not $run.SpawnSucceeded -or ($run.Lifecycle -band 4) -eq 0)) -or
+        ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) {
+        throw '固定自己終了診断の終了値・EOF・期限が実行記録と矛盾しています。'
+    }
+    return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; EntryObserved=$observed; OutputEof=$outputEof; DeadlineMet=$deadlineMet }
+}
+
 function Get-Session0InitRunEvidence($Run) {
     if (-not $Run.SpawnSucceeded -and ($null -ne $Run.ChildExit -or $Run.Stdout.Length -ne 0 -or $Run.Stderr.Length -ne 0)) {
         throw '追加診断の spawn と終了・出力が矛盾しています。'
@@ -1500,15 +1569,16 @@ function Read-Session0InitRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [s
 
 function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$ExpectedMask,
     [string]$ExpectedInitPath = '', [string]$ExpectedInitHash = '',
-    [string]$ExpectedEntryPath = '', [string]$ExpectedEntryHash = '') {
-    Assert-Session0ProbeParameters $ExpectedInitPath $ExpectedInitHash $ExpectedEntryPath $ExpectedEntryHash
+    [string]$ExpectedEntryPath = '', [string]$ExpectedEntryHash = '',
+    [string]$ExpectedTerminatePath = '', [string]$ExpectedTerminateHash = '') {
+    Assert-Session0ProbeParameters $ExpectedInitPath $ExpectedInitHash $ExpectedEntryPath $ExpectedEntryHash $ExpectedTerminatePath $ExpectedTerminateHash
     if ($ExpectedMask -ne 0x0002 -and $ExpectedMask -ne 0x0022) {
         throw '呼出側の station mask が許容範囲外です。'
     }
     if ($Bytes.Length -lt 44 -or $Bytes.Length -gt 65580) {
         throw '診断レコードの長さが許容範囲外です。'
     }
-    $expectedVersion = if ($ExpectedEntryPath) { [uint32]10 } else { [uint32]9 }
+    $expectedVersion = if ($ExpectedTerminatePath) { [uint32]11 } elseif ($ExpectedEntryPath) { [uint32]10 } else { [uint32]9 }
     if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
         [BitConverter]::ToUInt32($Bytes, 4) -ne $expectedVersion) {
         throw '診断レコードの magic または version が一致しません。'
@@ -1549,6 +1619,11 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
     if ($ExpectedEntryPath) {
         $entryProbeRecord = Read-Session0EntryRecord $Bytes $offset $requestedMask $fields[2] `
             $ExpectedEntryPath $ExpectedEntryHash $initProbeRecord $baseline $noWindow
+    }
+    $terminateProbeRecord = $null
+    if ($ExpectedTerminatePath) {
+        $terminateProbeRecord = Read-Session0TerminateRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedTerminatePath $ExpectedTerminateHash $initProbeRecord $entryProbeRecord $baseline $noWindow
     }
     if ($null -ne $initProbeRecord -and $initProbeRecord.Run.TargetDesktop.Length -ne 0 -and
         ($initProbeRecord.Run.TargetDesktop -ceq $baseline.TargetDesktop -or $initProbeRecord.Run.TargetDesktop -ceq $noWindow.TargetDesktop)) {
@@ -1615,7 +1690,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
         DesktopSacl = $fields[7]; StationAccess = $fields[8]; DesktopAccess = $fields[9]
         UiProbe = $fields[10]; ActionDesktop = $fields[11]; Cwd = $fields[12]
         EnvironmentHash = $fields[13]
-        Baseline = $baseline; NoWindow = $noWindow; InitProbe = $initProbeRecord; EntryProbe = $entryProbeRecord
+        Baseline = $baseline; NoWindow = $noWindow; InitProbe = $initProbeRecord; EntryProbe = $entryProbeRecord; TerminateProbe = $terminateProbeRecord
         WorkerActionsSid = $workerActionsSid; StationAce = $stationAce; StationCleanup = $stationCleanup
     }
 }
@@ -1734,12 +1809,12 @@ try {
     if ($EntryProbePath) { $fixtureArguments += $entryProbe.Hash }
     if ($TerminateProbePath) { $fixtureArguments += $terminateProbe.Hash }
     Assert-Session0FixtureArguments $fixtureArguments
-    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 14)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
         $diagnosticNonce + ' ' + $StationMask
     if ($InitProbePath) { $imagePath += ' ' + $initProbe.Hash }
     if ($EntryProbePath) { $imagePath += ' ' + $entryProbe.Hash }
+    if ($TerminateProbePath) { $imagePath += ' ' + $terminateProbe.Hash }
     $serviceAccount = 'NT SERVICE\' + $serviceName
     $serviceHandle = [Sembazuru.WindowStationProbeNative]::CreateProbeService(
         $serviceName, $imagePath, $serviceAccount
@@ -1814,8 +1889,8 @@ try {
         throw
     }
 
-    # 旧形式の期限を保ち、4run形式には各runの終了確認時間を割り当てる。
-    $serviceDeadlineSeconds = Get-Session0ServiceDeadline ([bool]$InitProbePath) ([bool]$EntryProbePath)
+    # 旧形式の期限を保ち、追加runごとの終了確認時間を割り当てる。
+    $serviceDeadlineSeconds = Get-Session0ServiceDeadline ([bool]$InitProbePath) ([bool]$EntryProbePath) ([bool]$TerminateProbePath)
     $deadline = [DateTime]::UtcNow.AddSeconds($serviceDeadlineSeconds)
     $sawRunning = $false
     do {
@@ -1871,7 +1946,7 @@ try {
         throw 'Session 0 diagnostic record is missing.'
     }
     $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
-        $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash
+        $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash
     $classificationMap = @{
         1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
         2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
@@ -1901,9 +1976,15 @@ try {
         } else { $property }
         $detail.Add(('{0}={1}' -f $label, (Format-BoundedDiagnosticText $record.$property)))
     }
-    foreach ($name in @('Baseline', 'NoWindow', 'InitProbe', 'EntryProbe')) {
-        if ($name -in @('InitProbe', 'EntryProbe') -and $null -eq $record.$name) { continue }
-        $run = if ($name -in @('InitProbe', 'EntryProbe')) { $record.$name.Run } else { $record.$name }
+    foreach ($name in @('Baseline', 'NoWindow', 'InitProbe', 'EntryProbe', 'TerminateProbe')) {
+        if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe') -and $null -eq $record.$name) { continue }
+        $run = if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe')) { $record.$name.Run } else { $record.$name }
+        if ($name -eq 'TerminateProbe') {
+            $terminateOutcome = if ($record.TerminateProbe.EntryObserved) { 'entry-observed' } else { 'indeterminate' }
+            $detail.Add(('TerminateProbePath={0} TerminateProbeSha256={1} TerminateEntryObserved={2} TerminateProbeOutcome={3} TerminateProbeGatesVerified={4} TerminateProbeOutputEof={5} TerminateProbeDeadlineMet={6}' -f
+                $record.TerminateProbe.Path, $record.TerminateProbe.Sha256, $record.TerminateProbe.EntryObserved,
+                $terminateOutcome, (Test-Session0TerminateGates $record), $record.TerminateProbe.OutputEof, $record.TerminateProbe.DeadlineMet))
+        }
         if ($name -eq 'EntryProbe') {
             $entryOutcome = if ($record.EntryProbe.EntryObserved) { 'entry-observed' } else { 'indeterminate' }
             $detail.Add(('EntryProbePath={0} EntryProbeSha256={1} EntryObserved={2} EntryProbeOutcome={3} EntryProbeGatesVerified={4}' -f
@@ -1934,6 +2015,7 @@ try {
     }
     $diagnosticDetail = $detail -join ' '
     if ($EntryProbePath) { Assert-Session0EntryGates $record $diagnosticDetail }
+    if ($TerminateProbePath) { Assert-Session0TerminateGates $record $diagnosticDetail }
 
 }
 catch { $primaryError = $_.Exception }
@@ -2011,8 +2093,7 @@ finally {
 
     $initTreeSafe = Test-Session0InitTreeSafe ([bool]$InitProbePath) $serviceStartAttempted $record
     $entryTreeSafe = Test-Session0EntryTreeSafe ([bool]$EntryProbePath) $serviceStartAttempted $record
-    # 独立した終了記録が未接続の要求は、開始後の回収済みと見なさない。
-    $terminateTreeSafe = -not $TerminateProbePath -or -not $serviceStartAttempted
+    $terminateTreeSafe = Test-Session0TerminateTreeSafe ([bool]$TerminateProbePath) $serviceStartAttempted $record
     $probesTreeSafe = $initTreeSafe -and $entryTreeSafe -and $terminateTreeSafe
     if ($ownedRoot) {
         if (-not $probesTreeSafe -or -not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe) {
