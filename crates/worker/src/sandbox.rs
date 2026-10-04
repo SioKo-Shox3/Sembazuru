@@ -2442,6 +2442,7 @@ mod tests {
         nonce: String,
         station_profile: StationAccessProfile,
         init_probe_sha256: Option<String>,
+        entry_probe_sha256: Option<String>,
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
@@ -2546,7 +2547,7 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ];
-        if argv.len() != 11 && argv.len() != 12 {
+        if !matches!(argv.len(), 11..=13) {
             return Err("process argv cardinality");
         }
         if Path::new(&argv[0]).file_name() != Some(OsStr::new(WINDOW_STATION_SCM_SMOKE_BASENAME)) {
@@ -2605,12 +2606,28 @@ mod tests {
         } else {
             None
         };
+        let entry_probe_sha256 = if let Some(value) = argv.get(12) {
+            let hash = value
+                .to_str()
+                .ok_or("固定終了値診断のhashはUTF-8が必要です")?;
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("固定終了値診断のhashは小文字16進64桁が必要です");
+            }
+            Some(hash.to_owned())
+        } else {
+            None
+        };
         Ok(Session0DiagnosticConfig {
             fixture_root,
             record_directory,
             nonce,
             station_profile,
             init_probe_sha256,
+            entry_probe_sha256,
         })
     }
 
@@ -2750,6 +2767,32 @@ mod tests {
             argv[8] = directory.into();
             cases.push((argv, false));
         }
+        // 旧形式の全反例を追加hash形式でも保持する。末尾にEXEや任意引数は置けない。
+        let entry_hash = "0123456789abcdef".repeat(4);
+        for (mut argv, accepted) in cases
+            .clone()
+            .into_iter()
+            .filter(|(argv, _)| argv.len() == 12)
+        {
+            argv.push(entry_hash.clone().into());
+            cases.push((argv, accepted));
+        }
+        let mut entry = extended.clone();
+        entry.push(entry_hash.into());
+        for hash in [
+            "".to_owned(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            "C:\\other.exe".to_owned(),
+            format!("{} ", "a".repeat(64)),
+        ] {
+            let mut argv = entry.clone();
+            argv[12] = hash.into();
+            cases.push((argv, false));
+        }
+        cases.push(([entry, vec!["extra".into()]].concat(), false));
         cases.push(([extended, vec!["C:\\other.exe".into()]].concat(), false));
         cases
     }
@@ -2784,6 +2827,10 @@ mod tests {
                 assert_eq!(
                     config.init_probe_sha256.as_deref(),
                     argv.get(11).and_then(|v| v.to_str())
+                );
+                assert_eq!(
+                    config.entry_probe_sha256.as_deref(),
+                    argv.get(12).and_then(|v| v.to_str())
                 );
                 assert_eq!(config.nonce, argv[9].to_str().unwrap());
                 assert_eq!(config.fixture_root, PathBuf::from(&argv[7]));
@@ -3652,6 +3699,7 @@ mod tests {
             record_directory: root.clone(),
             nonce: "0123456789abcdef0123456789abcdef".into(),
             station_profile: StationAccessProfile::ReadAttributes,
+            entry_probe_sha256: None,
             init_probe_sha256: Some(
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             ),
@@ -3673,6 +3721,57 @@ mod tests {
         assert!(hold_session0_init_probe(&config).is_err());
         std::fs::remove_file(alias).unwrap();
         std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn session0_entry_probe_hold_uses_only_its_fixed_path_and_hash() {
+        let root = private_scratch_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let root = PathBuf::from(
+            std::fs::canonicalize(root)
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\"),
+        );
+        let kind = Session0ProbeKind::Entry;
+        let path = root.join(kind.basename());
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let mut config = Session0DiagnosticConfig {
+            fixture_root: root.clone(),
+            record_directory: root.clone(),
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            station_profile: StationAccessProfile::ReadAttributes,
+            init_probe_sha256: Some("0".repeat(64)),
+            entry_probe_sha256: Some(hash.into()),
+        };
+        // InitProbeが同じ内容でも、別名の実体からEntryProbeの証拠を得ない。
+        std::fs::write(root.join(SESSION0_INIT_BASENAME), b"abc").unwrap();
+        assert!(hold_session0_probe(&config, kind).is_err());
+        std::fs::write(&path, b"abc").unwrap();
+        let (held, actual) = hold_session0_probe(&config, kind).unwrap();
+        assert_eq!(actual, hash);
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        for expected in [None, Some("0".repeat(64)), Some(hash.to_uppercase())] {
+            config.entry_probe_sha256 = expected;
+            assert!(hold_session0_probe(&config, kind).is_err());
+        }
+        config.entry_probe_sha256 = Some(hash.into());
+        config.fixture_root = root.join(".");
+        assert!(hold_session0_probe(&config, kind).is_err());
+        config.fixture_root = root.clone();
+        drop(held);
+        let alias = root.join("alias.exe");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(hold_session0_probe(&config, kind).is_err());
+        std::fs::remove_file(alias).unwrap();
+        for bytes in [Vec::new(), vec![0; 1024 * 1024 + 1], b"different".to_vec()] {
+            std::fs::write(&path, bytes).unwrap();
+            assert!(hold_session0_probe(&config, kind).is_err());
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(root.join(SESSION0_INIT_BASENAME)).unwrap();
         std::fs::remove_dir(root).unwrap();
     }
 
@@ -3726,6 +3825,7 @@ mod tests {
             record_directory: root.clone(),
             nonce: "0123456789abcdef0123456789abcdef".into(),
             station_profile: StationAccessProfile::ReadAttributes,
+            entry_probe_sha256: None,
             init_probe_sha256: Some(
                 std::env::var("SEMBAZURU_TEST_INIT_SHA256").expect("ビルド済みEXEの独立hash"),
             ),
@@ -5197,14 +5297,43 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum Session0ProbeKind {
+        Init,
+        Entry,
+    }
+
+    impl Session0ProbeKind {
+        fn basename(self) -> &'static str {
+            match self {
+                Self::Init => SESSION0_INIT_BASENAME,
+                Self::Entry => "SbzSession0EntryProbe.exe",
+            }
+        }
+
+        fn expected_hash(self, config: &Session0DiagnosticConfig) -> Option<&str> {
+            match self {
+                Self::Init => config.init_probe_sha256.as_deref(),
+                Self::Entry => config.entry_probe_sha256.as_deref(),
+            }
+        }
+    }
+
     fn hold_session0_init_probe(config: &Session0DiagnosticConfig) -> io::Result<(File, String)> {
+        hold_session0_probe(config, Session0ProbeKind::Init)
+    }
+
+    fn hold_session0_probe(
+        config: &Session0DiagnosticConfig,
+        kind: Session0ProbeKind,
+    ) -> io::Result<(File, String)> {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
             GetFinalPathNameByHandleW,
         };
-        let path = config.fixture_root.join(SESSION0_INIT_BASENAME);
+        let path = config.fixture_root.join(kind.basename());
         let file = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ)
@@ -5254,7 +5383,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
             )
         };
         let hash = diagnostic_hex(&hash);
-        if status < 0 || config.init_probe_sha256.as_deref() != Some(hash.as_str()) {
+        if status < 0 || kind.expected_hash(config) != Some(hash.as_str()) {
             return Err(io::Error::other(
                 "追加診断EXEの実SHA256が期待値と一致しません",
             ));
@@ -5694,11 +5823,35 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
         )
     }
 
+    fn require_connected_session0_request(
+        config: &Session0DiagnosticConfig,
+    ) -> Result<(), &'static str> {
+        if config.entry_probe_sha256.is_some() {
+            return Err("固定終了値診断の実行はまだ接続されていません");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session0_entry_dispatcher_rejects_unconnected_request() {
+        for (argv, accepted) in session0_argv_corpus() {
+            if accepted {
+                let config = validate_window_station_scm_process_argv(&argv).unwrap();
+                assert_eq!(
+                    require_connected_session0_request(&config).is_ok(),
+                    argv.len() < 13
+                );
+            }
+        }
+    }
+
     #[test]
     #[ignore]
     fn window_station_scm_dispatcher_smoke_role() {
         let argv: Vec<_> = std::env::args_os().collect();
         let config = validate_window_station_scm_process_argv(&argv).expect("SCM 診断の引数契約");
+        // 証拠codecへ接続されていない要求をSCMへ登録しない。
+        require_connected_session0_request(&config).expect("SCM 診断の実行契約");
         SESSION0_DIAGNOSTIC_CONFIG
             .set(config)
             .expect("SCM 診断の設定は一度だけ設定する");

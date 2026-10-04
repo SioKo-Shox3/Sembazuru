@@ -15,7 +15,7 @@ function ConvertFrom-Session0StationMask([string]$Value) {
 }
 
 function Assert-Session0FixtureArguments([string[]]$Arguments) {
-    if ($Arguments.Count -ne 11 -and $Arguments.Count -ne 12) { throw 'SCM 診断の引数数が一致しません。' }
+    if ($Arguments.Count -lt 11 -or $Arguments.Count -gt 13) { throw 'SCM 診断の引数数が一致しません。' }
     $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
         '--nocapture', '--test-threads=1', '--')
     if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
@@ -30,7 +30,8 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
         throw 'SCM 診断のパスまたは nonce が不正です。'
     }
     $null = ConvertFrom-Session0StationMask $Arguments[10]
-    if ($Arguments.Count -eq 12) {
+    if ($Arguments.Count -ge 12) {
+        if ($Arguments.Count -eq 13) { Assert-Session0InitProbeHash $Arguments[12] }
         Assert-Session0InitProbeHash $Arguments[11]
         $root = $Arguments[7]
         if ($root -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
@@ -1056,11 +1057,18 @@ function Assert-Session0InitProbeSecurity($Identity, [string]$ServiceSid) {
     }
 }
 
-function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]$Hash) {
+# 種別から固定名を選ぶ。外部から任意の実行ファイル名を受け取らない。
+function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]$Hash, [string]$Kind = 'Init') {
+    $basename = switch -CaseSensitive ($Kind) {
+        'Init' { 'session0_init_probe.exe' }
+        'Entry' { 'session0_entry_probe.exe' }
+        default { throw '追加診断 EXE の種別が不正です。' }
+    }
+    $State.Kind = $Kind
     Assert-Session0InitProbeHash $Hash
     Assert-LocalAbsolutePath $Path '追加診断の source'
     $canonical = [IO.Path]::GetFullPath($Path)
-    if ([IO.Path]::GetFileName($canonical) -cne 'session0_init_probe.exe') {
+    if ([IO.Path]::GetFileName($canonical) -cne $basename) {
         throw '追加診断 EXE の source 名が一致しません。'
     }
     $State.Hash = $Hash
@@ -1076,7 +1084,12 @@ function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]
 }
 
 function Copy-Session0InitProbe([hashtable]$State, [string]$Root) {
-    $State.Path = Join-Path $Root 'SbzSession0InitProbe.exe'
+    $basename = switch -CaseSensitive ($State.Kind) {
+        'Init' { 'SbzSession0InitProbe.exe' }
+        'Entry' { 'SbzSession0EntryProbe.exe' }
+        default { throw '追加診断 EXE の種別が不正です。' }
+    }
+    $State.Path = Join-Path $Root $basename
     $State.Target = [Sembazuru.WindowStationProbeNative]::CreateProtectedFile(
         $State.Path, 'O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
     )
