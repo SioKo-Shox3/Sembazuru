@@ -2446,7 +2446,7 @@ mod tests {
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
     const SESSION0_DIAGNOSTIC_MAGIC: u32 = 0x5342_4434;
-    const SESSION0_DIAGNOSTIC_VERSION: u32 = 8;
+    const SESSION0_DIAGNOSTIC_VERSION: u32 = 9;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(u8)]
@@ -2883,7 +2883,10 @@ mod tests {
         ] {
             fields.push(diagnostic_hex(text.as_bytes()));
         }
-        for run in [&record.baseline, &record.no_window] {
+        for run in [&record.baseline, &record.no_window]
+            .into_iter()
+            .chain(record.init_probe.iter().map(|v| &v.run))
+        {
             fields.extend([
                 run.job_ui_restrictions.to_string(),
                 diagnostic_hex(run.job_ui_limits.as_bytes()),
@@ -2909,6 +2912,11 @@ mod tests {
         ] {
             fields.push(diagnostic_hex(value.as_bytes()));
         }
+        if let Some(init) = &record.init_probe {
+            fields.push(diagnostic_hex(init.path.as_bytes()));
+            fields.push(init.sha256.clone());
+            fields.push(init_probe_properties(&init.evidence));
+        }
         fields.join("\t")
     }
 
@@ -2918,6 +2926,7 @@ mod tests {
         nonce: String,
         expected: Option<Session0DiagnosticRecord>,
         expected_mask: u32,
+        expected_init: Option<(String, String)>,
     }
 
     fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
@@ -2930,6 +2939,7 @@ mod tests {
                 bytes: record.encode().unwrap(),
                 nonce: record.nonce.clone(),
                 expected_mask: record.requested_station_mask,
+                expected_init: None,
                 expected: Some(record),
             });
         };
@@ -3050,6 +3060,7 @@ mod tests {
                 nonce: record.nonce.clone(),
                 expected: None,
                 expected_mask: record.requested_station_mask,
+                expected_init: None,
             });
         };
         let u32_patch = |offset: usize, value: u32| {
@@ -3231,6 +3242,7 @@ mod tests {
             nonce: record.nonce.clone(),
             expected: None,
             expected_mask: record.requested_station_mask,
+            expected_init: None,
         });
         let forged: Vec<_> = cases
             .iter()
@@ -3255,6 +3267,7 @@ mod tests {
                     nonce: case.nonce.clone(),
                     expected: None,
                     expected_mask: case.expected_mask,
+                    expected_init: None,
                 }
             })
             .collect();
@@ -3290,6 +3303,7 @@ mod tests {
                     nonce: case.nonce.clone(),
                     expected: None,
                     expected_mask: case.expected_mask,
+                    expected_init: None,
                 }
             })
             .collect();
@@ -3349,11 +3363,400 @@ mod tests {
                         nonce: fixture.nonce.clone(),
                         expected: None,
                         expected_mask: fixture.requested_station_mask,
+                        expected_init: None,
                     });
                 }
             }
         }
+        cases.extend(session0_init_record_corpus());
         cases
+    }
+
+    fn init_record_bytes(
+        base: &Session0DiagnosticRecord,
+        init: &Session0InitProbeRecord,
+        summary: &str,
+    ) -> Vec<u8> {
+        let mut bytes = base.encode().unwrap();
+        assert_eq!(bytes.pop(), Some(0));
+        let mut payload = Writer::new();
+        payload.bool(true);
+        write_text(&mut payload, &init.path).unwrap();
+        write_text(&mut payload, &init.sha256).unwrap();
+        init.run
+            .encode_into(&mut payload, base.requested_station_mask)
+            .unwrap();
+        write_text(&mut payload, summary).unwrap();
+        bytes.extend(payload.into_bytes());
+        let length = (bytes.len() - 44) as u32;
+        bytes[40..44].copy_from_slice(&length.to_le_bytes());
+        bytes
+    }
+
+    fn session0_init_record_corpus() -> Vec<Session0DiagnosticCase> {
+        let mut cases = Vec::new();
+        for mask in [0x0002, 0x0022] {
+            let mut base = Session0DiagnosticRecord::fixture();
+            base.requested_station_mask = mask;
+            base.station_ace = format!("count=1;flags=0;mask=0x{mask:08x}");
+            base.baseline.target_access = verified_target_access(mask);
+            base.no_window.target_access = verified_target_access(mask);
+            // USER32成功をcmdの成功へ代入しない。cmd両腕が失敗したままのレコードを使う。
+            base.no_window.child_exit = Some(0xc000_0142);
+            base.classification = Session0DiagnosticOutcome::NoWindowNotSufficient;
+            let path = "C:\\Sembazuru Fixture\\SbzSession0InitProbe.exe".to_owned();
+            let hash = "1".repeat(64);
+            let mut run = base.baseline.clone();
+            run.target_desktop = format!("{}\\sbz-init-probe", base.station);
+            run.stderr.clear();
+            let mut valid_init = None;
+            for input in session0_init_probe_corpus() {
+                run.stdout = String::from_utf8_lossy(&input.stdout).into_owned();
+                run.stderr = String::from_utf8_lossy(&input.stderr).into_owned();
+                run.child_exit = input.child_exit;
+                let evidence =
+                    parse_init_probe_output(&input.stdout, &input.stderr, input.child_exit)
+                        .unwrap_or_else(|_| parse_init_probe_output(&[], &[], None).unwrap());
+                let init = Session0InitProbeRecord {
+                    path: path.clone(),
+                    sha256: hash.clone(),
+                    run: run.clone(),
+                    evidence,
+                };
+                let summary = input.expected.as_deref().unwrap_or("0,none,none,none,0");
+                let mut expected = base.clone();
+                expected.init_probe = Some(init.clone());
+                if input.name == "loaded-complete-Some(0)" {
+                    valid_init = Some(init.clone());
+                }
+                cases.push(Session0DiagnosticCase {
+                    name: "init-stage-corpus",
+                    bytes: init_record_bytes(&base, &init, summary),
+                    nonce: base.nonce.clone(),
+                    expected_mask: mask,
+                    expected_init: Some((path.clone(), hash.clone())),
+                    expected: input.expected.map(|_| expected),
+                });
+            }
+            let init = valid_init.expect("ロード成功の固定列");
+            let success_bytes =
+                init_record_bytes(&base, &init, &init_probe_properties(&init.evidence));
+            let mut push = |name, bytes, expected, expected_path: String, expected_hash: String| {
+                cases.push(Session0DiagnosticCase {
+                    name,
+                    bytes,
+                    nonce: base.nonce.clone(),
+                    expected_mask: mask,
+                    expected_init: Some((expected_path, expected_hash)),
+                    expected,
+                });
+            };
+            push(
+                "init-caller-hash",
+                success_bytes.clone(),
+                None,
+                path.clone(),
+                "2".repeat(64),
+            );
+            push(
+                "init-caller-path",
+                success_bytes.clone(),
+                None,
+                path.replace("Fixture", "Another"),
+                hash.clone(),
+            );
+            push(
+                "init-required-absent",
+                base.encode().unwrap(),
+                None,
+                path.clone(),
+                hash.clone(),
+            );
+            let mut false_cmd = success_bytes.clone();
+            false_cmd[45] = Session0DiagnosticOutcome::ActionStarts as u8;
+            push(
+                "init-cannot-prove-cmd",
+                false_cmd,
+                None,
+                path.clone(),
+                hash.clone(),
+            );
+            for name in [
+                "init-forged-hash",
+                "init-forged-path",
+                "init-wrong-basename",
+                "init-spawn-exit",
+                "init-spawn-output",
+                "init-no-window",
+                "init-relaxed-job",
+                "init-default-desktop",
+                "init-false-stage",
+                "init-cleanup-success",
+                "init-isolation-success",
+            ] {
+                let mut changed = init.clone();
+                let mut summary = init_probe_properties(&changed.evidence);
+                match name {
+                    "init-forged-hash" => changed.sha256 = "2".repeat(64),
+                    "init-forged-path" => changed.path = path.replace("Fixture", "Another"),
+                    "init-wrong-basename" => {
+                        changed.path =
+                            path.replace("SbzSession0InitProbe.exe", "OtherExecutable.exe")
+                    }
+                    "init-spawn-exit" => {
+                        changed.run.spawn_succeeded = false;
+                        changed.run.lifecycle = 11;
+                    }
+                    "init-spawn-output" => {
+                        changed.run.spawn_succeeded = false;
+                        changed.run.child_exit = None;
+                        changed.run.lifecycle = 11;
+                    }
+                    "init-no-window" => changed.run.creation_flags |= 0x0800_0000,
+                    "init-relaxed-job" => {
+                        changed.run.job_ui_restrictions = 0xbe;
+                        changed.run.job_ui_limits = describe_job_ui_limits(0xbe);
+                    }
+                    "init-default-desktop" => {
+                        changed.run.target_desktop = format!("{}\\Default", base.station)
+                    }
+                    "init-false-stage" => summary = "0,none,none,none,0".into(),
+                    "init-cleanup-success" => changed.run.lifecycle = 7,
+                    "init-isolation-success" => changed.run.lifecycle = 13,
+                    _ => unreachable!(),
+                }
+                push(
+                    name,
+                    init_record_bytes(&base, &changed, &summary),
+                    None,
+                    path.clone(),
+                    hash.clone(),
+                );
+            }
+            // 欠けた終了/隔離/desktop回収は段階観測を保持し、確定結果を禁止する。
+            for lifecycle in [7, 11, 13] {
+                let mut changed = init.clone();
+                changed.run.lifecycle = lifecycle;
+                changed.evidence.outcome = InitProbeOutcome::Indeterminate;
+                let mut expected = base.clone();
+                expected.init_probe = Some(changed.clone());
+                push(
+                    "init-incomplete-cleanup",
+                    init_record_bytes(&base, &changed, &init_probe_properties(&changed.evidence)),
+                    Some(expected),
+                    path.clone(),
+                    hash.clone(),
+                );
+            }
+            // initだけのTargetAccessを改ざんする。未確認ビットで隠す場合も検査する。
+            for lifecycle in [15, 13] {
+                let mut changed = init.clone();
+                changed.run.lifecycle = lifecycle;
+                changed.evidence = init_run_evidence(&changed.run).unwrap();
+                let mut bytes =
+                    init_record_bytes(&base, &changed, &init_probe_properties(&changed.evidence));
+                let from = format!("station:action_mask:mask=0x{mask:08x}");
+                let to = format!(
+                    "station:action_mask:mask=0x{:08x}",
+                    if mask == 2 { 0x22 } else { 2 }
+                );
+                let pos = bytes
+                    .windows(from.len())
+                    .rposition(|v| v == from.as_bytes())
+                    .unwrap();
+                bytes[pos..pos + to.len()].copy_from_slice(to.as_bytes());
+                push("init-target-mask", bytes, None, path.clone(), hash.clone());
+            }
+            for altered in [
+                format!("{path}\\"),
+                path.replace("Fixture", "Fixture\\."),
+                path.replace("Fixture", "Fixture\\"),
+                path.replace("C:", "c:") + ":stream",
+            ] {
+                let mut changed = init.clone();
+                changed.path = altered.clone();
+                cases.push(Session0DiagnosticCase {
+                    name: "init-invalid-path-with-matching-caller",
+                    bytes: init_record_bytes(
+                        &base,
+                        &changed,
+                        &init_probe_properties(&changed.evidence),
+                    ),
+                    nonce: base.nonce.clone(),
+                    expected_mask: mask,
+                    expected_init: Some((altered, hash.clone())),
+                    expected: None,
+                });
+            }
+            for name in [
+                "init-old-version",
+                "init-nonce-mismatch",
+                "init-desktop-reused",
+                "init-lifecycle-unknown",
+            ] {
+                let mut bytes = success_bytes.clone();
+                match name {
+                    "init-old-version" => bytes[4..8].copy_from_slice(&8u32.to_le_bytes()),
+                    "init-nonce-mismatch" => bytes[8] = b'1',
+                    "init-desktop-reused" => {
+                        let mut changed = init.clone();
+                        changed.run.target_desktop = base.baseline.target_desktop.clone();
+                        bytes = init_record_bytes(
+                            &base,
+                            &changed,
+                            &init_probe_properties(&changed.evidence),
+                        );
+                    }
+                    "init-lifecycle-unknown" => {
+                        // 末尾は段階証拠のtext。その直前がrunのlifecycleである。
+                        let pos = bytes.len() - 4 - init_probe_properties(&init.evidence).len() - 1;
+                        bytes[pos] = 0x80;
+                    }
+                    _ => unreachable!(),
+                }
+                cases.push(Session0DiagnosticCase {
+                    name,
+                    bytes,
+                    nonce: base.nonce.clone(),
+                    expected_mask: mask,
+                    expected_init: Some((path.clone(), hash.clone())),
+                    expected: None,
+                });
+            }
+            cases.push(Session0DiagnosticCase {
+                name: "init-unsolicited",
+                bytes: success_bytes,
+                nonce: base.nonce.clone(),
+                expected_mask: mask,
+                expected_init: None,
+                expected: None,
+            });
+        }
+        cases
+    }
+
+    #[test]
+    fn session0_init_probe_hold_rejects_replacement_and_false_identity() {
+        let root = private_scratch_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let root = PathBuf::from(
+            std::fs::canonicalize(root)
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\"),
+        );
+        let path = root.join(SESSION0_INIT_BASENAME);
+        std::fs::write(&path, b"abc").unwrap();
+        let mut config = Session0DiagnosticConfig {
+            fixture_root: root.clone(),
+            record_directory: root.clone(),
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            station_profile: StationAccessProfile::ReadAttributes,
+            init_probe_sha256: Some(
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            ),
+        };
+        let (held, hash) = hold_session0_init_probe(&config).unwrap();
+        assert_eq!(Some(hash), config.init_probe_sha256);
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        config.init_probe_sha256 = Some("0".repeat(64));
+        assert!(hold_session0_init_probe(&config).is_err());
+        drop(held);
+        config.init_probe_sha256 =
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into());
+        config.fixture_root = root.join(".");
+        assert!(hold_session0_init_probe(&config).is_err());
+        config.fixture_root = root.clone();
+        let alias = root.join("alias.exe");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(hold_session0_init_probe(&config).is_err());
+        std::fs::remove_file(alias).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[ignore]
+    fn session0_init_probe_local_restricted_run() {
+        // ローカル専用の固定ビルド成果物。SCMや製品workerは起動しない。
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.harness/T-011-init-probe/session0_init_probe.exe");
+        let root = private_scratch_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let root = PathBuf::from(
+            std::fs::canonicalize(root)
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\"),
+        );
+        let path = root.join(SESSION0_INIT_BASENAME);
+        let sddl = format!(
+            "D:P(A;;FA;;;{})(A;;FA;;;BA)",
+            current_user_sid_string().unwrap()
+        );
+        let mut staged = with_sddl_attributes(&sddl, |attributes| {
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            // SAFETY: 所有する試験rootの新規ファイルだけを明示DACLで作成する。
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ,
+                    attributes,
+                    windows_sys::Win32::Storage::FileSystem::CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: 成功したファイルハンドルの所有権を移す。
+            Ok(File::from(unsafe {
+                OwnedHandle::from_raw_handle(handle as RawHandle)
+            }))
+        })
+        .unwrap();
+        staged.write_all(&std::fs::read(source).unwrap()).unwrap();
+        staged.sync_all().unwrap();
+        drop(staged);
+        let config = Session0DiagnosticConfig {
+            fixture_root: root.clone(),
+            record_directory: root.clone(),
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            station_profile: StationAccessProfile::ReadAttributes,
+            init_probe_sha256: Some(
+                std::env::var("SEMBAZURU_TEST_INIT_SHA256").expect("ビルド済みEXEの独立hash"),
+            ),
+        };
+        let (held, hash) = hold_session0_init_probe(&config).unwrap();
+        let station = unsafe { GetProcessWindowStation() };
+        let before = station_dacl(station).unwrap();
+        let lease =
+            Arc::new(ActionStationLease::acquire_for_diagnostic(config.station_profile).unwrap());
+        assert_eq!(lease.station_name, "WinSta0");
+        let action = ActionToken::create_for_worker(lease).unwrap();
+        let scratch = PrivateScratch::create(&root, "init-local", &action).unwrap();
+        let (mut command, _) = session0_diagnostic_command(scratch.path()).unwrap();
+        command.application = path.clone();
+        command.arguments.clear();
+        let run = run_session0_diagnostic_child(&action, &command, TestCreationProfile::Production)
+            .unwrap();
+        eprintln!("追加診断の制限付きローカル実行: hash={hash} run={run:?}");
+        assert!(run.spawn_succeeded);
+        assert_eq!(run.creation_flags, 0x0008_0404);
+        assert_eq!(run.job_ui_restrictions, 0xfe);
+        assert_eq!(run.lifecycle & 13, 13);
+        let evidence =
+            parse_init_probe_output(run.stdout.as_bytes(), run.stderr.as_bytes(), run.child_exit)
+                .unwrap();
+        assert_eq!(evidence.outcome, InitProbeOutcome::LoadComplete);
+        drop(held);
+        drop(scratch);
+        drop(action);
+        assert_eq!(station_dacl(station).unwrap(), before);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3464,8 +3867,14 @@ mod tests {
     #[test]
     fn session0_diagnostic_record_codec_rejects_tampering() {
         for case in session0_diagnostic_corpus() {
-            let decoded =
-                Session0DiagnosticRecord::decode(&case.bytes, &case.nonce, case.expected_mask);
+            let decoded = Session0DiagnosticRecord::decode(
+                &case.bytes,
+                &case.nonce,
+                case.expected_mask,
+                case.expected_init
+                    .as_ref()
+                    .map(|(p, h)| (p.as_str(), h.as_str())),
+            );
             match case.expected {
                 Some(expected) => assert_eq!(decoded.unwrap(), expected, "{}", case.name),
                 None => assert!(decoded.is_err(), "accepted {}", case.name),
@@ -3727,18 +4136,26 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
     if ($definitions.Count -ne 1) { throw "関数の定義数が一致しません: $name" }
     . ([ScriptBlock]::Create($definitions[0].Extent.Text))
 }
+if (-not (Test-Session0InitTreeSafe $false $true $null) -or -not (Test-Session0InitTreeSafe $true $false $null) -or
+    (Test-Session0InitTreeSafe $true $true $null)) { throw '追加診断の開始前cleanup条件が矛盾しています。' }
+foreach ($bits in 0..15) {
+    $sample = [pscustomobject]@{ InitProbe = [pscustomobject]@{ Run = [pscustomobject]@{ Lifecycle = $bits } } }
+    if ((Test-Session0InitTreeSafe $true $true $sample) -ne (($bits -band 12) -eq 12)) {
+        throw '追加診断の終了・desktop回収条件が矛盾しています。'
+    }
+}
 $count = 0
 $argvCount = 0
 $initCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
-    $parts = $line.Split("`t", 6)
+    $parts = $line.Split("`t", 8)
     if ($parts[0] -ceq 'init') {
         $exit = if ($parts[3] -ceq 'none') { $null } else { [uint32]$parts[3] }
         $record = $null
@@ -3771,20 +4188,21 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $bytes = [Convert]::FromHexString($parts[2])
     $record = $null
     $rejected = $false
-    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) }
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] }
     catch { $rejected = $true }
     if ($parts[3] -ceq 'reject') {
         if (-not $rejected) { throw "不正な記録を受理しました: $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "正常な記録を拒否しました: $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne 24) { throw 'レコードのプロパティ数が一致しません。' }
+        if (@($record.PSObject.Properties).Count -ne 25) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId', 'RequestedStationMask')) { $values.Add([string]$record.$property) }
         foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        foreach ($run in @($record.Baseline, $record.NoWindow)) {
+        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }))) {
+            if ($null -eq $run) { continue }
             if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
             $values.Add([string]$run.JobUi)
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($run.JobUiLimits)).ToLowerInvariant())
@@ -3799,7 +4217,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         foreach ($property in @('WorkerActionsSid', 'StationAce', 'StationCleanup')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        if (($values -join "`t") -cne $parts[5]) { throw "記録のプロパティが一致しません: $($parts[0])" }
+        if ($null -ne $record.InitProbe) {
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.InitProbe.Path)).ToLowerInvariant())
+            $values.Add($record.InitProbe.Sha256)
+            $values.Add($record.InitProbe.Evidence)
+        }
+        if (($values -join "`t") -cne $parts[7]) { throw "記録のプロパティが一致しません: $($parts[0])" }
     }
     $count++
 }
@@ -3855,7 +4278,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         for case in &cases {
             let expected = case.expected.as_ref().map(diagnostic_properties);
             input.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.name,
                 case.nonce,
                 diagnostic_hex(&case.bytes),
@@ -3865,6 +4288,13 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                     "reject"
                 },
                 case.expected_mask,
+                diagnostic_hex(
+                    case.expected_init
+                        .as_ref()
+                        .map_or("", |(p, _)| p)
+                        .as_bytes()
+                ),
+                case.expected_init.as_ref().map_or("", |(_, h)| h),
                 expected.unwrap_or_default(),
             ));
         }
@@ -4705,6 +5135,133 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         }
     }
 
+    const SESSION0_INIT_BASENAME: &str = "SbzSession0InitProbe.exe";
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Session0InitProbeRecord {
+        path: String,
+        sha256: String,
+        run: Session0DiagnosticRun,
+        evidence: InitProbeEvidence,
+    }
+
+    fn init_run_evidence(run: &Session0DiagnosticRun) -> Result<InitProbeEvidence, String> {
+        if !run.spawn_succeeded
+            && (run.child_exit.is_some() || !run.stdout.is_empty() || !run.stderr.is_empty())
+        {
+            return Err("追加診断の spawn と終了・出力が矛盾しています".into());
+        }
+        let mut evidence =
+            parse_init_probe_output(run.stdout.as_bytes(), run.stderr.as_bytes(), run.child_exit)?;
+        // 段階とGLEは保持するが、終了・隔離・cleanup未確認を確定結果にはしない。
+        if run.lifecycle != 15 || !run.spawn_error.is_empty() {
+            evidence.outcome = InitProbeOutcome::Indeterminate;
+        }
+        Ok(evidence)
+    }
+
+    impl Session0InitProbeRecord {
+        fn validate(&self, station: &str, mask: u32) -> Result<(), String> {
+            let path = Path::new(&self.path);
+            let parent = path.parent().and_then(Path::to_str).unwrap_or("");
+            if self.path != format!("{parent}\\{SESSION0_INIT_BASENAME}")
+                || !session0_local_fixture_root(parent)
+                || self.sha256.len() != 64
+                || !self
+                    .sha256
+                    .bytes()
+                    .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
+            {
+                return Err("追加診断の固定pathまたはhashが不正です".into());
+            }
+            let run = &self.run;
+            if (run.spawn_succeeded
+                && (run.job_ui_restrictions != 0xfe
+                    || run.creation_flags != 0x0008_0404
+                    || run.lifecycle & 1 == 0))
+                || (run.lifecycle & 1 != 0
+                    && !run.target_desktop.starts_with(&format!("{station}\\sbz-")))
+                || (run.lifecycle & 2 != 0 && !run.observations_verified(mask))
+                || self.evidence != init_run_evidence(run)?
+            {
+                return Err("追加診断の実行契約または段階証拠が一致しません".into());
+            }
+            Ok(())
+        }
+
+        fn encode_into(&self, payload: &mut Writer, mask: u32) -> Result<(), String> {
+            write_text(payload, &self.path)?;
+            write_text(payload, &self.sha256)?;
+            self.run.encode_into(payload, mask)?;
+            write_text(payload, &init_probe_properties(&self.evidence))
+        }
+    }
+
+    fn hold_session0_init_probe(config: &Session0DiagnosticConfig) -> io::Result<(File, String)> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_FLAG_OPEN_REPARSE_POINT, GetFileInformationByHandle,
+            GetFinalPathNameByHandleW,
+        };
+        let path = config.fixture_root.join(SESSION0_INIT_BASENAME);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut final_path = vec![0u16; 32768];
+        // SAFETY: 保持中のファイルと実サイズの出力バッファを渡す。返された長さを照合してから読む。
+        let length = unsafe {
+            if GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle() as HANDLE,
+                final_path.as_mut_ptr(),
+                final_path.len() as u32,
+                0,
+            )
+        } as usize;
+        if length == 0 || length >= final_path.len() {
+            return Err(io::Error::last_os_error());
+        }
+        let actual = String::from_utf16(&final_path[..length]).map_err(io::Error::other)?;
+        let expected = format!("\\\\?\\{}", path.display());
+        if actual != expected || info.dwFileAttributes & 0x410 != 0 || info.nNumberOfLinks != 1 {
+            return Err(io::Error::other(
+                "追加診断EXEの最終path・regular・singlelinkが一致しません",
+            ));
+        }
+        // 固定の小さな診断EXEだけが対象。読取り量も上限+1で過大入力を検出する。
+        let mut bytes = Vec::new();
+        (&file).take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.is_empty() || bytes.len() > 1024 * 1024 {
+            return Err(io::Error::other("追加診断EXEのサイズが不正です"));
+        }
+        let mut hash = [0u8; 32];
+        // SAFETY: SHA256疑似ハンドルは解放不要。秘密鍵なし、長さを確認した入力と32 byte出力を渡す。
+        let status = unsafe {
+            BCryptHash(
+                BCRYPT_SHA256_ALG_HANDLE,
+                null(),
+                0,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+                hash.as_mut_ptr(),
+                hash.len() as u32,
+            )
+        };
+        let hash = diagnostic_hex(&hash);
+        if status < 0 || config.init_probe_sha256.as_deref() != Some(hash.as_str()) {
+            return Err(io::Error::other(
+                "追加診断EXEの実SHA256が期待値と一致しません",
+            ));
+        }
+        Ok((file, hash))
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Session0DiagnosticRecord {
         nonce: String,
@@ -4731,6 +5288,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         worker_actions_sid: String,
         station_ace: String,
         station_cleanup: String,
+        init_probe: Option<Session0InitProbeRecord>,
     }
 
     impl Session0DiagnosticRecord {
@@ -4801,6 +5359,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 worker_actions_sid: "S-1-5-100-1-2-3-4".into(),
                 station_ace: "count=1;flags=0;mask=0x00000002".into(),
                 station_cleanup: "removed".into(),
+                init_probe: None,
             }
         }
 
@@ -4913,6 +5472,20 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             ] {
                 write_text(&mut payload, value)?;
             }
+            payload.bool(self.init_probe.is_some());
+            if let Some(init) = &self.init_probe {
+                init.validate(&self.station, self.requested_station_mask)?;
+                if !init.run.target_desktop.is_empty()
+                    && [
+                        &self.baseline.target_desktop,
+                        &self.no_window.target_desktop,
+                    ]
+                    .contains(&&init.run.target_desktop)
+                {
+                    return Err("追加診断のdesktopがcmdと重複しています".into());
+                }
+                init.encode_into(&mut payload, self.requested_station_mask)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
@@ -4926,7 +5499,12 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             Ok(bytes)
         }
 
-        fn decode(bytes: &[u8], expected_nonce: &str, expected_mask: u32) -> Result<Self, String> {
+        fn decode(
+            bytes: &[u8],
+            expected_nonce: &str,
+            expected_mask: u32,
+            expected_init: Option<(&str, &str)>,
+        ) -> Result<Self, String> {
             validate_nonce(expected_nonce)?;
             diagnostic_station_profile(expected_mask)?;
             if bytes.len() < 44 || bytes.len() > 44 + Self::MAX_BYTES {
@@ -4969,6 +5547,28 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             let worker_actions_sid = read_text(&mut reader)?;
             let station_ace = read_text(&mut reader)?;
             let station_cleanup = read_text(&mut reader)?;
+            let init_probe = if read_strict_bool(&mut reader)? {
+                let path = read_text(&mut reader)?;
+                let sha256 = read_text(&mut reader)?;
+                let run = Session0DiagnosticRun::decode_from(&mut reader)?;
+                let evidence = init_run_evidence(&run)?;
+                if read_text(&mut reader)? != init_probe_properties(&evidence) {
+                    return Err("追加診断の段階証拠が出力と一致しません".into());
+                }
+                Some(Session0InitProbeRecord {
+                    path,
+                    sha256,
+                    run,
+                    evidence,
+                })
+            } else {
+                None
+            };
+            match (&init_probe, expected_init) {
+                (None, None) => {}
+                (Some(init), Some((path, hash))) if init.path == path && init.sha256 == hash => {}
+                _ => return Err("追加診断の有無・path・hash が呼出側の期待値と一致しません".into()),
+            }
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -4995,6 +5595,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 worker_actions_sid,
                 station_ace,
                 station_cleanup,
+                init_probe,
             };
             record.encode().map(|_| record)
         }
@@ -5556,7 +6157,9 @@ privileges={privileges:?}{restricted}",
                 Ok(Err(error)) => Err(format!("wait: {error}")),
                 Err(_) => {
                     process.terminate();
-                    let cleanup = process.wait().await;
+                    let cleanup =
+                        tokio::time::timeout(std::time::Duration::from_secs(35), process.wait())
+                            .await;
                     Err(format!("wait: deadline-exceeded;cleanup={cleanup:?}"))
                 }
             }
@@ -5572,20 +6175,27 @@ privileges={privileges:?}{restricted}",
             use tokio::io::AsyncReadExt;
             let (stdout, stderr) = runtime.block_on(async {
                 let (mut left, mut right) = (Vec::new(), Vec::new());
-                let _ = tokio::join!(
+                let mut stdout = (&mut stdout).take(4097);
+                let mut stderr = (&mut stderr).take(4097);
+                let (left_result, right_result) = tokio::join!(
                     stdout.read_to_end(&mut left),
                     stderr.read_to_end(&mut right)
                 );
+                if left_result.is_err() || right_result.is_err() {
+                    record.spawn_error.push_str(";output_read_failed");
+                }
                 (left, right)
             });
-            record.stdout = String::from_utf8_lossy(&stdout[..stdout.len().min(4096)]).into_owned();
-            record.stderr = String::from_utf8_lossy(&stderr[..stderr.len().min(4096)]).into_owned();
+            record.stdout = String::from_utf8_lossy(&stdout).into_owned();
+            record.stderr = String::from_utf8_lossy(&stderr).into_owned();
         }
         if process.tree_finished {
             record.lifecycle |= 4;
         }
         drop(process);
         record.observe_desktop_release();
+        // キャンセル済みのOS待機が残る場合も、所有ハンドルを保持するスレッドの終了を無限に待たない。
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
         Ok(record)
     }
 
@@ -5633,6 +6243,7 @@ privileges={privileges:?}{restricted}",
             worker_actions_sid: String::new(),
             station_ace: "unavailable:not-acquired".into(),
             station_cleanup: "unavailable:not-acquired".into(),
+            init_probe: None,
         };
         let lease = match ActionStationLease::acquire_for_diagnostic(config.station_profile) {
             Ok(lease) => Arc::new(lease),
@@ -5746,6 +6357,35 @@ privileges={privileges:?}{restricted}",
                     })?;
             }
             record.markers |= Session0DiagnosticRecord::SPAWN_RETURNED;
+            if config.init_probe_sha256.is_some() {
+                let (held, sha256) = hold_session0_init_probe(config)
+                    .map_err(|_| Session0DiagnosticFailureStage::Runtime)?;
+                let path = config.fixture_root.join(SESSION0_INIT_BASENAME);
+                let command = RestrictedCommand {
+                    application: path.clone(),
+                    arguments: Vec::new(),
+                    cwd: command.cwd.clone(),
+                    environment: command.environment.clone(),
+                };
+                let result = run_session0_diagnostic_child(
+                    &action,
+                    &command,
+                    TestCreationProfile::Production,
+                );
+                if result.as_ref().map_or(true, |run| run.lifecycle & 4 == 0) {
+                    // 終了確認不能時はworker終了まで読取り保持を残す。PS側もroot削除を拒む。
+                    std::mem::forget(held);
+                }
+                let run = result.map_err(|_| Session0DiagnosticFailureStage::Runtime)?;
+                let evidence =
+                    init_run_evidence(&run).map_err(|_| Session0DiagnosticFailureStage::Runtime)?;
+                record.init_probe = Some(Session0InitProbeRecord {
+                    path: path.to_string_lossy().into_owned(),
+                    sha256,
+                    run,
+                    evidence,
+                });
+            }
             Ok(())
         })();
         cleanup_session0_diagnostic_scratch(

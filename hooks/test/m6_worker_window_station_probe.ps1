@@ -43,6 +43,7 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
     }
 }
 
+$record = $null
 $requestedStationMask = ConvertFrom-Session0StationMask $StationMask
 
 $env:PSModulePath = "$PSHOME\Modules"
@@ -106,10 +107,11 @@ $leaseIdentity = $null
 $cleanupHandle = $null
 $targetStream = $null
 $sourceStream = $null
-$initProbe = @{ Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$initProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $serviceHandle = [IntPtr]::Zero
 $ownedRoot = $false
 $ownedService = $false
+$serviceStartAttempted = $false
 $primaryError = $null
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 $workerBefore = $null
@@ -1334,7 +1336,55 @@ function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset, [uint32]$Reque
     }
 }
 
-function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$ExpectedMask) {
+function Test-Session0InitTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.InitProbe -and
+        ($Record.InitProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Get-Session0InitRunEvidence($Run) {
+    if (-not $Run.SpawnSucceeded -and ($null -ne $Run.ChildExit -or $Run.Stdout.Length -ne 0 -or $Run.Stderr.Length -ne 0)) {
+        throw '追加診断の spawn と終了・出力が矛盾しています。'
+    }
+    $evidence = Read-Session0InitProbeOutput ([Text.Encoding]::UTF8.GetBytes($Run.Stdout)) ([Text.Encoding]::UTF8.GetBytes($Run.Stderr)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = foreach ($property in @('Stage', 'Preloaded', 'LoadResult', 'Gle', 'Outcome')) {
+        if ($null -eq $evidence.$property) { 'none' } else { [string]$evidence.$property }
+    }
+    return $values -join ','
+}
+
+function Read-Session0InitRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash) {
+    if ($Offset.Value -ge $Bytes.Length -or $Bytes[$Offset.Value] -gt 1) { throw '追加診断の有無が不正です。' }
+    $present = $Bytes[$Offset.Value] -eq 1
+    $Offset.Value++
+    if (-not $present) {
+        if ($ExpectedPath.Length -ne 0 -or $ExpectedHash.Length -ne 0) { throw '要求した追加診断がありません。' }
+        return $null
+    }
+    $path = Read-Session0Text $Bytes $Offset
+    $hash = Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or
+        -not $path.EndsWith('\SbzSession0InitProbe.exe', [StringComparison]::Ordinal) -or
+        $path -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+        @($path.Substring(3).Split('\') | Where-Object {
+            $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+        }).Count -ne 0) {
+        throw '追加診断の固定path・hashが呼出側の期待値と一致しません。'
+    }
+    $run = Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if (($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station + '\sbz-'), [StringComparison]::Ordinal))) {
+        throw '追加診断のJob・製品flags・専用desktopが一致しません。'
+    }
+    $evidence = Read-Session0Text $Bytes $Offset
+    if ($evidence -cne (Get-Session0InitRunEvidence $run)) { throw '追加診断の段階証拠が出力と一致しません。' }
+    return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; Evidence=$evidence }
+}
+
+function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$ExpectedMask,
+    [string]$ExpectedInitPath = '', [string]$ExpectedInitHash = '') {
     if ($ExpectedMask -ne 0x0002 -and $ExpectedMask -ne 0x0022) {
         throw '呼出側の station mask が許容範囲外です。'
     }
@@ -1342,7 +1392,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
         throw '診断レコードの長さが許容範囲外です。'
     }
     if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
-        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]8) {
+        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]9) {
         throw '診断レコードの magic または version が一致しません。'
     }
     if ($Nonce -cnotmatch '\A[0-9a-fA-F]{32}\z') { throw '診断の nonce の形式が不正です。' }
@@ -1376,6 +1426,11 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
     $workerActionsSid = Read-Session0Text $Bytes $offset
     $stationAce = Read-Session0Text $Bytes $offset
     $stationCleanup = Read-Session0Text $Bytes $offset
+    $initProbeRecord = Read-Session0InitRecord $Bytes $offset $requestedMask $fields[2] $ExpectedInitPath $ExpectedInitHash
+    if ($null -ne $initProbeRecord -and $initProbeRecord.Run.TargetDesktop.Length -ne 0 -and
+        ($initProbeRecord.Run.TargetDesktop -ceq $baseline.TargetDesktop -or $initProbeRecord.Run.TargetDesktop -ceq $noWindow.TargetDesktop)) {
+        throw '追加診断のdesktopがcmdと重複しています。'
+    }
     $maskSeparator = $stationAce.LastIndexOf(';mask=0x', [StringComparison]::Ordinal)
     if ($maskSeparator -ge 0 -and $stationAce.Substring($maskSeparator + 8) -cne ('{0:x8}' -f $requestedMask)) {
         throw '実測した station ACE の mask が要求と一致しません。'
@@ -1437,7 +1492,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
         DesktopSacl = $fields[7]; StationAccess = $fields[8]; DesktopAccess = $fields[9]
         UiProbe = $fields[10]; ActionDesktop = $fields[11]; Cwd = $fields[12]
         EnvironmentHash = $fields[13]
-        Baseline = $baseline; NoWindow = $noWindow
+        Baseline = $baseline; NoWindow = $noWindow; InitProbe = $initProbeRecord
         WorkerActionsSid = $workerActionsSid; StationAce = $stationAce; StationCleanup = $stationCleanup
     }
 }
@@ -1609,6 +1664,7 @@ try {
         })
         if ($ace.Count -ne 1) { throw "$($check[2]) lacks the exact throwaway service SID right." }
     }
+    $serviceStartAttempted = $true
     try { [Sembazuru.WindowStationProbeNative]::StartWithoutArguments($serviceHandle) }
     catch {
         $nativeError = $null
@@ -1625,7 +1681,9 @@ try {
         throw
     }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    # 追加runでは3回の10秒期限と、失敗時のJob回収・OS待機の終了確認を含める。
+    $serviceDeadlineSeconds = if ($InitProbePath) { 360 } else { 30 }
+    $deadline = [DateTime]::UtcNow.AddSeconds($serviceDeadlineSeconds)
     $sawRunning = $false
     do {
         $status = [Sembazuru.WindowStationProbeNative]::QueryStatus($serviceHandle)
@@ -1639,7 +1697,7 @@ try {
         }
         if ($status.State -eq $serviceRunning) { $sawRunning = $true }
         if ($status.State -eq $serviceStopped) { break }
-        if ([DateTime]::UtcNow -ge $deadline) { throw 'SCM smoke did not stop in 30 seconds.' }
+        if ([DateTime]::UtcNow -ge $deadline) { throw ('SCM 診断が {0} 秒以内に停止しませんでした。' -f $serviceDeadlineSeconds) }
         Start-Sleep -Milliseconds 100
     } while ($true)
     if ($status.Win32ExitCode -ne $errorServiceSpecific -or
@@ -1680,7 +1738,7 @@ try {
         throw 'Session 0 diagnostic record is missing.'
     }
     $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
-        $diagnosticNonce $requestedStationMask
+        $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash
     $classificationMap = @{
         1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
         2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
@@ -1710,8 +1768,18 @@ try {
         } else { $property }
         $detail.Add(('{0}={1}' -f $label, (Format-BoundedDiagnosticText $record.$property)))
     }
-    foreach ($name in @('Baseline', 'NoWindow')) {
-        $run = $record.$name
+    foreach ($name in @('Baseline', 'NoWindow', 'InitProbe')) {
+        if ($name -eq 'InitProbe' -and $null -eq $record.InitProbe) { continue }
+        $run = if ($name -eq 'InitProbe') { $record.InitProbe.Run } else { $record.$name }
+        if ($name -eq 'InitProbe') {
+            $detail.Add(('InitProbePath={0} InitProbeSha256={1} InitProbeEvidence={2}' -f $record.InitProbe.Path, $record.InitProbe.Sha256, $record.InitProbe.Evidence))
+            $stage = $record.InitProbe.Evidence.Split(',')
+            $stageNames = @('entry-unobserved', 'entry', 'preloaded-observed', 'load-begin', 'load-result', 'complete')
+            $outcomeNames = @('indeterminate', 'already-loaded', 'load-failed', 'load-complete')
+            $gle = if ($stage[3] -ceq 'none') { 'none' } else { '0x{0:x8}' -f [uint32]$stage[3] }
+            $detail.Add(('InitProbeStage={0} InitProbePreloaded={1} InitProbeLoadResult={2} InitProbeGLE={3} InitProbeOutcome={4}' -f
+                $stageNames[[int]$stage[0]], $stage[1], $stage[2], $gle, $outcomeNames[[int]$stage[4]]))
+        }
         $exitText = if ($null -eq $run.ChildExit) { 'none' } else { '0x{0:x8}' -f $run.ChildExit }
         $detail.Add(('{0}JobUi=0x{1:x8} {0}CreationFlags=0x{2:x8} {0}SpawnSucceeded={3} {0}ChildExit={4}' -f
             $name, $run.JobUi, $run.CreationFlags, $run.SpawnSucceeded, $exitText))
@@ -1802,8 +1870,9 @@ finally {
         }
     }
 
+    $initTreeSafe = Test-Session0InitTreeSafe ([bool]$InitProbePath) $serviceStartAttempted $record
     if ($ownedRoot) {
-        if (-not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe) {
+        if (-not $initTreeSafe -or -not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe) {
             $cleanupErrors.Add('fixture root preserved because SCM cleanup was not proven safe')
         }
         else {
@@ -1864,11 +1933,19 @@ finally {
         }
     }
     foreach ($name in @('Source', 'Target', 'Lease', 'ReadHold')) {
+        if (-not $initTreeSafe -and $name -ne 'Source') { continue }
         if ($null -ne $initProbe[$name]) {
             try { $initProbe[$name].Dispose() }
             catch { $cleanupErrors.Add("追加診断 $name のハンドル解放: $($_.Exception.Message)") }
             $initProbe[$name] = $null
         }
+    }
+    if (-not $initTreeSafe) {
+        # ホスト終了まで保持する。確認不能を通常cleanupへ読み替えない。
+        $retained = Get-Variable -Name SembazuruSession0RetainedInitProbes -Scope Global -ErrorAction SilentlyContinue
+        if ($null -eq $retained) { $global:SembazuruSession0RetainedInitProbes = [Collections.Generic.List[object]]::new() }
+        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; Root=$rootHandle })
+        $rootHandle = $null
     }
     if ($null -ne $targetHandle) {
         try { $targetHandle.Dispose() }
