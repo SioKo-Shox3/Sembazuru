@@ -5,15 +5,26 @@ param(
     [string]$InitProbePath,
     [string]$InitProbeSha256,
     [string]$EntryProbePath,
-    [string]$EntryProbeSha256
+    [string]$EntryProbeSha256,
+    [string]$TerminateProbePath,
+    [string]$TerminateProbeSha256
 )
 
-function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [string]$EntryPath, [string]$EntryHash) {
+function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [string]$EntryPath, [string]$EntryHash,
+    [string]$TerminatePath, [string]$TerminateHash) {
     if ([string]::IsNullOrEmpty($InitPath) -ne [string]::IsNullOrEmpty($InitHash) -or
-        [string]::IsNullOrEmpty($EntryPath) -ne [string]::IsNullOrEmpty($EntryHash)) {
+        [string]::IsNullOrEmpty($EntryPath) -ne [string]::IsNullOrEmpty($EntryHash) -or
+        [string]::IsNullOrEmpty($TerminatePath) -ne [string]::IsNullOrEmpty($TerminateHash)) {
         throw '診断EXEのパスとSHA-256は組で指定してください。'
     }
     if ($EntryPath -and -not $InitPath) { throw '固定終了値診断にはInitProbeの指定が必要です。' }
+    if ($TerminatePath -and (-not $InitPath -or -not $EntryPath)) {
+        throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。'
+    }
+}
+
+function Assert-Session0ConnectedRequest([bool]$TerminateRequested) {
+    if ($TerminateRequested) { throw '固定自己終了診断の実行と記録は未接続です。' }
 }
 
 function Get-Session0ServiceDeadline([bool]$InitRequested, [bool]$EntryRequested) {
@@ -35,7 +46,7 @@ function ConvertFrom-Session0StationMask([string]$Value) {
 }
 
 function Assert-Session0FixtureArguments([string[]]$Arguments) {
-    if ($Arguments.Count -lt 11 -or $Arguments.Count -gt 13) { throw 'SCM 診断の引数数が一致しません。' }
+    if ($Arguments.Count -lt 11 -or $Arguments.Count -gt 14) { throw 'SCM 診断の引数数が一致しません。' }
     $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
         '--nocapture', '--test-threads=1', '--')
     if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
@@ -51,7 +62,8 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
     }
     $null = ConvertFrom-Session0StationMask $Arguments[10]
     if ($Arguments.Count -ge 12) {
-        if ($Arguments.Count -eq 13) { Assert-Session0InitProbeHash $Arguments[12] }
+        if ($Arguments.Count -eq 14) { Assert-Session0InitProbeHash $Arguments[13] }
+        if ($Arguments.Count -ge 13) { Assert-Session0InitProbeHash $Arguments[12] }
         Assert-Session0InitProbeHash $Arguments[11]
         $root = $Arguments[7]
         if ($root -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
@@ -88,7 +100,7 @@ Set-StrictMode -Version Latest
 if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
     throw 'Elevated direct -File execution is forbidden; use the verified in-memory bootstrap.'
 }
-if ($args.Count -ne 0) { throw '指定できる引数は ArtifactPath、ExpectedSha256、StationMask、InitProbePath、InitProbeSha256、EntryProbePath、EntryProbeSha256 だけです。' }
+if ($args.Count -ne 0) { throw '指定できる引数は ArtifactPath、ExpectedSha256、StationMask、InitProbePath、InitProbeSha256、EntryProbePath、EntryProbeSha256、TerminateProbePath、TerminateProbeSha256 だけです。' }
 if ([string]::IsNullOrWhiteSpace($ArtifactPath) -or
     [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
     throw 'ArtifactPath and ExpectedSha256 are required after elevation.'
@@ -97,7 +109,9 @@ if ($ExpectedSha256 -notmatch '\A[0-9a-fA-F]{64}\z') {
     throw 'ExpectedSha256 must be exactly 64 hexadecimal characters.'
 }
 $ExpectedSha256 = $ExpectedSha256.ToLowerInvariant()
-Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256
+Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256
+# 実行と独立記録が揃うまでは、ファイル配置やSCMの照会より前に拒否する。
+Assert-Session0ConnectedRequest ([bool]$TerminateProbePath)
 
 $serviceName = 'SembazuruWindowStationProbeSmoke'
 $workerServiceName = 'SembazuruWorker'
@@ -128,6 +142,7 @@ $targetStream = $null
 $sourceStream = $null
 $initProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $entryProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$terminateProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $serviceHandle = [IntPtr]::Zero
 $ownedRoot = $false
 $ownedService = $false
@@ -1052,6 +1067,11 @@ function Assert-Session0InitProbeHash([string]$Hash) {
     }
 }
 
+function Assert-Session0ProbeContentHash([string]$Actual, [string]$Expected) {
+    Assert-Session0InitProbeHash $Expected
+    if ($Actual -cne $Expected) { throw '追加診断EXEの実SHA-256が期待値と一致しません。' }
+}
+
 function Assert-Session0InitProbeSecurity($Identity, [string]$ServiceSid) {
     if ([string]::IsNullOrEmpty($ServiceSid)) { Assert-ExactFileSecurity $Identity; return }
     if (-not $Identity.DaclPresent -or -not $Identity.DaclNonNull) {
@@ -1076,20 +1096,30 @@ function Assert-Session0InitProbeSecurity($Identity, [string]$ServiceSid) {
     }
 }
 
-# 種別から固定名を選ぶ。外部から任意の実行ファイル名を受け取らない。
-function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]$Hash, [string]$Kind = 'Init') {
-    $basename = switch -CaseSensitive ($Kind) {
-        'Init' { 'session0_init_probe.exe' }
-        'Entry' { 'session0_entry_probe.exe' }
+# 種別と用途から固定名だけを選ぶ。sourceと保護先を交換できない。
+function Get-Session0ProbeBasename([string]$Kind, [bool]$Source) {
+    switch -CaseSensitive ($Kind) {
+        'Init' { if ($Source) { return 'session0_init_probe.exe' }; return 'SbzSession0InitProbe.exe' }
+        'Entry' { if ($Source) { return 'session0_entry_probe.exe' }; return 'SbzSession0EntryProbe.exe' }
+        'Terminate' { if ($Source) { return 'session0_terminate_probe.exe' }; return 'SbzSession0TerminateProbe.exe' }
         default { throw '追加診断 EXE の種別が不正です。' }
     }
-    $State.Kind = $Kind
-    Assert-Session0InitProbeHash $Hash
+}
+
+function Get-Session0ProbeSourcePath([string]$Path, [string]$Kind) {
+    $basename = Get-Session0ProbeBasename $Kind $true
     Assert-LocalAbsolutePath $Path '追加診断の source'
     $canonical = [IO.Path]::GetFullPath($Path)
     if ([IO.Path]::GetFileName($canonical) -cne $basename) {
         throw '追加診断 EXE の source 名が一致しません。'
     }
+    return $canonical
+}
+
+function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]$Hash, [string]$Kind = 'Init') {
+    $canonical = Get-Session0ProbeSourcePath $Path $Kind
+    $State.Kind = $Kind
+    Assert-Session0InitProbeHash $Hash
     $State.Hash = $Hash
     $State.Source = [IO.FileStream]::new(
         $canonical, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
@@ -1098,16 +1128,12 @@ function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]
         $State.Source.SafeFileHandle.DangerousGetHandle()
     )
     Assert-RegularIdentity $identity $canonical '追加診断の source'
-    if ((Get-StreamSha256 $State.Source) -cne $Hash) { throw '追加診断 source の SHA-256 が一致しません。' }
+    Assert-Session0ProbeContentHash (Get-StreamSha256 $State.Source) $Hash
     $State.Source.Position = 0
 }
 
 function Copy-Session0InitProbe([hashtable]$State, [string]$Root) {
-    $basename = switch -CaseSensitive ($State.Kind) {
-        'Init' { 'SbzSession0InitProbe.exe' }
-        'Entry' { 'SbzSession0EntryProbe.exe' }
-        default { throw '追加診断 EXE の種別が不正です。' }
-    }
+    $basename = Get-Session0ProbeBasename $State.Kind $false
     $State.Path = Join-Path $Root $basename
     $State.Target = [Sembazuru.WindowStationProbeNative]::CreateProtectedFile(
         $State.Path, 'O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
@@ -1123,7 +1149,7 @@ function Copy-Session0InitProbe([hashtable]$State, [string]$Root) {
         $State.Source.CopyTo($stream)
         $stream.Flush($true)
         $stream.Position = 0
-        if ((Get-StreamSha256 $stream) -cne $State.Hash) { throw '追加診断 target の SHA-256 が一致しません。' }
+        Assert-Session0ProbeContentHash (Get-StreamSha256 $stream) $State.Hash
     }
     finally { $stream.Dispose() }
     $State.Lease = [Sembazuru.WindowStationProbeNative]::OpenLease($State.Path)
@@ -1139,7 +1165,7 @@ function Copy-Session0InitProbe([hashtable]$State, [string]$Root) {
         $State.ReadHold.SafeFileHandle.DangerousGetHandle()
     )
     Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の read hold'
-    if ((Get-StreamSha256 $State.ReadHold) -cne $State.Hash) { throw '追加診断の保持中 hash が一致しません。' }
+    Assert-Session0ProbeContentHash (Get-StreamSha256 $State.ReadHold) $State.Hash
 }
 
 function Grant-Session0InitProbeRead([hashtable]$State, [string]$ServiceSid) {
@@ -1619,6 +1645,7 @@ try {
     $sourceStream.Position = 0
     if ($InitProbePath) { Open-Session0InitProbeSource $initProbe $InitProbePath $InitProbeSha256 }
     if ($EntryProbePath) { Open-Session0InitProbeSource $entryProbe $EntryProbePath $EntryProbeSha256 'Entry' }
+    if ($TerminateProbePath) { Open-Session0InitProbeSource $terminateProbe $TerminateProbePath $TerminateProbeSha256 'Terminate' }
 
     $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
     if ([string]::IsNullOrWhiteSpace($programFiles)) { throw 'Program Files known folder is empty.' }
@@ -1661,6 +1688,7 @@ try {
         )
         if ($InitProbePath) { Copy-Session0InitProbe $initProbe $root }
         if ($EntryProbePath) { Copy-Session0InitProbe $entryProbe $root }
+        if ($TerminateProbePath) { Copy-Session0InitProbe $terminateProbe $root }
     }
     finally { $restore.Dispose() }
 
@@ -1704,7 +1732,9 @@ try {
         '--nocapture', '--test-threads=1', '--', $root, $root, $diagnosticNonce, $StationMask)
     if ($InitProbePath) { $fixtureArguments += $initProbe.Hash }
     if ($EntryProbePath) { $fixtureArguments += $entryProbe.Hash }
+    if ($TerminateProbePath) { $fixtureArguments += $terminateProbe.Hash }
     Assert-Session0FixtureArguments $fixtureArguments
+    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 14)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
         $diagnosticNonce + ' ' + $StationMask
@@ -1751,6 +1781,7 @@ try {
     finally { $targetAclHandle.Dispose() }
     if ($InitProbePath) { Grant-Session0InitProbeRead $initProbe $serviceSid }
     if ($EntryProbePath) { Grant-Session0InitProbeRead $entryProbe $serviceSid }
+    if ($TerminateProbePath) { Grant-Session0InitProbeRead $terminateProbe $serviceSid }
     $serviceRootIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($rootHandle.Handle)
     $serviceExeIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($targetLease.Handle)
     $leaseIdentity = $serviceExeIdentity
@@ -1980,7 +2011,9 @@ finally {
 
     $initTreeSafe = Test-Session0InitTreeSafe ([bool]$InitProbePath) $serviceStartAttempted $record
     $entryTreeSafe = Test-Session0EntryTreeSafe ([bool]$EntryProbePath) $serviceStartAttempted $record
-    $probesTreeSafe = $initTreeSafe -and $entryTreeSafe
+    # 独立した終了記録が未接続の要求は、開始後の回収済みと見なさない。
+    $terminateTreeSafe = -not $TerminateProbePath -or -not $serviceStartAttempted
+    $probesTreeSafe = $initTreeSafe -and $entryTreeSafe -and $terminateTreeSafe
     if ($ownedRoot) {
         if (-not $probesTreeSafe -or -not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe) {
             $cleanupErrors.Add('fixture root preserved because SCM cleanup was not proven safe')
@@ -2002,6 +2035,7 @@ finally {
                     try { [Sembazuru.WindowStationProbeNative]::MarkDelete($recordCleanup.Handle) }
                     finally { $recordCleanup.Dispose() }
                 }
+                Remove-Session0InitProbe $terminateProbe
                 Remove-Session0InitProbe $entryProbe
                 Remove-Session0InitProbe $initProbe
                 if ($null -ne $targetLease) {
@@ -2043,7 +2077,7 @@ finally {
             catch { $cleanupErrors.Add("fixture cleanup: $($_.Exception.Message)") }
         }
     }
-    foreach ($probe in @($initProbe, $entryProbe)) {
+    foreach ($probe in @($initProbe, $entryProbe, $terminateProbe)) {
         foreach ($name in @('Source', 'Target', 'Lease', 'ReadHold')) {
             if (-not $probesTreeSafe -and $name -ne 'Source') { continue }
             if ($null -ne $probe[$name]) {
@@ -2057,7 +2091,7 @@ finally {
         # ホスト終了まで保持する。確認不能を通常cleanupへ読み替えない。
         $retained = Get-Variable -Name SembazuruSession0RetainedInitProbes -Scope Global -ErrorAction SilentlyContinue
         if ($null -eq $retained) { $global:SembazuruSession0RetainedInitProbes = [Collections.Generic.List[object]]::new() }
-        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; EntryProbe=$entryProbe; Root=$rootHandle })
+        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; EntryProbe=$entryProbe; TerminateProbe=$terminateProbe; Root=$rootHandle })
         $rootHandle = $null
     }
     if ($null -ne $targetHandle) {
