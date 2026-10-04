@@ -56,6 +56,17 @@ jobs:
           )
           $expectedInitBuildSha256 = (Get-FileHash -LiteralPath $initBuildPath -Algorithm SHA256).Hash
           $expectedInitSourceSha256 = (Get-FileHash -LiteralPath $initSourcePath -Algorithm SHA256).Hash
+          $entryBuildPath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_entry_probe.ps1')
+          )
+          $entrySourcePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_entry_probe.cpp')
+          )
+          $entryProbePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE '.harness/T-011-entry-probe/session0_entry_probe.exe')
+          )
+          $expectedEntryBuildSha256 = (Get-FileHash -LiteralPath $entryBuildPath -Algorithm SHA256).Hash
+          $expectedEntrySourceSha256 = (Get-FileHash -LiteralPath $entrySourcePath -Algorithm SHA256).Hash
           & rustup toolchain install 1.97.0 --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain の導入に失敗しました。' }
           $artifacts = @(& cargo +1.97.0 test -p sembazuru-worker --lib --locked --no-run --message-format=json)
@@ -116,10 +127,14 @@ jobs:
           $probeInput = $null
           $initBuildInput = $null
           $initSourceInput = $null
+          $entryBuildInput = $null
+          $entrySourceInput = $null
           try {
               $probeInput = Open-VerifiedInput $probePath $expectedProbeSha256
               $initBuildInput = Open-VerifiedInput $initBuildPath $expectedInitBuildSha256
               $initSourceInput = Open-VerifiedInput $initSourcePath $expectedInitSourceSha256
+              $entryBuildInput = Open-VerifiedInput $entryBuildPath $expectedEntryBuildSha256
+              $entrySourceInput = Open-VerifiedInput $entrySourcePath $expectedEntrySourceSha256
               $initBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($initBuildInput.Bytes)
               $tokens = $null
               $parseErrors = $null
@@ -131,19 +146,33 @@ jobs:
               & ($initBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw '追加診断 EXE のビルドに失敗しました。' }
               $expectedInitProbeSha256 = (Get-FileHash -LiteralPath $initProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              $entryBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($entryBuildInput.Bytes)
+              $tokens = $null
+              $parseErrors = $null
+              $entryBuildAst = [Management.Automation.Language.Parser]::ParseInput(
+                  $entryBuildText, $entryBuildPath, [ref]$tokens, [ref]$parseErrors
+              )
+              if ($parseErrors.Count -ne 0) { throw '固定終了値診断のビルドスクリプトに構文エラーがあります。' }
+              & ($entryBuildAst.GetScriptBlock()) -BuildOnly
+              if ($LASTEXITCODE -ne 0) { throw '固定終了値診断 EXE のビルドに失敗しました。' }
+              $expectedEntryProbeSha256 = (Get-FileHash -LiteralPath $entryProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
               Write-Host ('commit={0} requested_station_mask={1} verified_script_sha256={2} verified_init_build_sha256={3} verified_init_source_sha256={4}' -f
                   $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $probeInput.Sha256,
                   $initBuildInput.Sha256, $initSourceInput.Sha256)
-              # 候補ごとに独立ビルドした2つの EXE を別々の hash として記録する。
-              Write-Host ('commit={0} requested_station_mask={1} expected_executable_sha256={2} expected_init_probe_sha256={3}' -f
-                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $expectedArtifactSha256, $expectedInitProbeSha256)
+              Write-Host ('commit={0} requested_station_mask={1} verified_entry_build_sha256={2} verified_entry_source_sha256={3}' -f
+                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $entryBuildInput.Sha256, $entrySourceInput.Sha256)
+              # 候補ごとに独立ビルドした3つの EXE を別々の hash として記録する。
+              Write-Host ('commit={0} requested_station_mask={1} expected_executable_sha256={2} expected_init_probe_sha256={3} expected_entry_probe_sha256={4}' -f
+                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $expectedArtifactSha256,
+                  $expectedInitProbeSha256, $expectedEntryProbeSha256)
               $probeText = [Text.UTF8Encoding]::new($false, $true).GetString($probeInput.Bytes)
               & ([ScriptBlock]::Create($probeText)) -ArtifactPath $artifactPath `
                   -ExpectedSha256 $expectedArtifactSha256 -StationMask $env:SBZ_DIAGNOSTIC_STATION_MASK `
-                  -InitProbePath $initProbePath -InitProbeSha256 $expectedInitProbeSha256
+                  -InitProbePath $initProbePath -InitProbeSha256 $expectedInitProbeSha256 `
+                  -EntryProbePath $entryProbePath -EntryProbeSha256 $expectedEntryProbeSha256
               if ($LASTEXITCODE -ne 0) { throw 'Session 0 診断に失敗しました。' }
           } finally {
-              foreach ($inputFile in @($initSourceInput, $initBuildInput, $probeInput)) {
+              foreach ($inputFile in @($entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
                   if ($null -ne $inputFile) { $inputFile.Stream.Dispose() }
               }
           }
