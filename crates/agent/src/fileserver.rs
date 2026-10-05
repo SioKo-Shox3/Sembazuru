@@ -1778,33 +1778,33 @@ mod tests {
     #[test]
     fn path_corpus_scope_allows_short_name_component_in_declared_root_prefix_only() {
         let root =
-            normalize_root("C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x").expect("root");
+            normalize_root("C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-x").expect("root");
         let root = root.as_str();
 
         assert!(
             path_in_scope(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\src\\in.h",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-x\\src\\in.h",
                 Some(root)
             ),
             "a short-name component inherited from the declared root prefix must not break supply"
         );
         assert_eq!(
             root_relative_path(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\src\\in.h",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-x\\src\\in.h",
                 root
             ),
             Some("src\\in.h".to_string())
         );
         assert!(
             !path_in_scope(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\PROGRA~1\\tool.exe",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-x\\PROGRA~1\\tool.exe",
                 Some(root)
             ),
             "a short-name component in the root-relative suffix must still fail closed"
         );
         assert_eq!(
             root_relative_path(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-x\\PROGRA~1\\tool.exe",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-x\\PROGRA~1\\tool.exe",
                 root
             ),
             None
@@ -1814,46 +1814,46 @@ mod tests {
     #[test]
     fn path_corpus_declared_output_normalization_allows_short_alias_root_prefix_only() {
         let root =
-            normalize_root("C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root").expect("root");
+            normalize_root("C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root").expect("root");
 
         assert_eq!(
             normalize_declared_output(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj",
                 Some(&root)
             ),
             Some(
-                "c:\\users\\kingka~1\\appdata\\local\\temp\\sbz-dp-root\\obj\\out.obj".to_string()
+                "c:\\users\\testus~1\\appdata\\local\\temp\\sbz-dp-root\\obj\\out.obj".to_string()
             )
         );
         assert_eq!(
             normalize_declared_output(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\PROGRA~1\\tool.obj",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\PROGRA~1\\tool.obj",
                 Some(&root)
             ),
             None
         );
         assert_eq!(
             normalize_declared_output(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\outside\\obj\\out.obj",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\outside\\obj\\out.obj",
                 Some(&root)
             ),
             None
         );
 
         for rejected in [
-            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj:ads",
-            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\NUL.txt",
-            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\bad.",
+            "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj:ads",
+            "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\NUL.txt",
+            "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\bad.",
             "\\\\host\\share\\obj\\out.obj",
             "C:obj\\out.obj",
-            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\..\\outside\\out.obj",
+            "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\..\\outside\\out.obj",
         ] {
             assert_eq!(normalize_declared_output(rejected, Some(&root)), None);
         }
 
         assert_eq!(
             normalize_declared_output(
-                "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj",
+                "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj",
                 None
             ),
             None

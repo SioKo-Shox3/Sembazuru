@@ -2229,7 +2229,9 @@ fn parse_directory_records(
             .filter(|end| *end <= buffer.len())
             .ok_or_else(|| integrity("malformed machine-store directory enumeration"))?;
         let wide = buffer[header_end..name_end]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]]))
             .collect::<Vec<_>>();
         let name = OsString::from_wide(&wide);
@@ -2745,7 +2747,6 @@ pub(crate) fn install_after_root_drop_hook_for_test(
 mod machine_config_tests {
     use std::collections::VecDeque;
     use std::fs;
-    use std::os::windows::fs::OpenOptionsExt as _;
     use std::sync::{Arc, Barrier};
     use std::thread;
 

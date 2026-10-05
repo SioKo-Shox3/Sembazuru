@@ -30,6 +30,7 @@ rationale are public: <https://github.com/SioKo-Shox3/Sembazuru> (see
 | `sembazuru-daemon.exe` | Local agent: schedules actions, serves files | yes |
 | `sembazuru-worker.exe` | Remote worker: runs the compiler under virtualization | yes |
 | `sembazuru-gui.exe` | Resident dashboard (user-session tray; **non-elevated, no injection**) | yes |
+| `sembazuru-storectl.exe` | Machine-store helper: installer lifecycle actions, and the elevated write of a join (**no injection**) | yes |
 | `launcher.exe` | Injector: starts the compiler with the hook DLL loaded | **yes — EDR-relevant** |
 | `sbz_interceptor64.dll` (and `…32.dll`) | The injected hook DLL | **yes — EDR-relevant** |
 
