@@ -193,6 +193,7 @@ jobs:
               & ($terminateBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw '固定自己終了診断 EXE のビルドに失敗しました。' }
               $expectedTerminateProbeSha256 = (Get-FileHash -LiteralPath $terminateProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              # 二候補は保持済みの共通 C++ から生成し、AST のファイル情報で固定出力先を解決する。
               $subsystemBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($subsystemBuildInput.Bytes)
               $tokens = $null
               $parseErrors = $null
