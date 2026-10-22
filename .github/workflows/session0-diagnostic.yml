@@ -95,6 +95,17 @@ jobs:
               (Join-Path $env:GITHUB_WORKSPACE '.harness/T-011-windows-init-probe/session0_windows_init_probe.exe')
           )
           $expectedWindowsInitBuildSha256 = (Get-FileHash -LiteralPath $windowsInitBuildPath -Algorithm SHA256).Hash
+          $windowsStartupBuildPath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_windows_startup_probe.ps1')
+          )
+          $windowsStartupSourcePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_windows_startup_probe.cpp')
+          )
+          $windowsStartupProbePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE '.harness/T-011-windows-startup-probe/session0_windows_startup_probe.exe')
+          )
+          $expectedWindowsStartupBuildSha256 = (Get-FileHash -LiteralPath $windowsStartupBuildPath -Algorithm SHA256).Hash
+          $expectedWindowsStartupSourceSha256 = (Get-FileHash -LiteralPath $windowsStartupSourcePath -Algorithm SHA256).Hash
           & rustup toolchain install 1.97.0 --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain の導入に失敗しました。' }
           $artifacts = @(& cargo +1.97.0 test -p sembazuru-worker --lib --locked --no-run --message-format=json)
@@ -161,6 +172,8 @@ jobs:
           $terminateSourceInput = $null
           $subsystemBuildInput = $null
           $windowsInitBuildInput = $null
+          $windowsStartupBuildInput = $null
+          $windowsStartupSourceInput = $null
           try {
               $probeInput = Open-VerifiedInput $probePath $expectedProbeSha256
               $initBuildInput = Open-VerifiedInput $initBuildPath $expectedInitBuildSha256
@@ -171,6 +184,8 @@ jobs:
               $terminateSourceInput = Open-VerifiedInput $terminateSourcePath $expectedTerminateSourceSha256
               $subsystemBuildInput = Open-VerifiedInput $subsystemBuildPath $expectedSubsystemBuildSha256
               $windowsInitBuildInput = Open-VerifiedInput $windowsInitBuildPath $expectedWindowsInitBuildSha256
+              $windowsStartupBuildInput = Open-VerifiedInput $windowsStartupBuildPath $expectedWindowsStartupBuildSha256
+              $windowsStartupSourceInput = Open-VerifiedInput $windowsStartupSourcePath $expectedWindowsStartupSourceSha256
               $initBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($initBuildInput.Bytes)
               $tokens = $null
               $parseErrors = $null
@@ -225,8 +240,21 @@ jobs:
               & ($windowsInitBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw 'WINDOWS 初期化診断 EXE のビルドに失敗しました。' }
               $expectedWindowsInitProbeSha256 = (Get-FileHash -LiteralPath $windowsInitProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              # WINDOWS 起動情報診断は保持済みの専用 C++ と PS バイト列から生成する。
+              $windowsStartupBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($windowsStartupBuildInput.Bytes)
+              $tokens = $null
+              $parseErrors = $null
+              $windowsStartupBuildAst = [Management.Automation.Language.Parser]::ParseInput(
+                  $windowsStartupBuildText, $windowsStartupBuildPath, [ref]$tokens, [ref]$parseErrors
+              )
+              if ($parseErrors.Count -ne 0) { throw 'WINDOWS 起動情報診断のビルドスクリプトに構文エラーがあります。' }
+              & ($windowsStartupBuildAst.GetScriptBlock()) -BuildOnly
+              if ($LASTEXITCODE -ne 0) { throw 'WINDOWS 起動情報診断 EXE のビルドに失敗しました。' }
+              $expectedWindowsStartupProbeSha256 = (Get-FileHash -LiteralPath $windowsStartupProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
               Write-Host ('commit={0} requested_station_mask={1} verified_windows_init_build_sha256={2}' -f
                   $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $windowsInitBuildInput.Sha256)
+              Write-Host ('commit={0} requested_station_mask={1} verified_windows_startup_build_sha256={2} verified_windows_startup_source_sha256={3}' -f
+                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $windowsStartupBuildInput.Sha256, $windowsStartupSourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_script_sha256={2} verified_init_build_sha256={3} verified_init_source_sha256={4}' -f
                   $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $probeInput.Sha256,
                   $initBuildInput.Sha256, $initSourceInput.Sha256)
@@ -247,7 +275,8 @@ jobs:
                   @('terminate_probe', $terminateProbePath, $expectedTerminateProbeSha256),
                   @('console_probe', $consoleProbePath, $expectedConsoleProbeSha256),
                   @('windows_probe', $windowsProbePath, $expectedWindowsProbeSha256),
-                  @('windows_init_probe', $windowsInitProbePath, $expectedWindowsInitProbeSha256)
+                  @('windows_init_probe', $windowsInitProbePath, $expectedWindowsInitProbeSha256),
+                  @('windows_startup_probe', $windowsStartupProbePath, $expectedWindowsStartupProbeSha256)
               )) {
                   Write-Host ('commit={0} requested_station_mask={1} {2}_path={3} {2}_sha256={4}' -f
                       $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $executable[0], $executable[1], $executable[2])
@@ -260,10 +289,11 @@ jobs:
                   -TerminateProbePath $terminateProbePath -TerminateProbeSha256 $expectedTerminateProbeSha256 `
                   -ConsoleProbePath $consoleProbePath -ConsoleProbeSha256 $expectedConsoleProbeSha256 `
                   -WindowsProbePath $windowsProbePath -WindowsProbeSha256 $expectedWindowsProbeSha256 `
-                  -WindowsInitProbePath $windowsInitProbePath -WindowsInitProbeSha256 $expectedWindowsInitProbeSha256
+                  -WindowsInitProbePath $windowsInitProbePath -WindowsInitProbeSha256 $expectedWindowsInitProbeSha256 `
+                  -WindowsStartupProbePath $windowsStartupProbePath -WindowsStartupProbeSha256 $expectedWindowsStartupProbeSha256
               if ($LASTEXITCODE -ne 0) { throw 'Session 0 診断に失敗しました。' }
           } finally {
-              foreach ($inputFile in @($windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
+              foreach ($inputFile in @($windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
                   if ($null -ne $inputFile) { $inputFile.Stream.Dispose() }
               }
           }
