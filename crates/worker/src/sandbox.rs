@@ -3085,6 +3085,7 @@ mod tests {
             .chain(record.entry_probe.iter().map(|v| &v.run))
             .chain(record.terminate_probe.iter().map(|v| &v.run))
             .chain(record.subsystem_probes.iter().flatten().map(|v| &v.run))
+            .chain(record.windows_init_probe.iter().map(|v| &v.run))
         {
             fields.extend([
                 run.job_ui_restrictions.to_string(),
@@ -3134,6 +3135,15 @@ mod tests {
             fields.push(probe.deadline_met.to_string());
             fields.push(probe.gates_verified(record).to_string());
         }
+        if let Some(probe) = &record.windows_init_probe {
+            fields.push(diagnostic_hex(probe.path.as_bytes()));
+            fields.push(probe.sha256.clone());
+            fields.push(probe.properties());
+            fields.push(probe.output_eof.to_string());
+            fields.push(probe.deadline_met.to_string());
+            fields.push(probe.sequence_verified().to_string());
+            fields.push(probe.gates_verified(record).to_string());
+        }
         fields.join("\t")
     }
 
@@ -3147,6 +3157,7 @@ mod tests {
         expected_entry: Option<(String, String)>,
         expected_terminate: Option<(String, String)>,
         expected_subsystem: Option<[(String, String); 2]>,
+        expected_windows_init: Option<(String, String)>,
     }
 
     fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
@@ -3155,6 +3166,7 @@ mod tests {
         let mut cases = Vec::new();
         let mut accept = |name, record: Session0DiagnosticRecord| {
             cases.push(Session0DiagnosticCase {
+                expected_windows_init: None,
                 expected_subsystem: None,
                 name,
                 bytes: record.encode().unwrap(),
@@ -3278,6 +3290,7 @@ mod tests {
 
         let mut reject = |name, bytes| {
             cases.push(Session0DiagnosticCase {
+                expected_windows_init: None,
                 expected_subsystem: None,
                 name,
                 bytes,
@@ -3463,6 +3476,7 @@ mod tests {
             .copy_from_slice(&(action_length + 1).to_le_bytes());
         oversized[40..44].copy_from_slice(&65537u32.to_le_bytes());
         cases.push(Session0DiagnosticCase {
+            expected_windows_init: None,
             expected_subsystem: None,
             name: "payload-65537",
             bytes: oversized,
@@ -3491,6 +3505,7 @@ mod tests {
                 let mut bytes = case.bytes.clone();
                 bytes[45] = Session0DiagnosticOutcome::ActionStarts as u8;
                 Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3530,6 +3545,7 @@ mod tests {
                 bytes[offset + run.into_bytes().len() - 1] = 15;
                 bytes[45] = Session0DiagnosticOutcome::ActionStarts as u8;
                 Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3593,6 +3609,7 @@ mod tests {
                     let altered = format!("station:action_mask:mask=0x{mask:08x}");
                     forged[position..position + altered.len()].copy_from_slice(altered.as_bytes());
                     cases.push(Session0DiagnosticCase {
+                        expected_windows_init: None,
                         expected_subsystem: None,
                         name: "target-mask-mismatch-unverified-indeterminate",
                         bytes: forged.clone(),
@@ -3610,6 +3627,7 @@ mod tests {
         cases.extend(session0_entry_record_corpus());
         cases.extend(session0_terminate_record_corpus());
         cases.extend(session0_subsystem_record_corpus());
+        cases.extend(session0_windows_init_record_corpus());
         cases
     }
 
@@ -3671,6 +3689,7 @@ mod tests {
                     valid_init = Some(init.clone());
                 }
                 cases.push(Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name: "init-stage-corpus",
                     bytes: init_record_bytes(&base, &init, summary),
@@ -3687,6 +3706,7 @@ mod tests {
                 init_record_bytes(&base, &init, &init_probe_properties(&init.evidence));
             let mut push = |name, bytes, expected, expected_path: String, expected_hash: String| {
                 cases.push(Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -3823,6 +3843,7 @@ mod tests {
                 let mut changed = init.clone();
                 changed.path = altered.clone();
                 cases.push(Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name: "init-invalid-path-with-matching-caller",
                     bytes: init_record_bytes(
@@ -3865,6 +3886,7 @@ mod tests {
                     _ => unreachable!(),
                 }
                 cases.push(Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -3877,6 +3899,7 @@ mod tests {
                 });
             }
             cases.push(Session0DiagnosticCase {
+                expected_windows_init: None,
                 expected_subsystem: None,
                 name: "init-unsolicited",
                 bytes: success_bytes,
@@ -4192,6 +4215,7 @@ mod tests {
                 }
                 parent.entry_probe = Some(changed);
                 cases.push(Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4567,6 +4591,7 @@ mod tests {
                 }
                 parent.terminate_probe = Some(changed);
                 cases.push(Session0DiagnosticCase {
+                    expected_windows_init: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4595,6 +4620,7 @@ mod tests {
                     record.classification =
                         classify_session0_diagnostic_ab(true, left, true, right);
                     cases.push(Session0DiagnosticCase {
+                        expected_windows_init: None,
                         expected_subsystem: None,
                         name: "cmd-arms-terminate",
                         bytes: record.encode().unwrap(),
@@ -4969,6 +4995,7 @@ mod tests {
                         expected_init: base_case.expected_init.clone(),
                         expected_entry: base_case.expected_entry.clone(),
                         expected_terminate: base_case.expected_terminate.clone(),
+                        expected_windows_init: None,
                         expected_subsystem: if name == "subsystem-unsolicited" {
                             None
                         } else {
@@ -5416,7 +5443,7 @@ mod tests {
     }
 
     #[test]
-    fn session0_windows_init_arguments_reject_unconnected_requests() {
+    fn session0_windows_init_arguments_require_predecessors() {
         let mut argv = session0_argv_corpus()
             .into_iter()
             .find(|(argv, accepted)| argv.len() == 16 && *accepted)
@@ -5430,7 +5457,7 @@ mod tests {
                 config.windows_init_probe_sha256.as_deref(),
                 argv[16].to_str()
             );
-            // 純粋検査だけが17形式を解析し、完全な要求も登録前に拒否する。
+            // 17形式は全先行診断が揃うときだけ受理する。
             for bits in 0..64 {
                 let mut candidate = config.clone();
                 for (index, slot) in [
@@ -5450,7 +5477,7 @@ mod tests {
                 }
                 assert_eq!(
                     require_connected_session0_request(&candidate).is_ok(),
-                    matches!(bits, 0 | 1 | 3 | 7 | 31)
+                    matches!(bits, 0 | 1 | 3 | 7 | 31 | 63)
                 );
             }
             for index in 11..17 {
@@ -5493,7 +5520,7 @@ mod tests {
         }
         assert!(SESSION0_DIAGNOSTIC_CONFIG.get().is_none());
         eprintln!(
-            "WINDOWS_INIT_ARGV=17 BOTH_MASKS=True UNCONNECTED_REJECTED=True CONFIG_UNREGISTERED=True"
+            "WINDOWS_INIT_ARGV=17 BOTH_MASKS=True PREDECESSORS_REQUIRED=True CONFIG_UNREGISTERED=True"
         );
     }
 
@@ -5945,9 +5972,16 @@ mod tests {
                 case.expected_terminate
                     .as_ref()
                     .map(|(p, h)| (p.as_str(), h.as_str())),
-                case.expected_subsystem
-                    .as_ref()
-                    .map(|pair| pair.each_ref().map(|(p, h)| (p.as_str(), h.as_str()))),
+                Session0ExpectedProbes {
+                    subsystem: case
+                        .expected_subsystem
+                        .as_ref()
+                        .map(|pair| pair.each_ref().map(|(p, h)| (p.as_str(), h.as_str()))),
+                    windows_init: case
+                        .expected_windows_init
+                        .as_ref()
+                        .map(|(p, h)| (p.as_str(), h.as_str())),
+                },
             );
             match case.expected {
                 Some(expected) => assert_eq!(decoded.unwrap(), expected, "{}", case.name),
@@ -6210,7 +6244,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('Read-Session0WindowsInitRecord', 'Get-Session0WindowsInitEvidence', 'Test-Session0WindowsInitSequence', 'Test-Session0WindowsInitGates', 'Test-Session0WindowsInitTreeSafe', 'Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -6267,7 +6301,7 @@ $count = 0
 $argvCount = 0
 $initCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
-    $parts = $line.Split("`t", 16)
+    $parts = $line.Split("`t", 18)
     if ($parts[0] -ceq 'init') {
         $exit = if ($parts[3] -ceq 'none') { $null } else { [uint32]$parts[3] }
         $record = $null
@@ -6300,20 +6334,20 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $bytes = [Convert]::FromHexString($parts[2])
     $record = $null
     $rejected = $false
-    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] }
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[15]))) $parts[16] }
     catch { $rejected = $true }
     if ($parts[3] -ceq 'reject') {
         if (-not $rejected) { throw "不正な記録を受理しました: $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "正常な記録を拒否しました: $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne 29) { throw 'レコードのプロパティ数が一致しません。' }
+        if (@($record.PSObject.Properties).Count -ne 30) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId', 'RequestedStationMask')) { $values.Add([string]$record.$property) }
         foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }))) {
+        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }), $(if ($null -ne $record.WindowsInitProbe) { $record.WindowsInitProbe.Run }))) {
             if ($null -eq $run) { continue }
             if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
             $values.Add([string]$run.JobUi)
@@ -6368,7 +6402,15 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             if ($parentRejected -eq $gates) { throw 'subsystem対照の親ゲート拒否が一致しません。' }
             $values.Add(([string]$gates).ToLowerInvariant())
         }
-        if (($values -join "`t") -cne $parts[15]) { throw "記録のプロパティが一致しません: $($parts[0])" }
+        if ($null -ne $record.WindowsInitProbe) {
+            $probe = $record.WindowsInitProbe
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($probe.Path)).ToLowerInvariant())
+            $values.Add($probe.Sha256); $values.Add($probe.Evidence)
+            foreach ($value in @($probe.OutputEof, $probe.DeadlineMet, (Test-Session0WindowsInitSequence $probe), (Test-Session0WindowsInitGates $record))) {
+                $values.Add(([string]$value).ToLowerInvariant())
+            }
+        }
+        if (($values -join "`t") -cne $parts[17]) { throw "記録のプロパティが一致しません: $($parts[0])" }
     }
     $count++
 }
@@ -6424,7 +6466,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         for case in &cases {
             let expected = case.expected.as_ref().map(diagnostic_properties);
             input.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.name,
                 case.nonce,
                 diagnostic_hex(&case.bytes),
@@ -6469,6 +6511,13 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                         .as_bytes()
                 ),
                 case.expected_subsystem.as_ref().map_or("", |v| &v[1].1),
+                diagnostic_hex(
+                    case.expected_windows_init
+                        .as_ref()
+                        .map_or("", |(p, _)| p)
+                        .as_bytes()
+                ),
+                case.expected_windows_init.as_ref().map_or("", |(_, h)| h),
                 expected.unwrap_or_default(),
             ));
         }
@@ -7566,6 +7615,709 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         }
     }
 
+    struct Session0ExpectedProbes<'a> {
+        subsystem: Option<[(&'a str, &'a str); 2]>,
+        windows_init: Option<(&'a str, &'a str)>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Session0WindowsInitProbeRecord {
+        path: String,
+        sha256: String,
+        // この領域だけStdout/Stderrをraw bytesの小文字hexとして保存する。
+        run: Session0DiagnosticRun,
+        evidence: Option<InitProbeEvidence>,
+        output_eof: bool,
+        deadline_met: bool,
+    }
+
+    fn windows_init_bytes(text: &str) -> Result<Vec<u8>, String> {
+        if text.len() > 8194 || !text.len().is_multiple_of(2) {
+            return Err("WINDOWS初期化診断の出力長が不正です".into());
+        }
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                if !pair
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+                {
+                    return Err("WINDOWS初期化診断の出力hexが不正です".into());
+                }
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+
+    fn windows_init_run_evidence(run: &Session0DiagnosticRun) -> Option<InitProbeEvidence> {
+        let left = windows_init_bytes(&run.stdout).ok()?;
+        let right = windows_init_bytes(&run.stderr).ok()?;
+        // 契約違反列もraw出力は残す。列/終了値の合格とは独立した記録にする。
+        let mut evidence = match parse_init_probe_output(&left, &right, run.child_exit) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                let mut evidence = parse_init_probe_output(&left, &[], None).ok()?;
+                evidence.outcome = InitProbeOutcome::Indeterminate;
+                evidence
+            }
+        };
+        if run.lifecycle != 15 || !run.spawn_error.is_empty() {
+            evidence.outcome = InitProbeOutcome::Indeterminate;
+        }
+        Some(evidence)
+    }
+
+    impl Session0WindowsInitProbeRecord {
+        fn properties(&self) -> String {
+            self.evidence
+                .as_ref()
+                .map_or_else(|| "invalid".into(), init_probe_properties)
+        }
+
+        fn sequence_verified(&self) -> bool {
+            let (Ok(left), Ok(right)) = (
+                windows_init_bytes(&self.run.stdout),
+                windows_init_bytes(&self.run.stderr),
+            ) else {
+                return false;
+            };
+            parse_init_probe_output(&left, &right, self.run.child_exit)
+                .is_ok_and(|e| e.outcome != InitProbeOutcome::Indeterminate)
+        }
+
+        fn gates_verified(&self, record: &Session0DiagnosticRecord) -> bool {
+            let run = &self.run;
+            record.session_id == 0
+                && !record.worker_actions_sid.is_empty()
+                && record.station_ace
+                    == format!(
+                        "count=1;flags=0;mask=0x{:08x}",
+                        record.requested_station_mask
+                    )
+                && record.station_cleanup == "removed"
+                && run.spawn_succeeded
+                && run.lifecycle == 15
+                && run.observations_verified(record.requested_station_mask)
+                && run.stderr.is_empty()
+                && run.spawn_error.is_empty()
+                && self.output_eof
+                && self.deadline_met
+                && run.child_exit.is_some()
+        }
+
+        fn validate(&self, record: &Session0DiagnosticRecord) -> Result<(), String> {
+            let pair = record
+                .subsystem_probes
+                .as_ref()
+                .ok_or("WINDOWS初期化診断にはsubsystem対照が必要です")?;
+            let parent = Path::new(&pair[0].path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            let run = &self.run;
+            if self.path != format!("{parent}\\{}", Session0ProbeKind::WindowsInit.basename())
+                || self.sha256.len() != 64
+                || !self
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                || (!run.spawn_succeeded
+                    && (run.child_exit.is_some()
+                        || !run.stdout.is_empty()
+                        || !run.stderr.is_empty()))
+                || (run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe
+                        || run.creation_flags != 0x0008_0404
+                        || run.lifecycle & 1 == 0))
+                || (run.lifecycle & 1 != 0
+                    && !run
+                        .target_desktop
+                        .starts_with(&format!("{}\\sbz-", record.station)))
+                || (!run.target_desktop.is_empty()
+                    && [&record.baseline, &record.no_window]
+                        .into_iter()
+                        .chain(record.init_probe.iter().map(|p| &p.run))
+                        .chain(record.entry_probe.iter().map(|p| &p.run))
+                        .chain(record.terminate_probe.iter().map(|p| &p.run))
+                        .chain(pair.iter().map(|p| &p.run))
+                        .any(|r| r.target_desktop == run.target_desktop))
+                || (self.output_eof && !run.spawn_succeeded)
+                || (self.deadline_met && (!run.spawn_succeeded || run.child_exit.is_none()))
+                || self.evidence != windows_init_run_evidence(run)
+            {
+                return Err("WINDOWS初期化診断の固定組・実行契約・段階証拠が一致しません".into());
+            }
+            windows_init_bytes(&run.stdout)?;
+            windows_init_bytes(&run.stderr)?;
+            Ok(())
+        }
+
+        fn encode_into(&self, payload: &mut Writer, mask: u32) -> Result<(), String> {
+            write_text(payload, &self.path)?;
+            write_text(payload, &self.sha256)?;
+            self.run.encode_into(payload, mask)?;
+            write_text(payload, &self.properties())?;
+            payload.bool(self.output_eof);
+            payload.bool(self.deadline_met);
+            Ok(())
+        }
+    }
+
+    fn snapshot_windows_init_output(
+        probe: &mut Session0WindowsInitProbeRecord,
+        left: &[u8],
+        right: &[u8],
+    ) {
+        probe.run.stdout = diagnostic_hex(left);
+        probe.run.stderr = diagnostic_hex(right);
+        probe.evidence = windows_init_run_evidence(&probe.run);
+    }
+
+    // 保存先を起動前に作り、途中の失敗でも先行runの観測を置き換えない。
+    fn collect_session0_windows_init_run(
+        record: &mut Session0DiagnosticRecord,
+        config: &Session0DiagnosticConfig,
+        command: &RestrictedCommand,
+        execute: impl FnOnce(
+            &mut Session0WindowsInitProbeRecord,
+            &RestrictedCommand,
+        ) -> Result<(), String>,
+    ) -> Result<(), Session0DiagnosticFailureStage> {
+        let mut run = Session0DiagnosticRun::empty();
+        run.stdout.clear();
+        run.stderr.clear();
+        record.windows_init_probe = Some(Session0WindowsInitProbeRecord {
+            path: config
+                .fixture_root
+                .join(Session0ProbeKind::WindowsInit.basename())
+                .to_string_lossy()
+                .into_owned(),
+            sha256: config.windows_init_probe_sha256.as_ref().unwrap().clone(),
+            evidence: windows_init_run_evidence(&run),
+            run,
+            output_eof: false,
+            deadline_met: false,
+        });
+        let probe = record.windows_init_probe.as_mut().unwrap();
+        let command = RestrictedCommand {
+            application: PathBuf::from(&probe.path),
+            arguments: Vec::new(),
+            cwd: command.cwd.clone(),
+            environment: command.environment.clone(),
+        };
+        if let Err(error) = execute(probe, &command) {
+            probe.run.spawn_error.push_str(&error);
+            probe.evidence = windows_init_run_evidence(&probe.run);
+            return Err(Session0DiagnosticFailureStage::Runtime);
+        }
+        Ok(())
+    }
+
+    fn run_session0_windows_init_child(
+        action: &ActionToken,
+        command: &RestrictedCommand,
+        probe: &mut Session0WindowsInitProbeRecord,
+    ) -> Result<(), String> {
+        let mut process = match RestrictedProcess::spawn_for_session0_diagnostic(
+            action,
+            command,
+            TestCreationProfile::Production,
+            &mut probe.run,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                probe.run.spawn_error = format!("spawn: {error}");
+                probe.run.observe_desktop_release();
+                return Ok(());
+            }
+        };
+        probe.run.spawn_succeeded = true;
+        probe.run.job_ui_restrictions = process
+            .job()
+            .ui_restrictions_for_test()
+            .map_err(|e| format!("Job照会失敗: {e}"))?;
+        probe.run.job_ui_limits = describe_job_ui_limits(probe.run.job_ui_restrictions);
+        if probe.run.job_ui_restrictions != 0xfe {
+            return Err("WINDOWS初期化診断のJob制限が一致しません".into());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let mut output = process
+            .take_output()
+            .ok()
+            .map(|(left, right)| (left.take(4097), right.take(4097)));
+        let start = std::time::Instant::now();
+        let observed = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    async {
+                        let exit = observe_session0_child_exit(&process).await?;
+                        probe.run.child_exit = Some(exit);
+                        probe.deadline_met = start.elapsed() <= std::time::Duration::from_secs(10);
+                        Ok::<(), io::Error>(())
+                    },
+                    async {
+                        if let Some((stdout, stderr)) = output.as_mut() {
+                            let result = tokio::join!(
+                                stdout.read_to_end(&mut left),
+                                stderr.read_to_end(&mut right)
+                            );
+                            probe.output_eof = matches!(result, (Ok(_), Ok(_)))
+                                && left.len() <= 4096
+                                && right.len() <= 4096;
+                        }
+                    }
+                )
+            })
+            .await
+        });
+        if !matches!(observed, Ok((Ok(()), ()))) {
+            probe
+                .run
+                .spawn_error
+                .push_str("wait: deadline-exceeded-or-query-failed");
+            process.terminate();
+        }
+        // 出力と終了値の保存は、失敗・キャンセルし得る回収awaitより先に行う。
+        snapshot_windows_init_output(probe, &left, &right);
+        let job = Arc::clone(&process.job);
+        let cleanup = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                preserve_session0_exit_before_cleanup(
+                    &mut probe.run,
+                    observe_session0_child_exit(&process),
+                    async move {
+                        tokio::task::spawn_blocking(move || job.terminate_and_wait())
+                            .await
+                            .map_err(|_| io::Error::other("診断のJob回収タスクが失敗しました"))?
+                    },
+                ),
+            )
+            .await
+        });
+        if matches!(cleanup, Ok(Ok(()))) {
+            process.tree_finished = true;
+            process.process.take();
+            probe.run.lifecycle |= 4;
+            if !probe.output_eof
+                && let Some((stdout, stderr)) = output.as_mut()
+            {
+                let result = runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        tokio::join!(
+                            stdout.read_to_end(&mut left),
+                            stderr.read_to_end(&mut right)
+                        )
+                    })
+                    .await
+                });
+                probe.output_eof = matches!(result, Ok((Ok(_), Ok(_))))
+                    && left.len() <= 4096
+                    && right.len() <= 4096;
+            }
+        } else {
+            probe
+                .run
+                .spawn_error
+                .push_str(&format!(";tree_cleanup:{cleanup:?}"));
+        }
+        if !probe.output_eof {
+            probe.run.spawn_error.push_str(";output_eof_unconfirmed");
+        }
+        drop(output);
+        drop(process);
+        probe.run.observe_desktop_release();
+        snapshot_windows_init_output(probe, &left, &right);
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        Ok(())
+    }
+
+    fn session0_windows_init_record_corpus() -> Vec<Session0DiagnosticCase> {
+        let mut cases = Vec::new();
+        for base_case in session0_subsystem_record_corpus()
+            .into_iter()
+            .filter(|c| c.name == "subsystem-observed")
+            .step_by(2)
+        {
+            let base = base_case.expected.unwrap();
+            let full = concat!(
+                "SBZ_INIT_PROBE_V1 entry\n",
+                "SBZ_INIT_PROBE_V1 user32_preloaded=0\n",
+                "SBZ_INIT_PROBE_V1 user32_load_begin\n",
+                "SBZ_INIT_PROBE_V1 user32_load_result=1 gle=0x000036b7\n",
+                "SBZ_INIT_PROBE_V1 complete\n"
+            );
+            let mut run = base.baseline.clone();
+            run.target_desktop = format!("{}\\sbz-windows-init", base.station);
+            run.child_exit = Some(0);
+            run.stdout = diagnostic_hex(full.as_bytes());
+            run.stderr.clear();
+            let probe = Session0WindowsInitProbeRecord {
+                path: r"C:\fixture\SbzSession0WindowsInitProbe.exe".into(),
+                sha256: "6".repeat(64),
+                evidence: windows_init_run_evidence(&run),
+                run,
+                output_eof: true,
+                deadline_met: true,
+            };
+            // 旧Initの全段階・途中・終了値反例を新領域にも使う。旧期待値は書き換えない。
+            for input in session0_init_probe_corpus() {
+                let mut record = base.clone();
+                let mut probe = probe.clone();
+                probe.run.stdout = diagnostic_hex(&input.stdout);
+                probe.run.stderr = diagnostic_hex(&input.stderr);
+                probe.run.child_exit = input.child_exit;
+                probe.deadline_met = input.child_exit.is_some();
+                probe.evidence = windows_init_run_evidence(&probe.run);
+                record.windows_init_probe = Some(probe.clone());
+                cases.push(Session0DiagnosticCase {
+                    name: "windows-init-stage-corpus",
+                    bytes: record.encode().unwrap(),
+                    nonce: record.nonce.clone(),
+                    expected_mask: record.requested_station_mask,
+                    expected_init: base_case.expected_init.clone(),
+                    expected_entry: base_case.expected_entry.clone(),
+                    expected_terminate: base_case.expected_terminate.clone(),
+                    expected_subsystem: base_case.expected_subsystem.clone(),
+                    expected_windows_init: Some((probe.path, probe.sha256)),
+                    expected: Some(record),
+                });
+            }
+            for name in [
+                "windows-init-complete",
+                "windows-init-nonce",
+                "windows-init-mask",
+                "windows-init-path",
+                "windows-init-hash",
+                "windows-init-role",
+                "windows-init-other-root",
+                "windows-init-duplicate-desktop",
+                "windows-init-default",
+                "windows-init-job",
+                "windows-init-flags",
+                "windows-init-evidence",
+                "windows-init-column-exit",
+                "windows-init-partial",
+                "windows-init-abnormal-exit",
+                "windows-init-timeout",
+                "windows-init-cleanup-error",
+                "windows-init-desktop-error",
+                "windows-init-station-error",
+                "windows-init-no-eof",
+                "windows-init-stderr",
+                "windows-init-raw-invalid",
+                "windows-init-no-exit",
+                "windows-init-missing",
+                "windows-init-unsolicited",
+                "windows-init-bool",
+                "windows-init-trailing",
+            ] {
+                let mut parent = base.clone();
+                let mut changed = probe.clone();
+                let mut nonce = base.nonce.clone();
+                let mut mask = base.requested_station_mask;
+                let mut expected = (probe.path.clone(), probe.sha256.clone());
+                let accepted = match name {
+                    "windows-init-nonce" => {
+                        nonce = "f".repeat(32);
+                        false
+                    }
+                    "windows-init-mask" => {
+                        mask = if mask == 2 { 0x22 } else { 2 };
+                        false
+                    }
+                    "windows-init-path" => {
+                        expected.0 = expected.0.to_uppercase();
+                        false
+                    }
+                    "windows-init-hash" => {
+                        expected.1 = "7".repeat(64);
+                        false
+                    }
+                    "windows-init-role" => {
+                        changed.path = base.init_probe.as_ref().unwrap().path.clone();
+                        expected.0 = changed.path.clone();
+                        false
+                    }
+                    "windows-init-other-root" => {
+                        changed.path = changed.path.replace("fixture", "other");
+                        expected.0 = changed.path.clone();
+                        false
+                    }
+                    "windows-init-duplicate-desktop" => {
+                        changed.run.target_desktop = base.subsystem_probes.as_ref().unwrap()[1]
+                            .run
+                            .target_desktop
+                            .clone();
+                        false
+                    }
+                    "windows-init-default" => {
+                        changed.run.target_desktop = format!("{}\\Default", base.station);
+                        false
+                    }
+                    "windows-init-job" => {
+                        changed.run.job_ui_restrictions = 0;
+                        changed.run.job_ui_limits = describe_job_ui_limits(0);
+                        false
+                    }
+                    "windows-init-flags" => {
+                        changed.run.creation_flags = 0x0808_0404;
+                        false
+                    }
+                    "windows-init-column-exit" => {
+                        changed.run.child_exit = Some(11);
+                        true
+                    }
+                    "windows-init-partial" => {
+                        changed.run.stdout=diagnostic_hex(b"SBZ_INIT_PROBE_V1 entry\nSBZ_INIT_PROBE_V1 user32_preloaded=0\nSBZ_INIT_PROBE_V1 user32_load_begin\nSBZ_INIT");
+                        changed.run.child_exit = Some(13);
+                        true
+                    }
+                    "windows-init-abnormal-exit" => {
+                        changed.run.child_exit = Some(0xc000_0005);
+                        true
+                    }
+                    "windows-init-timeout" => {
+                        changed.run.spawn_error = "wait: deadline-exceeded".into();
+                        changed.deadline_met = false;
+                        changed.output_eof = false;
+                        changed.run.lifecycle = 3;
+                        true
+                    }
+                    "windows-init-cleanup-error" => {
+                        changed.run.spawn_error = ";tree_cleanup:failure".into();
+                        changed.run.lifecycle = 3;
+                        true
+                    }
+                    "windows-init-desktop-error" => {
+                        changed.run.spawn_error = ";desktop_cleanup:gle=5".into();
+                        changed.run.lifecycle = 7;
+                        true
+                    }
+                    "windows-init-station-error" => {
+                        parent.station_cleanup = "unconfirmed".into();
+                        parent.classification = Session0DiagnosticOutcome::Indeterminate;
+                        true
+                    }
+                    "windows-init-no-eof" => {
+                        changed.output_eof = false;
+                        true
+                    }
+                    "windows-init-stderr" => {
+                        changed.run.stderr = "ff".into();
+                        true
+                    }
+                    "windows-init-raw-invalid" => {
+                        changed.run.stdout = "ff00".into();
+                        true
+                    }
+                    "windows-init-no-exit" => {
+                        changed.run.child_exit = None;
+                        changed.deadline_met = false;
+                        true
+                    }
+                    "windows-init-evidence"
+                    | "windows-init-missing"
+                    | "windows-init-unsolicited"
+                    | "windows-init-bool"
+                    | "windows-init-trailing" => false,
+                    _ => true,
+                };
+                changed.evidence = windows_init_run_evidence(&changed.run);
+                if name == "windows-init-evidence" {
+                    changed.evidence = None;
+                }
+                let mut bytes = parent.encode().unwrap();
+                if name != "windows-init-missing" {
+                    let mut payload = Writer::new();
+                    changed
+                        .encode_into(&mut payload, parent.requested_station_mask)
+                        .unwrap();
+                    bytes.extend(payload.into_bytes());
+                }
+                bytes[4..8].copy_from_slice(&13u32.to_le_bytes());
+                if name == "windows-init-bool" {
+                    let n = bytes.len();
+                    bytes[n - 1] = 2;
+                }
+                if name == "windows-init-trailing" {
+                    bytes.push(0);
+                }
+                let length = (bytes.len() - 44) as u32;
+                bytes[40..44].copy_from_slice(&length.to_le_bytes());
+                parent.windows_init_probe = Some(changed);
+                cases.push(Session0DiagnosticCase {
+                    name,
+                    bytes,
+                    nonce,
+                    expected_mask: mask,
+                    expected_init: base_case.expected_init.clone(),
+                    expected_entry: base_case.expected_entry.clone(),
+                    expected_terminate: base_case.expected_terminate.clone(),
+                    expected_subsystem: base_case.expected_subsystem.clone(),
+                    expected_windows_init: if name == "windows-init-unsolicited" {
+                        None
+                    } else {
+                        Some(expected)
+                    },
+                    expected: accepted.then_some(parent),
+                });
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn session0_windows_init_observation_gates_and_retention() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for case in session0_windows_init_record_corpus() {
+            if let Some(record) = case.expected {
+                let probe = record.windows_init_probe.as_ref().unwrap();
+                assert_ne!(
+                    record.classification,
+                    Session0DiagnosticOutcome::ActionStarts
+                );
+                if case.name == "windows-init-complete" {
+                    assert!(probe.sequence_verified());
+                    assert!(probe.gates_verified(&record));
+                    assert_eq!(probe.evidence.as_ref().unwrap().gle, Some(0x36b7));
+                    // 回収が失敗/キャンセルされても、取得した出力・段階・終了値を保存する。
+                    for timeout in [false, true] {
+                        let mut saved = probe.clone();
+                        saved.run.lifecycle = 3;
+                        let left = windows_init_bytes(&saved.run.stdout).unwrap();
+                        snapshot_windows_init_output(&mut saved, &left, &[]);
+                        let result = runtime.block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_millis(10),
+                                preserve_session0_exit_before_cleanup(
+                                    &mut saved.run,
+                                    async { panic!("取得済み終了値の再取得は禁止") },
+                                    async {
+                                        if timeout {
+                                            std::future::pending::<()>().await;
+                                        }
+                                        Err(io::Error::other("回収失敗の反例"))
+                                    },
+                                ),
+                            )
+                            .await
+                        });
+                        assert!(!matches!(result, Ok(Ok(()))));
+                        assert_eq!(saved.run.child_exit, Some(0));
+                        assert_eq!(saved.run.stdout, probe.run.stdout);
+                        assert_eq!(
+                            saved.evidence.as_ref().unwrap().stage,
+                            InitProbeStage::Complete
+                        );
+                    }
+                }
+                if case.name == "windows-init-partial" {
+                    assert_eq!(
+                        probe.evidence.as_ref().unwrap().stage,
+                        InitProbeStage::LoadBegin
+                    );
+                    assert!(!probe.sequence_verified());
+                }
+                if matches!(
+                    case.name,
+                    "windows-init-column-exit"
+                        | "windows-init-abnormal-exit"
+                        | "windows-init-raw-invalid"
+                ) {
+                    assert!(!probe.sequence_verified());
+                }
+                if matches!(
+                    case.name,
+                    "windows-init-timeout"
+                        | "windows-init-cleanup-error"
+                        | "windows-init-no-exit"
+                        | "windows-init-no-eof"
+                        | "windows-init-station-error"
+                        | "windows-init-desktop-error"
+                ) {
+                    assert!(!probe.gates_verified(&record));
+                }
+                if case.name == "windows-init-complete" {
+                    for index in 0..8 {
+                        for bits in [3, 7, 11, 15] {
+                            let mut candidate = record.clone();
+                            let run = match index {
+                                0 => &mut candidate.baseline,
+                                1 => &mut candidate.no_window,
+                                2 => &mut candidate.init_probe.as_mut().unwrap().run,
+                                3 => &mut candidate.entry_probe.as_mut().unwrap().run,
+                                4 => &mut candidate.terminate_probe.as_mut().unwrap().run,
+                                5 | 6 => {
+                                    &mut candidate.subsystem_probes.as_mut().unwrap()[index - 5].run
+                                }
+                                _ => &mut candidate.windows_init_probe.as_mut().unwrap().run,
+                            };
+                            run.lifecycle = bits;
+                            let confirmed = session0_windows_init_resources_finished(&candidate);
+                            assert_eq!(confirmed, bits & 12 == 12);
+                            let owned = Arc::new(());
+                            let mut retained = Session0RetainedResources(Some(Arc::clone(&owned)));
+                            retained.release_if_confirmed(confirmed);
+                            drop(retained);
+                            assert_eq!(Arc::strong_count(&owned), if confirmed { 1 } else { 2 });
+                        }
+                    }
+                    let mut argv = session0_argv_corpus()
+                        .into_iter()
+                        .find(|(a, ok)| a.len() == 16 && *ok)
+                        .unwrap()
+                        .0;
+                    argv.push("6".repeat(64).into());
+                    let config = validate_window_station_scm_process_argv(&argv).unwrap();
+                    let mut parent = record.clone();
+                    let before = parent.clone();
+                    let result = collect_session0_windows_init_run(
+                        &mut parent,
+                        &config,
+                        &RestrictedCommand::new("unused.exe", r"C:\fixture"),
+                        |target, cmd| {
+                            assert_eq!(
+                                cmd.application,
+                                config
+                                    .fixture_root
+                                    .join(Session0ProbeKind::WindowsInit.basename())
+                            );
+                            assert!(cmd.arguments.is_empty());
+                            *target = probe.clone();
+                            Err("追加run後の失敗".into())
+                        },
+                    );
+                    assert!(result.is_err());
+                    assert_eq!(parent.baseline, before.baseline);
+                    assert_eq!(parent.init_probe, before.init_probe);
+                    assert_eq!(parent.entry_probe, before.entry_probe);
+                    assert_eq!(parent.terminate_probe, before.terminate_probe);
+                    assert_eq!(parent.subsystem_probes, before.subsystem_probes);
+                    assert_eq!(
+                        parent.windows_init_probe.as_ref().unwrap().run.child_exit,
+                        Some(0)
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "WINDOWS_INIT: 両mask/段階/非0GLE/異常終了/出力バイト列/回収前保存/先行観測/終了未確認保持を確認"
+        );
+    }
+
     fn validate_session0_subsystem(record: &Session0DiagnosticRecord) -> Result<(), String> {
         if let Some(probes) = &record.subsystem_probes {
             let terminate = record
@@ -7610,6 +8362,17 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 .subsystem_probes
                 .as_ref()
                 .is_some_and(|pair| pair.iter().all(|p| p.run.lifecycle & 12 == 12))
+    }
+
+    fn session0_windows_init_resources_finished(record: &Session0DiagnosticRecord) -> bool {
+        session0_subsystem_resources_finished(record)
+            && record
+                .windows_init_probe
+                .as_ref()
+                .is_some_and(|p| p.run.lifecycle & 12 == 12)
+            && [&record.baseline, &record.no_window]
+                .iter()
+                .all(|r| r.lifecycle & 12 == 12)
     }
 
     // 終了を確認できない経路では、保持資源をworker終了まで解放しない。
@@ -7767,6 +8530,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         entry_probe: Option<Session0EntryProbeRecord>,
         terminate_probe: Option<Session0TerminateProbeRecord>,
         subsystem_probes: Option<[Session0TerminateProbeRecord; 2]>,
+        windows_init_probe: Option<Session0WindowsInitProbeRecord>,
     }
 
     impl Session0DiagnosticRecord {
@@ -7840,7 +8604,8 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 init_probe: None,
                 entry_probe: None,
         terminate_probe: None,
-        subsystem_probes: None,
+                subsystem_probes: None,
+                windows_init_probe: None,
             }
         }
 
@@ -7981,13 +8746,19 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                     probe.encode_into(&mut payload, self.requested_station_mask)?;
                 }
             }
+            if let Some(probe) = &self.windows_init_probe {
+                probe.validate(self)?;
+                probe.encode_into(&mut payload, self.requested_station_mask)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
             let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
-            let version = if self.subsystem_probes.is_some() {
+            let version = if self.windows_init_probe.is_some() {
+                13
+            } else if self.subsystem_probes.is_some() {
                 SESSION0_SUBSYSTEM_DIAGNOSTIC_VERSION
             } else if self.terminate_probe.is_some() {
                 SESSION0_TERMINATE_DIAGNOSTIC_VERSION
@@ -8010,8 +8781,12 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             expected_init: Option<(&str, &str)>,
             expected_entry: Option<(&str, &str)>,
             expected_terminate: Option<(&str, &str)>,
-            expected_subsystem: Option<[(&str, &str); 2]>,
+            expected_probes: Session0ExpectedProbes<'_>,
         ) -> Result<Self, String> {
+            let Session0ExpectedProbes {
+                subsystem: expected_subsystem,
+                windows_init: expected_windows_init,
+            } = expected_probes;
             validate_nonce(expected_nonce)?;
             diagnostic_station_profile(expected_mask)?;
             if bytes.len() < 44 || bytes.len() > 44 + Self::MAX_BYTES {
@@ -8022,7 +8797,9 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             };
             if u32_at(0) != SESSION0_DIAGNOSTIC_MAGIC
                 || u32_at(4)
-                    != if expected_subsystem.is_some() {
+                    != if expected_windows_init.is_some() {
+                        13
+                    } else if expected_subsystem.is_some() {
                         SESSION0_SUBSYSTEM_DIAGNOSTIC_VERSION
                     } else if expected_terminate.is_some() {
                         SESSION0_TERMINATE_DIAGNOSTIC_VERSION
@@ -8144,6 +8921,32 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
             } else {
                 None
             };
+            let windows_init_probe =
+                if let Some((expected_path, expected_hash)) = expected_windows_init {
+                    let path = read_text(&mut reader)?;
+                    let sha256 = read_text(&mut reader)?;
+                    if path != expected_path || sha256 != expected_hash {
+                        return Err(
+                            "WINDOWS初期化診断のpath・hashが呼出側の期待値と一致しません".into(),
+                        );
+                    }
+                    let run = Session0DiagnosticRun::decode_from(&mut reader)?;
+                    let properties = read_text(&mut reader)?;
+                    let probe = Session0WindowsInitProbeRecord {
+                        path,
+                        sha256,
+                        evidence: windows_init_run_evidence(&run),
+                        run,
+                        output_eof: read_strict_bool(&mut reader)?,
+                        deadline_met: read_strict_bool(&mut reader)?,
+                    };
+                    if properties != probe.properties() {
+                        return Err("WINDOWS初期化診断の段階証拠が出力と一致しません".into());
+                    }
+                    Some(probe)
+                } else {
+                    None
+                };
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -8174,6 +8977,7 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
                 entry_probe,
                 terminate_probe,
                 subsystem_probes,
+                windows_init_probe,
             };
             record.encode().map(|_| record)
         }
@@ -8275,17 +9079,15 @@ steps=[station:maximum_allowed:mask=0x02000000;allowed=false;gle=5]"
     fn require_connected_session0_request(
         config: &Session0DiagnosticConfig,
     ) -> Result<(), &'static str> {
-        // 実行・独立記録・回収が揃うまで、新要求は設定登録とdispatcherより前に拒否する。
-        if config.windows_init_probe_sha256.is_some() {
-            if config.init_probe_sha256.is_none()
+        // 設定登録とdispatcherより前に、診断の依存関係を検証する。
+        if config.windows_init_probe_sha256.is_some()
+            && (config.init_probe_sha256.is_none()
                 || config.entry_probe_sha256.is_none()
                 || config.terminate_probe_sha256.is_none()
                 || config.console_probe_sha256.is_none()
-                || config.windows_probe_sha256.is_none()
-            {
-                return Err("WINDOWS初期化診断には先行5診断が必要です");
-            }
-            return Err("WINDOWS初期化診断の実行・独立記録・回収は未接続です");
+                || config.windows_probe_sha256.is_none())
+        {
+            return Err("WINDOWS初期化診断には先行5診断が必要です");
         }
         if (config.console_probe_sha256.is_some() || config.windows_probe_sha256.is_some())
             && (config.console_probe_sha256.is_none()
@@ -9081,6 +9883,7 @@ privileges={privileges:?}{restricted}",
             entry_probe: None,
             terminate_probe: None,
             subsystem_probes: None,
+            windows_init_probe: None,
         };
         let lease = match ActionStationLease::acquire_for_diagnostic(config.station_profile) {
             Ok(lease) => Arc::new(lease),
@@ -9245,7 +10048,11 @@ privileges={privileges:?}{restricted}",
                 Session0ProbeKind::Terminate,
                 Session0ProbeKind::Console,
                 Session0ProbeKind::Windows,
+                Session0ProbeKind::WindowsInit,
             ] {
+                if kind.expected_hash(config).is_none() {
+                    continue;
+                }
                 files.push(
                     hold_session0_probe(config, kind)
                         .map_err(|_| Session0DiagnosticFailureStage::Runtime)?
@@ -9399,9 +10206,18 @@ privileges={privileges:?}{restricted}",
                     run_session0_terminate_child(&action, command)
                 })?;
             }
+            if config.windows_init_probe_sha256.is_some() {
+                collect_session0_windows_init_run(record, config, &command, |probe, command| {
+                    run_session0_windows_init_child(&action, command, probe)
+                })?;
+            }
             Ok(())
         })();
-        subsystem_hold.release_if_confirmed(session0_subsystem_resources_finished(record));
+        subsystem_hold.release_if_confirmed(if config.windows_init_probe_sha256.is_some() {
+            session0_windows_init_resources_finished(record)
+        } else {
+            session0_subsystem_resources_finished(record)
+        });
         cleanup_session0_diagnostic_scratch(
             scratch.path(),
             &config.record_directory,
