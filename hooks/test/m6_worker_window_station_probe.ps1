@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$ArtifactPath,
     [string]$ExpectedSha256,
     [string]$StationMask = '0x0002',
