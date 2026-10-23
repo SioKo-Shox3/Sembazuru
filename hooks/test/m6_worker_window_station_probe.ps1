@@ -2301,15 +2301,6 @@ try {
         $scratchCleanupFailureMagic = 'scratch-cleanup'
         $runtimeFailureMagic = 'runtime'
     }
-    if ($WindowsStartupProbePath -and $null -ne $diagnosticRecordPath -and [IO.File]::Exists($diagnosticRecordPath)) {
-        $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
-            $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash `
-            $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash $windowsInitProbe.Path $windowsInitProbe.Hash $windowsStartupProbe.Path $windowsStartupProbe.Hash
-    }
-    if ($failureStages.ContainsKey($status.ServiceSpecificExitCode)) {
-        throw ('Session 0 diagnostic harness failure stage={0} service=0x{1:x8}' -f
-            $failureStages[$status.ServiceSpecificExitCode], $status.ServiceSpecificExitCode)
-    }
     if ($null -eq $diagnosticRecordPath -or -not [IO.File]::Exists($diagnosticRecordPath)) {
         throw 'Session 0 diagnostic record is missing.'
     }
@@ -2322,14 +2313,16 @@ try {
         3 = @{ Name = 'INDETERMINATE'; Magic = $indeterminateMagic }
         4 = @{ Name = 'ACTION_STARTS'; Magic = $actionStartsMagic }
     }
-    if (-not $classificationMap.ContainsKey([int]$record.Classification)) {
-        throw '診断の分類が不正です。'
+    if (-not $failureStages.ContainsKey($status.ServiceSpecificExitCode)) {
+        if (-not $classificationMap.ContainsKey([int]$record.Classification)) {
+            throw '診断の分類が不正です。'
+        }
+        $classification = $classificationMap[[int]$record.Classification]
+        if ($status.ServiceSpecificExitCode -ne $classification.Magic) {
+            throw 'SCM diagnostic outcome magic disagrees with the bounded record.'
+        }
+        $diagnosticClassification = $classification.Name
     }
-    $classification = $classificationMap[[int]$record.Classification]
-    if ($status.ServiceSpecificExitCode -ne $classification.Magic) {
-        throw 'SCM diagnostic outcome magic disagrees with the bounded record.'
-    }
-    $diagnosticClassification = $classification.Name
     $detail = [Collections.Generic.List[string]]::new()
     $detail.Add(('RequestedStationMask=0x{0:x8}' -f $record.RequestedStationMask))
     $detail.Add(('service=0x{0:x8} session={1} markers=0x{2:x2}' -f
@@ -2395,6 +2388,12 @@ try {
         }
     }
     $diagnosticDetail = $detail -join ' '
+    if ($failureStages.ContainsKey($status.ServiceSpecificExitCode)) {
+        # 照合済みの有界raw・取得exitを、回収でrecordを消す前にログへ残す。
+        Write-Host "Session0FailureDetail: $diagnosticDetail"
+        throw ('Session 0 診断ハーネスが失敗しました: stage={0} service=0x{1:x8}' -f
+            $failureStages[$status.ServiceSpecificExitCode], $status.ServiceSpecificExitCode)
+    }
     if ($EntryProbePath) { Assert-Session0EntryGates $record $diagnosticDetail }
     if ($TerminateProbePath) { Assert-Session0TerminateGates $record $diagnosticDetail }
     if ($ConsoleProbePath) { Assert-Session0SubsystemGates $record 'Console' $diagnosticDetail; Assert-Session0SubsystemGates $record 'Windows' $diagnosticDetail }
