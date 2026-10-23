@@ -128,6 +128,17 @@ jobs:
           )
           $expectedWin32uInitBuildSha256 = (Get-FileHash -LiteralPath $win32uInitBuildPath -Algorithm SHA256).Hash
           $expectedWin32uInitSourceSha256 = (Get-FileHash -LiteralPath $win32uInitSourcePath -Algorithm SHA256).Hash
+          $win32uUser32BuildPath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_win32u_user32_probe.ps1')
+          )
+          $win32uUser32SourcePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_win32u_user32_probe.cpp')
+          )
+          $win32uUser32ProbePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE '.harness/T-011-N40-win32u-user32-probe/session0_win32u_user32_probe.exe')
+          )
+          $expectedWin32uUser32BuildSha256 = (Get-FileHash -LiteralPath $win32uUser32BuildPath -Algorithm SHA256).Hash
+          $expectedWin32uUser32SourceSha256 = (Get-FileHash -LiteralPath $win32uUser32SourcePath -Algorithm SHA256).Hash
           & rustup toolchain install 1.97.0 --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain の導入に失敗しました。' }
           $artifacts = @(& cargo +1.97.0 test -p sembazuru-worker --lib --locked --no-run --message-format=json)
@@ -149,6 +160,23 @@ jobs:
           using System.Runtime.InteropServices;
           using System.Text;
           public static class Session0BootstrapNative {
+              [StructLayout(LayoutKind.Sequential)]
+              public struct FileInformation {
+                  public uint Attributes;
+                  public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+                  public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+                  public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+                  public uint VolumeSerialNumber;
+                  public uint FileSizeHigh;
+                  public uint FileSizeLow;
+                  public uint LinkCount;
+                  public uint FileIndexHigh;
+                  public uint FileIndexLow;
+              }
+              [DllImport("kernel32.dll", SetLastError = true)]
+              [return: MarshalAs(UnmanagedType.Bool)]
+              public static extern bool GetFileInformationByHandle(
+                  IntPtr handle, out FileInformation information);
               [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
               public static extern uint GetFinalPathNameByHandleW(
                   IntPtr handle, StringBuilder path, uint length, uint flags);
@@ -159,6 +187,13 @@ jobs:
                   $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
               )
               try {
+                  $information = [Session0BootstrapNative+FileInformation]::new()
+                  if (-not [Session0BootstrapNative]::GetFileInformationByHandle(
+                      $stream.SafeFileHandle.DangerousGetHandle(), [ref]$information
+                  )) { throw '診断入力の実体情報を取得できません。' }
+                  if (($information.Attributes -band [uint32]0x410) -ne 0 -or $information.LinkCount -ne 1) {
+                      throw '診断入力には通常の非reparse単一linkファイルが必要です。'
+                  }
                   $finalPath = [Text.StringBuilder]::new(32768)
                   $length = [Session0BootstrapNative]::GetFinalPathNameByHandleW(
                       $stream.SafeFileHandle.DangerousGetHandle(), $finalPath, $finalPath.Capacity, 0
@@ -200,6 +235,8 @@ jobs:
           $gdi32InitSourceInput = $null
           $win32uInitBuildInput = $null
           $win32uInitSourceInput = $null
+          $win32uUser32BuildInput = $null
+          $win32uUser32SourceInput = $null
           try {
               $probeInput = Open-VerifiedInput $probePath $expectedProbeSha256
               $initBuildInput = Open-VerifiedInput $initBuildPath $expectedInitBuildSha256
@@ -216,6 +253,8 @@ jobs:
               $gdi32InitSourceInput = Open-VerifiedInput $gdi32InitSourcePath $expectedGdi32InitSourceSha256
               $win32uInitBuildInput = Open-VerifiedInput $win32uInitBuildPath $expectedWin32uInitBuildSha256
               $win32uInitSourceInput = Open-VerifiedInput $win32uInitSourcePath $expectedWin32uInitSourceSha256
+              $win32uUser32BuildInput = Open-VerifiedInput $win32uUser32BuildPath $expectedWin32uUser32BuildSha256
+              $win32uUser32SourceInput = Open-VerifiedInput $win32uUser32SourcePath $expectedWin32uUser32SourceSha256
               $initBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($initBuildInput.Bytes)
               $tokens = $null
               $parseErrors = $null
@@ -303,6 +342,19 @@ jobs:
               & ($win32uInitBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw 'WIN32U 明示ロード診断 EXE のビルドに失敗しました。' }
               $expectedWin32uInitProbeSha256 = (Get-FileHash -LiteralPath $win32uInitProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              # WIN32U 先行 USER32 診断は保持済みの専用 C++ と PS バイト列から生成する。
+              $win32uUser32BuildText = [Text.UTF8Encoding]::new($false, $true).GetString($win32uUser32BuildInput.Bytes)
+              $tokens = $null
+              $parseErrors = $null
+              $win32uUser32BuildAst = [Management.Automation.Language.Parser]::ParseInput(
+                  $win32uUser32BuildText, $win32uUser32BuildPath, [ref]$tokens, [ref]$parseErrors
+              )
+              if ($parseErrors.Count -ne 0) { throw 'WIN32U 先行 USER32 診断のビルドスクリプトに構文エラーがあります。' }
+              & ($win32uUser32BuildAst.GetScriptBlock()) -BuildOnly
+              if ($LASTEXITCODE -ne 0) { throw 'WIN32U 先行 USER32 診断 EXE のビルドに失敗しました。' }
+              $expectedWin32uUser32ProbeSha256 = (Get-FileHash -LiteralPath $win32uUser32ProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              Write-Host ('commit={0} requested_station_mask={1} verified_win32u_user32_build_sha256={2} verified_win32u_user32_source_sha256={3}' -f
+                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $win32uUser32BuildInput.Sha256, $win32uUser32SourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_win32u_init_build_sha256={2} verified_win32u_init_source_sha256={3}' -f
                   $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $win32uInitBuildInput.Sha256, $win32uInitSourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_gdi32_init_build_sha256={2} verified_gdi32_init_source_sha256={3}' -f
@@ -334,7 +386,8 @@ jobs:
                   @('windows_init_probe', $windowsInitProbePath, $expectedWindowsInitProbeSha256),
                   @('windows_startup_probe', $windowsStartupProbePath, $expectedWindowsStartupProbeSha256),
                   @('gdi32_init_probe', $gdi32InitProbePath, $expectedGdi32InitProbeSha256),
-                  @('win32u_init_probe', $win32uInitProbePath, $expectedWin32uInitProbeSha256)
+                  @('win32u_init_probe', $win32uInitProbePath, $expectedWin32uInitProbeSha256),
+                  @('win32u_user32_probe', $win32uUser32ProbePath, $expectedWin32uUser32ProbeSha256)
               )) {
                   Write-Host ('commit={0} requested_station_mask={1} {2}_path={3} {2}_sha256={4}' -f
                       $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $executable[0], $executable[1], $executable[2])
@@ -350,10 +403,11 @@ jobs:
                   -WindowsInitProbePath $windowsInitProbePath -WindowsInitProbeSha256 $expectedWindowsInitProbeSha256 `
                   -WindowsStartupProbePath $windowsStartupProbePath -WindowsStartupProbeSha256 $expectedWindowsStartupProbeSha256 `
                   -Gdi32InitProbePath $gdi32InitProbePath -Gdi32InitProbeSha256 $expectedGdi32InitProbeSha256 `
-                  -Win32uInitProbePath $win32uInitProbePath -Win32uInitProbeSha256 $expectedWin32uInitProbeSha256
+                  -Win32uInitProbePath $win32uInitProbePath -Win32uInitProbeSha256 $expectedWin32uInitProbeSha256 `
+                  -Win32uUser32ProbePath $win32uUser32ProbePath -Win32uUser32ProbeSha256 $expectedWin32uUser32ProbeSha256
               if ($LASTEXITCODE -ne 0) { throw 'Session 0 診断に失敗しました。' }
           } finally {
-              foreach ($inputFile in @($win32uInitSourceInput, $win32uInitBuildInput, $gdi32InitSourceInput, $gdi32InitBuildInput, $windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
+              foreach ($inputFile in @($win32uUser32SourceInput, $win32uUser32BuildInput, $win32uInitSourceInput, $win32uInitBuildInput, $gdi32InitSourceInput, $gdi32InitBuildInput, $windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
                   if ($null -ne $inputFile) { $inputFile.Stream.Dispose() }
               }
           }
