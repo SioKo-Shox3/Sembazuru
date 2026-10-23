@@ -17,7 +17,9 @@ param(
     [string]$WindowsStartupProbePath,
     [string]$WindowsStartupProbeSha256,
     [string]$Gdi32InitProbePath,
-    [string]$Gdi32InitProbeSha256
+    [string]$Gdi32InitProbeSha256,
+    [string]$Win32uInitProbePath,
+    [string]$Win32uInitProbeSha256
 )
 
 function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [string]$EntryPath, [string]$EntryHash,
@@ -25,7 +27,8 @@ function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [s
     [string]$ConsolePath, [string]$ConsoleHash, [string]$WindowsPath, [string]$WindowsHash,
     [string]$WindowsInitPath, [string]$WindowsInitHash,
     [string]$WindowsStartupPath = '', [string]$WindowsStartupHash = '',
-    [string]$Gdi32InitPath = '', [string]$Gdi32InitHash = '') {
+    [string]$Gdi32InitPath = '', [string]$Gdi32InitHash = '',
+    [string]$Win32uInitPath = '', [string]$Win32uInitHash = '') {
     if ([string]::IsNullOrEmpty($InitPath) -ne [string]::IsNullOrEmpty($InitHash) -or
         [string]::IsNullOrEmpty($EntryPath) -ne [string]::IsNullOrEmpty($EntryHash) -or
         [string]::IsNullOrEmpty($TerminatePath) -ne [string]::IsNullOrEmpty($TerminateHash) -or
@@ -33,12 +36,17 @@ function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [s
         [string]::IsNullOrEmpty($WindowsPath) -ne [string]::IsNullOrEmpty($WindowsHash) -or
         [string]::IsNullOrEmpty($WindowsInitPath) -ne [string]::IsNullOrEmpty($WindowsInitHash) -or
         [string]::IsNullOrEmpty($WindowsStartupPath) -ne [string]::IsNullOrEmpty($WindowsStartupHash) -or
-        [string]::IsNullOrEmpty($Gdi32InitPath) -ne [string]::IsNullOrEmpty($Gdi32InitHash)) {
+        [string]::IsNullOrEmpty($Gdi32InitPath) -ne [string]::IsNullOrEmpty($Gdi32InitHash) -or
+        [string]::IsNullOrEmpty($Win32uInitPath) -ne [string]::IsNullOrEmpty($Win32uInitHash)) {
         throw '診断EXEのパスとSHA-256は組で指定してください。'
     }
     if ($EntryPath -and -not $InitPath) { throw '固定終了値診断にはInitProbeの指定が必要です。' }
     if ($TerminatePath -and (-not $InitPath -or -not $EntryPath)) {
         throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。'
+    }
+    if ($Win32uInitPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath)) {
+        throw 'WIN32U初期化診断にはInit・Entry・Terminate・Console・Windows・WindowsInit・WindowsStartup・Gdi32Initの指定が必要です。'
     }
     if ($Gdi32InitPath -and
         (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath)) {
@@ -102,8 +110,13 @@ function ConvertFrom-Session0StationMask([string]$Value) {
     }
 }
 
+# 実行・独立記録・回収を接続するまで、配置やサービス登録へ進めない。
+function Assert-Session0ConnectedRequest([bool]$Win32uInitRequested) {
+    if ($Win32uInitRequested) { throw 'WIN32U初期化診断の実行・記録・回収は未接続です。' }
+}
+
 function Assert-Session0FixtureArguments([string[]]$Arguments) {
-    if ($Arguments.Count -notin @(11, 12, 13, 14, 16, 17, 18, 19)) { throw 'SCM 診断の引数数が一致しません。' }
+    if ($Arguments.Count -notin @(11, 12, 13, 14, 16, 17, 18, 19, 20)) { throw 'SCM 診断の引数数が一致しません。' }
     $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
         '--nocapture', '--test-threads=1', '--')
     if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
@@ -119,7 +132,8 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
     }
     $null = ConvertFrom-Session0StationMask $Arguments[10]
     if ($Arguments.Count -ge 12) {
-        if ($Arguments.Count -eq 19) { Assert-Session0InitProbeHash $Arguments[18] }
+        if ($Arguments.Count -eq 20) { Assert-Session0InitProbeHash $Arguments[19] }
+        if ($Arguments.Count -ge 19) { Assert-Session0InitProbeHash $Arguments[18] }
         if ($Arguments.Count -ge 18) { Assert-Session0InitProbeHash $Arguments[17] }
         if ($Arguments.Count -ge 17) { Assert-Session0InitProbeHash $Arguments[16] }
         if ($Arguments.Count -ge 16) {
@@ -141,8 +155,9 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
 }
 
 # 組と先行診断の不足は、環境変更や保護配置より前に拒否する。
-Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256 $ConsoleProbePath $ConsoleProbeSha256 $WindowsProbePath $WindowsProbeSha256 $WindowsInitProbePath $WindowsInitProbeSha256 $WindowsStartupProbePath $WindowsStartupProbeSha256 $Gdi32InitProbePath $Gdi32InitProbeSha256
-if ($args.Count -ne 0) { throw '指定できる引数はArtifactPath、ExpectedSha256、StationMaskとInit/Entry/Terminate/Console/Windows/WindowsInit/WindowsStartup/Gdi32InitのProbePath・ProbeSha256だけです。' }
+Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256 $ConsoleProbePath $ConsoleProbeSha256 $WindowsProbePath $WindowsProbeSha256 $WindowsInitProbePath $WindowsInitProbeSha256 $WindowsStartupProbePath $WindowsStartupProbeSha256 $Gdi32InitProbePath $Gdi32InitProbeSha256 $Win32uInitProbePath $Win32uInitProbeSha256
+Assert-Session0ConnectedRequest ([bool]$Win32uInitProbePath)
+if ($args.Count -ne 0) { throw '指定できる引数はArtifactPath、ExpectedSha256、StationMaskとInit/Entry/Terminate/Console/Windows/WindowsInit/WindowsStartup/Gdi32Init/Win32uInitのProbePath・ProbeSha256だけです。' }
 
 $record = $null
 $requestedStationMask = ConvertFrom-Session0StationMask $StationMask
@@ -1176,6 +1191,7 @@ function Get-Session0ProbeBasename([string]$Kind, [bool]$Source) {
         'WindowsInit' { if ($Source) { return 'session0_windows_init_probe.exe' }; return 'SbzSession0WindowsInitProbe.exe' }
         'WindowsStartup' { if ($Source) { return 'session0_windows_startup_probe.exe' }; return 'SbzSession0WindowsStartupProbe.exe' }
         'Gdi32Init' { if ($Source) { return 'session0_gdi32_init_probe.exe' }; return 'SbzSession0Gdi32InitProbe.exe' }
+        'Win32uInit' { if ($Source) { return 'session0_win32u_init_probe.exe' }; return 'SbzSession0Win32uInitProbe.exe' }
         default { throw '追加診断 EXE の種別が不正です。' }
     }
 }
@@ -1187,7 +1203,7 @@ function Get-Session0ProbeSourcePath([string]$Path, [string]$Kind) {
     if ([IO.Path]::GetFileName($canonical) -cne $basename) {
         throw '追加診断 EXE の source 名が一致しません。'
     }
-    if ($Kind -cin @('WindowsInit', 'WindowsStartup', 'Gdi32Init') -and $Path -cne $canonical) {
+    if ($Kind -cin @('WindowsInit', 'WindowsStartup', 'Gdi32Init', 'Win32uInit') -and $Path -cne $canonical) {
         throw 'WINDOWS診断のsourceは正規の固定pathが必要です。'
     }
     if ($Kind -cin @('Console', 'Windows')) {
@@ -2315,6 +2331,7 @@ try {
     if ($WindowsStartupProbePath) { $fixtureArguments += $windowsStartupProbe.Hash }
     if ($Gdi32InitProbePath) { $fixtureArguments += $gdi32InitProbe.Hash }
     Assert-Session0FixtureArguments $fixtureArguments
+    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 20)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
         $diagnosticNonce + ' ' + $StationMask
