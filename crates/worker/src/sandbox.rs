@@ -3211,6 +3211,7 @@ mod tests {
             .chain(record.win32u_user32_probe.iter().map(|v| &v.run))
             .chain(record.user32_resource_probe.iter().map(|v| &v.run))
             .chain(record.user32_resource_load_probe.iter().map(|v| &v.run))
+            .chain(record.user32_mitigation_probe.iter().map(|v| &v.run))
         {
             fields.extend([
                 run.job_ui_restrictions.to_string(),
@@ -3323,6 +3324,15 @@ mod tests {
             fields.push(probe.sequence_verified().to_string());
             fields.push(probe.gates_verified(record).to_string());
         }
+        if let Some(probe) = &record.user32_mitigation_probe {
+            fields.push(diagnostic_hex(probe.path.as_bytes()));
+            fields.push(probe.sha256.clone());
+            fields.push(probe.properties());
+            fields.push(probe.output_eof.to_string());
+            fields.push(probe.deadline_met.to_string());
+            fields.push(probe.sequence_verified().to_string());
+            fields.push(probe.gates_verified(record).to_string());
+        }
         fields.join("\t")
     }
 
@@ -3344,6 +3354,7 @@ mod tests {
         expected_win32u_user32: Option<(String, String)>,
         expected_user32_resource: Option<(String, String)>,
         expected_user32_resource_load: Option<(String, String)>,
+        expected_user32_mitigation: Option<(String, String)>,
     }
 
     fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
@@ -3359,6 +3370,7 @@ mod tests {
                 expected_win32u_user32: None,
                 expected_user32_resource: None,
                 expected_user32_resource_load: None,
+                expected_user32_mitigation: None,
                 expected_subsystem: None,
                 name,
                 bytes: record.encode().unwrap(),
@@ -3489,6 +3501,7 @@ mod tests {
                 expected_win32u_user32: None,
                 expected_user32_resource: None,
                 expected_user32_resource_load: None,
+                expected_user32_mitigation: None,
                 expected_subsystem: None,
                 name,
                 bytes,
@@ -3681,6 +3694,7 @@ mod tests {
             expected_win32u_user32: None,
             expected_user32_resource: None,
             expected_user32_resource_load: None,
+            expected_user32_mitigation: None,
             expected_subsystem: None,
             name: "payload-65537",
             bytes: oversized,
@@ -3716,6 +3730,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3762,6 +3777,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3832,6 +3848,7 @@ mod tests {
                         expected_win32u_user32: None,
                         expected_user32_resource: None,
                         expected_user32_resource_load: None,
+                        expected_user32_mitigation: None,
                         expected_subsystem: None,
                         name: "target-mask-mismatch-unverified-indeterminate",
                         bytes: forged.clone(),
@@ -3856,6 +3873,7 @@ mod tests {
         cases.extend(session0_win32u_user32_record_corpus());
         cases.extend(session0_user32_resource_record_corpus());
         cases.extend(session0_user32_resource_load_record_corpus());
+        cases.extend(session0_user32_mitigation_record_corpus());
         cases
     }
 
@@ -3924,6 +3942,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name: "init-stage-corpus",
                     bytes: init_record_bytes(&base, &init, summary),
@@ -3947,6 +3966,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4090,6 +4110,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name: "init-invalid-path-with-matching-caller",
                     bytes: init_record_bytes(
@@ -4139,6 +4160,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4158,6 +4180,7 @@ mod tests {
                 expected_win32u_user32: None,
                 expected_user32_resource: None,
                 expected_user32_resource_load: None,
+                expected_user32_mitigation: None,
                 expected_subsystem: None,
                 name: "init-unsolicited",
                 bytes: success_bytes,
@@ -4480,6 +4503,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4862,6 +4886,7 @@ mod tests {
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4897,6 +4922,7 @@ mod tests {
                         expected_win32u_user32: None,
                         expected_user32_resource: None,
                         expected_user32_resource_load: None,
+                        expected_user32_mitigation: None,
                         expected_subsystem: None,
                         name: "cmd-arms-terminate",
                         bytes: record.encode().unwrap(),
@@ -5278,6 +5304,7 @@ mod tests {
                         expected_win32u_user32: None,
                         expected_user32_resource: None,
                         expected_user32_resource_load: None,
+                        expected_user32_mitigation: None,
                         expected_subsystem: if name == "subsystem-unsolicited" {
                             None
                         } else {
@@ -6971,11 +6998,8 @@ mod tests {
                 config.user32_mitigation_probe_sha256.as_deref(),
                 argv[23].to_str()
             );
-            // 全先行組が揃っても、未接続要求を設定登録前に拒否する。
-            assert_eq!(
-                require_connected_session0_request(&config),
-                Err("自己Win32k policy診断の実行・記録・回収は未接続です")
-            );
+            // 完全な24形式を接続し、先行12診断の欠落は個別に拒否する。
+            assert_eq!(require_connected_session0_request(&config), Ok(()));
             for index in 0..12 {
                 let mut candidate = config.clone();
                 let slots = [
@@ -7551,6 +7575,10 @@ mod tests {
                         .expected_user32_resource_load
                         .as_ref()
                         .map(|(p, h)| (p.as_str(), h.as_str())),
+                    user32_mitigation: case
+                        .expected_user32_mitigation
+                        .as_ref()
+                        .map(|(p, h)| (p.as_str(), h.as_str())),
                 },
             );
             match case.expected {
@@ -7814,7 +7842,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('Read-Session0User32ResourceLoadStartupSnapshot', 'Read-Session0User32ResourceLoadStartupProgress', 'Get-Session0User32ResourceLoadEvidence', 'Test-Session0User32ResourceLoadSequence', 'Test-Session0User32ResourceLoadGates', 'Test-Session0User32ResourceLoadTreeSafe', 'Read-Session0User32ResourceLoadRecord', 'Read-Session0User32ResourceStartupSnapshot', 'Read-Session0User32ResourceStartupProgress', 'Get-Session0User32ResourceEvidence', 'Test-Session0User32ResourceSequence', 'Test-Session0User32ResourceGates', 'Test-Session0User32ResourceTreeSafe', 'Read-Session0User32ResourceRecord', 'Read-Session0Win32uUser32StartupSnapshot', 'Read-Session0Win32uUser32StartupProgress', 'Get-Session0Win32uUser32Evidence', 'Test-Session0Win32uUser32Sequence', 'Test-Session0Win32uUser32Gates', 'Test-Session0Win32uUser32TreeSafe', 'Read-Session0Win32uUser32Record', 'Read-Session0Win32uStartupSnapshot', 'Read-Session0Win32uStartupProgress', 'Get-Session0Win32uInitEvidence', 'Test-Session0Win32uInitSequence', 'Test-Session0Win32uInitGates', 'Test-Session0Win32uInitTreeSafe', 'Read-Session0Win32uInitRecord', 'Read-Session0Gdi32StartupSnapshot', 'Read-Session0Gdi32StartupProgress', 'Get-Session0Gdi32InitEvidence', 'Test-Session0Gdi32InitSequence', 'Test-Session0Gdi32InitGates', 'Test-Session0Gdi32InitTreeSafe', 'Read-Session0Gdi32InitRecord', 'Read-Session0StartupSnapshot', 'Read-Session0StartupProgress', 'Get-Session0WindowsStartupEvidence', 'Test-Session0WindowsStartupSequence', 'Test-Session0WindowsStartupGates', 'Test-Session0WindowsStartupTreeSafe', 'Read-Session0WindowsStartupRecord', 'Read-Session0WindowsInitRecord', 'Get-Session0WindowsInitEvidence', 'Test-Session0WindowsInitSequence', 'Test-Session0WindowsInitGates', 'Test-Session0WindowsInitTreeSafe', 'Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('Read-Session0User32MitigationPolicyResult', 'Read-Session0User32MitigationStartupSnapshot', 'Read-Session0User32MitigationStartupProgress', 'Get-Session0User32MitigationEvidence', 'Test-Session0User32MitigationSequence', 'Test-Session0User32MitigationGates', 'Test-Session0User32MitigationTreeSafe', 'Read-Session0User32MitigationRecord', 'Read-Session0User32ResourceLoadStartupSnapshot', 'Read-Session0User32ResourceLoadStartupProgress', 'Get-Session0User32ResourceLoadEvidence', 'Test-Session0User32ResourceLoadSequence', 'Test-Session0User32ResourceLoadGates', 'Test-Session0User32ResourceLoadTreeSafe', 'Read-Session0User32ResourceLoadRecord', 'Read-Session0User32ResourceStartupSnapshot', 'Read-Session0User32ResourceStartupProgress', 'Get-Session0User32ResourceEvidence', 'Test-Session0User32ResourceSequence', 'Test-Session0User32ResourceGates', 'Test-Session0User32ResourceTreeSafe', 'Read-Session0User32ResourceRecord', 'Read-Session0Win32uUser32StartupSnapshot', 'Read-Session0Win32uUser32StartupProgress', 'Get-Session0Win32uUser32Evidence', 'Test-Session0Win32uUser32Sequence', 'Test-Session0Win32uUser32Gates', 'Test-Session0Win32uUser32TreeSafe', 'Read-Session0Win32uUser32Record', 'Read-Session0Win32uStartupSnapshot', 'Read-Session0Win32uStartupProgress', 'Get-Session0Win32uInitEvidence', 'Test-Session0Win32uInitSequence', 'Test-Session0Win32uInitGates', 'Test-Session0Win32uInitTreeSafe', 'Read-Session0Win32uInitRecord', 'Read-Session0Gdi32StartupSnapshot', 'Read-Session0Gdi32StartupProgress', 'Get-Session0Gdi32InitEvidence', 'Test-Session0Gdi32InitSequence', 'Test-Session0Gdi32InitGates', 'Test-Session0Gdi32InitTreeSafe', 'Read-Session0Gdi32InitRecord', 'Read-Session0StartupSnapshot', 'Read-Session0StartupProgress', 'Get-Session0WindowsStartupEvidence', 'Test-Session0WindowsStartupSequence', 'Test-Session0WindowsStartupGates', 'Test-Session0WindowsStartupTreeSafe', 'Read-Session0WindowsStartupRecord', 'Read-Session0WindowsInitRecord', 'Get-Session0WindowsInitEvidence', 'Test-Session0WindowsInitSequence', 'Test-Session0WindowsInitGates', 'Test-Session0WindowsInitTreeSafe', 'Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -7871,7 +7899,7 @@ $count = 0
 $argvCount = 0
 $initCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
-    $parts = $line.Split("`t", 30)
+    $parts = $line.Split("`t", 32)
     if ($parts[0] -ceq 'init') {
         $exit = if ($parts[3] -ceq 'none') { $null } else { [uint32]$parts[3] }
         $record = $null
@@ -7904,20 +7932,20 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $bytes = [Convert]::FromHexString($parts[2])
     $record = $null
     $rejected = $false
-    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[15]))) $parts[16] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[17]))) $parts[18] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[19]))) $parts[20] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[21]))) $parts[22] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[23]))) $parts[24] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[25]))) $parts[26] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[27]))) $parts[28] }
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[15]))) $parts[16] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[17]))) $parts[18] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[19]))) $parts[20] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[21]))) $parts[22] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[23]))) $parts[24] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[25]))) $parts[26] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[27]))) $parts[28] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[29]))) $parts[30] }
     catch { $rejected = $true }
     if ($parts[3] -ceq 'reject') {
         if (-not $rejected) { throw "不正な記録を受理しました: $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "正常な記録を拒否しました: $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne $(if ($parts[27]) {36} elseif ($parts[25]) {35} elseif ($parts[23]) {34} elseif ($parts[21]) {33} elseif ($parts[19]) {32} elseif ($parts[17]) {31} else {30})) { throw 'レコードのプロパティ数が一致しません。' }
+        if (@($record.PSObject.Properties).Count -ne $(if ($parts[29]) {37} elseif ($parts[27]) {36} elseif ($parts[25]) {35} elseif ($parts[23]) {34} elseif ($parts[21]) {33} elseif ($parts[19]) {32} elseif ($parts[17]) {31} else {30})) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId', 'RequestedStationMask')) { $values.Add([string]$record.$property) }
         foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }), $(if ($null -ne $record.WindowsInitProbe) { $record.WindowsInitProbe.Run }), $(if ($parts[17]) { $record.WindowsStartupProbe.Run }), $(if ($parts[19]) { $record.Gdi32InitProbe.Run }), $(if ($parts[21]) { $record.Win32uInitProbe.Run }), $(if ($parts[23]) { $record.Win32uUser32Probe.Run }), $(if ($parts[25]) { $record.User32ResourceProbe.Run }), $(if ($parts[27]) { $record.User32ResourceLoadProbe.Run }))) {
+        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }), $(if ($null -ne $record.WindowsInitProbe) { $record.WindowsInitProbe.Run }), $(if ($parts[17]) { $record.WindowsStartupProbe.Run }), $(if ($parts[19]) { $record.Gdi32InitProbe.Run }), $(if ($parts[21]) { $record.Win32uInitProbe.Run }), $(if ($parts[23]) { $record.Win32uUser32Probe.Run }), $(if ($parts[25]) { $record.User32ResourceProbe.Run }), $(if ($parts[27]) { $record.User32ResourceLoadProbe.Run }), $(if ($parts[29]) { $record.User32MitigationProbe.Run }))) {
             if ($null -eq $run) { continue }
             if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
             $values.Add([string]$run.JobUi)
@@ -8028,7 +8056,15 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 $values.Add(([string]$value).ToLowerInvariant())
             }
         }
-        if (($values -join "`t") -cne $parts[29]) { throw "記録のプロパティが一致しません: $($parts[0])" }
+        if ($parts[29]) {
+            $probe = $record.User32MitigationProbe
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($probe.Path)).ToLowerInvariant())
+            $values.Add($probe.Sha256); $values.Add($probe.Evidence)
+            foreach ($value in @($probe.OutputEof, $probe.DeadlineMet, (Test-Session0User32MitigationSequence $probe), (Test-Session0User32MitigationGates $record))) {
+                $values.Add(([string]$value).ToLowerInvariant())
+            }
+        }
+        if (($values -join "`t") -cne $parts[31]) { throw "記録のプロパティが一致しません: $($parts[0])" }
     }
     $count++
 }
@@ -8084,7 +8120,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         for case in &cases {
             let expected = case.expected.as_ref().map(diagnostic_properties);
             input.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.name,
                 case.nonce,
                 diagnostic_hex(&case.bytes),
@@ -8155,6 +8191,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 case.expected_user32_resource.as_ref().map_or("", |(_,h)|h),
                 diagnostic_hex(case.expected_user32_resource_load.as_ref().map_or("", |(p,_)|p).as_bytes()),
                 case.expected_user32_resource_load.as_ref().map_or("", |(_,h)|h),
+                diagnostic_hex(case.expected_user32_mitigation.as_ref().map_or("", |(p,_)|p).as_bytes()),
+                case.expected_user32_mitigation.as_ref().map_or("", |(_,h)|h),
                 expected.unwrap_or_default(),
             ));
         }
@@ -9261,6 +9299,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         win32u_user32: Option<(&'a str, &'a str)>,
         user32_resource: Option<(&'a str, &'a str)>,
         user32_resource_load: Option<(&'a str, &'a str)>,
+        user32_mitigation: Option<(&'a str, &'a str)>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13175,6 +13214,1086 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         Ok(())
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct User32MitigationStartupSnapshot {
+        state: String,
+        units: usize,
+        hex: String,
+        modules: [u8; 3],
+    }
+
+    impl User32MitigationStartupSnapshot {
+        fn parse(line: &str, phase: &str) -> Option<Self> {
+            let tail =
+                line.strip_prefix(&format!("SBZ_USER32_MITIGATION_PROBE_V1 {phase} desktop="))?;
+            let cols: Vec<_> = tail.split(' ').collect();
+            if cols.len() != 6 {
+                return None;
+            }
+            let state = cols[0];
+            let n = cols[1].strip_prefix("units=")?;
+            let units: usize = n.parse().ok()?;
+            if units > 128 || n != units.to_string() {
+                return None;
+            }
+            let hex = cols[2].strip_prefix("hex=")?;
+            if units == 0 {
+                if hex != "-" {
+                    return None;
+                }
+            } else if hex.len() != units * 4
+                || !hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || hex
+                    .as_bytes()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|u| u == b"0000")
+            {
+                return None;
+            }
+            let valid = match state {
+                "null" | "empty" => units == 0,
+                "terminated" => (1..128).contains(&units),
+                "bounded" => units == 128,
+                "unreadable" => units < 128,
+                _ => false,
+            };
+            if !valid {
+                return None;
+            }
+            let mut modules = [0; 3];
+            for (i, name) in ["user32=", "gdi32=", "win32u="].into_iter().enumerate() {
+                modules[i] = match cols[i + 3].strip_prefix(name)? {
+                    "0" => 0,
+                    "1" => 1,
+                    _ => return None,
+                };
+            }
+            Some(Self {
+                state: state.into(),
+                units,
+                hex: hex.into(),
+                modules,
+            })
+        }
+
+        fn properties(&self) -> String {
+            format!(
+                "{},{},{},{},{},{}",
+                self.state, self.units, self.hex, self.modules[0], self.modules[1], self.modules[2]
+            )
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct User32MitigationPolicy {
+        result: u8,
+        gle: u32,
+        flags: Option<u32>,
+    }
+
+    impl User32MitigationPolicy {
+        fn properties(&self) -> String {
+            let number = |v: Option<u32>| v.map_or_else(|| "none".into(), |v| v.to_string());
+            [
+                self.result.to_string(),
+                self.gle.to_string(),
+                number(self.flags),
+                number(self.flags.map(|v| v & 1)),
+                number(self.flags.map(|v| (v >> 1) & 1)),
+                number(self.flags.map(|v| v & !3)),
+            ]
+            .join(",")
+        }
+
+        fn parse(line: &str, phase: &str) -> Option<Self> {
+            let text = line.strip_prefix(&format!(
+                "SBZ_USER32_MITIGATION_PROBE_V1 {phase}_query_result="
+            ))?;
+            let (result, text) = text.split_once(" gle=0x")?;
+            let (gle, text) = text.split_once(" flags=")?;
+            let hex = |v: &str| {
+                if v.len() != 8
+                    || !v
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                {
+                    None
+                } else {
+                    u32::from_str_radix(v, 16).ok()
+                }
+            };
+            let gle = hex(gle)?;
+            if result == "0" && text == "unavailable" {
+                return Some(Self {
+                    result: 0,
+                    gle,
+                    flags: None,
+                });
+            }
+            if result != "1" {
+                return None;
+            }
+            let (flags, text) = text.strip_prefix("0x")?.split_once(" win32k=")?;
+            let (win32k, text) = text.split_once(" audit=")?;
+            let (audit, unknown) = text.split_once(" unknown=0x")?;
+            let flags = hex(flags)?;
+            if win32k != (flags & 1).to_string()
+                || audit != ((flags >> 1) & 1).to_string()
+                || hex(unknown)? != flags & !3
+            {
+                return None;
+            }
+            Some(Self {
+                result: 1,
+                gle,
+                flags: Some(flags),
+            })
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct User32MitigationEvidence {
+        stage: u8,
+        before: Option<User32MitigationStartupSnapshot>,
+        before_policy: Option<User32MitigationPolicy>,
+        user32_preloaded: Option<u8>,
+        load_flags: Option<u32>,
+        user32_result: Option<u8>,
+        user32_gle: Option<u32>,
+        user32_complete: bool,
+        after_policy: Option<User32MitigationPolicy>,
+        after: Option<User32MitigationStartupSnapshot>,
+        valid: bool,
+        partial: bool,
+        outcome: u8,
+    }
+
+    impl User32MitigationEvidence {
+        fn properties(&self) -> String {
+            let number = |v: Option<u32>| v.map_or_else(|| "none".into(), |v| v.to_string());
+            let snapshot = |v: &Option<User32MitigationStartupSnapshot>| {
+                v.as_ref().map_or_else(
+                    || "none".into(),
+                    User32MitigationStartupSnapshot::properties,
+                )
+            };
+            let policy = |v: &Option<User32MitigationPolicy>| {
+                v.as_ref()
+                    .map_or_else(|| "none".into(), User32MitigationPolicy::properties)
+            };
+            [
+                self.stage.to_string(),
+                snapshot(&self.before),
+                policy(&self.before_policy),
+                number(self.user32_preloaded.map(u32::from)),
+                number(self.load_flags),
+                number(self.user32_result.map(u32::from)),
+                number(self.user32_gle),
+                u8::from(self.user32_complete).to_string(),
+                policy(&self.after_policy),
+                snapshot(&self.after),
+                u8::from(self.valid).to_string(),
+                u8::from(self.partial).to_string(),
+                self.outcome.to_string(),
+            ]
+            .join(";")
+        }
+    }
+
+    // 自己policyの取得状態・未知bit・直後GLEを終了値や回収の成否と独立して保持する。
+    fn parse_user32_mitigation_output(bytes: &[u8], exit: Option<u32>) -> User32MitigationEvidence {
+        let mut e = User32MitigationEvidence {
+            stage: 0,
+            before: None,
+            before_policy: None,
+            user32_preloaded: None,
+            load_flags: None,
+            user32_result: None,
+            user32_gle: None,
+            user32_complete: false,
+            after_policy: None,
+            after: None,
+            valid: bytes.len() <= 2048,
+            partial: !bytes.is_empty() && !bytes.ends_with(b"\n"),
+            outcome: 0,
+        };
+        let p = "SBZ_USER32_MITIGATION_PROBE_V1 ";
+        let bit = |s: &str| match s {
+            "0" => Some(0),
+            "1" => Some(1),
+            _ => None,
+        };
+        let mut rows = bytes.split(|b| *b == b'\n').peekable();
+        while let Some(row) = rows.next() {
+            if rows.peek().is_none() {
+                break;
+            }
+            let line = match std::str::from_utf8(row) {
+                Ok(s) if s.is_ascii() => s,
+                _ => {
+                    e.valid = false;
+                    break;
+                }
+            };
+            let valid = match e.stage {
+                0 if line == format!("{p}entry") => {
+                    e.stage = 1;
+                    true
+                }
+                1 => match User32MitigationStartupSnapshot::parse(line, "before") {
+                    Some(v) => {
+                        e.before = Some(v);
+                        e.stage = 2;
+                        true
+                    }
+                    _ => false,
+                },
+                2 if line == format!("{p}before_query_begin") => {
+                    e.stage = 3;
+                    true
+                }
+                3 => match User32MitigationPolicy::parse(line, "before") {
+                    Some(v) => {
+                        e.before_policy = Some(v);
+                        e.stage = 4;
+                        true
+                    }
+                    _ => false,
+                },
+                4 => match line
+                    .strip_prefix(&format!("{p}user32_preloaded="))
+                    .and_then(bit)
+                {
+                    Some(v) => {
+                        e.user32_preloaded = Some(v);
+                        e.stage = 5;
+                        true
+                    }
+                    _ => false,
+                },
+                5 if line == format!("{p}user32_load_begin flags=0x00000800") => {
+                    e.load_flags = Some(0x800);
+                    e.stage = 6;
+                    true
+                }
+                6 => {
+                    let result = line
+                        .strip_prefix(&format!("{p}user32_load_result="))
+                        .and_then(|v| v.split_once(" gle=0x"))
+                        .filter(|(_, g)| {
+                            g.len() == 8
+                                && g.bytes()
+                                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                        })
+                        .and_then(|(r, g)| Some((bit(r)?, u32::from_str_radix(g, 16).ok()?)));
+                    if let Some((r, g)) = result {
+                        e.user32_result = Some(r);
+                        e.user32_gle = Some(g);
+                        e.stage = 7;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                7 if line == format!("{p}user32_complete") => {
+                    e.user32_complete = true;
+                    e.stage = 8;
+                    true
+                }
+                8 if line == format!("{p}after_query_begin") => {
+                    e.stage = 9;
+                    true
+                }
+                9 => match User32MitigationPolicy::parse(line, "after") {
+                    Some(v) => {
+                        e.after_policy = Some(v);
+                        e.stage = 10;
+                        true
+                    }
+                    _ => false,
+                },
+                10 => match User32MitigationStartupSnapshot::parse(line, "after") {
+                    Some(v) => {
+                        e.after = Some(v);
+                        e.stage = 11;
+                        true
+                    }
+                    _ => false,
+                },
+                11 if line == format!("{p}complete") => {
+                    e.stage = 12;
+                    true
+                }
+                _ => false,
+            };
+            if !valid {
+                e.valid = false;
+                break;
+            }
+        }
+        if !bytes.is_ascii() {
+            e.valid = false;
+        }
+        if e.valid && !e.partial && e.stage == 12 {
+            let expected = if e.before_policy.as_ref().is_some_and(|v| v.result == 0)
+                || e.after_policy.as_ref().is_some_and(|v| v.result == 0)
+            {
+                31
+            } else if e.user32_result == Some(0) {
+                11
+            } else {
+                0
+            };
+            if exit == Some(expected) {
+                e.outcome = match expected {
+                    31 => 1,
+                    11 => 2,
+                    _ => 3,
+                };
+            }
+        }
+        e
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Session0User32MitigationProbeRecord {
+        path: String,
+        sha256: String,
+        // この領域だけStdout/Stderrをraw bytesの小文字hexとして保存する。
+        run: Session0DiagnosticRun,
+        evidence: Option<User32MitigationEvidence>,
+        output_eof: bool,
+        deadline_met: bool,
+    }
+
+    fn user32_mitigation_bytes(text: &str) -> Result<Vec<u8>, String> {
+        if text.len() > 4098 || !text.len().is_multiple_of(2) {
+            return Err("自己Win32k policy診断の出力長が不正です".into());
+        }
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                if !pair
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+                {
+                    return Err("自己Win32k policy診断の出力hexが不正です".into());
+                }
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+
+    fn user32_mitigation_run_evidence(
+        run: &Session0DiagnosticRun,
+    ) -> Option<User32MitigationEvidence> {
+        let left = user32_mitigation_bytes(&run.stdout).ok()?;
+        let right = user32_mitigation_bytes(&run.stderr).ok()?;
+        let mut evidence = parse_user32_mitigation_output(&left, run.child_exit);
+        // stderr・隔離・回収は列の成否とは独立したゲートにする。
+        let _ = right;
+        if run.lifecycle != 15 || !run.spawn_error.is_empty() {
+            evidence.outcome = 0;
+        }
+        Some(evidence)
+    }
+
+    impl Session0User32MitigationProbeRecord {
+        fn properties(&self) -> String {
+            self.evidence
+                .as_ref()
+                .map_or_else(|| "invalid".into(), User32MitigationEvidence::properties)
+        }
+
+        fn sequence_verified(&self) -> bool {
+            user32_mitigation_bytes(&self.run.stdout).is_ok_and(|left| {
+                parse_user32_mitigation_output(&left, self.run.child_exit).outcome != 0
+            })
+        }
+
+        fn gates_verified(&self, record: &Session0DiagnosticRecord) -> bool {
+            let run = &self.run;
+            record.session_id == 0
+                && !record.worker_actions_sid.is_empty()
+                && record.station_ace
+                    == format!(
+                        "count=1;flags=0;mask=0x{:08x}",
+                        record.requested_station_mask
+                    )
+                && record.station_cleanup == "removed"
+                && run.spawn_succeeded
+                && run.lifecycle == 15
+                && run.observations_verified(record.requested_station_mask)
+                && run.stderr.is_empty()
+                && run.spawn_error.is_empty()
+                && self.output_eof
+                && self.deadline_met
+                && run.child_exit.is_some()
+        }
+
+        fn validate(&self, record: &Session0DiagnosticRecord) -> Result<(), String> {
+            if record.user32_resource_load_probe.is_none() {
+                return Err(
+                    "自己Win32k policy診断にはUSER32リソース保持後ロード診断が必要です".into(),
+                );
+            }
+            let pair = record
+                .subsystem_probes
+                .as_ref()
+                .ok_or("自己Win32k policy診断にはsubsystem対照が必要です")?;
+            let parent = Path::new(&pair[0].path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            let run = &self.run;
+            if self.path
+                != format!(
+                    "{parent}\\{}",
+                    Session0ProbeKind::User32Mitigation.basename()
+                )
+                || self.sha256.len() != 64
+                || !self
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                || (!run.spawn_succeeded
+                    && (run.child_exit.is_some()
+                        || !run.stdout.is_empty()
+                        || !run.stderr.is_empty()))
+                || (run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe
+                        || run.creation_flags != 0x0008_0404
+                        || run.lifecycle & 1 == 0))
+                || (run.lifecycle & 1 != 0
+                    && !run
+                        .target_desktop
+                        .starts_with(&format!("{}\\sbz-", record.station)))
+                || (!run.target_desktop.is_empty()
+                    && [&record.baseline, &record.no_window]
+                        .into_iter()
+                        .chain(record.init_probe.iter().map(|p| &p.run))
+                        .chain(record.entry_probe.iter().map(|p| &p.run))
+                        .chain(record.terminate_probe.iter().map(|p| &p.run))
+                        .chain(pair.iter().map(|p| &p.run))
+                        .chain(record.windows_init_probe.iter().map(|p| &p.run))
+                        .chain(record.windows_startup_probe.iter().map(|p| &p.run))
+                        .chain(record.gdi32_init_probe.iter().map(|p| &p.run))
+                        .chain(record.win32u_init_probe.iter().map(|p| &p.run))
+                        .chain(record.win32u_user32_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_resource_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_resource_load_probe.iter().map(|p| &p.run))
+                        .any(|r| r.target_desktop == run.target_desktop))
+                || (self.output_eof && !run.spawn_succeeded)
+                || (self.deadline_met && (!run.spawn_succeeded || run.child_exit.is_none()))
+                || self.evidence != user32_mitigation_run_evidence(run)
+            {
+                return Err(
+                    "自己Win32k policy診断の固定組・実行契約・段階証拠が一致しません".into(),
+                );
+            }
+            if self.properties().len() > 2048 {
+                return Err("自己Win32k policy診断の証拠長が不正です".into());
+            }
+            user32_mitigation_bytes(&run.stdout)?;
+            user32_mitigation_bytes(&run.stderr)?;
+            Ok(())
+        }
+
+        fn encode_into(&self, payload: &mut Writer, mask: u32) -> Result<(), String> {
+            write_text(payload, &self.path)?;
+            write_text(payload, &self.sha256)?;
+            self.run.encode_into(payload, mask)?;
+            write_text(payload, &self.properties())?;
+            payload.bool(self.output_eof);
+            payload.bool(self.deadline_met);
+            Ok(())
+        }
+    }
+
+    fn snapshot_user32_mitigation_output(
+        probe: &mut Session0User32MitigationProbeRecord,
+        left: &[u8],
+        right: &[u8],
+    ) {
+        probe.run.stdout = diagnostic_hex(left);
+        probe.run.stderr = diagnostic_hex(right);
+        probe.evidence = user32_mitigation_run_evidence(&probe.run);
+    }
+
+    // 保存先を起動前に作り、途中の失敗でも先行runの観測を置き換えない。
+    fn collect_session0_user32_mitigation_run(
+        record: &mut Session0DiagnosticRecord,
+        config: &Session0DiagnosticConfig,
+        command: &RestrictedCommand,
+        execute: impl FnOnce(
+            &mut Session0User32MitigationProbeRecord,
+            &RestrictedCommand,
+        ) -> Result<(), String>,
+    ) -> Result<(), Session0DiagnosticFailureStage> {
+        let mut run = Session0DiagnosticRun::empty();
+        run.stdout.clear();
+        run.stderr.clear();
+        record.user32_mitigation_probe = Some(Session0User32MitigationProbeRecord {
+            path: config
+                .fixture_root
+                .join(Session0ProbeKind::User32Mitigation.basename())
+                .to_string_lossy()
+                .into_owned(),
+            sha256: config
+                .user32_mitigation_probe_sha256
+                .as_ref()
+                .unwrap()
+                .clone(),
+            evidence: user32_mitigation_run_evidence(&run),
+            run,
+            output_eof: false,
+            deadline_met: false,
+        });
+        let probe = record.user32_mitigation_probe.as_mut().unwrap();
+        let command = RestrictedCommand {
+            application: PathBuf::from(&probe.path),
+            arguments: Vec::new(),
+            cwd: command.cwd.clone(),
+            environment: command.environment.clone(),
+        };
+        if let Err(error) = execute(probe, &command) {
+            probe.run.spawn_error.push_str(&error);
+            probe.evidence = user32_mitigation_run_evidence(&probe.run);
+            return Err(Session0DiagnosticFailureStage::Runtime);
+        }
+        Ok(())
+    }
+
+    fn run_session0_user32_mitigation_child(
+        action: &ActionToken,
+        command: &RestrictedCommand,
+        probe: &mut Session0User32MitigationProbeRecord,
+    ) -> Result<(), String> {
+        let mut process = match RestrictedProcess::spawn_for_session0_diagnostic(
+            action,
+            command,
+            TestCreationProfile::Production,
+            &mut probe.run,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                probe.run.spawn_error = format!("spawn: {error}");
+                probe.run.observe_desktop_release();
+                return Ok(());
+            }
+        };
+        probe.run.spawn_succeeded = true;
+        probe.run.job_ui_restrictions = process
+            .job()
+            .ui_restrictions_for_test()
+            .map_err(|e| format!("Job照会失敗: {e}"))?;
+        probe.run.job_ui_limits = describe_job_ui_limits(probe.run.job_ui_restrictions);
+        if probe.run.job_ui_restrictions != 0xfe {
+            return Err("自己Win32k policy診断のJob制限が一致しません".into());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let mut output = process
+            .take_output()
+            .ok()
+            .map(|(left, right)| (left.take(2049), right.take(2049)));
+        let start = std::time::Instant::now();
+        let observed = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    async {
+                        let exit = observe_session0_child_exit(&process).await?;
+                        probe.run.child_exit = Some(exit);
+                        probe.deadline_met = start.elapsed() <= std::time::Duration::from_secs(10);
+                        Ok::<(), io::Error>(())
+                    },
+                    async {
+                        if let Some((stdout, stderr)) = output.as_mut() {
+                            let result = tokio::join!(
+                                stdout.read_to_end(&mut left),
+                                stderr.read_to_end(&mut right)
+                            );
+                            probe.output_eof = matches!(result, (Ok(_), Ok(_)))
+                                && left.len() <= 2048
+                                && right.len() <= 2048;
+                        }
+                    }
+                )
+            })
+            .await
+        });
+        if !matches!(observed, Ok((Ok(()), ()))) {
+            probe
+                .run
+                .spawn_error
+                .push_str("wait: deadline-exceeded-or-query-failed");
+            process.terminate();
+        }
+        // 出力と終了値の保存は、失敗・キャンセルし得る回収awaitより先に行う。
+        snapshot_user32_mitigation_output(probe, &left, &right);
+        let job = Arc::clone(&process.job);
+        let cleanup = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                preserve_session0_exit_before_cleanup(
+                    &mut probe.run,
+                    observe_session0_child_exit(&process),
+                    async move {
+                        tokio::task::spawn_blocking(move || job.terminate_and_wait())
+                            .await
+                            .map_err(|_| io::Error::other("診断のJob回収タスクが失敗しました"))?
+                    },
+                ),
+            )
+            .await
+        });
+        if matches!(cleanup, Ok(Ok(()))) {
+            process.tree_finished = true;
+            process.process.take();
+            probe.run.lifecycle |= 4;
+            if !probe.output_eof
+                && let Some((stdout, stderr)) = output.as_mut()
+            {
+                let result = runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        tokio::join!(
+                            stdout.read_to_end(&mut left),
+                            stderr.read_to_end(&mut right)
+                        )
+                    })
+                    .await
+                });
+                probe.output_eof = matches!(result, Ok((Ok(_), Ok(_))))
+                    && left.len() <= 2048
+                    && right.len() <= 2048;
+            }
+        } else {
+            probe
+                .run
+                .spawn_error
+                .push_str(&format!(";tree_cleanup:{cleanup:?}"));
+        }
+        if !probe.output_eof {
+            probe.run.spawn_error.push_str(";output_eof_unconfirmed");
+        }
+        drop(output);
+        drop(process);
+        probe.run.observe_desktop_release();
+        snapshot_user32_mitigation_output(probe, &left, &right);
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        Ok(())
+    }
+
+    fn user32_mitigation_valid_output(
+        snapshot: &str,
+        before: Option<u32>,
+        after: Option<u32>,
+        loaded: bool,
+    ) -> String {
+        let p = "SBZ_USER32_MITIGATION_PROBE_V1 ";
+        let policy = |phase: &str, flags: Option<u32>, gle: u32| {
+            flags.map_or_else(
+            || format!("{p}{phase}_query_result=0 gle=0x{gle:08x} flags=unavailable\n"),
+            |v| format!("{p}{phase}_query_result=1 gle=0x{gle:08x} flags=0x{v:08x} win32k={} audit={} unknown=0x{:08x}\n", v & 1, (v >> 1) & 1, v & !3))
+        };
+        format!(
+            "{p}entry\n{p}before {snapshot}\n{p}before_query_begin\n{}{p}user32_preloaded=0\n{p}user32_load_begin flags=0x00000800\n{p}user32_load_result={} gle=0x0000045a\n{p}user32_complete\n{p}after_query_begin\n{}{p}after {snapshot}\n{p}complete\n",
+            policy("before", before, 0x12345678),
+            u8::from(loaded),
+            policy("after", after, 0x87654321)
+        )
+    }
+
+    fn session0_user32_mitigation_record_corpus() -> Vec<Session0DiagnosticCase> {
+        let mut cases = Vec::new();
+        for base_case in session0_user32_resource_load_record_corpus()
+            .into_iter()
+            .filter(|c| c.name == "user32-resource-load-wire" && c.expected.is_some())
+        {
+            let base = base_case.expected.as_ref().unwrap();
+            let text = user32_mitigation_valid_output(
+                "desktop=null units=0 hex=- user32=0 gdi32=0 win32u=0",
+                Some(0),
+                Some(0),
+                true,
+            );
+            let mut run = base
+                .user32_resource_load_probe
+                .as_ref()
+                .unwrap()
+                .run
+                .clone();
+            run.target_desktop = format!("{}\\sbz-user32-mitigation", base.station);
+            run.stdout = diagnostic_hex(text.as_bytes());
+            run.stderr.clear();
+            run.child_exit = Some(0);
+            let probe = Session0User32MitigationProbeRecord {
+                path: r"C:\fixture\SbzSession0User32MitigationProbe.exe".into(),
+                sha256: "d".repeat(64),
+                evidence: user32_mitigation_run_evidence(&run),
+                run,
+                output_eof: true,
+                deadline_met: true,
+            };
+            let mut push =
+                |name, mut changed: Session0User32MitigationProbeRecord, alter: usize| {
+                    changed.evidence = user32_mitigation_run_evidence(&changed.run);
+                    let mut parent = base.clone();
+                    parent.user32_mitigation_probe = Some(changed.clone());
+                    let mut case = base_case.clone();
+                    case.name = name;
+                    case.expected_user32_mitigation =
+                        Some((changed.path.clone(), changed.sha256.clone()));
+                    let mut bytes = parent.encode().unwrap();
+                    let replace = |bytes: &mut Vec<u8>, old: &str, new: &str| {
+                        let pos = bytes
+                            .windows(old.len())
+                            .rposition(|v| v == old.as_bytes())
+                            .unwrap();
+                        assert_eq!(
+                            u32::from_le_bytes(bytes[pos - 4..pos].try_into().unwrap()) as usize,
+                            old.len()
+                        );
+                        bytes.splice(pos..pos + old.len(), new.bytes());
+                        bytes[pos - 4..pos].copy_from_slice(&(new.len() as u32).to_le_bytes());
+                    };
+                    match alter {
+                        1 => case.nonce = "f".repeat(32),
+                        2 => case.expected_mask = if case.expected_mask == 2 { 34 } else { 2 },
+                        3 => {
+                            case.expected_user32_mitigation.as_mut().unwrap().0 =
+                                changed.path.to_uppercase()
+                        }
+                        4 => case.expected_user32_mitigation.as_mut().unwrap().1 = "a".repeat(64),
+                        5 => case.expected_user32_mitigation = None,
+                        6 => bytes[4..8].copy_from_slice(&19u32.to_le_bytes()),
+                        7 => {
+                            let n = bytes.len();
+                            bytes[n - 1] = 2;
+                        }
+                        8 => bytes.push(0),
+                        9 => replace(&mut bytes, &changed.properties(), "forged"),
+                        10 => replace(
+                            &mut bytes,
+                            &changed.run.target_desktop,
+                            &base
+                                .user32_resource_load_probe
+                                .as_ref()
+                                .unwrap()
+                                .run
+                                .target_desktop,
+                        ),
+                        11 => replace(
+                            &mut bytes,
+                            &changed.run.target_desktop,
+                            &format!("{}\\Default", base.station),
+                        ),
+                        12 => replace(&mut bytes, &changed.run.stdout, &"ab".repeat(2050)),
+                        13 => replace(
+                            &mut bytes,
+                            &changed.path,
+                            &base.user32_resource_load_probe.as_ref().unwrap().path,
+                        ),
+                        14 => case.expected_user32_resource_load = None,
+                        _ => (),
+                    }
+                    let length = (bytes.len() - 44) as u32;
+                    bytes[40..44].copy_from_slice(&length.to_le_bytes());
+                    case.bytes = bytes;
+                    case.expected = (alter == 0).then_some(parent);
+                    cases.push(case);
+                };
+            for alter in 0..15 {
+                push("user32-mitigation-wire", probe.clone(), alter);
+            }
+            // query失敗後もロードと後queryを保持し、取得成功非0GLEと未知bitを失わない。
+            for (before, after, loaded, exit, outcome) in [
+                (None, Some(0x80000003), true, 31, 1),
+                (Some(0), None, false, 31, 1),
+                (None, None, true, 31, 1),
+                (Some(3), Some(0), false, 11, 2),
+                (Some(u32::MAX), Some(0x80000000), true, 0, 3),
+            ] {
+                let raw = user32_mitigation_valid_output(
+                    "desktop=null units=0 hex=- user32=0 gdi32=1 win32u=0",
+                    before,
+                    after,
+                    loaded,
+                );
+                let evidence = parse_user32_mitigation_output(raw.as_bytes(), Some(exit));
+                assert_eq!(evidence.stage, 12);
+                assert_eq!(evidence.outcome, outcome);
+                assert_eq!(evidence.before_policy.as_ref().unwrap().flags, before);
+                assert_eq!(evidence.after_policy.as_ref().unwrap().flags, after);
+                assert_eq!(evidence.before_policy.as_ref().unwrap().gle, 0x12345678);
+                assert_eq!(evidence.after_policy.as_ref().unwrap().gle, 0x87654321);
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(raw.as_bytes());
+                changed.run.child_exit = Some(exit);
+                push("user32-mitigation-policy", changed, 0);
+            }
+            for (state, units, hex) in [
+                ("empty", 0, "-".into()),
+                ("terminated", 1, "d800".into()),
+                ("terminated", 127, "ffff".repeat(127)),
+                ("bounded", 128, "dc00".repeat(128)),
+                ("unreadable", 0, "-".into()),
+                ("unreadable", 127, "0061".repeat(127)),
+            ] {
+                let raw = user32_mitigation_valid_output(
+                    &format!("desktop={state} units={units} hex={hex} user32=0 gdi32=0 win32u=0"),
+                    Some(0),
+                    Some(3),
+                    true,
+                );
+                let evidence = parse_user32_mitigation_output(raw.as_bytes(), Some(0));
+                assert!(raw.len() <= 2048);
+                assert_eq!(evidence.stage, 12);
+                assert_eq!(evidence.outcome, 3);
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(raw.as_bytes());
+                push("user32-mitigation-startup", changed, 0);
+            }
+            let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+            assert_eq!(lines.len(), 12);
+            for stage in 0..=12 {
+                let raw = lines[..stage].concat();
+                for exit in [
+                    None,
+                    Some(13),
+                    Some(0xc0000142),
+                    Some(0),
+                    Some(11),
+                    Some(31),
+                ] {
+                    let e = parse_user32_mitigation_output(raw.as_bytes(), exit);
+                    assert_eq!(e.stage, stage as u8);
+                    assert_eq!(
+                        e.outcome,
+                        if stage == 12 && exit == Some(0) { 3 } else { 0 }
+                    );
+                    let mut changed = probe.clone();
+                    changed.run.stdout = diagnostic_hex(raw.as_bytes());
+                    changed.run.child_exit = exit;
+                    if exit.is_none() {
+                        changed.deadline_met = false;
+                    }
+                    push("user32-mitigation-prefix-exit", changed, 0);
+                }
+            }
+            for raw in [
+                format!(
+                    "{}SBZ_USER32_MITIGATION_PROBE_V1 after_",
+                    lines[..8].concat()
+                ),
+                text.replace("flags=0x00000000 win32k=0", "flags=0x00000000 win32k=1"),
+                text.replace(
+                    "flags=0x00000000 win32k=0 audit=0 unknown=0x00000000",
+                    "flags=unavailable",
+                ),
+                text.replace("\n", "\r\n"),
+                format!("{text}extra\n"),
+            ] {
+                let e = parse_user32_mitigation_output(raw.as_bytes(), Some(0));
+                assert_eq!(e.outcome, 0);
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(raw.as_bytes());
+                push("user32-mitigation-incomplete-invalid", changed, 0);
+            }
+            for raw in [
+                vec![b'a'; 2049],
+                vec![0xff],
+                [text.as_bytes(), &[0xff]].concat(),
+            ] {
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(&raw);
+                assert_eq!(parse_user32_mitigation_output(&raw, Some(0)).outcome, 0);
+                push("user32-mitigation-bounded-raw", changed, 0);
+            }
+            for gate in 0..6 {
+                let mut changed = probe.clone();
+                match gate {
+                    0 => changed.output_eof = false,
+                    1 => changed.deadline_met = false,
+                    2 => changed.run.stderr = "61".into(),
+                    3 => changed.run.lifecycle = 3,
+                    4 => changed.run.spawn_error = "回収未確認".into(),
+                    _ => {
+                        changed.run.isolation = "unconfirmed".into();
+                        // 隔離未確認の反例では、確認済みを示す既存bitも落とす。
+                        changed.run.lifecycle &= !2;
+                    }
+                }
+                let mut parent = base.clone();
+                parent.user32_mitigation_probe = Some(changed.clone());
+                assert!(changed.sequence_verified());
+                assert!(!changed.gates_verified(&parent));
+                push("user32-mitigation-operational", changed, 0);
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn session0_user32_mitigation_observation_and_retention() {
+        for case in session0_user32_mitigation_record_corpus()
+            .into_iter()
+            .filter(|c| c.name == "user32-mitigation-wire" && c.expected.is_some())
+        {
+            let mut record = case.expected.unwrap();
+            assert!(
+                record
+                    .user32_mitigation_probe
+                    .as_ref()
+                    .unwrap()
+                    .sequence_verified()
+            );
+            assert!(
+                record
+                    .user32_mitigation_probe
+                    .as_ref()
+                    .unwrap()
+                    .gates_verified(&record)
+            );
+            for i in 0..15 {
+                for bits in 0..16 {
+                    let mut changed = record.clone();
+                    let run = match i {
+                        0 => &mut changed.baseline,
+                        1 => &mut changed.no_window,
+                        2 => &mut changed.init_probe.as_mut().unwrap().run,
+                        3 => &mut changed.entry_probe.as_mut().unwrap().run,
+                        4 => &mut changed.terminate_probe.as_mut().unwrap().run,
+                        5 | 6 => &mut changed.subsystem_probes.as_mut().unwrap()[i - 5].run,
+                        7 => &mut changed.windows_init_probe.as_mut().unwrap().run,
+                        8 => &mut changed.windows_startup_probe.as_mut().unwrap().run,
+                        9 => &mut changed.gdi32_init_probe.as_mut().unwrap().run,
+                        10 => &mut changed.win32u_init_probe.as_mut().unwrap().run,
+                        11 => &mut changed.win32u_user32_probe.as_mut().unwrap().run,
+                        12 => &mut changed.user32_resource_probe.as_mut().unwrap().run,
+                        13 => &mut changed.user32_resource_load_probe.as_mut().unwrap().run,
+                        _ => &mut changed.user32_mitigation_probe.as_mut().unwrap().run,
+                    };
+                    run.lifecycle = bits;
+                    let confirmed = session0_user32_mitigation_resources_finished(&changed);
+                    assert_eq!(confirmed, bits & 12 == 12);
+                    let owned = Arc::new(());
+                    let mut held = Session0RetainedResources(Some(Arc::clone(&owned)));
+                    held.release_if_confirmed(confirmed);
+                    drop(held);
+                    assert_eq!(Arc::strong_count(&owned), if confirmed { 1 } else { 2 });
+                }
+            }
+            let mut argv = session0_argv_corpus()
+                .into_iter()
+                .find(|(a, ok)| a.len() == 16 && *ok)
+                .unwrap()
+                .0;
+            argv.extend((6..14).map(|n| format!("{n:x}").repeat(64).into()));
+            let config = validate_window_station_scm_process_argv(&argv).unwrap();
+            let before = record.clone();
+            let result = collect_session0_user32_mitigation_run(
+                &mut record,
+                &config,
+                &RestrictedCommand::new("unused.exe", r"C:\fixture"),
+                |p, c| {
+                    assert_eq!(
+                        c.application,
+                        config
+                            .fixture_root
+                            .join(Session0ProbeKind::User32Mitigation.basename())
+                    );
+                    assert!(c.arguments.is_empty());
+                    p.run = before.user32_mitigation_probe.as_ref().unwrap().run.clone();
+                    p.run.lifecycle = 3;
+                    p.run.child_exit = Some(31);
+                    let raw = user32_mitigation_valid_output(
+                        "desktop=empty units=0 hex=- user32=0 gdi32=0 win32u=0",
+                        None,
+                        Some(0x80000000),
+                        false,
+                    );
+                    snapshot_user32_mitigation_output(p, raw.as_bytes(), &[]);
+                    assert_eq!(p.evidence.as_ref().unwrap().stage, 12);
+                    Err("保存後回収失敗".into())
+                },
+            );
+            assert!(result.is_err());
+            let mut earlier = record.clone();
+            earlier.user32_mitigation_probe = before.user32_mitigation_probe.clone();
+            assert_eq!(earlier, before);
+            let p = record.user32_mitigation_probe.as_mut().unwrap();
+            let evidence = p.evidence.clone();
+            let raw = p.run.stdout.clone();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert!(
+                runtime
+                    .block_on(preserve_session0_exit_before_cleanup(
+                        &mut p.run,
+                        async { panic!("取得済みexitを再照会") },
+                        async { Err(io::Error::other("回収失敗")) }
+                    ))
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(1),
+                            preserve_session0_exit_before_cleanup(
+                                &mut p.run,
+                                async { panic!("取得済みexitを再照会") },
+                                std::future::pending::<io::Result<()>>(),
+                            ),
+                        )
+                        .await
+                    })
+                    .is_err()
+            );
+            assert_eq!(p.run.child_exit, Some(31));
+            assert_eq!(p.run.stdout, raw);
+            assert_eq!(p.evidence, evidence);
+            assert_eq!(
+                p.evidence
+                    .as_ref()
+                    .unwrap()
+                    .before_policy
+                    .as_ref()
+                    .unwrap()
+                    .flags,
+                None
+            );
+            assert_eq!(
+                p.evidence
+                    .as_ref()
+                    .unwrap()
+                    .after_policy
+                    .as_ref()
+                    .unwrap()
+                    .flags,
+                Some(0x80000000)
+            );
+        }
+        eprintln!(
+            "USER32_MITIGATION_BOTH_MASKS=True ALL_15_RUNS_RETAINED=True PREFIX_RAW_EXIT_BEFORE_CLEANUP=True EARLIER_14_RUNS_PRESERVED=True"
+        );
+    }
+
     fn startup_valid_output(snapshot: &str, loaded: bool, preloaded: bool) -> String {
         let p = "SBZ_WINDOWS_STARTUP_PROBE_V1 ";
         if preloaded {
@@ -13325,6 +14444,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected: accepted.then_some(parent),
                 });
             };
@@ -13776,6 +14896,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                         expected_win32u_user32: None,
                         expected_user32_resource: None,
                         expected_user32_resource_load: None,
+                        expected_user32_mitigation: None,
                         expected_windows_startup: base_case.expected_windows_startup.clone(),
                         expected: accepted.then_some(parent),
                     });
@@ -14262,6 +15383,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                         expected_win32u_user32: None,
                         expected_user32_resource: None,
                         expected_user32_resource_load: None,
+                        expected_user32_mitigation: None,
                         expected_gdi32_init: base_case.expected_gdi32_init.clone(),
                         expected_windows_startup: base_case.expected_windows_startup.clone(),
                         expected: accepted.then_some(parent),
@@ -14759,6 +15881,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_win32u_user32: if alter == 14 { None } else { Some(expected) },
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
                     expected_gdi32_init: base_case.expected_gdi32_init.clone(),
                     expected_windows_startup: base_case.expected_windows_startup.clone(),
@@ -15280,6 +16403,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_windows_init: base_case.expected_windows_init.clone(),
                     expected_user32_resource: if alter == 14 { None } else { Some(expected) },
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected_win32u_user32: base_case.expected_win32u_user32.clone(),
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
                     expected_gdi32_init: base_case.expected_gdi32_init.clone(),
@@ -15830,6 +16954,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_subsystem: base_case.expected_subsystem.clone(),
                     expected_windows_init: base_case.expected_windows_init.clone(),
                     expected_user32_resource_load: if alter == 14 { None } else { Some(expected) },
+                    expected_user32_mitigation: None,
                     expected_user32_resource: base_case.expected_user32_resource.clone(),
                     expected_win32u_user32: base_case.expected_win32u_user32.clone(),
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
@@ -16265,6 +17390,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected: Some(record),
                 });
             }
@@ -16451,6 +17577,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_win32u_user32: None,
                     expected_user32_resource: None,
                     expected_user32_resource_load: None,
+                    expected_user32_mitigation: None,
                     expected: accepted.then_some(parent),
                 });
             }
@@ -16706,6 +17833,14 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 .is_some_and(|p| p.run.lifecycle & 12 == 12)
     }
 
+    fn session0_user32_mitigation_resources_finished(record: &Session0DiagnosticRecord) -> bool {
+        session0_user32_resource_load_resources_finished(record)
+            && record
+                .user32_mitigation_probe
+                .as_ref()
+                .is_some_and(|p| p.run.lifecycle & 12 == 12)
+    }
+
     struct Session0RetainedResources<T>(Option<T>);
 
     impl<T> Session0RetainedResources<T> {
@@ -16888,6 +18023,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         win32u_user32_probe: Option<Session0Win32uUser32ProbeRecord>,
         user32_resource_probe: Option<Session0User32ResourceProbeRecord>,
         user32_resource_load_probe: Option<Session0User32ResourceLoadProbeRecord>,
+        user32_mitigation_probe: Option<Session0User32MitigationProbeRecord>,
     }
 
     impl Session0DiagnosticRecord {
@@ -16969,6 +18105,7 @@ win32u_init_probe: None,
 win32u_user32_probe: None,
 user32_resource_probe: None,
 user32_resource_load_probe: None,
+user32_mitigation_probe: None,
             }
         }
 
@@ -17137,13 +18274,19 @@ user32_resource_load_probe: None,
                 probe.validate(self)?;
                 probe.encode_into(&mut payload, self.requested_station_mask)?;
             }
+            if let Some(probe) = &self.user32_mitigation_probe {
+                probe.validate(self)?;
+                probe.encode_into(&mut payload, self.requested_station_mask)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
             let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
-            let version = if self.user32_resource_load_probe.is_some() {
+            let version = if self.user32_mitigation_probe.is_some() {
+                20
+            } else if self.user32_resource_load_probe.is_some() {
                 19
             } else if self.user32_resource_probe.is_some() {
                 18
@@ -17191,6 +18334,7 @@ user32_resource_load_probe: None,
                 win32u_user32: expected_win32u_user32,
                 user32_resource: expected_user32_resource,
                 user32_resource_load: expected_user32_resource_load,
+                user32_mitigation: expected_user32_mitigation,
             } = expected_probes;
             validate_nonce(expected_nonce)?;
             diagnostic_station_profile(expected_mask)?;
@@ -17202,7 +18346,9 @@ user32_resource_load_probe: None,
             };
             if u32_at(0) != SESSION0_DIAGNOSTIC_MAGIC
                 || u32_at(4)
-                    != if expected_user32_resource_load.is_some() {
+                    != if expected_user32_mitigation.is_some() {
+                        20
+                    } else if expected_user32_resource_load.is_some() {
                         19
                     } else if expected_user32_resource.is_some() {
                         18
@@ -17520,6 +18666,33 @@ user32_resource_load_probe: None,
                 } else {
                     None
                 };
+            let user32_mitigation_probe = if let Some((expected_path, expected_hash)) =
+                expected_user32_mitigation
+            {
+                let path = read_text(&mut reader)?;
+                let sha256 = read_text(&mut reader)?;
+                if path != expected_path || sha256 != expected_hash {
+                    return Err(
+                        "自己Win32k policy診断のpath・hashが呼出側の期待値と一致しません".into(),
+                    );
+                }
+                let run = Session0DiagnosticRun::decode_from(&mut reader)?;
+                let properties = read_text(&mut reader)?;
+                let probe = Session0User32MitigationProbeRecord {
+                    path,
+                    sha256,
+                    evidence: user32_mitigation_run_evidence(&run),
+                    run,
+                    output_eof: read_strict_bool(&mut reader)?,
+                    deadline_met: read_strict_bool(&mut reader)?,
+                };
+                if properties != probe.properties() {
+                    return Err("自己Win32k policy診断の段階証拠が出力と一致しません".into());
+                }
+                Some(probe)
+            } else {
+                None
+            };
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -17557,6 +18730,7 @@ user32_resource_load_probe: None,
                 win32u_user32_probe,
                 user32_resource_probe,
                 user32_resource_load_probe,
+                user32_mitigation_probe,
             };
             record.encode().map(|_| record)
         }
@@ -17658,8 +18832,8 @@ user32_resource_load_probe: None,
     fn require_connected_session0_request(
         config: &Session0DiagnosticConfig,
     ) -> Result<(), &'static str> {
-        if config.user32_mitigation_probe_sha256.is_some() {
-            if config.init_probe_sha256.is_none()
+        if config.user32_mitigation_probe_sha256.is_some()
+            && (config.init_probe_sha256.is_none()
                 || config.entry_probe_sha256.is_none()
                 || config.terminate_probe_sha256.is_none()
                 || config.console_probe_sha256.is_none()
@@ -17670,12 +18844,9 @@ user32_resource_load_probe: None,
                 || config.win32u_init_probe_sha256.is_none()
                 || config.win32u_user32_probe_sha256.is_none()
                 || config.user32_resource_probe_sha256.is_none()
-                || config.user32_resource_load_probe_sha256.is_none()
-            {
-                return Err("自己Win32k policy診断には先行12診断が必要です");
-            }
-            // 実行・独立記録・回収が揃うまで、設定登録とdispatcherより前に拒否する。
-            return Err("自己Win32k policy診断の実行・記録・回収は未接続です");
+                || config.user32_resource_load_probe_sha256.is_none())
+        {
+            return Err("自己Win32k policy診断には先行12診断が必要です");
         }
         if config.user32_resource_load_probe_sha256.is_some()
             && (config.init_probe_sha256.is_none()
@@ -18563,6 +19734,7 @@ privileges={privileges:?}{restricted}",
             win32u_user32_probe: None,
             user32_resource_probe: None,
             user32_resource_load_probe: None,
+            user32_mitigation_probe: None,
         };
         let lease = match ActionStationLease::acquire_for_diagnostic(config.station_profile) {
             Ok(lease) => Arc::new(lease),
@@ -18734,6 +19906,7 @@ privileges={privileges:?}{restricted}",
                 Session0ProbeKind::Win32uUser32,
                 Session0ProbeKind::User32Resource,
                 Session0ProbeKind::User32ResourceLoad,
+                Session0ProbeKind::User32Mitigation,
             ] {
                 if kind.expected_hash(config).is_none() {
                     continue;
@@ -18937,27 +20110,35 @@ privileges={privileges:?}{restricted}",
                     },
                 )?;
             }
+            if config.user32_mitigation_probe_sha256.is_some() {
+                collect_session0_user32_mitigation_run(
+                    record,
+                    config,
+                    &command,
+                    |probe, command| run_session0_user32_mitigation_child(&action, command, probe),
+                )?;
+            }
             Ok(())
         })();
-        subsystem_hold.release_if_confirmed(
-            if config.user32_resource_load_probe_sha256.is_some() {
-                session0_user32_resource_load_resources_finished(record)
-            } else if config.user32_resource_probe_sha256.is_some() {
-                session0_user32_resource_resources_finished(record)
-            } else if config.win32u_user32_probe_sha256.is_some() {
-                session0_win32u_user32_resources_finished(record)
-            } else if config.win32u_init_probe_sha256.is_some() {
-                session0_win32u_init_resources_finished(record)
-            } else if config.gdi32_init_probe_sha256.is_some() {
-                session0_gdi32_init_resources_finished(record)
-            } else if config.windows_startup_probe_sha256.is_some() {
-                session0_windows_startup_resources_finished(record)
-            } else if config.windows_init_probe_sha256.is_some() {
-                session0_windows_init_resources_finished(record)
-            } else {
-                session0_subsystem_resources_finished(record)
-            },
-        );
+        subsystem_hold.release_if_confirmed(if config.user32_mitigation_probe_sha256.is_some() {
+            session0_user32_mitigation_resources_finished(record)
+        } else if config.user32_resource_load_probe_sha256.is_some() {
+            session0_user32_resource_load_resources_finished(record)
+        } else if config.user32_resource_probe_sha256.is_some() {
+            session0_user32_resource_resources_finished(record)
+        } else if config.win32u_user32_probe_sha256.is_some() {
+            session0_win32u_user32_resources_finished(record)
+        } else if config.win32u_init_probe_sha256.is_some() {
+            session0_win32u_init_resources_finished(record)
+        } else if config.gdi32_init_probe_sha256.is_some() {
+            session0_gdi32_init_resources_finished(record)
+        } else if config.windows_startup_probe_sha256.is_some() {
+            session0_windows_startup_resources_finished(record)
+        } else if config.windows_init_probe_sha256.is_some() {
+            session0_windows_init_resources_finished(record)
+        } else {
+            session0_subsystem_resources_finished(record)
+        });
         cleanup_session0_diagnostic_scratch(
             scratch.path(),
             &config.record_directory,
