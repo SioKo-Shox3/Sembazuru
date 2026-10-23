@@ -91,7 +91,12 @@ function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [s
 }
 
 function Get-Session0ServiceDeadline([bool]$InitRequested, [bool]$EntryRequested, [bool]$TerminateRequested = $false,
-    [bool]$SubsystemRequested = $false, [bool]$WindowsInitRequested = $false, [bool]$WindowsStartupRequested = $false, [bool]$Gdi32InitRequested = $false, [bool]$Win32uInitRequested = $false, [bool]$Win32uUser32Requested = $false, [bool]$User32ResourceRequested = $false) {
+    [bool]$SubsystemRequested = $false, [bool]$WindowsInitRequested = $false, [bool]$WindowsStartupRequested = $false, [bool]$Gdi32InitRequested = $false, [bool]$Win32uInitRequested = $false, [bool]$Win32uUser32Requested = $false, [bool]$User32ResourceRequested = $false, [bool]$User32ResourceLoadRequested = $false) {
+    if ($User32ResourceLoadRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested -or -not $Gdi32InitRequested -or -not $Win32uInitRequested -or -not $Win32uUser32Requested -or -not $User32ResourceRequested) { throw 'USER32リソース保持後ロード診断の期限には先行11診断が必要です。' }
+        # 旧13runの1417秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
+        return (4 * 106 + 3 * 107 + 7 * 107 + 30)
+    }
     if ($User32ResourceRequested) {
         if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested -or -not $Gdi32InitRequested -or -not $Win32uInitRequested -or -not $Win32uUser32Requested) { throw 'USER32リソース診断の期限には先行10診断が必要です。' }
         # 旧12runの1310秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
@@ -152,7 +157,8 @@ function ConvertFrom-Session0StationMask([string]$Value) {
 # 実行・独立記録・保持回収が揃った固定要求だけを受け付ける。
 function Assert-Session0ConnectedRequest([bool]$User32ResourceLoadRequested) {
     # 実行・独立記録・全保持回収が揃うまで、配置やサービス登録へ進めない。
-    if ($User32ResourceLoadRequested) { throw 'USER32リソース保持後ロード診断の実行・記録・回収は未接続です。' }
+    # 固定組検査後に、実行・独立v19・全保持回収を同時に接続する。
+    $null = $User32ResourceLoadRequested
 }
 
 function Assert-Session0FixtureArguments([string[]]$Arguments) {
@@ -268,6 +274,7 @@ $gdi32InitProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Ident
 $win32uInitProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'Win32uInit' }
 $win32uUser32Probe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'Win32uUser32' }
 $user32ResourceProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'User32Resource' }
+$user32ResourceLoadProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'User32ResourceLoad' }
 $initProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $entryProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $terminateProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
@@ -2413,6 +2420,167 @@ function Read-Session0User32ResourceRecord([byte[]]$Bytes, [ref]$Offset, [uint32
     return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
 }
 
+function Read-Session0User32ResourceLoadStartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_USER32_RESOURCE_LOAD_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0User32ResourceLoadStartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $rows = [Text.Encoding]::Latin1.GetString($Bytes).Split("`n")
+    $result = [ordered]@{ Stage = 0; Before = $null; ResourcePreloaded = $null; ResourceFlags = $null
+        ResourceResult = $null; ResourceGle = $null; DatafileBit = $null; ImageBit = $null; Reused = $null
+        ResourceKind = 0; ResourceComplete = $false; AfterResource = $null; User32Preloaded = $null
+        User32Result = $null; User32Gle = $null; User32Complete = $false; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_USER32_RESOURCE_LOAD_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 { $result.Before = Read-Session0User32ResourceLoadStartupSnapshot $line 'before'; $result.Stage = 2 }
+            2 {
+                if ($line -cnotmatch ('\A' + $prefix + 'resource_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.ResourcePreloaded = [int]$matches[1]; $result.Stage = 3
+            }
+            3 {
+                if ($line -cne ($prefix + 'resource_flags=0x00000860')) { throw 'リソースマッピングの固定flagsが一致しません。' }
+                $result.ResourceFlags = '0x00000860'; $result.Stage = 4
+            }
+            4 { if ($line -cne ($prefix + 'resource_map_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 5 }
+            5 {
+                if ($line -cnotmatch ('\A' + $prefix + 'resource_map_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.ResourceResult = [int]$matches[1]; $result.ResourceGle = '0x' + $matches[2]; $result.Stage = 6
+            }
+            6 {
+                if ($line -cnotmatch ('\A' + $prefix + 'resource_handle datafile_bit=([01]) image_bit=(0|2) reused=([01])\z')) { throw '返却handle識別bitの固定表現が不正です。' }
+                $result.DatafileBit = [int]$matches[1]; $result.ImageBit = [int]$matches[2]; $result.Reused = [int]$matches[3]
+                if (($result.ResourceResult -eq 0 -and ($result.DatafileBit -ne 0 -or $result.ImageBit -ne 0 -or $result.Reused -ne 0)) -or
+                    ($result.Reused -eq 1 -and ($result.ResourcePreloaded -ne 1 -or $result.DatafileBit -ne 0 -or $result.ImageBit -ne 0))) {
+                    throw '取得結果・既ロード・識別bit・handle再利用が矛盾しています。'
+                }
+                $result.ResourceKind = if ($result.ResourceResult -eq 0) { 1 } elseif ($result.DatafileBit -ne 0 -or $result.ImageBit -ne 0) {
+                    2
+                } elseif ($result.Reused -eq 1) { 3 } else { 4 }
+                $result.Stage = 7
+            }
+            7 {
+                if ($line -cne ($prefix + 'resource_complete')) { throw '固定段階列の順序が不正です。' }
+                $result.ResourceComplete = $true; $result.Stage = 8
+            }
+            8 {
+                if ($line -cnotmatch ('\A' + $prefix + 'after_resource user32=([01]) gdi32=([01]) win32u=([01])\z')) { throw '中間モジュール照会の固定表現が不正です。' }
+                $result.AfterResource = [pscustomobject]@{ User32 = [int]$matches[1]; Gdi32 = [int]$matches[2]; Win32u = [int]$matches[3] }
+                $result.Stage = 9
+            }
+            9 {
+                if ($result.ResourceResult -eq 0) {
+                    $result.After = Read-Session0User32ResourceLoadStartupSnapshot $line 'after'; $result.Stage = 14
+                } else {
+                    if ($line -cnotmatch ('\A' + $prefix + 'user32_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                    $result.User32Preloaded = [int]$matches[1]; $result.Stage = 10
+                }
+            }
+            10 { if ($line -cne ($prefix + 'user32_load_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 11 }
+            11 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Result = [int]$matches[1]; $result.User32Gle = '0x' + $matches[2]; $result.Stage = 12
+            }
+            12 {
+                if ($line -cne ($prefix + 'user32_complete')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Complete = $true; $result.Stage = 13
+            }
+            13 { $result.After = Read-Session0User32ResourceLoadStartupSnapshot $line 'after'; $result.Stage = 14 }
+            14 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 15
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    if (@($Bytes | Where-Object { $_ -gt 127 }).Count) { $result.Valid=$false }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.ResourceResult -eq 0){11}elseif($result.User32Result -eq 0){21}else{0}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 11){1}else{2+($result.ResourceKind-2)*2+[int]($expected-eq 0)}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0User32ResourceLoadEvidence($Run) {
+    # raw bytesを復元し、USER32リソース保持後ロード専用parserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw 'USER32リソース保持後ロード診断の出力hexが不正です。' }
+    $evidence = Read-Session0User32ResourceLoadStartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = @([string]$evidence.Stage)
+    foreach ($property in @('Before','ResourcePreloaded','ResourceFlags','ResourceResult','ResourceGle','DatafileBit','ImageBit','Reused','ResourceKind','ResourceComplete','AfterResource','User32Preloaded','User32Result','User32Gle','User32Complete','After','Valid','Partial','Outcome')) {
+        $value=$evidence.$property
+        $values += $(if ($null -eq $value) { 'none' }
+            elseif ($property -cin @('ResourceFlags','ResourceGle','User32Gle')) { [string][Convert]::ToUInt32($value.Substring(2),16) }
+            elseif ($property -cin @('Before','After')) { @($value.State,$value.Units,$value.Hex,$value.User32,$value.Gdi32,$value.Win32u) -join ',' }
+            elseif ($property -ceq 'AfterResource') { @($value.User32,$value.Gdi32,$value.Win32u) -join ',' }
+            elseif ($property -cin @('ResourceComplete','User32Complete','Valid','Partial')) { [string][int]$value }
+            else { [string]$value })
+    }
+    return $values -join ';'
+}
+
+function Test-Session0User32ResourceLoadSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0User32ResourceLoadStartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0User32ResourceLoadGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.User32ResourceLoadProbe) { return $false }
+    $probe=$Record.User32ResourceLoadProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0User32ResourceLoadTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.User32ResourceLoadProbe -and ($Record.User32ResourceLoadProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0User32ResourceLoadRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0User32ResourceLoadProbe.exe')) { throw 'USER32リソース保持後ロード診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'USER32リソース保持後ロード診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw 'USER32リソース保持後ロード診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0User32ResourceLoadEvidence $run)) { throw 'USER32リソース保持後ロード診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'USER32リソース保持後ロード診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'USER32リソース保持後ロード診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
 function Get-Session0WindowsInitEvidence($Run) {
     # raw bytesを復元し、旧Initと同じparserで段階/GLEを独立照合する。
     if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,4097}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,4097}\z') { throw 'WINDOWS初期化診断の出力hexが不正です。' }
@@ -2511,15 +2679,16 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
     [string]$ExpectedGdi32InitPath = '', [string]$ExpectedGdi32InitHash = '',
     [string]$ExpectedWin32uInitPath = '', [string]$ExpectedWin32uInitHash = '',
     [string]$ExpectedWin32uUser32Path = '', [string]$ExpectedWin32uUser32Hash = '',
-    [string]$ExpectedUser32ResourcePath = '', [string]$ExpectedUser32ResourceHash = '') {
-    Assert-Session0ProbeParameters $ExpectedInitPath $ExpectedInitHash $ExpectedEntryPath $ExpectedEntryHash $ExpectedTerminatePath $ExpectedTerminateHash $ExpectedConsolePath $ExpectedConsoleHash $ExpectedWindowsPath $ExpectedWindowsHash $ExpectedWindowsInitPath $ExpectedWindowsInitHash $ExpectedWindowsStartupPath $ExpectedWindowsStartupHash $ExpectedGdi32InitPath $ExpectedGdi32InitHash $ExpectedWin32uInitPath $ExpectedWin32uInitHash $ExpectedWin32uUser32Path $ExpectedWin32uUser32Hash $ExpectedUser32ResourcePath $ExpectedUser32ResourceHash
+    [string]$ExpectedUser32ResourcePath = '', [string]$ExpectedUser32ResourceHash = '',
+    [string]$ExpectedUser32ResourceLoadPath = '', [string]$ExpectedUser32ResourceLoadHash = '') {
+    Assert-Session0ProbeParameters $ExpectedInitPath $ExpectedInitHash $ExpectedEntryPath $ExpectedEntryHash $ExpectedTerminatePath $ExpectedTerminateHash $ExpectedConsolePath $ExpectedConsoleHash $ExpectedWindowsPath $ExpectedWindowsHash $ExpectedWindowsInitPath $ExpectedWindowsInitHash $ExpectedWindowsStartupPath $ExpectedWindowsStartupHash $ExpectedGdi32InitPath $ExpectedGdi32InitHash $ExpectedWin32uInitPath $ExpectedWin32uInitHash $ExpectedWin32uUser32Path $ExpectedWin32uUser32Hash $ExpectedUser32ResourcePath $ExpectedUser32ResourceHash $ExpectedUser32ResourceLoadPath $ExpectedUser32ResourceLoadHash
     if ($ExpectedMask -ne 0x0002 -and $ExpectedMask -ne 0x0022) {
         throw '呼出側の station mask が許容範囲外です。'
     }
     if ($Bytes.Length -lt 44 -or $Bytes.Length -gt 65580) {
         throw '診断レコードの長さが許容範囲外です。'
     }
-    $expectedVersion = if ($ExpectedUser32ResourcePath) { [uint32]18 } elseif ($ExpectedWin32uUser32Path) { [uint32]17 } elseif ($ExpectedWin32uInitPath) { [uint32]16 } elseif ($ExpectedGdi32InitPath) { [uint32]15 } elseif ($ExpectedWindowsStartupPath) { [uint32]14 } elseif ($ExpectedWindowsInitPath) { [uint32]13 } elseif ($ExpectedConsolePath) { [uint32]12 } elseif ($ExpectedTerminatePath) { [uint32]11 } elseif ($ExpectedEntryPath) { [uint32]10 } else { [uint32]9 }
+    $expectedVersion = if ($ExpectedUser32ResourceLoadPath) { [uint32]19 } elseif ($ExpectedUser32ResourcePath) { [uint32]18 } elseif ($ExpectedWin32uUser32Path) { [uint32]17 } elseif ($ExpectedWin32uInitPath) { [uint32]16 } elseif ($ExpectedGdi32InitPath) { [uint32]15 } elseif ($ExpectedWindowsStartupPath) { [uint32]14 } elseif ($ExpectedWindowsInitPath) { [uint32]13 } elseif ($ExpectedConsolePath) { [uint32]12 } elseif ($ExpectedTerminatePath) { [uint32]11 } elseif ($ExpectedEntryPath) { [uint32]10 } else { [uint32]9 }
     if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
         [BitConverter]::ToUInt32($Bytes, 4) -ne $expectedVersion) {
         throw '診断レコードの magic または version が一致しません。'
@@ -2600,6 +2769,10 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
         $user32ResourceProbeRecord = Read-Session0User32ResourceRecord $Bytes $offset $requestedMask $fields[2] `
             $ExpectedUser32ResourcePath $ExpectedUser32ResourceHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run, $gdi32InitProbeRecord.Run, $win32uInitProbeRecord.Run, $win32uUser32ProbeRecord.Run) $consoleProbeRecord.Path
     }
+    if ($ExpectedUser32ResourceLoadPath) {
+        $user32ResourceLoadProbeRecord = Read-Session0User32ResourceLoadRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedUser32ResourceLoadPath $ExpectedUser32ResourceLoadHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run, $gdi32InitProbeRecord.Run, $win32uInitProbeRecord.Run, $win32uUser32ProbeRecord.Run, $user32ResourceProbeRecord.Run) $consoleProbeRecord.Path
+    }
     if ($null -ne $initProbeRecord -and $initProbeRecord.Run.TargetDesktop.Length -ne 0 -and
         ($initProbeRecord.Run.TargetDesktop -ceq $baseline.TargetDesktop -or $initProbeRecord.Run.TargetDesktop -ceq $noWindow.TargetDesktop)) {
         throw '追加診断のdesktopがcmdと重複しています。'
@@ -2674,6 +2847,7 @@ function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$
     if ($ExpectedWin32uInitPath) { $result | Add-Member NoteProperty Win32uInitProbe $win32uInitProbeRecord }
     if ($ExpectedWin32uUser32Path) { $result | Add-Member NoteProperty Win32uUser32Probe $win32uUser32ProbeRecord }
     if ($ExpectedUser32ResourcePath) { $result | Add-Member NoteProperty User32ResourceProbe $user32ResourceProbeRecord }
+    if ($ExpectedUser32ResourceLoadPath) { $result | Add-Member NoteProperty User32ResourceLoadProbe $user32ResourceLoadProbeRecord }
     return $result
 }
 
@@ -2711,6 +2885,7 @@ try {
     if ($Win32uInitProbePath) { Open-Session0InitProbeSource $win32uInitProbe $Win32uInitProbePath $Win32uInitProbeSha256 'Win32uInit' }
     if ($Win32uUser32ProbePath) { Open-Session0InitProbeSource $win32uUser32Probe $Win32uUser32ProbePath $Win32uUser32ProbeSha256 'Win32uUser32' }
     if ($User32ResourceProbePath) { Open-Session0InitProbeSource $user32ResourceProbe $User32ResourceProbePath $User32ResourceProbeSha256 'User32Resource' }
+    if ($User32ResourceLoadProbePath) { Open-Session0InitProbeSource $user32ResourceLoadProbe $User32ResourceLoadProbePath $User32ResourceLoadProbeSha256 'User32ResourceLoad' }
 
     $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
     if ([string]::IsNullOrWhiteSpace($programFiles)) { throw 'Program Files known folder is empty.' }
@@ -2762,6 +2937,7 @@ try {
         if ($Win32uInitProbePath) { Copy-Session0InitProbe $win32uInitProbe $root }
         if ($Win32uUser32ProbePath) { Copy-Session0InitProbe $win32uUser32Probe $root }
         if ($User32ResourceProbePath) { Copy-Session0InitProbe $user32ResourceProbe $root }
+        if ($User32ResourceLoadProbePath) { Copy-Session0InitProbe $user32ResourceLoadProbe $root }
     }
     finally { $restore.Dispose() }
 
@@ -2814,6 +2990,7 @@ try {
     if ($Win32uInitProbePath) { $fixtureArguments += $win32uInitProbe.Hash }
     if ($Win32uUser32ProbePath) { $fixtureArguments += $win32uUser32Probe.Hash }
     if ($User32ResourceProbePath) { $fixtureArguments += $user32ResourceProbe.Hash }
+    if ($User32ResourceLoadProbePath) { $fixtureArguments += $user32ResourceLoadProbe.Hash }
     Assert-Session0FixtureArguments $fixtureArguments
     Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 23)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
@@ -2830,6 +3007,7 @@ try {
     if ($Win32uInitProbePath) { $imagePath += ' ' + $win32uInitProbe.Hash }
     if ($Win32uUser32ProbePath) { $imagePath += ' ' + $win32uUser32Probe.Hash }
     if ($User32ResourceProbePath) { $imagePath += ' ' + $user32ResourceProbe.Hash }
+    if ($User32ResourceLoadProbePath) { $imagePath += ' ' + $user32ResourceLoadProbe.Hash }
     $serviceAccount = 'NT SERVICE\' + $serviceName
     $serviceHandle = [Sembazuru.WindowStationProbeNative]::CreateProbeService(
         $serviceName, $imagePath, $serviceAccount
@@ -2880,6 +3058,7 @@ try {
     if ($Win32uInitProbePath) { Grant-Session0InitProbeRead $win32uInitProbe $serviceSid }
     if ($Win32uUser32ProbePath) { Grant-Session0InitProbeRead $win32uUser32Probe $serviceSid }
     if ($User32ResourceProbePath) { Grant-Session0InitProbeRead $user32ResourceProbe $serviceSid }
+    if ($User32ResourceLoadProbePath) { Grant-Session0InitProbeRead $user32ResourceLoadProbe $serviceSid }
     $serviceRootIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($rootHandle.Handle)
     $serviceExeIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($targetLease.Handle)
     $leaseIdentity = $serviceExeIdentity
@@ -2913,7 +3092,7 @@ try {
     }
 
     # 旧形式の期限を保ち、追加runごとの終了確認時間を割り当てる。
-    $serviceDeadlineSeconds = Get-Session0ServiceDeadline ([bool]$InitProbePath) ([bool]$EntryProbePath) ([bool]$TerminateProbePath) ([bool]$ConsoleProbePath) ([bool]$WindowsInitProbePath) ([bool]$WindowsStartupProbePath) ([bool]$Gdi32InitProbePath) ([bool]$Win32uInitProbePath) ([bool]$Win32uUser32ProbePath) ([bool]$User32ResourceProbePath)
+    $serviceDeadlineSeconds = Get-Session0ServiceDeadline ([bool]$InitProbePath) ([bool]$EntryProbePath) ([bool]$TerminateProbePath) ([bool]$ConsoleProbePath) ([bool]$WindowsInitProbePath) ([bool]$WindowsStartupProbePath) ([bool]$Gdi32InitProbePath) ([bool]$Win32uInitProbePath) ([bool]$Win32uUser32ProbePath) ([bool]$User32ResourceProbePath) ([bool]$User32ResourceLoadProbePath)
     $deadline = [DateTime]::UtcNow.AddSeconds($serviceDeadlineSeconds)
     $sawRunning = $false
     do {
@@ -2966,7 +3145,7 @@ try {
     }
     $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
         $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash `
-        $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash $windowsInitProbe.Path $windowsInitProbe.Hash $windowsStartupProbe.Path $windowsStartupProbe.Hash $gdi32InitProbe.Path $gdi32InitProbe.Hash $win32uInitProbe.Path $win32uInitProbe.Hash $win32uUser32Probe.Path $win32uUser32Probe.Hash $user32ResourceProbe.Path $user32ResourceProbe.Hash
+        $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash $windowsInitProbe.Path $windowsInitProbe.Hash $windowsStartupProbe.Path $windowsStartupProbe.Hash $gdi32InitProbe.Path $gdi32InitProbe.Hash $win32uInitProbe.Path $win32uInitProbe.Hash $win32uUser32Probe.Path $win32uUser32Probe.Hash $user32ResourceProbe.Path $user32ResourceProbe.Hash $user32ResourceLoadProbe.Path $user32ResourceLoadProbe.Hash
     $classificationMap = @{
         1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
         2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
@@ -2998,9 +3177,9 @@ try {
         } else { $property }
         $detail.Add(('{0}={1}' -f $label, (Format-BoundedDiagnosticText $record.$property)))
     }
-    foreach ($name in (@('Baseline', 'NoWindow', 'InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe') + $(if ($WindowsStartupProbePath) { @('WindowsStartupProbe') } else { @() }) + $(if ($Gdi32InitProbePath) { @('Gdi32InitProbe') } else { @() }) + $(if ($Win32uInitProbePath) { @('Win32uInitProbe') } else { @() }) + $(if ($Win32uUser32ProbePath) { @('Win32uUser32Probe') } else { @() }) + $(if ($User32ResourceProbePath) { @('User32ResourceProbe') } else { @() }))) {
-        if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe', 'WindowsStartupProbe', 'Gdi32InitProbe', 'Win32uInitProbe', 'Win32uUser32Probe', 'User32ResourceProbe') -and $null -eq $record.$name) { continue }
-        $run = if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe', 'WindowsStartupProbe', 'Gdi32InitProbe', 'Win32uInitProbe', 'Win32uUser32Probe', 'User32ResourceProbe')) { $record.$name.Run } else { $record.$name }
+    foreach ($name in (@('Baseline', 'NoWindow', 'InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe') + $(if ($WindowsStartupProbePath) { @('WindowsStartupProbe') } else { @() }) + $(if ($Gdi32InitProbePath) { @('Gdi32InitProbe') } else { @() }) + $(if ($Win32uInitProbePath) { @('Win32uInitProbe') } else { @() }) + $(if ($Win32uUser32ProbePath) { @('Win32uUser32Probe') } else { @() }) + $(if ($User32ResourceProbePath) { @('User32ResourceProbe') } else { @() }) + $(if ($User32ResourceLoadProbePath) { @('User32ResourceLoadProbe') } else { @() }))) {
+        if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe', 'WindowsStartupProbe', 'Gdi32InitProbe', 'Win32uInitProbe', 'Win32uUser32Probe', 'User32ResourceProbe', 'User32ResourceLoadProbe') -and $null -eq $record.$name) { continue }
+        $run = if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe', 'WindowsStartupProbe', 'Gdi32InitProbe', 'Win32uInitProbe', 'Win32uUser32Probe', 'User32ResourceProbe', 'User32ResourceLoadProbe')) { $record.$name.Run } else { $record.$name }
         if ($name -in @('ConsoleProbe', 'WindowsProbe')) {
             $probe = $record.$name
             $kind = $name.Replace('Probe', '')
@@ -3035,6 +3214,9 @@ try {
         }
         if ($name -eq 'User32ResourceProbe') {
             $detail.Add(('User32ResourceProbePath={0} User32ResourceProbeSha256={1} User32ResourceProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.User32ResourceProbe.Path, $record.User32ResourceProbe.Sha256, $record.User32ResourceProbe.Evidence, $run.Stdout, $run.Stderr, $record.User32ResourceProbe.OutputEof, $record.User32ResourceProbe.DeadlineMet, (Test-Session0User32ResourceSequence $record.User32ResourceProbe)))
+        }
+        if ($name -eq 'User32ResourceLoadProbe') {
+            $detail.Add(('User32ResourceLoadProbePath={0} User32ResourceLoadProbeSha256={1} User32ResourceLoadProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.User32ResourceLoadProbe.Path, $record.User32ResourceLoadProbe.Sha256, $record.User32ResourceLoadProbe.Evidence, $run.Stdout, $run.Stderr, $record.User32ResourceLoadProbe.OutputEof, $record.User32ResourceLoadProbe.DeadlineMet, (Test-Session0User32ResourceLoadSequence $record.User32ResourceLoadProbe)))
         }
         if ($name -eq 'InitProbe') {
             $detail.Add(('InitProbePath={0} InitProbeSha256={1} InitProbeEvidence={2}' -f $record.InitProbe.Path, $record.InitProbe.Sha256, $record.InitProbe.Evidence))
@@ -3092,6 +3274,10 @@ try {
     if ($User32ResourceProbePath) {
         if (-not (Test-Session0User32ResourceSequence $record.User32ResourceProbe)) { throw "USER32リソース診断の段階列・対応終了値が未達です: $diagnosticDetail" }
         if (-not (Test-Session0User32ResourceGates $record)) { throw "USER32リソース診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
+    }
+    if ($User32ResourceLoadProbePath) {
+        if (-not (Test-Session0User32ResourceLoadSequence $record.User32ResourceLoadProbe)) { throw "USER32リソース保持後ロード診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0User32ResourceLoadGates $record)) { throw "USER32リソース保持後ロード診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
     }
 
 }
@@ -3173,7 +3359,7 @@ finally {
         try {
             $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
                 $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash `
-                $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash $windowsInitProbe.Path $windowsInitProbe.Hash $windowsStartupProbe.Path $windowsStartupProbe.Hash $gdi32InitProbe.Path $gdi32InitProbe.Hash $win32uInitProbe.Path $win32uInitProbe.Hash $win32uUser32Probe.Path $win32uUser32Probe.Hash $user32ResourceProbe.Path $user32ResourceProbe.Hash
+                $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash $windowsInitProbe.Path $windowsInitProbe.Hash $windowsStartupProbe.Path $windowsStartupProbe.Hash $gdi32InitProbe.Path $gdi32InitProbe.Hash $win32uInitProbe.Path $win32uInitProbe.Hash $win32uUser32Probe.Path $win32uUser32Probe.Hash $user32ResourceProbe.Path $user32ResourceProbe.Hash $user32ResourceLoadProbe.Path $user32ResourceLoadProbe.Hash
         } catch { $cleanupErrors.Add("終了時の独立record照合: $($_.Exception.Message)") }
     }
     $initTreeSafe = Test-Session0InitTreeSafe ([bool]$InitProbePath) $serviceStartAttempted $record
@@ -3186,7 +3372,8 @@ finally {
     $win32uInitTreeSafe = Test-Session0Win32uInitTreeSafe ([bool]$Win32uInitProbePath) $serviceStartAttempted $record
     $win32uUser32TreeSafe = Test-Session0Win32uUser32TreeSafe ([bool]$Win32uUser32ProbePath) $serviceStartAttempted $record
     $user32ResourceTreeSafe = Test-Session0User32ResourceTreeSafe ([bool]$User32ResourceProbePath) $serviceStartAttempted $record
-    $probesTreeSafe = $user32ResourceTreeSafe -and $win32uUser32TreeSafe -and $win32uInitTreeSafe -and $gdi32InitTreeSafe -and $windowsStartupTreeSafe -and $initTreeSafe -and $entryTreeSafe -and $terminateTreeSafe -and $subsystemTreeSafe -and $windowsInitTreeSafe
+    $user32ResourceLoadTreeSafe = Test-Session0User32ResourceLoadTreeSafe ([bool]$User32ResourceLoadProbePath) $serviceStartAttempted $record
+    $probesTreeSafe = $user32ResourceLoadTreeSafe -and $user32ResourceTreeSafe -and $win32uUser32TreeSafe -and $win32uInitTreeSafe -and $gdi32InitTreeSafe -and $windowsStartupTreeSafe -and $initTreeSafe -and $entryTreeSafe -and $terminateTreeSafe -and $subsystemTreeSafe -and $windowsInitTreeSafe
     if ($WindowsInitProbePath -and $serviceStartAttempted) {
         $probesTreeSafe = $probesTreeSafe -and $null -ne $record -and
             ($record.Baseline.Lifecycle -band 12) -eq 12 -and ($record.NoWindow.Lifecycle -band 12) -eq 12
@@ -3213,6 +3400,7 @@ finally {
                     try { [Sembazuru.WindowStationProbeNative]::MarkDelete($recordCleanup.Handle) }
                     finally { $recordCleanup.Dispose() }
                 }
+                Remove-Session0InitProbe $user32ResourceLoadProbe
                 Remove-Session0InitProbe $user32ResourceProbe
                 Remove-Session0InitProbe $win32uUser32Probe
                 Remove-Session0InitProbe $win32uInitProbe
@@ -3263,7 +3451,7 @@ finally {
             catch { $cleanupErrors.Add("fixture cleanup: $($_.Exception.Message)") }
         }
     }
-    foreach ($probe in @($initProbe, $entryProbe, $terminateProbe, $consoleProbe, $windowsProbe, $windowsInitProbe, $windowsStartupProbe, $gdi32InitProbe, $win32uInitProbe, $win32uUser32Probe, $user32ResourceProbe)) {
+    foreach ($probe in @($initProbe, $entryProbe, $terminateProbe, $consoleProbe, $windowsProbe, $windowsInitProbe, $windowsStartupProbe, $gdi32InitProbe, $win32uInitProbe, $win32uUser32Probe, $user32ResourceProbe, $user32ResourceLoadProbe)) {
         foreach ($name in @('Source', 'Target', 'Lease', 'ReadHold')) {
             if ($retainSubsystem -or (-not $probesTreeSafe -and $name -ne 'Source')) { continue }
             if ($null -ne $probe[$name]) {
@@ -3277,7 +3465,7 @@ finally {
         # ホスト終了まで保持する。確認不能を通常cleanupへ読み替えない。
         $retained = Get-Variable -Name SembazuruSession0RetainedInitProbes -Scope Global -ErrorAction SilentlyContinue
         if ($null -eq $retained) { $global:SembazuruSession0RetainedInitProbes = [Collections.Generic.List[object]]::new() }
-        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; EntryProbe=$entryProbe; TerminateProbe=$terminateProbe; ConsoleProbe=$consoleProbe; WindowsProbe=$windowsProbe; WindowsInitProbe=$windowsInitProbe; WindowsStartupProbe=$windowsStartupProbe; Gdi32InitProbe=$gdi32InitProbe; Win32uInitProbe=$win32uInitProbe; Win32uUser32Probe=$win32uUser32Probe; User32ResourceProbe=$user32ResourceProbe; Root=$rootHandle; FixtureTarget=$(if ($retainSubsystem) { $targetHandle }); FixtureLease=$(if ($retainSubsystem) { $targetLease }) })
+        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; EntryProbe=$entryProbe; TerminateProbe=$terminateProbe; ConsoleProbe=$consoleProbe; WindowsProbe=$windowsProbe; WindowsInitProbe=$windowsInitProbe; WindowsStartupProbe=$windowsStartupProbe; Gdi32InitProbe=$gdi32InitProbe; Win32uInitProbe=$win32uInitProbe; Win32uUser32Probe=$win32uUser32Probe; User32ResourceProbe=$user32ResourceProbe; User32ResourceLoadProbe=$user32ResourceLoadProbe; Root=$rootHandle; FixtureTarget=$(if ($retainSubsystem) { $targetHandle }); FixtureLease=$(if ($retainSubsystem) { $targetLease }) })
         $rootHandle = $null
         if ($retainSubsystem) { $targetHandle = $null; $targetLease = $null }
     }
