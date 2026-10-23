@@ -106,6 +106,17 @@ jobs:
           )
           $expectedWindowsStartupBuildSha256 = (Get-FileHash -LiteralPath $windowsStartupBuildPath -Algorithm SHA256).Hash
           $expectedWindowsStartupSourceSha256 = (Get-FileHash -LiteralPath $windowsStartupSourcePath -Algorithm SHA256).Hash
+          $gdi32InitBuildPath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_gdi32_init_probe.ps1')
+          )
+          $gdi32InitSourcePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_gdi32_init_probe.cpp')
+          )
+          $gdi32InitProbePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE '.harness/T-011-N30-gdi32-init-probe/session0_gdi32_init_probe.exe')
+          )
+          $expectedGdi32InitBuildSha256 = (Get-FileHash -LiteralPath $gdi32InitBuildPath -Algorithm SHA256).Hash
+          $expectedGdi32InitSourceSha256 = (Get-FileHash -LiteralPath $gdi32InitSourcePath -Algorithm SHA256).Hash
           & rustup toolchain install 1.97.0 --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain の導入に失敗しました。' }
           $artifacts = @(& cargo +1.97.0 test -p sembazuru-worker --lib --locked --no-run --message-format=json)
@@ -174,6 +185,8 @@ jobs:
           $windowsInitBuildInput = $null
           $windowsStartupBuildInput = $null
           $windowsStartupSourceInput = $null
+          $gdi32InitBuildInput = $null
+          $gdi32InitSourceInput = $null
           try {
               $probeInput = Open-VerifiedInput $probePath $expectedProbeSha256
               $initBuildInput = Open-VerifiedInput $initBuildPath $expectedInitBuildSha256
@@ -186,6 +199,8 @@ jobs:
               $windowsInitBuildInput = Open-VerifiedInput $windowsInitBuildPath $expectedWindowsInitBuildSha256
               $windowsStartupBuildInput = Open-VerifiedInput $windowsStartupBuildPath $expectedWindowsStartupBuildSha256
               $windowsStartupSourceInput = Open-VerifiedInput $windowsStartupSourcePath $expectedWindowsStartupSourceSha256
+              $gdi32InitBuildInput = Open-VerifiedInput $gdi32InitBuildPath $expectedGdi32InitBuildSha256
+              $gdi32InitSourceInput = Open-VerifiedInput $gdi32InitSourcePath $expectedGdi32InitSourceSha256
               $initBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($initBuildInput.Bytes)
               $tokens = $null
               $parseErrors = $null
@@ -251,6 +266,19 @@ jobs:
               & ($windowsStartupBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw 'WINDOWS 起動情報診断 EXE のビルドに失敗しました。' }
               $expectedWindowsStartupProbeSha256 = (Get-FileHash -LiteralPath $windowsStartupProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              # GDI32 明示ロード診断は保持済みの専用 C++ と PS バイト列から生成する。
+              $gdi32InitBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($gdi32InitBuildInput.Bytes)
+              $tokens = $null
+              $parseErrors = $null
+              $gdi32InitBuildAst = [Management.Automation.Language.Parser]::ParseInput(
+                  $gdi32InitBuildText, $gdi32InitBuildPath, [ref]$tokens, [ref]$parseErrors
+              )
+              if ($parseErrors.Count -ne 0) { throw 'GDI32 明示ロード診断のビルドスクリプトに構文エラーがあります。' }
+              & ($gdi32InitBuildAst.GetScriptBlock()) -BuildOnly
+              if ($LASTEXITCODE -ne 0) { throw 'GDI32 明示ロード診断 EXE のビルドに失敗しました。' }
+              $expectedGdi32InitProbeSha256 = (Get-FileHash -LiteralPath $gdi32InitProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              Write-Host ('commit={0} requested_station_mask={1} verified_gdi32_init_build_sha256={2} verified_gdi32_init_source_sha256={3}' -f
+                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $gdi32InitBuildInput.Sha256, $gdi32InitSourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_windows_init_build_sha256={2}' -f
                   $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $windowsInitBuildInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_windows_startup_build_sha256={2} verified_windows_startup_source_sha256={3}' -f
@@ -276,7 +304,8 @@ jobs:
                   @('console_probe', $consoleProbePath, $expectedConsoleProbeSha256),
                   @('windows_probe', $windowsProbePath, $expectedWindowsProbeSha256),
                   @('windows_init_probe', $windowsInitProbePath, $expectedWindowsInitProbeSha256),
-                  @('windows_startup_probe', $windowsStartupProbePath, $expectedWindowsStartupProbeSha256)
+                  @('windows_startup_probe', $windowsStartupProbePath, $expectedWindowsStartupProbeSha256),
+                  @('gdi32_init_probe', $gdi32InitProbePath, $expectedGdi32InitProbeSha256)
               )) {
                   Write-Host ('commit={0} requested_station_mask={1} {2}_path={3} {2}_sha256={4}' -f
                       $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $executable[0], $executable[1], $executable[2])
@@ -290,10 +319,11 @@ jobs:
                   -ConsoleProbePath $consoleProbePath -ConsoleProbeSha256 $expectedConsoleProbeSha256 `
                   -WindowsProbePath $windowsProbePath -WindowsProbeSha256 $expectedWindowsProbeSha256 `
                   -WindowsInitProbePath $windowsInitProbePath -WindowsInitProbeSha256 $expectedWindowsInitProbeSha256 `
-                  -WindowsStartupProbePath $windowsStartupProbePath -WindowsStartupProbeSha256 $expectedWindowsStartupProbeSha256
+                  -WindowsStartupProbePath $windowsStartupProbePath -WindowsStartupProbeSha256 $expectedWindowsStartupProbeSha256 `
+                  -Gdi32InitProbePath $gdi32InitProbePath -Gdi32InitProbeSha256 $expectedGdi32InitProbeSha256
               if ($LASTEXITCODE -ne 0) { throw 'Session 0 診断に失敗しました。' }
           } finally {
-              foreach ($inputFile in @($windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
+              foreach ($inputFile in @($gdi32InitSourceInput, $gdi32InitBuildInput, $windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
                   if ($null -ne $inputFile) { $inputFile.Stream.Dispose() }
               }
           }
