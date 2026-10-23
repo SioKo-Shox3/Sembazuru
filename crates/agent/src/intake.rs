@@ -1669,12 +1669,12 @@ mod tests {
     #[test]
     fn path_corpus_declared_output_specs_keep_short_alias_root_prefix() {
         let root = crate::fileserver::normalize_root(
-            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root",
+            "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root",
         )
         .expect("root");
         let declared_outputs = vec![
-            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj".to_string(),
-            "C:\\Users\\<user>\\AppData\\Local\\Temp\\sbz-dp-root\\PROGRA~1\\tool.obj"
+            "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\obj\\out.obj".to_string(),
+            "C:\\Users\\TESTUS~1\\AppData\\Local\\Temp\\sbz-dp-root\\PROGRA~1\\tool.obj"
                 .to_string(),
         ];
 
@@ -1684,7 +1684,7 @@ mod tests {
         assert_eq!(
             specs[0].final_path,
             std::path::PathBuf::from(
-                "c:\\users\\kingka~1\\appdata\\local\\temp\\sbz-dp-root\\obj\\out.obj"
+                "c:\\users\\testus~1\\appdata\\local\\temp\\sbz-dp-root\\obj\\out.obj"
             )
         );
     }

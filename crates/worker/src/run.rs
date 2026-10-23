@@ -14,6 +14,7 @@
 //! local fallback completes the build (DESIGN §2, non-negotiable #2) — so the worker
 //! does NOT wait to drain in-flight actions on shutdown; a stop is always safe.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -50,6 +51,8 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
              execution to the network — never in production."
         );
     }
+    // サービスステーションの lease を確定するまで、Execution の listener を公開しない。
+    let action_station = Arc::new(crate::sandbox::ActionStationLease::acquire()?);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     eprintln!("sembazuru-worker: Execution service on {local}");
@@ -68,8 +71,8 @@ pub async fn run_worker(config: WorkerConfig, shutdown: CancellationToken) -> Re
     tokio::fs::create_dir_all(&scratch_root).await?;
 
     let service = match config.capacity {
-        Some(c) => WorkerService::with_capacity(c),
-        None => WorkerService::new(),
+        Some(c) => WorkerService::with_capacity_and_station(c, action_station),
+        None => WorkerService::with_station(action_station),
     }
     .with_action_capability_auth(config.cluster_token.clone(), worker_id.clone())
     .with_action_timeout_secs(config.action_timeout_secs)

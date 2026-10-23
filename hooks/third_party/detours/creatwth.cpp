@@ -1134,6 +1134,123 @@ VOID WINAPI FreeExeHelper(PDETOUR_EXE_HELPER *pHelper)
     }
 }
 
+// SEMBAZURU LOCAL PATCH (see VENDORED.md): how long the cross-bitness
+// rundll32 helper may run before the caller stops waiting for it. This is a
+// policy bound, not a claim that a slower helper is necessarily wedged:
+// injecting into an already-suspended process is sub-second work, and a
+// caller that gives up early only loses the injection, which every caller
+// already handles as a failure.
+#define DETOUR_HELPER_TIMEOUT_MS 15000
+
+// How long to confirm the helper is gone after asking it to terminate.
+// TerminateProcess is asynchronous, so the kill is only observed here.
+#define DETOUR_HELPER_KILL_TIMEOUT_MS 5000
+
+// SEMBAZURU LOCAL PATCH (see VENDORED.md): a job whose closure kills whatever
+// is left in it, so cleanup does not depend on TerminateProcess succeeding or
+// on the helper responding to it.
+//
+// Best effort on purpose. The caller may already run inside a job that does
+// not permit what this one needs (the Sembazuru worker sandboxes actions in a
+// UI-restricted job with no breakaway), and losing a cleanup backstop is not
+// a reason to refuse an injection that would otherwise succeed. Callers treat
+// NULL as "no job" and carry on.
+static
+HANDLE WINAPI CreateHelperJob(VOID)
+{
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (hJob == NULL) {
+        DETOUR_TRACE(("CreateJobObject failed: %d\n", GetLastError()));
+        return NULL;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+    ZeroMemory(&jeli, sizeof(jeli));
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    if (!SetInformationJobObject(hJob, JobObjectExtendedLimitInformation,
+                                 &jeli, sizeof(jeli))) {
+        DETOUR_TRACE(("SetInformationJobObject failed: %d\n", GetLastError()));
+        CloseHandle(hJob);
+        return NULL;
+    }
+
+    return hJob;
+}
+
+// Puts the (still suspended) helper in the job if there is one. Failing to
+// assign it is not fatal: the helper is then bounded only by the wait below,
+// which is still strictly better than the unbounded wait this patch replaces.
+static
+VOID WINAPI TryAssignHelperToJob(_Inout_ HANDLE *phJob, _In_ HANDLE hProcess)
+{
+    if (*phJob == NULL) {
+        return;
+    }
+    if (!AssignProcessToJobObject(*phJob, hProcess)) {
+        DETOUR_TRACE(("AssignProcessToJobObject failed: %d\n", GetLastError()));
+        CloseHandle(*phJob);
+        *phJob = NULL;
+    }
+}
+
+// SEMBAZURU LOCAL PATCH (see VENDORED.md): upstream waits INFINITE on the
+// helper. rundll32 puts up a modal error box when it cannot load the DLL named
+// on its command line, and nothing dismisses that box on a build machine, so
+// the wait never ends. A helper that does not exit must surface as an
+// injection failure so the caller's fail-closed path runs, not as a hang.
+//
+// Reports which of three things happened, because they are not the same: the
+// helper exited on its own, the caller stopped waiting, or the wait itself
+// failed. Only the first yields a meaningful exit code.
+enum DETOUR_HELPER_WAIT {
+    DETOUR_HELPER_EXITED,
+    DETOUR_HELPER_TIMED_OUT,
+    DETOUR_HELPER_WAIT_FAILED,
+};
+
+static
+DETOUR_HELPER_WAIT WINAPI WaitForHelperProcess(_In_ HANDLE hProcess,
+                                               _Out_ PDWORD pdwResult)
+{
+    *pdwResult = 500;
+
+    DWORD dwWait = WaitForSingleObject(hProcess, DETOUR_HELPER_TIMEOUT_MS);
+    if (dwWait == WAIT_OBJECT_0) {
+        GetExitCodeProcess(hProcess, pdwResult);
+        return DETOUR_HELPER_EXITED;
+    }
+
+    DETOUR_HELPER_WAIT result = DETOUR_HELPER_TIMED_OUT;
+    if (dwWait == WAIT_TIMEOUT) {
+        DETOUR_TRACE(("Rundll32.exe did not exit within %d ms\n",
+                      DETOUR_HELPER_TIMEOUT_MS));
+    }
+    else {
+        DETOUR_TRACE(("Waiting on rundll32.exe failed: %d\n", GetLastError()));
+        result = DETOUR_HELPER_WAIT_FAILED;
+    }
+
+    // Reap regardless of why the wait ended. A helper this function stops
+    // waiting for must not be left running because the wait API failed, and
+    // the caller is about to drop the only handle to it.
+    if (!TerminateProcess(hProcess, ~0u)) {
+        DETOUR_TRACE(("TerminateProcess(rundll32.exe) failed: %d\n",
+                      GetLastError()));
+    }
+    else if (WaitForSingleObject(hProcess, DETOUR_HELPER_KILL_TIMEOUT_MS)
+             == WAIT_OBJECT_0) {
+        return result;
+    }
+
+    // Termination was refused, or is still pending past the confirmation
+    // window. Whatever is left is the job's to reap; without one it outlives
+    // this call. That is the one case this patch does not close, and it is
+    // recorded in VENDORED.md rather than papered over.
+    DETOUR_TRACE(("Rundll32.exe termination unconfirmed\n"));
+    return result;
+}
+
 BOOL WINAPI DetourProcessViaHelperA(_In_ DWORD dwTargetPid,
                                     _In_ LPCSTR lpDllName,
                                     _In_ PDETOUR_CREATE_PROCESS_ROUTINEA pfCreateProcessA)
@@ -1153,6 +1270,7 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
     CHAR szExe[MAX_PATH];
     CHAR szCommand[MAX_PATH];
     PDETOUR_EXE_HELPER helper = NULL;
+    HANDLE hJob = NULL;
     HRESULT hr;
 
     DETOUR_TRACE(("DetourProcessViaHelperDlls(pid=%d,dlls=%d)\n", dwTargetPid, nDlls));
@@ -1163,6 +1281,7 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
     if (!AllocExeHelper(&helper, dwTargetPid, nDlls, rlpDlls)) {
         goto Cleanup;
     }
+    hJob = CreateHelperJob();
 
     DWORD nLen = GetEnvironmentVariableA("WINDIR", szExe, ARRAYSIZE(szExe));
     if (nLen == 0 || nLen >= ARRAYSIZE(szExe)) {
@@ -1206,15 +1325,21 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
             goto Cleanup;
         }
 
+        TryAssignHelperToJob(&hJob, pi.hProcess);
+
         ResumeThread(pi.hThread);
-        WaitForSingleObject(pi.hProcess, INFINITE);
 
         DWORD dwResult = 500;
-        GetExitCodeProcess(pi.hProcess, &dwResult);
+        DETOUR_HELPER_WAIT wait = WaitForHelperProcess(pi.hProcess, &dwResult);
 
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
+        if (wait != DETOUR_HELPER_EXITED) {
+            SetLastError(wait == DETOUR_HELPER_TIMED_OUT ? ERROR_TIMEOUT
+                                                         : ERROR_PROCESS_ABORTED);
+            goto Cleanup;
+        }
         if (dwResult != 0) {
             DETOUR_TRACE(("Rundll32.exe failed: result=%d\n", dwResult));
             goto Cleanup;
@@ -1227,6 +1352,12 @@ BOOL WINAPI DetourProcessViaHelperDllsA(_In_ DWORD dwTargetPid,
     }
 
   Cleanup:
+    // Closing the job kills any helper still alive, whether or not
+    // TerminateProcess above was able to.
+    if (hJob != NULL) {
+        CloseHandle(hJob);
+        hJob = NULL;
+    }
     FreeExeHelper(&helper);
     return Result;
 }
@@ -1249,6 +1380,7 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
     WCHAR szExe[MAX_PATH];
     WCHAR szCommand[MAX_PATH];
     PDETOUR_EXE_HELPER helper = NULL;
+    HANDLE hJob = NULL;
     HRESULT hr;
 
     DETOUR_TRACE(("DetourProcessViaHelperDlls(pid=%d,dlls=%d)\n", dwTargetPid, nDlls));
@@ -1259,6 +1391,7 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
     if (!AllocExeHelper(&helper, dwTargetPid, nDlls, rlpDlls)) {
         goto Cleanup;
     }
+    hJob = CreateHelperJob();
 
     DWORD nLen = GetEnvironmentVariableW(L"WINDIR", szExe, ARRAYSIZE(szExe));
     if (nLen == 0 || nLen >= ARRAYSIZE(szExe)) {
@@ -1302,17 +1435,23 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
             goto Cleanup;
         }
 
+        TryAssignHelperToJob(&hJob, pi.hProcess);
+
         ResumeThread(pi.hThread);
 
         ResumeThread(pi.hThread);
-        WaitForSingleObject(pi.hProcess, INFINITE);
 
         DWORD dwResult = 500;
-        GetExitCodeProcess(pi.hProcess, &dwResult);
+        DETOUR_HELPER_WAIT wait = WaitForHelperProcess(pi.hProcess, &dwResult);
 
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
 
+        if (wait != DETOUR_HELPER_EXITED) {
+            SetLastError(wait == DETOUR_HELPER_TIMED_OUT ? ERROR_TIMEOUT
+                                                         : ERROR_PROCESS_ABORTED);
+            goto Cleanup;
+        }
         if (dwResult != 0) {
             DETOUR_TRACE(("Rundll32.exe failed: result=%d\n", dwResult));
             goto Cleanup;
@@ -1325,6 +1464,12 @@ BOOL WINAPI DetourProcessViaHelperDllsW(_In_ DWORD dwTargetPid,
     }
 
   Cleanup:
+    // Closing the job kills any helper still alive, whether or not
+    // TerminateProcess above was able to.
+    if (hJob != NULL) {
+        CloseHandle(hJob);
+        hJob = NULL;
+    }
     FreeExeHelper(&helper);
     return Result;
 }

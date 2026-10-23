@@ -3,6 +3,7 @@
   <PropertyGroup>
     <OutputName>Sembazuru</OutputName>
     <OutputType>Package</OutputType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <!-- 64-bit package so binaries land under Program Files (not the x86 view),
          which the GUI self-elevation image-integrity assumption requires. -->
     <Platform Condition="'$(Platform)' == '' Or '$(Platform)' == 'AnyCPU'">x64</Platform>
@@ -26,6 +27,12 @@
     <SbzVersion Condition="'$(SbzVersion)' == ''">0.0.3</SbzVersion>
     <DefineConstants>ProductVersion=$(SbzVersion);RustTarget=$(SbzRustTarget);StoreCtl=$(SbzStoreCtl);RollbackFixture=$(SbzRollbackFixture);Hooks=$(SbzHooks);Integration=$(SbzIntegration)</DefineConstants>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Compile only the MSI package source; Bundle.wixproj owns bundle.wxs. -->
+    <Compile Remove="**/*.wxs" />
+    <Compile Include="sembazuru.wxs" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- Firewall extension for the LAN listen-port exceptions (M9.5b). -->

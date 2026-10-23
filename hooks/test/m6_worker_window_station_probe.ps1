@@ -1,7 +1,228 @@
 param(
     [string]$ArtifactPath,
-    [string]$ExpectedSha256
+    [string]$ExpectedSha256,
+    [string]$StationMask = '0x0002',
+    [string]$InitProbePath,
+    [string]$InitProbeSha256,
+    [string]$EntryProbePath,
+    [string]$EntryProbeSha256,
+    [string]$TerminateProbePath,
+    [string]$TerminateProbeSha256,
+    [string]$ConsoleProbePath,
+    [string]$ConsoleProbeSha256,
+    [string]$WindowsProbePath,
+    [string]$WindowsProbeSha256,
+    [string]$WindowsInitProbePath,
+    [string]$WindowsInitProbeSha256,
+    [string]$WindowsStartupProbePath,
+    [string]$WindowsStartupProbeSha256,
+    [string]$Gdi32InitProbePath,
+    [string]$Gdi32InitProbeSha256,
+    [string]$Win32uInitProbePath,
+    [string]$Win32uInitProbeSha256,
+    [string]$Win32uUser32ProbePath,
+    [string]$Win32uUser32ProbeSha256,
+    [string]$User32ResourceProbePath,
+    [string]$User32ResourceProbeSha256,
+    [string]$User32ResourceLoadProbePath,
+    [string]$User32ResourceLoadProbeSha256,
+    [string]$User32MitigationProbePath,
+    [string]$User32MitigationProbeSha256
 )
+
+function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [string]$EntryPath, [string]$EntryHash,
+    [string]$TerminatePath, [string]$TerminateHash,
+    [string]$ConsolePath, [string]$ConsoleHash, [string]$WindowsPath, [string]$WindowsHash,
+    [string]$WindowsInitPath, [string]$WindowsInitHash,
+    [string]$WindowsStartupPath = '', [string]$WindowsStartupHash = '',
+    [string]$Gdi32InitPath = '', [string]$Gdi32InitHash = '',
+    [string]$Win32uInitPath = '', [string]$Win32uInitHash = '',
+    [string]$Win32uUser32Path = '', [string]$Win32uUser32Hash = '',
+    [string]$User32ResourcePath = '', [string]$User32ResourceHash = '',
+    [string]$User32ResourceLoadPath = '', [string]$User32ResourceLoadHash = '',
+    [string]$User32MitigationPath = '', [string]$User32MitigationHash = '') {
+    if ([string]::IsNullOrEmpty($InitPath) -ne [string]::IsNullOrEmpty($InitHash) -or
+        [string]::IsNullOrEmpty($EntryPath) -ne [string]::IsNullOrEmpty($EntryHash) -or
+        [string]::IsNullOrEmpty($TerminatePath) -ne [string]::IsNullOrEmpty($TerminateHash) -or
+        [string]::IsNullOrEmpty($ConsolePath) -ne [string]::IsNullOrEmpty($ConsoleHash) -or
+        [string]::IsNullOrEmpty($WindowsPath) -ne [string]::IsNullOrEmpty($WindowsHash) -or
+        [string]::IsNullOrEmpty($WindowsInitPath) -ne [string]::IsNullOrEmpty($WindowsInitHash) -or
+        [string]::IsNullOrEmpty($WindowsStartupPath) -ne [string]::IsNullOrEmpty($WindowsStartupHash) -or
+        [string]::IsNullOrEmpty($Gdi32InitPath) -ne [string]::IsNullOrEmpty($Gdi32InitHash) -or
+        [string]::IsNullOrEmpty($Win32uInitPath) -ne [string]::IsNullOrEmpty($Win32uInitHash) -or
+        [string]::IsNullOrEmpty($Win32uUser32Path) -ne [string]::IsNullOrEmpty($Win32uUser32Hash) -or
+        [string]::IsNullOrEmpty($User32ResourcePath) -ne [string]::IsNullOrEmpty($User32ResourceHash) -or
+        [string]::IsNullOrEmpty($User32ResourceLoadPath) -ne [string]::IsNullOrEmpty($User32ResourceLoadHash) -or
+        [string]::IsNullOrEmpty($User32MitigationPath) -ne [string]::IsNullOrEmpty($User32MitigationHash)) {
+        throw '診断EXEのパスとSHA-256は組で指定してください。'
+    }
+    if ($EntryPath -and -not $InitPath) { throw '固定終了値診断にはInitProbeの指定が必要です。' }
+    if ($TerminatePath -and (-not $InitPath -or -not $EntryPath)) {
+        throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。'
+    }
+    if ($User32MitigationPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath -or -not $Win32uInitPath -or -not $Win32uUser32Path -or -not $User32ResourcePath -or -not $User32ResourceLoadPath)) {
+        throw '自己Win32k policy診断には先行12診断の指定が必要です。'
+    }
+    if ($User32ResourceLoadPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath -or -not $Win32uInitPath -or -not $Win32uUser32Path -or -not $User32ResourcePath)) {
+        throw 'USER32リソース保持後ロード診断にはInit・Entry・Terminate・Console・Windows・WindowsInit・WindowsStartup・Gdi32Init・Win32uInit・Win32uUser32・User32Resourceの指定が必要です。'
+    }
+    if ($User32ResourcePath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath -or -not $Win32uInitPath -or -not $Win32uUser32Path)) {
+        throw 'USER32リソース診断にはInit・Entry・Terminate・Console・Windows・WindowsInit・WindowsStartup・Gdi32Init・Win32uInit・Win32uUser32の指定が必要です。'
+    }
+    if ($Win32uUser32Path -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath -or -not $Win32uInitPath)) {
+        throw 'WIN32U先行USER32診断にはInit・Entry・Terminate・Console・Windows・WindowsInit・WindowsStartup・Gdi32Init・Win32uInitの指定が必要です。'
+    }
+    if ($Win32uInitPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath)) {
+        throw 'WIN32U初期化診断にはInit・Entry・Terminate・Console・Windows・WindowsInit・WindowsStartup・Gdi32Initの指定が必要です。'
+    }
+    if ($Gdi32InitPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath)) {
+        throw 'GDI32初期化診断にはInit・Entry・Terminate・Console・Windows・WindowsInit・WindowsStartupの指定が必要です。'
+    }
+    if ($WindowsStartupPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath)) {
+        throw 'WINDOWS起動情報診断にはInit・Entry・Terminate・Console・Windows・WindowsInitの指定が必要です。'
+    }
+    if ($WindowsInitPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath)) {
+        throw 'WINDOWS初期化診断にはInit・Entry・Terminate・Console・Windowsの指定が必要です。'
+    }
+    if (($ConsolePath -or $WindowsPath) -and
+        (-not $ConsolePath -or -not $WindowsPath -or -not $InitPath -or -not $EntryPath -or -not $TerminatePath)) {
+        throw 'subsystem対照には両候補とInitProbe・EntryProbe・TerminateProbeの指定が必要です。'
+    }
+}
+
+function Get-Session0ServiceDeadline([bool]$InitRequested, [bool]$EntryRequested, [bool]$TerminateRequested = $false,
+    [bool]$SubsystemRequested = $false, [bool]$WindowsInitRequested = $false, [bool]$WindowsStartupRequested = $false, [bool]$Gdi32InitRequested = $false, [bool]$Win32uInitRequested = $false, [bool]$Win32uUser32Requested = $false, [bool]$User32ResourceRequested = $false, [bool]$User32ResourceLoadRequested = $false, [bool]$User32MitigationRequested = $false) {
+    if ($User32MitigationRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested -or -not $Gdi32InitRequested -or -not $Win32uInitRequested -or -not $Win32uUser32Requested -or -not $User32ResourceRequested -or -not $User32ResourceLoadRequested) { throw '自己Win32k policy診断の期限には先行12診断が必要です。' }
+        # 旧14runの1524秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
+        return (4 * 106 + 3 * 107 + 8 * 107 + 30)
+    }
+    if ($User32ResourceLoadRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested -or -not $Gdi32InitRequested -or -not $Win32uInitRequested -or -not $Win32uUser32Requested -or -not $User32ResourceRequested) { throw 'USER32リソース保持後ロード診断の期限には先行11診断が必要です。' }
+        # 旧13runの1417秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
+        return (4 * 106 + 3 * 107 + 7 * 107 + 30)
+    }
+    if ($User32ResourceRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested -or -not $Gdi32InitRequested -or -not $Win32uInitRequested -or -not $Win32uUser32Requested) { throw 'USER32リソース診断の期限には先行10診断が必要です。' }
+        # 旧12runの1310秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
+        return (4 * 106 + 3 * 107 + 6 * 107 + 30)
+    }
+    if ($Win32uUser32Requested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested -or -not $Gdi32InitRequested -or -not $Win32uInitRequested) { throw 'WIN32U先行USER32診断の期限には先行9診断が必要です。' }
+        # 旧11runの1203秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
+        return (4 * 106 + 3 * 107 + 5 * 107 + 30)
+    }
+    if ($Win32uInitRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested -or -not $Gdi32InitRequested) { throw 'WIN32U初期化診断の期限には先行8診断が必要です。' }
+        # 旧10runの1096秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
+        return (4 * 106 + 3 * 107 + 4 * 107 + 30)
+    }
+    if ($Gdi32InitRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested -or -not $WindowsStartupRequested) { throw 'GDI32初期化診断の期限には先行7診断が必要です。' }
+        # 旧9runの989秒へ追加1runの実行・回収・EOF・Drop・runtime停止107秒を加える。
+        return (4 * 106 + 3 * 107 + 3 * 107 + 30)
+    }
+    if ($WindowsStartupRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested -or -not $WindowsInitRequested) { throw 'WINDOWS起動情報診断には先行6診断が必要です。' }
+        # 旧4runと自己終了3runと追加2runの実行・再wait・EOF・Drop・runtime停止、余裕30秒。新18形式だけ989秒。
+        return 4 * (10 + 35 + 30 + 30 + 1) + 3 * (10 + 35 + 1 + 30 + 30 + 1) + 2 * (10 + 35 + 1 + 30 + 30 + 1) + 30
+    }
+    if ($WindowsInitRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested -or -not $SubsystemRequested) { throw 'WINDOWS初期化診断には先行5診断が必要です。' }
+        # 旧4run/自己終了3run/追加1runの実行・再wait・EOF・Drop・runtime停止と余裕30秒。上限882秒。
+        return 4 * (10 + 35 + 30 + 30 + 1) + 3 * (10 + 35 + 1 + 30 + 30 + 1) + (10 + 35 + 1 + 30 + 30 + 1) + 30
+    }
+    if ($SubsystemRequested) {
+        if (-not $InitRequested -or -not $EntryRequested -or -not $TerminateRequested) { throw 'subsystem対照には先行3診断が必要です。' }
+        # 旧4runと自己終了3runの実行/再wait/EOF/Drop/runtime停止に余裕30秒を加える。
+        return 4 * (10 + 35 + 30 + 30 + 1) + 3 * (10 + 35 + 1 + 30 + 30 + 1) + 30
+    }
+    if ($TerminateRequested) {
+        if (-not $InitRequested -or -not $EntryRequested) { throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。' }
+        # 旧4runに新runの終了10秒/回収35秒/EOF1秒/Drop30+30秒/runtime停止1秒と余裕30秒を加える。
+        return 4 * (10 + 35 + 30 + 30 + 1) + (10 + 35 + 1 + 30 + 30 + 1) + 30
+    }
+    if ($EntryRequested) {
+        if (-not $InitRequested) { throw '固定終了値診断にはInitProbeの指定が必要です。' }
+        # 4runの実行10秒+再wait35秒+Dropの直下子30秒/Job30秒+runtime停止1秒、外側余裕30秒。
+        return 4 * (10 + 35 + 30 + 30 + 1) + 30
+    }
+    if ($InitRequested) { return 360 }
+    return 30
+}
+
+function ConvertFrom-Session0StationMask([string]$Value) {
+    switch -CaseSensitive ($Value) {
+        '0x0002' { return [uint32]0x0002 }
+        '0x0022' { return [uint32]0x0022 }
+        default { throw '診断の station mask は 0x0002 または 0x0022 が必要です。' }
+    }
+}
+
+# 実行・独立記録・保持回収が揃った固定要求だけを受け付ける。
+function Assert-Session0ConnectedRequest([bool]$User32MitigationRequested) {
+    # 固定組検査後に、実行・独立v20・全保持回収へ進む。
+    $null = $User32MitigationRequested
+}
+
+function Assert-Session0FixtureArguments([string[]]$Arguments) {
+    if ($Arguments.Count -notin @(11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24)) { throw 'SCM 診断の引数数が一致しません。' }
+    $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
+        '--nocapture', '--test-threads=1', '--')
+    if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
+        throw 'SCM 診断の実行ファイル名が一致しません。'
+    }
+    for ($i = 0; $i -lt $fixed.Count; $i++) {
+        if ($Arguments[$i + 1] -cne $fixed[$i]) { throw 'SCM 診断の固定引数が一致しません。' }
+    }
+    if (-not [IO.Path]::IsPathFullyQualified($Arguments[7]) -or
+        -not [IO.Path]::IsPathFullyQualified($Arguments[8]) -or
+        $Arguments[9] -cnotmatch '\A[0-9a-fA-F]{32}\z') {
+        throw 'SCM 診断のパスまたは nonce が不正です。'
+    }
+    $null = ConvertFrom-Session0StationMask $Arguments[10]
+    if ($Arguments.Count -ge 12) {
+        if ($Arguments.Count -eq 24) { Assert-Session0InitProbeHash $Arguments[23] }
+        if ($Arguments.Count -ge 23) { Assert-Session0InitProbeHash $Arguments[22] }
+        if ($Arguments.Count -ge 22) { Assert-Session0InitProbeHash $Arguments[21] }
+        if ($Arguments.Count -ge 21) { Assert-Session0InitProbeHash $Arguments[20] }
+        if ($Arguments.Count -ge 20) { Assert-Session0InitProbeHash $Arguments[19] }
+        if ($Arguments.Count -ge 19) { Assert-Session0InitProbeHash $Arguments[18] }
+        if ($Arguments.Count -ge 18) { Assert-Session0InitProbeHash $Arguments[17] }
+        if ($Arguments.Count -ge 17) { Assert-Session0InitProbeHash $Arguments[16] }
+        if ($Arguments.Count -ge 16) {
+            Assert-Session0InitProbeHash $Arguments[14]
+            Assert-Session0InitProbeHash $Arguments[15]
+        }
+        if ($Arguments.Count -ge 14) { Assert-Session0InitProbeHash $Arguments[13] }
+        if ($Arguments.Count -ge 13) { Assert-Session0InitProbeHash $Arguments[12] }
+        Assert-Session0InitProbeHash $Arguments[11]
+        $root = $Arguments[7]
+        if ($root -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+            @($root.Substring(3).Split('\') | Where-Object {
+                $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+            }).Count -ne 0 -or $Arguments[8] -cne $root -or
+            $Arguments[0] -cne ($root + '\SbzWindowStationScmSmoke.exe')) {
+            throw '追加診断の固定配置が一致しません。'
+        }
+    }
+}
+
+# 組と先行診断の不足は、環境変更や保護配置より前に拒否する。
+Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256 $ConsoleProbePath $ConsoleProbeSha256 $WindowsProbePath $WindowsProbeSha256 $WindowsInitProbePath $WindowsInitProbeSha256 $WindowsStartupProbePath $WindowsStartupProbeSha256 $Gdi32InitProbePath $Gdi32InitProbeSha256 $Win32uInitProbePath $Win32uInitProbeSha256 $Win32uUser32ProbePath $Win32uUser32ProbeSha256 $User32ResourceProbePath $User32ResourceProbeSha256 $User32ResourceLoadProbePath $User32ResourceLoadProbeSha256 $User32MitigationProbePath $User32MitigationProbeSha256
+Assert-Session0ConnectedRequest ([bool]$User32MitigationProbePath)
+if ($args.Count -ne 0) { throw '指定できる引数はArtifactPath、ExpectedSha256、StationMaskとInit/Entry/Terminate/Console/Windows/WindowsInit/WindowsStartup/Gdi32Init/Win32uInit/Win32uUser32/User32Resource/User32ResourceLoad/User32MitigationのProbePath・ProbeSha256だけです。' }
+
+$record = $null
+$requestedStationMask = ConvertFrom-Session0StationMask $StationMask
 
 $env:PSModulePath = "$PSHOME\Modules"
 $principal = [Security.Principal.WindowsPrincipal]::new(
@@ -17,16 +238,13 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # SECURITY CONTRACT: this file is a runner payload, never an elevated `-File` target. The
-# outer bootstrap (constructed by the orchestrator at execution time, not stored in this repo)
-# must open these runner bytes once with FileShare.Read, verify their final local path and
-# expected SHA-256, then invoke exactly those bytes via ScriptBlock::Create. It must elevate a
-# protected absolute pwsh.exe with -NoProfile -NonInteractive and ProcessStartInfo.ArgumentList,
-# UseShellExecute=true, Verb=runas. A ScriptBlock invocation has no PSCommandPath.
+# outer bootstrap must run in an already-elevated PowerShell, open these runner bytes once
+# with FileShare.Read, verify their final local path and expected SHA-256, then invoke exactly
+# those bytes via ScriptBlock::Create. A ScriptBlock invocation has no PSCommandPath.
 # Do not add cmdlets outside the $PSHOME startup set; native P/Invoke is required for SCM reads.
 if (-not [string]::IsNullOrEmpty($PSCommandPath)) {
     throw 'Elevated direct -File execution is forbidden; use the verified in-memory bootstrap.'
 }
-if ($args.Count -ne 0) { throw 'This probe accepts only ArtifactPath and ExpectedSha256.' }
 if ([string]::IsNullOrWhiteSpace($ArtifactPath) -or
     [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
     throw 'ArtifactPath and ExpectedSha256 are required after elevation.'
@@ -40,9 +258,10 @@ $serviceName = 'SembazuruWindowStationProbeSmoke'
 $workerServiceName = 'SembazuruWorker'
 $fixtureBasename = 'SbzWindowStationScmSmoke.exe'
 $selector = 'sandbox::tests::window_station_scm_dispatcher_smoke_role'
-$desktopCausalMagic = [uint32]0x53425a31
-$desktopNotSufficientMagic = [uint32]0x53425a32
-$indeterminateMagic = [uint32]0x53425a33
+$noWindowCausalMagic = [uint32]0x53425b31
+$noWindowNotSufficientMagic = [uint32]0x53425b32
+$indeterminateMagic = [uint32]0x53425b33
+$actionStartsMagic = [uint32]0x53425b34
 $contractFailureMagic = [uint32]0x53425aff
 $diagnosticFailureMagic = [uint32]0x53425afe
 $brokerTokenFailureMagic = [uint32]0x53425af0
@@ -62,9 +281,23 @@ $leaseIdentity = $null
 $cleanupHandle = $null
 $targetStream = $null
 $sourceStream = $null
+$windowsInitProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'WindowsInit' }
+$windowsStartupProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'WindowsStartup' }
+$gdi32InitProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'Gdi32Init' }
+$win32uInitProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'Win32uInit' }
+$win32uUser32Probe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'Win32uUser32' }
+$user32ResourceProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'User32Resource' }
+$user32ResourceLoadProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'User32ResourceLoad' }
+$user32MitigationProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = ''; Kind = 'User32Mitigation' }
+$initProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$entryProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$terminateProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$consoleProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
+$windowsProbe = @{ Path = ''; Hash = ''; Source = $null; Target = $null; Identity = $null; Lease = $null; ReadHold = $null; ServiceSid = '' }
 $serviceHandle = [IntPtr]::Zero
 $ownedRoot = $false
 $ownedService = $false
+$serviceStartAttempted = $false
 $primaryError = $null
 $cleanupErrors = [Collections.Generic.List[string]]::new()
 $workerBefore = $null
@@ -979,6 +1212,238 @@ function Get-StreamSha256([IO.Stream]$Stream) {
     finally { $sha.Dispose() }
 }
 
+function Assert-Session0InitProbeHash([string]$Hash) {
+    if ($Hash -cnotmatch '\A[0-9a-f]{64}\z') {
+        throw '追加診断 EXE の SHA-256 は小文字16進64桁が必要です。'
+    }
+}
+
+function Assert-Session0ProbeContentHash([string]$Actual, [string]$Expected) {
+    Assert-Session0InitProbeHash $Expected
+    if ($Actual -cne $Expected) { throw '追加診断EXEの実SHA-256が期待値と一致しません。' }
+}
+
+function Assert-Session0InitProbeSecurity($Identity, [string]$ServiceSid) {
+    if ([string]::IsNullOrEmpty($ServiceSid)) { Assert-ExactFileSecurity $Identity; return }
+    if (-not $Identity.DaclPresent -or -not $Identity.DaclNonNull) {
+        throw '追加診断 EXE の DACL がありません。'
+    }
+    $descriptor = Get-RawDescriptor $Identity.SecuritySddl
+    $aces = @($descriptor.DiscretionaryAcl)
+    if ($descriptor.Owner.Value -ne 'S-1-5-18' -or $aces.Count -ne 3 -or
+        ($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0) {
+        throw '追加診断 EXE の所有者・保護 DACL・ACE 数が一致しません。'
+    }
+    foreach ($entry in @(@('S-1-5-18', [uint32]0x001f01ff),
+        @('S-1-5-32-544', [uint32]0x001f01ff), @($ServiceSid, [uint32]0x001200a9))) {
+        $matching = @($aces | Where-Object {
+            $_ -is [Security.AccessControl.CommonAce] -and
+            $_.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+            $_.SecurityIdentifier.Value -eq $entry[0] -and
+            (Convert-AccessMaskToUInt32 $_.AccessMask) -eq $entry[1] -and
+            $_.AceFlags -eq [Security.AccessControl.AceFlags]::None
+        })
+        if ($matching.Count -ne 1) { throw '追加診断 EXE の許可権限が一致しません。' }
+    }
+}
+
+# 種別と用途から固定名だけを選ぶ。sourceと保護先を交換できない。
+function Get-Session0ProbeBasename([string]$Kind, [bool]$Source) {
+    switch -CaseSensitive ($Kind) {
+        'Init' { if ($Source) { return 'session0_init_probe.exe' }; return 'SbzSession0InitProbe.exe' }
+        'Entry' { if ($Source) { return 'session0_entry_probe.exe' }; return 'SbzSession0EntryProbe.exe' }
+        'Terminate' { if ($Source) { return 'session0_terminate_probe.exe' }; return 'SbzSession0TerminateProbe.exe' }
+        'Console' { if ($Source) { return 'session0_subsystem_probe.exe' }; return 'SbzSession0ConsoleProbe.exe' }
+        'Windows' { if ($Source) { return 'session0_subsystem_probe.exe' }; return 'SbzSession0WindowsProbe.exe' }
+        'WindowsInit' { if ($Source) { return 'session0_windows_init_probe.exe' }; return 'SbzSession0WindowsInitProbe.exe' }
+        'WindowsStartup' { if ($Source) { return 'session0_windows_startup_probe.exe' }; return 'SbzSession0WindowsStartupProbe.exe' }
+        'Gdi32Init' { if ($Source) { return 'session0_gdi32_init_probe.exe' }; return 'SbzSession0Gdi32InitProbe.exe' }
+        'Win32uInit' { if ($Source) { return 'session0_win32u_init_probe.exe' }; return 'SbzSession0Win32uInitProbe.exe' }
+        'Win32uUser32' { if ($Source) { return 'session0_win32u_user32_probe.exe' }; return 'SbzSession0Win32uUser32Probe.exe' }
+        'User32Resource' { if ($Source) { return 'session0_user32_resource_probe.exe' }; return 'SbzSession0User32ResourceProbe.exe' }
+        'User32ResourceLoad' { if ($Source) { return 'session0_user32_resource_load_probe.exe' }; return 'SbzSession0User32ResourceLoadProbe.exe' }
+        'User32Mitigation' { if ($Source) { return 'session0_user32_mitigation_probe.exe' }; return 'SbzSession0User32MitigationProbe.exe' }
+        default { throw '追加診断 EXE の種別が不正です。' }
+    }
+}
+
+function Get-Session0ProbeSourcePath([string]$Path, [string]$Kind) {
+    $basename = Get-Session0ProbeBasename $Kind $true
+    Assert-LocalAbsolutePath $Path '追加診断の source'
+    $canonical = [IO.Path]::GetFullPath($Path)
+    if ([IO.Path]::GetFileName($canonical) -cne $basename) {
+        throw '追加診断 EXE の source 名が一致しません。'
+    }
+    if ($Kind -cin @('WindowsInit', 'WindowsStartup', 'Gdi32Init', 'Win32uInit', 'Win32uUser32', 'User32Resource', 'User32ResourceLoad', 'User32Mitigation') -and $Path -cne $canonical) {
+        throw 'WINDOWS診断のsourceは正規の固定pathが必要です。'
+    }
+    if ($Kind -cin @('Console', 'Windows')) {
+        $directory = [IO.Path]::GetDirectoryName($canonical)
+        if ($Path -cne $canonical -or [IO.Path]::GetFileName($directory) -cne $Kind.ToLowerInvariant()) {
+            throw 'subsystem対照のsourceサブディレクトリが一致しません。'
+        }
+    }
+    return $canonical
+}
+
+function Open-Session0InitProbeSource([hashtable]$State, [string]$Path, [string]$Hash, [string]$Kind = 'Init') {
+    $canonical = Get-Session0ProbeSourcePath $Path $Kind
+    $State.Kind = $Kind
+    Assert-Session0InitProbeHash $Hash
+    $State.Hash = $Hash
+    $State.Source = [IO.FileStream]::new(
+        $canonical, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
+    )
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
+        $State.Source.SafeFileHandle.DangerousGetHandle()
+    )
+    Assert-RegularIdentity $identity $canonical '追加診断の source'
+    Assert-Session0ProbeContentHash (Get-StreamSha256 $State.Source) $Hash
+    $State.Source.Position = 0
+}
+
+function Copy-Session0InitProbe([hashtable]$State, [string]$Root) {
+    $basename = Get-Session0ProbeBasename $State.Kind $false
+    $State.Path = Join-Path $Root $basename
+    $State.Target = [Sembazuru.WindowStationProbeNative]::CreateProtectedFile(
+        $State.Path, 'O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+    )
+    $State.Identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Target.Handle)
+    Assert-RegularIdentity $State.Identity $State.Path '追加診断の target'
+    Assert-Session0InitProbeSecurity $State.Identity ''
+    $stream = [IO.FileStream]::new(
+        [Microsoft.Win32.SafeHandles.SafeFileHandle]::new($State.Target.Handle, $false),
+        [IO.FileAccess]::ReadWrite
+    )
+    try {
+        $State.Source.CopyTo($stream)
+        $stream.Flush($true)
+        $stream.Position = 0
+        Assert-Session0ProbeContentHash (Get-StreamSha256 $stream) $State.Hash
+    }
+    finally { $stream.Dispose() }
+    $State.Lease = [Sembazuru.WindowStationProbeNative]::OpenLease($State.Path)
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Lease.Handle)
+    Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の lease'
+    $State.Target.Dispose()
+    $State.Target = $null
+    # 書込みハンドルを閉じた後も、実体と hash を再照合した読取りハンドルで変更・削除を拒む。
+    $State.ReadHold = [IO.FileStream]::new(
+        $State.Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read
+    )
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
+        $State.ReadHold.SafeFileHandle.DangerousGetHandle()
+    )
+    Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の read hold'
+    Assert-Session0ProbeContentHash (Get-StreamSha256 $State.ReadHold) $State.Hash
+}
+
+function Grant-Session0InitProbeRead([hashtable]$State, [string]$ServiceSid) {
+    $mutation = [Sembazuru.WindowStationProbeNative]::OpenAclMutation($State.Path, $false)
+    try {
+        $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($mutation.Handle)
+        Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の ACL 更新'
+        [Sembazuru.WindowStationProbeNative]::SetProtectedDacl($mutation.Handle,
+            ('O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x001200a9;;;{0})' -f $ServiceSid))
+    }
+    finally { $mutation.Dispose() }
+    $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Lease.Handle)
+    Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の service lease' -AllowSecuritySddlChange
+    Assert-Session0InitProbeSecurity $identity $ServiceSid
+    $State.ServiceSid = $ServiceSid
+}
+
+function Remove-Session0InitProbe([hashtable]$State) {
+    # 呼出元がサービスの停止と不在を確認してから、保持中の実体だけを削除する。
+    if ($null -ne $State.ReadHold) { $State.ReadHold.Dispose(); $State.ReadHold = $null }
+    if ($null -ne $State.Target) {
+        [Sembazuru.WindowStationProbeNative]::MarkDelete($State.Target.Handle)
+        $State.Target.Dispose()
+        $State.Target = $null
+    }
+    elseif ($null -ne $State.Lease) {
+        $held = [Sembazuru.WindowStationProbeNative]::InspectHandle($State.Lease.Handle)
+        Assert-EquivalentFileIdentity $State.Identity $held $State.Path '追加診断の削除 lease' -AllowSecuritySddlChange
+        Assert-Session0InitProbeSecurity $held $State.ServiceSid
+        $cleanup = [Sembazuru.WindowStationProbeNative]::OpenCleanupDelete($State.Path)
+        try {
+            $identity = [Sembazuru.WindowStationProbeNative]::InspectHandle($cleanup.Handle)
+            Assert-EquivalentFileIdentity $State.Identity $identity $State.Path '追加診断の削除 target' -AllowSecuritySddlChange
+            Assert-Session0InitProbeSecurity $identity $State.ServiceSid
+            [Sembazuru.WindowStationProbeNative]::MarkDelete($cleanup.Handle)
+        }
+        finally { $cleanup.Dispose() }
+    }
+    if ($null -ne $State.Lease) { $State.Lease.Dispose(); $State.Lease = $null }
+}
+
+function Read-Session0InitProbeOutput([byte[]]$Stdout, [byte[]]$Stderr, [Nullable[uint32]]$ChildExit) {
+    if ($Stdout.Length -gt 1024 -or $Stderr.Length -gt 1024 -or $Stderr.Length -ne 0) {
+        throw '到達点診断の出力上限または stderr が不正です。'
+    }
+    # '?' は GLE の小文字16進数字1桁だけに一致する。行末も含め固定列と照合する。
+    $prefix = "SBZ_INIT_PROBE_V1 entry`nSBZ_INIT_PROBE_V1 user32_preloaded="
+    $load = "0`nSBZ_INIT_PROBE_V1 user32_load_begin`nSBZ_INIT_PROBE_V1 user32_load_result="
+    $tail = " gle=0x????????`nSBZ_INIT_PROBE_V1 complete`n"
+    $templates = @(
+        [pscustomobject]@{ Text = $prefix + $load + '1' + $tail; Preloaded = $false; Result = $true; Exit = 0 },
+        [pscustomobject]@{ Text = $prefix + $load + '0' + $tail; Preloaded = $false; Result = $false; Exit = 11 },
+        [pscustomobject]@{ Text = $prefix + "1`nSBZ_INIT_PROBE_V1 complete`n"; Preloaded = $true; Result = $false; Exit = 12 }
+    )
+    $matched = $null
+    foreach ($candidate in $templates) {
+        if ($Stdout.Length -gt $candidate.Text.Length) { continue }
+        $valid = $true
+        for ($i = 0; $i -lt $Stdout.Length; $i++) {
+            $expected = [int][char]$candidate.Text[$i]
+            $actual = [int]$Stdout[$i]
+            if ($expected -eq 63) {
+                if (-not (($actual -ge 48 -and $actual -le 57) -or ($actual -ge 97 -and $actual -le 102))) {
+                    $valid = $false
+                    break
+                }
+            } elseif ($actual -ne $expected) {
+                $valid = $false
+                break
+            }
+        }
+        if ($valid) { $matched = $candidate; break }
+    }
+    if ($null -eq $matched) { throw '到達点診断の版、段階、順序または文字が不正です。' }
+    $complete = $Stdout.Length -eq $matched.Text.Length
+    # 出力完了と終了は別の観測。契約上の終了値だけを列と照合し、異常終了は証拠を残す。
+    if ($null -ne $ChildExit -and $ChildExit -in @(0, 11, 12) -and
+        (-not $complete -or $ChildExit -ne $matched.Exit)) {
+        throw '到達点診断の段階列と終了値が一致しません。'
+    }
+    # ASCII の固定列照合後に変換し、LF まで観測できた行だけを数える。
+    $text = [Text.Encoding]::ASCII.GetString($Stdout)
+    $lines = $text.Split("`n")
+    $count = $lines.Length - 1
+    $stage = switch ($count) {
+        0 { 0 }
+        1 { 1 }
+        2 { 2 }
+        3 { if ($matched.Preloaded) { 5 } else { 3 } }
+        4 { 4 }
+        default { 5 }
+    }
+    $preloaded = $null
+    if ($count -ge 2) { $preloaded = [int]$matched.Preloaded }
+    $result = $null
+    $gle = $null
+    if (-not $matched.Preloaded -and $count -ge 4) {
+        $result = [int]$matched.Result
+        $gle = [Convert]::ToUInt32($lines[3].Substring($lines[3].Length - 8), 16)
+    }
+    # 開始後の列の中断は観測不足であり、DLL の失敗と断定しない。
+    $outcome = 0
+    if ($complete -and $null -ne $ChildExit -and $ChildExit -eq $matched.Exit) {
+        $outcome = if ($matched.Preloaded) { 1 } elseif ($matched.Result) { 3 } else { 2 }
+    }
+    return [pscustomobject]@{ Stage = $stage; Preloaded = $preloaded; LoadResult = $result; Gle = $gle; Outcome = $outcome }
+}
+
 function Read-Session0U32([byte[]]$Bytes, [ref]$Offset) {
     if ($Offset.Value -gt $Bytes.Length - 4) { throw 'Session 0 diagnostic record is truncated.' }
     $value = [BitConverter]::ToUInt32($Bytes, $Offset.Value)
@@ -991,75 +1456,1577 @@ function Read-Session0Text([byte[]]$Bytes, [ref]$Offset) {
     if ($length -gt 32768 -or $Offset.Value -gt $Bytes.Length - [int]$length) {
         throw 'Session 0 diagnostic text is invalid or exceeds its bound.'
     }
-    $value = [Text.Encoding]::UTF8.GetString($Bytes, $Offset.Value, [int]$length)
+    $value = [Text.UTF8Encoding]::new($false, $true).GetString($Bytes, $Offset.Value, [int]$length)
     $Offset.Value += [int]$length
     return $value
 }
 
-function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset) {
+function Expand-Session0JobUi([uint32]$Mask) {
+    $named = @(
+        @([uint32]1, 'handles'), @([uint32]2, 'readclipboard'), @([uint32]4, 'writeclipboard'),
+        @([uint32]8, 'systemparameters'), @([uint32]16, 'displaysettings'),
+        @([uint32]32, 'globalatoms'), @([uint32]64, 'desktop'), @([uint32]128, 'exitwindows')
+    )
+    $parts = [Collections.Generic.List[string]]::new()
+    $covered = [uint32]0
+    foreach ($entry in $named) {
+        $bit = [uint32]$entry[0]
+        $covered = [uint32]($covered -bor $bit)
+        $parts.Add(('{0}={1}' -f $entry[1], $(if (($Mask -band $bit) -ne 0) { 1 } else { 0 })))
+    }
+    $parts.Add(('unknown=0x{0:x8}' -f [uint32]($Mask -bxor ($Mask -band $covered))))
+    return $parts -join ';'
+}
+
+function Test-Session0TargetEvidence([string]$Dacl, [string]$Sacl, [string]$Access, [string]$Isolation, [uint32]$RequestedMask) {
+    # 保護 DACL の2主体、完全な label、アクセスと隔離の実測が全て必要。
+    $sid = 'S-1-[0-9]+(?:-[0-9]+)+'
+    $pattern = '\Acontrol=0x([0-9a-fA-F]{4});aces=\[type=0;flags=0;mask=0x000f01ff;sid=(' +
+        $sid + '),type=0;flags=0;mask=0x000201ff;sid=(' + $sid + ')\]\z'
+    if ($Dacl -cnotmatch $pattern) { return $false }
+    if (([Convert]::ToUInt16($Matches[1], 16) -band 0x1000) -eq 0 -or $Matches[2] -ceq $Matches[3]) {
+        return $false
+    }
+    if ($Sacl -cne 'label=absent;implied_integrity=8192') {
+        if ($Sacl -cnotmatch '\Alabel_aces=\[(.+)\]\z') { return $false }
+        $aces = $Matches[1].Split(',')
+        foreach ($ace in $aces) {
+            if ($ace -cnotmatch '\Atype=17;flags=([0-9]+);mask=0x[0-9a-fA-F]{8};sid=S-1-16-([0-9]+)\z') {
+                return $false
+            }
+            $flags = [uint32]0
+            $integrity = [uint32]0
+            if (-not [uint32]::TryParse($Matches[1], [ref]$flags) -or $flags -gt 255 -or
+                -not [uint32]::TryParse($Matches[2], [ref]$integrity)) { return $false }
+        }
+    }
+    $expectedAccess = 'scope=broker-impersonated;first_failure=none;steps=[' +
+        'station:maximum_allowed:mask=0x02000000;allowed=true;gle=0,' +
+        'station:read_attributes:mask=0x00000002;allowed=true;gle=0,' +
+        ('station:action_mask:mask=0x{0:x8};allowed=true;gle=0,' -f $RequestedMask) +
+        'desktop:maximum_allowed:mask=0x02000000;allowed=true;gle=0,' +
+        'desktop:read_objects:mask=0x00000001;allowed=true;gle=0,' +
+        'desktop:action_mask:mask=0x000201ff;allowed=true;gle=0]'
+    $expectedIsolation = 'own=Ok(true);other_maximum=Err(5);default_maximum=Err(5);' +
+        'write_dac=Err(5);write_owner=Err(5);default_dacl_safe=true;tcb_absent=true'
+    return $Access -ceq $expectedAccess -and $Isolation -ceq $expectedIsolation
+}
+
+function Read-Session0DiagnosticRun([byte[]]$Bytes, [ref]$Offset, [uint32]$RequestedMask) {
     $jobUi = Read-Session0U32 $Bytes $Offset
+    $jobUiLimits = Read-Session0Text $Bytes $Offset
+    if ($jobUiLimits -cne (Expand-Session0JobUi $jobUi)) {
+        throw '診断の Job UI 名称が mask と一致しません。'
+    }
+    $creationFlags = Read-Session0U32 $Bytes $Offset
     if ($Offset.Value -ge $Bytes.Length -or ($Bytes[$Offset.Value] -ne 0 -and $Bytes[$Offset.Value] -ne 1)) {
-        throw 'Session 0 diagnostic run spawn-success flag is invalid.'
+        throw '診断の起動成功フラグが不正です。'
     }
     $spawnSucceeded = $Bytes[$Offset.Value] -eq 1
     $Offset.Value++
     $spawnError = Read-Session0Text $Bytes $Offset
     if ($Offset.Value -ge $Bytes.Length -or ($Bytes[$Offset.Value] -ne 0 -and $Bytes[$Offset.Value] -ne 1)) {
-        throw 'Session 0 diagnostic run child-exit flag is invalid.'
+        throw '診断の子プロセス終了フラグが不正です。'
     }
     $hasExit = $Bytes[$Offset.Value] -eq 1
     $Offset.Value++
     $childExit = $null
     if ($hasExit) { $childExit = Read-Session0U32 $Bytes $Offset }
+    $stdout = Read-Session0Text $Bytes $Offset
+    $stderr = Read-Session0Text $Bytes $Offset
+    $targetDesktop = Read-Session0Text $Bytes $Offset
+    $targetDacl = Read-Session0Text $Bytes $Offset
+    $targetSacl = Read-Session0Text $Bytes $Offset
+    $targetAccess = Read-Session0Text $Bytes $Offset
+    # 明示された測定 mask は、分類や隔離確認ビットと独立して照合する。
+    $maskSteps = $targetAccess.Split([string[]]@('station:action_mask:mask=0x'), [StringSplitOptions]::None)
+    for ($i = 1; $i -lt $maskSteps.Count; $i++) {
+        if ($maskSteps[$i].Split(';')[0] -cne ('{0:x8}' -f $RequestedMask)) {
+            throw 'TargetAccess の station mask が要求と一致しません。'
+        }
+    }
+    $isolation = Read-Session0Text $Bytes $Offset
+    if ($Offset.Value -ge $Bytes.Length) { throw '診断の終了処理情報がありません。' }
+    $lifecycle = $Bytes[$Offset.Value]
+    $Offset.Value++
+    if (($lifecycle -band 0xf0) -ne 0 -or
+        (($lifecycle -band 14) -ne 0 -and ($lifecycle -band 1) -eq 0) -or
+        (($lifecycle -band 4) -ne 0 -and -not $spawnSucceeded) -or
+        (($lifecycle -band 2) -ne 0 -and -not (Test-Session0TargetEvidence $targetDacl $targetSacl $targetAccess $isolation $RequestedMask))) {
+        throw '診断の作成・終了処理情報が矛盾しています。'
+    }
     return [PSCustomObject]@{
-        JobUi = $jobUi; SpawnSucceeded = $spawnSucceeded; SpawnError = $spawnError
-        ChildExit = $childExit; Stdout = Read-Session0Text $Bytes $Offset
-        Stderr = Read-Session0Text $Bytes $Offset
+        JobUi = $jobUi; JobUiLimits = $jobUiLimits; CreationFlags = $creationFlags
+        SpawnSucceeded = $spawnSucceeded; SpawnError = $spawnError
+        ChildExit = $childExit; Stdout = $stdout; Stderr = $stderr
+        TargetDesktop = $targetDesktop; TargetDacl = $targetDacl; TargetSacl = $targetSacl
+        TargetAccess = $targetAccess; Isolation = $isolation; Lifecycle = $lifecycle
     }
 }
 
-function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce) {
-    if ($Bytes.Length -lt 46 -or $Bytes.Length -gt 65580) {
-        throw 'Session 0 diagnostic record length is outside its bounded contract.'
+function Test-Session0InitTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.InitProbe -and
+        ($Record.InitProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Test-Session0EntryTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.EntryProbe -and
+        ($Record.EntryProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Get-Session0EntryObserved($Run) {
+    # 取得済み終了値の観測を、後続の出力・desktop回収エラーから独立させる。
+    return $Run.SpawnSucceeded -and $null -ne $Run.ChildExit -and
+        $Run.ChildExit -eq [uint32]0x53425a45 -and -not $Run.SpawnError.StartsWith('wait:', [StringComparison]::Ordinal)
+}
+
+function Test-Session0EntryGates($Record) {
+    if ($null -eq $Record.EntryProbe) { return $false }
+    $run = $Record.EntryProbe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stdout.Length -eq 0 -and $run.Stderr.Length -eq 0 -and -not $run.SpawnError.Contains('output_read_failed')
+}
+
+function Assert-Session0EntryGates($Record, [string]$Detail = '') {
+    if (-not (Test-Session0EntryGates $Record)) {
+        throw "固定終了値診断の空出力・隔離・終了確認ゲートが未達です: $Detail"
     }
-    if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424432 -or
-        [BitConverter]::ToUInt32($Bytes, 4) -ne [uint32]3) {
-        throw 'Session 0 diagnostic record magic/version mismatch.'
+}
+
+function Read-Session0EntryRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $Init, $Baseline, $NoWindow) {
+    if ($null -eq $Init) { throw '固定終了値診断にはInitProbeの記録が必要です。' }
+    $path = Read-Session0Text $Bytes $Offset
+    $hash = Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or
+        -not $path.EndsWith('\SbzSession0EntryProbe.exe', [StringComparison]::Ordinal) -or
+        $path -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+        @($path.Substring(3).Split('\') | Where-Object {
+            $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+        }).Count -ne 0 -or
+        $Init.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0InitProbe.exe')) {
+        throw '固定終了値診断のpath・hashが呼出側の期待値と一致しません。'
     }
+    $run = Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and $null -ne $run.ChildExit) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station + '\sbz-'), [StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -ne 0 -and ($run.TargetDesktop -ceq $Baseline.TargetDesktop -or
+            $run.TargetDesktop -ceq $NoWindow.TargetDesktop -or $run.TargetDesktop -ceq $Init.Run.TargetDesktop))) {
+        throw '固定終了値診断のJob・製品flags・専用desktopが一致しません。'
+    }
+    if ($Offset.Value -ge $Bytes.Length -or $Bytes[$Offset.Value] -gt 1) { throw '固定終了値診断の肯定bitが不正です。' }
+    $observed = $Bytes[$Offset.Value] -eq 1
+    $Offset.Value++
+    if ($observed -ne (Get-Session0EntryObserved $run)) { throw '固定終了値診断の肯定bitと子の終了値が一致しません。' }
+    return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; EntryObserved=$observed }
+}
+
+function Test-Session0TerminateTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.TerminateProbe -and
+        ($Record.TerminateProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Test-Session0SubsystemTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    if (-not $Requested -or -not $StartAttempted) { return $true }
+    if ($null -eq $Record) { return $false }
+    foreach ($name in @('ConsoleProbe', 'WindowsProbe')) {
+        if ($null -eq $Record.$name -or ($Record.$name.Run.Lifecycle -band 12) -ne 12) { return $false }
+    }
+    return $true
+}
+
+function Test-Session0SubsystemGates($Record, [string]$Kind) {
+    if ($Kind -cnotin @('Console', 'Windows')) { throw 'subsystem対照の役割が不正です。' }
+    return Test-Session0TerminateGates $Record $Record.($Kind + 'Probe')
+}
+
+function Assert-Session0SubsystemGates($Record, [string]$Kind, [string]$Detail = '') {
+    if (-not (Test-Session0SubsystemGates $Record $Kind)) { throw "subsystem対照の空出力・隔離・終了確認ゲートが未達です: $Kind $Detail" }
+}
+
+function Get-Session0TerminateObserved($Run) {
+    # 取得済み終了値の観測を、後続の出力・desktop回収エラーから独立させる。
+    return $Run.SpawnSucceeded -and $null -ne $Run.ChildExit -and
+        $Run.ChildExit -eq [uint32]0x53425a54
+}
+
+function Test-Session0TerminateGates($Record, $Probe = $Record.TerminateProbe) {
+    if ($null -eq $Probe) { return $false }
+    $run = $Probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stdout.Length -eq 0 -and $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and
+        $Probe.OutputEof -and $Probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Assert-Session0TerminateGates($Record, [string]$Detail = '') {
+    if (-not (Test-Session0TerminateGates $Record)) {
+        throw "固定自己終了診断の空出力・隔離・終了確認ゲートが未達です: $Detail"
+    }
+}
+
+function Read-Session0TerminateRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $Init, $Entry, $Baseline, $NoWindow) {
+    if ($null -eq $Init) { throw '固定自己終了診断にはInitProbeの記録が必要です。' }
+    if ($null -eq $Entry) { throw '固定自己終了診断にはEntryProbeの記録が必要です。' }
+    $path = Read-Session0Text $Bytes $Offset
+    $hash = Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or
+        -not $path.EndsWith('\SbzSession0TerminateProbe.exe', [StringComparison]::Ordinal) -or
+        $path -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+        @($path.Substring(3).Split('\') | Where-Object {
+            $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+        }).Count -ne 0 -or
+        $Init.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0InitProbe.exe') -or
+        $Entry.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0EntryProbe.exe')) {
+        throw '固定自己終了診断のpath・hashが呼出側の期待値と一致しません。'
+    }
+    $run = Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and $null -ne $run.ChildExit) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station + '\sbz-'), [StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -ne 0 -and ($run.TargetDesktop -ceq $Baseline.TargetDesktop -or
+            $run.TargetDesktop -ceq $NoWindow.TargetDesktop -or $run.TargetDesktop -ceq $Init.Run.TargetDesktop -or $run.TargetDesktop -ceq $Entry.Run.TargetDesktop))) {
+        throw '固定自己終了診断のJob・製品flags・専用desktopが一致しません。'
+    }
+    if ($Offset.Value -ge $Bytes.Length -or $Bytes[$Offset.Value] -gt 1) { throw '固定自己終了診断の肯定bitが不正です。' }
+    $observed = $Bytes[$Offset.Value] -eq 1
+    $Offset.Value++
+    if ($observed -ne (Get-Session0TerminateObserved $run)) { throw '固定自己終了診断の肯定bitと子の終了値が一致しません。' }
+    if ($Offset.Value + 2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value + 1] -gt 1) {
+        throw '固定自己終了診断のEOF・期限bitが不正です。'
+    }
+    $outputEof = $Bytes[$Offset.Value] -eq 1
+    $deadlineMet = $Bytes[$Offset.Value + 1] -eq 1
+    $Offset.Value += 2
+    if (($outputEof -and (-not $run.SpawnSucceeded -or ($run.Lifecycle -band 4) -eq 0)) -or
+        ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) {
+        throw '固定自己終了診断の終了値・EOF・期限が実行記録と矛盾しています。'
+    }
+    return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; EntryObserved=$observed; OutputEof=$outputEof; DeadlineMet=$deadlineMet }
+}
+
+function Read-Session0SubsystemRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $Init, $Entry, $Baseline, $NoWindow, $Terminate, $Other, [string]$Kind) {
+    if ($Kind -cnotin @('Console', 'Windows')) { throw 'subsystem対照の役割が不正です。' }
+    if ($null -eq $Terminate) { throw 'subsystem対照には自己終了診断が必要です。' }
+    $basename = Get-Session0ProbeBasename $Kind $false
+    if ($null -eq $Init) { throw 'subsystem対照にはInitProbeの記録が必要です。' }
+    if ($null -eq $Entry) { throw 'subsystem対照にはEntryProbeの記録が必要です。' }
+    $path = Read-Session0Text $Bytes $Offset
+    $hash = Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or
+        -not $path.EndsWith(('\' + $basename), [StringComparison]::Ordinal) -or
+        $path -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+        @($path.Substring(3).Split('\') | Where-Object {
+            $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+        }).Count -ne 0 -or
+        $Init.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0InitProbe.exe') -or
+        $Entry.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0EntryProbe.exe') -or
+        $Terminate.Path -cne ([IO.Path]::GetDirectoryName($path) + '\SbzSession0TerminateProbe.exe')) {
+        throw 'subsystem対照のpath・hashが呼出側の期待値と一致しません。'
+    }
+    $run = Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and $null -ne $run.ChildExit) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station + '\sbz-'), [StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -ne 0 -and ($run.TargetDesktop -ceq $Baseline.TargetDesktop -or
+            $run.TargetDesktop -ceq $NoWindow.TargetDesktop -or $run.TargetDesktop -ceq $Init.Run.TargetDesktop -or $run.TargetDesktop -ceq $Entry.Run.TargetDesktop -or
+            $run.TargetDesktop -ceq $Terminate.Run.TargetDesktop -or ($null -ne $Other -and $run.TargetDesktop -ceq $Other.Run.TargetDesktop)))) {
+        throw 'subsystem対照のJob・製品flags・専用desktopが一致しません。'
+    }
+    if ($Offset.Value -ge $Bytes.Length -or $Bytes[$Offset.Value] -gt 1) { throw 'subsystem対照の肯定bitが不正です。' }
+    $observed = $Bytes[$Offset.Value] -eq 1
+    $Offset.Value++
+    if ($observed -ne (Get-Session0TerminateObserved $run)) { throw 'subsystem対照の肯定bitと子の終了値が一致しません。' }
+    if ($Offset.Value + 2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value + 1] -gt 1) {
+        throw 'subsystem対照のEOF・期限bitが不正です。'
+    }
+    $outputEof = $Bytes[$Offset.Value] -eq 1
+    $deadlineMet = $Bytes[$Offset.Value + 1] -eq 1
+    $Offset.Value += 2
+    if (($outputEof -and (-not $run.SpawnSucceeded -or ($run.Lifecycle -band 4) -eq 0)) -or
+        ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) {
+        throw 'subsystem対照の終了値・EOF・期限が実行記録と矛盾しています。'
+    }
+    return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; EntryObserved=$observed; OutputEof=$outputEof; DeadlineMet=$deadlineMet }
+}
+
+function Get-Session0InitRunEvidence($Run) {
+    if (-not $Run.SpawnSucceeded -and ($null -ne $Run.ChildExit -or $Run.Stdout.Length -ne 0 -or $Run.Stderr.Length -ne 0)) {
+        throw '追加診断の spawn と終了・出力が矛盾しています。'
+    }
+    $evidence = Read-Session0InitProbeOutput ([Text.Encoding]::UTF8.GetBytes($Run.Stdout)) ([Text.Encoding]::UTF8.GetBytes($Run.Stderr)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = foreach ($property in @('Stage', 'Preloaded', 'LoadResult', 'Gle', 'Outcome')) {
+        if ($null -eq $evidence.$property) { 'none' } else { [string]$evidence.$property }
+    }
+    return $values -join ','
+}
+
+function Read-Session0StartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_WINDOWS_STARTUP_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0StartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $text = [Text.Encoding]::Latin1.GetString($Bytes)
+    $rows = $text.Split("`n")
+    $result = [ordered]@{ Stage = 0; Preloaded = $null; Before = $null; LoadResult = $null; Gle = $null; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_WINDOWS_STARTUP_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.Preloaded = [int]$matches[1]; $result.Stage = 2
+            }
+            2 { $result.Before = Read-Session0StartupSnapshot $line 'before'; $result.Stage = 3 }
+            3 {
+                if ($result.Preloaded -eq 1) {
+                    if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                    $result.Complete = $true; $result.Stage = 7
+                } else {
+                    if ($line -cne ($prefix + 'user32_load_begin')) { throw '固定段階列の順序が不正です。' }
+                    $result.Stage = 4
+                }
+            }
+            4 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.LoadResult = [int]$matches[1]; $result.Gle = '0x' + $matches[2]; $result.Stage = 5
+            }
+            5 { $result.After = Read-Session0StartupSnapshot $line 'after'; $result.Stage = 6 }
+            6 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 7
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    if (@($Bytes | Where-Object { $_ -gt 127 }).Count) { $result.Valid=$false }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.Preloaded -eq 1){12}elseif($result.LoadResult -eq 1){0}else{11}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 12){1}elseif($expected -eq 0){3}else{2}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0WindowsStartupEvidence($Run) {
+    # raw bytesを復元し、旧Initと同じparserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw 'WINDOWS起動情報診断の出力hexが不正です。' }
+    $evidence = Read-Session0StartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = foreach ($property in @('Stage','Preloaded','LoadResult','Gle')) {
+        if ($null -eq $evidence.$property) { 'none' }
+        elseif ($property -ceq 'Gle') { [string][Convert]::ToUInt32($evidence.Gle.Substring(2),16) }
+        else { [string]$evidence.$property }
+    }
+    foreach ($property in @('Before','After')) {
+        $snapshot=$evidence.$property
+        $values += $(if ($null -eq $snapshot) {'none'} else {
+            @($snapshot.State,$snapshot.Units,$snapshot.Hex,$snapshot.User32,$snapshot.Gdi32,$snapshot.Win32u) -join ','
+        })
+    }
+    $values += [string][int]$evidence.Valid; $values += [string][int]$evidence.Partial; $values += [string]$evidence.Outcome
+    return $values -join ';'
+}
+
+function Test-Session0WindowsStartupSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0StartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0WindowsStartupGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.WindowsStartupProbe) { return $false }
+    $probe=$Record.WindowsStartupProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0WindowsStartupTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.WindowsStartupProbe -and ($Record.WindowsStartupProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0WindowsStartupRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0WindowsStartupProbe.exe')) { throw 'WINDOWS起動情報診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'WINDOWS起動情報診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw 'WINDOWS起動情報診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0WindowsStartupEvidence $run)) { throw 'WINDOWS起動情報診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'WINDOWS起動情報診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'WINDOWS起動情報診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Read-Session0Gdi32StartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_GDI32_INIT_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0Gdi32StartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $text = [Text.Encoding]::Latin1.GetString($Bytes)
+    $rows = $text.Split("`n")
+    $result = [ordered]@{ Stage = 0; Preloaded = $null; Before = $null; LoadResult = $null; Gle = $null; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_GDI32_INIT_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 {
+                if ($line -cnotmatch ('\A' + $prefix + 'gdi32_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.Preloaded = [int]$matches[1]; $result.Stage = 2
+            }
+            2 { $result.Before = Read-Session0Gdi32StartupSnapshot $line 'before'; $result.Stage = 3 }
+            3 {
+                if ($result.Preloaded -eq 1) {
+                    if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                    $result.Complete = $true; $result.Stage = 7
+                } else {
+                    if ($line -cne ($prefix + 'gdi32_load_begin')) { throw '固定段階列の順序が不正です。' }
+                    $result.Stage = 4
+                }
+            }
+            4 {
+                if ($line -cnotmatch ('\A' + $prefix + 'gdi32_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.LoadResult = [int]$matches[1]; $result.Gle = '0x' + $matches[2]; $result.Stage = 5
+            }
+            5 { $result.After = Read-Session0Gdi32StartupSnapshot $line 'after'; $result.Stage = 6 }
+            6 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 7
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    if (@($Bytes | Where-Object { $_ -gt 127 }).Count) { $result.Valid=$false }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.Preloaded -eq 1){12}elseif($result.LoadResult -eq 1){0}else{11}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 12){1}elseif($expected -eq 0){3}else{2}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0Gdi32InitEvidence($Run) {
+    # raw bytesを復元し、GDI32専用parserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw 'GDI32初期化診断の出力hexが不正です。' }
+    $evidence = Read-Session0Gdi32StartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = foreach ($property in @('Stage','Preloaded','LoadResult','Gle')) {
+        if ($null -eq $evidence.$property) { 'none' }
+        elseif ($property -ceq 'Gle') { [string][Convert]::ToUInt32($evidence.Gle.Substring(2),16) }
+        else { [string]$evidence.$property }
+    }
+    foreach ($property in @('Before','After')) {
+        $snapshot=$evidence.$property
+        $values += $(if ($null -eq $snapshot) {'none'} else {
+            @($snapshot.State,$snapshot.Units,$snapshot.Hex,$snapshot.User32,$snapshot.Gdi32,$snapshot.Win32u) -join ','
+        })
+    }
+    $values += [string][int]$evidence.Valid; $values += [string][int]$evidence.Partial; $values += [string]$evidence.Outcome
+    return $values -join ';'
+}
+
+function Test-Session0Gdi32InitSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0Gdi32StartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0Gdi32InitGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.Gdi32InitProbe) { return $false }
+    $probe=$Record.Gdi32InitProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0Gdi32InitTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.Gdi32InitProbe -and ($Record.Gdi32InitProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0Gdi32InitRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0Gdi32InitProbe.exe')) { throw 'GDI32初期化診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'GDI32初期化診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw 'GDI32初期化診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0Gdi32InitEvidence $run)) { throw 'GDI32初期化診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'GDI32初期化診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'GDI32初期化診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Read-Session0Win32uStartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_WIN32U_INIT_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0Win32uStartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $text = [Text.Encoding]::Latin1.GetString($Bytes)
+    $rows = $text.Split("`n")
+    $result = [ordered]@{ Stage = 0; Preloaded = $null; Before = $null; LoadResult = $null; Gle = $null; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_WIN32U_INIT_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 {
+                if ($line -cnotmatch ('\A' + $prefix + 'win32u_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.Preloaded = [int]$matches[1]; $result.Stage = 2
+            }
+            2 { $result.Before = Read-Session0Win32uStartupSnapshot $line 'before'; $result.Stage = 3 }
+            3 {
+                if ($result.Preloaded -eq 1) {
+                    if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                    $result.Complete = $true; $result.Stage = 7
+                } else {
+                    if ($line -cne ($prefix + 'win32u_load_begin')) { throw '固定段階列の順序が不正です。' }
+                    $result.Stage = 4
+                }
+            }
+            4 {
+                if ($line -cnotmatch ('\A' + $prefix + 'win32u_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.LoadResult = [int]$matches[1]; $result.Gle = '0x' + $matches[2]; $result.Stage = 5
+            }
+            5 { $result.After = Read-Session0Win32uStartupSnapshot $line 'after'; $result.Stage = 6 }
+            6 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 7
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    if (@($Bytes | Where-Object { $_ -gt 127 }).Count) { $result.Valid=$false }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.Preloaded -eq 1){12}elseif($result.LoadResult -eq 1){0}else{11}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 12){1}elseif($expected -eq 0){3}else{2}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0Win32uInitEvidence($Run) {
+    # raw bytesを復元し、WIN32U専用parserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw 'WIN32U初期化診断の出力hexが不正です。' }
+    $evidence = Read-Session0Win32uStartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = foreach ($property in @('Stage','Preloaded','LoadResult','Gle')) {
+        if ($null -eq $evidence.$property) { 'none' }
+        elseif ($property -ceq 'Gle') { [string][Convert]::ToUInt32($evidence.Gle.Substring(2),16) }
+        else { [string]$evidence.$property }
+    }
+    foreach ($property in @('Before','After')) {
+        $snapshot=$evidence.$property
+        $values += $(if ($null -eq $snapshot) {'none'} else {
+            @($snapshot.State,$snapshot.Units,$snapshot.Hex,$snapshot.User32,$snapshot.Gdi32,$snapshot.Win32u) -join ','
+        })
+    }
+    $values += [string][int]$evidence.Valid; $values += [string][int]$evidence.Partial; $values += [string]$evidence.Outcome
+    return $values -join ';'
+}
+
+function Test-Session0Win32uInitSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0Win32uStartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0Win32uInitGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.Win32uInitProbe) { return $false }
+    $probe=$Record.Win32uInitProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0Win32uInitTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.Win32uInitProbe -and ($Record.Win32uInitProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0Win32uInitRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0Win32uInitProbe.exe')) { throw 'WIN32U初期化診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'WIN32U初期化診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw 'WIN32U初期化診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0Win32uInitEvidence $run)) { throw 'WIN32U初期化診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'WIN32U初期化診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'WIN32U初期化診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Read-Session0Win32uUser32StartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_WIN32U_USER32_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0Win32uUser32StartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $rows = [Text.Encoding]::Latin1.GetString($Bytes).Split("`n")
+    $result = [ordered]@{ Stage = 0; Before = $null; Win32uPreloaded = $null; Win32uResult = $null
+        Win32uGle = $null; Win32uComplete = $false; AfterWin32u = $null; User32Preloaded = $null
+        User32Result = $null; User32Gle = $null; User32Complete = $false; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_WIN32U_USER32_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 { $result.Before = Read-Session0Win32uUser32StartupSnapshot $line 'before'; $result.Stage = 2 }
+            2 {
+                if ($line -cnotmatch ('\A' + $prefix + 'win32u_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.Win32uPreloaded = [int]$matches[1]; $result.Stage = 3
+            }
+            3 { if ($line -cne ($prefix + 'win32u_load_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 4 }
+            4 {
+                if ($line -cnotmatch ('\A' + $prefix + 'win32u_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.Win32uResult = [int]$matches[1]; $result.Win32uGle = '0x' + $matches[2]; $result.Stage = 5
+            }
+            5 {
+                if ($line -cne ($prefix + 'win32u_complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Win32uComplete = $true; $result.Stage = 6
+            }
+            6 {
+                if ($line -cnotmatch ('\A' + $prefix + 'after_win32u user32=([01]) gdi32=([01]) win32u=([01])\z')) { throw '中間モジュール照会の固定表現が不正です。' }
+                $result.AfterWin32u = [pscustomobject]@{ User32 = [int]$matches[1]; Gdi32 = [int]$matches[2]; Win32u = [int]$matches[3] }
+                $result.Stage = 7
+            }
+            7 {
+                if ($result.Win32uResult -eq 0) {
+                    $result.After = Read-Session0Win32uUser32StartupSnapshot $line 'after'; $result.Stage = 12
+                } else {
+                    if ($line -cnotmatch ('\A' + $prefix + 'user32_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                    $result.User32Preloaded = [int]$matches[1]; $result.Stage = 8
+                }
+            }
+            8 { if ($line -cne ($prefix + 'user32_load_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 9 }
+            9 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Result = [int]$matches[1]; $result.User32Gle = '0x' + $matches[2]; $result.Stage = 10
+            }
+            10 {
+                if ($line -cne ($prefix + 'user32_complete')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Complete = $true; $result.Stage = 11
+            }
+            11 { $result.After = Read-Session0Win32uUser32StartupSnapshot $line 'after'; $result.Stage = 12 }
+            12 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 13
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    if (@($Bytes | Where-Object { $_ -gt 127 }).Count) { $result.Valid=$false }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.Win32uResult -eq 0){11}elseif($result.User32Result -eq 0){21}else{0}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 11){1}elseif($expected -eq 21){2}else{3}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0Win32uUser32Evidence($Run) {
+    # raw bytesを復元し、WIN32U専用parserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw 'WIN32U先行USER32診断の出力hexが不正です。' }
+    $evidence = Read-Session0Win32uUser32StartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = @([string]$evidence.Stage)
+    foreach ($module in @('Win32u','User32')) {
+        foreach ($suffix in @('Preloaded','Result','Gle')) {
+            $value=$evidence.($module+$suffix)
+            $values += $(if ($null -eq $value) { 'none' } elseif ($suffix -ceq 'Gle') { [string][Convert]::ToUInt32($value.Substring(2),16) } else { [string]$value })
+        }
+        $values += [string][int]$evidence.($module+'Complete')
+    }
+    foreach ($property in @('Before','AfterWin32u','After')) {
+        $snapshot=$evidence.$property
+        $values += $(if ($null -eq $snapshot) {'none'} elseif ($property -ceq 'AfterWin32u') {
+            @($snapshot.User32,$snapshot.Gdi32,$snapshot.Win32u) -join ','
+        } else {
+            @($snapshot.State,$snapshot.Units,$snapshot.Hex,$snapshot.User32,$snapshot.Gdi32,$snapshot.Win32u) -join ','
+        })
+    }
+    $values += [string][int]$evidence.Valid; $values += [string][int]$evidence.Partial; $values += [string]$evidence.Outcome
+    return $values -join ';'
+}
+
+function Test-Session0Win32uUser32Sequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0Win32uUser32StartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0Win32uUser32Gates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.Win32uUser32Probe) { return $false }
+    $probe=$Record.Win32uUser32Probe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0Win32uUser32TreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.Win32uUser32Probe -and ($Record.Win32uUser32Probe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0Win32uUser32Record([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0Win32uUser32Probe.exe')) { throw 'WIN32U先行USER32診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'WIN32U先行USER32診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw 'WIN32U先行USER32診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0Win32uUser32Evidence $run)) { throw 'WIN32U先行USER32診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'WIN32U先行USER32診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'WIN32U先行USER32診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Read-Session0User32ResourceStartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_USER32_RESOURCE_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0User32ResourceStartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $rows = [Text.Encoding]::Latin1.GetString($Bytes).Split("`n")
+    $result = [ordered]@{ Stage = 0; Before = $null; Preloaded = $null; Flags = $null; LoadResult = $null
+        Gle = $null; DatafileBit = $null; ImageBit = $null; Reused = $null; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_USER32_RESOURCE_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 { $result.Before = Read-Session0User32ResourceStartupSnapshot $line 'before'; $result.Stage = 2 }
+            2 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.Preloaded = [int]$matches[1]; $result.Stage = 3
+            }
+            3 {
+                if ($line -cne ($prefix + 'flags=0x00000860')) { throw 'リソースマッピングの固定flagsが一致しません。' }
+                $result.Flags = '0x00000860'; $result.Stage = 4
+            }
+            4 { if ($line -cne ($prefix + 'user32_map_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 5 }
+            5 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_map_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.LoadResult = [int]$matches[1]; $result.Gle = '0x' + $matches[2]; $result.Stage = 6
+            }
+            6 {
+                if ($line -cnotmatch ('\A' + $prefix + 'handle datafile_bit=([01]) image_bit=(0|2) reused=([01])\z')) { throw '返却handle識別bitの固定表現が不正です。' }
+                $result.DatafileBit = [int]$matches[1]; $result.ImageBit = [int]$matches[2]; $result.Reused = [int]$matches[3]
+                if (($result.LoadResult -eq 0 -and ($result.DatafileBit -ne 0 -or $result.ImageBit -ne 0 -or $result.Reused -ne 0)) -or
+                    ($result.Reused -eq 1 -and ($result.Preloaded -ne 1 -or $result.DatafileBit -ne 0 -or $result.ImageBit -ne 0))) {
+                    throw '取得結果・既ロード・識別bit・handle再利用が矛盾しています。'
+                }
+                $result.Stage = 7
+            }
+            7 { $result.After = Read-Session0User32ResourceStartupSnapshot $line 'after'; $result.Stage = 8 }
+            8 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 9
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    if (@($Bytes | Where-Object { $_ -gt 127 }).Count) { $result.Valid=$false }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.LoadResult -eq 0){11}elseif($result.DatafileBit -ne 0 -or $result.ImageBit -ne 0){0}elseif($result.Reused -eq 1){12}else{14}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 11){1}elseif($expected -eq 0){2}elseif($expected -eq 12){3}else{4}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0User32ResourceEvidence($Run) {
+    # raw bytesを復元し、USER32リソース専用parserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw 'USER32リソース診断の出力hexが不正です。' }
+    $evidence = Read-Session0User32ResourceStartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = @([string]$evidence.Stage)
+    foreach ($property in @('Preloaded','Flags','LoadResult','Gle','DatafileBit','ImageBit','Reused')) {
+        $value=$evidence.$property
+        $values += $(if ($null -eq $value) { 'none' } elseif ($property -cin @('Gle','Flags')) { [string][Convert]::ToUInt32($value.Substring(2),16) } else { [string]$value })
+    }
+    foreach ($property in @('Before','After')) {
+        $snapshot=$evidence.$property
+        $values += $(if ($null -eq $snapshot) {'none'} else {@($snapshot.State,$snapshot.Units,$snapshot.Hex,$snapshot.User32,$snapshot.Gdi32,$snapshot.Win32u) -join ','})
+    }
+    $values += [string][int]$evidence.Valid; $values += [string][int]$evidence.Partial; $values += [string]$evidence.Outcome
+    return $values -join ';'
+}
+
+function Test-Session0User32ResourceSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0User32ResourceStartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0User32ResourceGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.User32ResourceProbe) { return $false }
+    $probe=$Record.User32ResourceProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0User32ResourceTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.User32ResourceProbe -and ($Record.User32ResourceProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0User32ResourceRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0User32ResourceProbe.exe')) { throw 'USER32リソース診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'USER32リソース診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw 'USER32リソース診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0User32ResourceEvidence $run)) { throw 'USER32リソース診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'USER32リソース診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'USER32リソース診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Read-Session0User32ResourceLoadStartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_USER32_RESOURCE_LOAD_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0User32ResourceLoadStartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $rows = [Text.Encoding]::Latin1.GetString($Bytes).Split("`n")
+    $result = [ordered]@{ Stage = 0; Before = $null; ResourcePreloaded = $null; ResourceFlags = $null
+        ResourceResult = $null; ResourceGle = $null; DatafileBit = $null; ImageBit = $null; Reused = $null
+        ResourceKind = 0; ResourceComplete = $false; AfterResource = $null; User32Preloaded = $null
+        User32Result = $null; User32Gle = $null; User32Complete = $false; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_USER32_RESOURCE_LOAD_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 { $result.Before = Read-Session0User32ResourceLoadStartupSnapshot $line 'before'; $result.Stage = 2 }
+            2 {
+                if ($line -cnotmatch ('\A' + $prefix + 'resource_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.ResourcePreloaded = [int]$matches[1]; $result.Stage = 3
+            }
+            3 {
+                if ($line -cne ($prefix + 'resource_flags=0x00000860')) { throw 'リソースマッピングの固定flagsが一致しません。' }
+                $result.ResourceFlags = '0x00000860'; $result.Stage = 4
+            }
+            4 { if ($line -cne ($prefix + 'resource_map_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 5 }
+            5 {
+                if ($line -cnotmatch ('\A' + $prefix + 'resource_map_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.ResourceResult = [int]$matches[1]; $result.ResourceGle = '0x' + $matches[2]; $result.Stage = 6
+            }
+            6 {
+                if ($line -cnotmatch ('\A' + $prefix + 'resource_handle datafile_bit=([01]) image_bit=(0|2) reused=([01])\z')) { throw '返却handle識別bitの固定表現が不正です。' }
+                $result.DatafileBit = [int]$matches[1]; $result.ImageBit = [int]$matches[2]; $result.Reused = [int]$matches[3]
+                if (($result.ResourceResult -eq 0 -and ($result.DatafileBit -ne 0 -or $result.ImageBit -ne 0 -or $result.Reused -ne 0)) -or
+                    ($result.Reused -eq 1 -and ($result.ResourcePreloaded -ne 1 -or $result.DatafileBit -ne 0 -or $result.ImageBit -ne 0))) {
+                    throw '取得結果・既ロード・識別bit・handle再利用が矛盾しています。'
+                }
+                $result.ResourceKind = if ($result.ResourceResult -eq 0) { 1 } elseif ($result.DatafileBit -ne 0 -or $result.ImageBit -ne 0) {
+                    2
+                } elseif ($result.Reused -eq 1) { 3 } else { 4 }
+                $result.Stage = 7
+            }
+            7 {
+                if ($line -cne ($prefix + 'resource_complete')) { throw '固定段階列の順序が不正です。' }
+                $result.ResourceComplete = $true; $result.Stage = 8
+            }
+            8 {
+                if ($line -cnotmatch ('\A' + $prefix + 'after_resource user32=([01]) gdi32=([01]) win32u=([01])\z')) { throw '中間モジュール照会の固定表現が不正です。' }
+                $result.AfterResource = [pscustomobject]@{ User32 = [int]$matches[1]; Gdi32 = [int]$matches[2]; Win32u = [int]$matches[3] }
+                $result.Stage = 9
+            }
+            9 {
+                if ($result.ResourceResult -eq 0) {
+                    $result.After = Read-Session0User32ResourceLoadStartupSnapshot $line 'after'; $result.Stage = 14
+                } else {
+                    if ($line -cnotmatch ('\A' + $prefix + 'user32_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                    $result.User32Preloaded = [int]$matches[1]; $result.Stage = 10
+                }
+            }
+            10 { if ($line -cne ($prefix + 'user32_load_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 11 }
+            11 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Result = [int]$matches[1]; $result.User32Gle = '0x' + $matches[2]; $result.Stage = 12
+            }
+            12 {
+                if ($line -cne ($prefix + 'user32_complete')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Complete = $true; $result.Stage = 13
+            }
+            13 { $result.After = Read-Session0User32ResourceLoadStartupSnapshot $line 'after'; $result.Stage = 14 }
+            14 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 15
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    if (@($Bytes | Where-Object { $_ -gt 127 }).Count) { $result.Valid=$false }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.ResourceResult -eq 0){11}elseif($result.User32Result -eq 0){21}else{0}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 11){1}else{2+($result.ResourceKind-2)*2+[int]($expected-eq 0)}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0User32ResourceLoadEvidence($Run) {
+    # raw bytesを復元し、USER32リソース保持後ロード専用parserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw 'USER32リソース保持後ロード診断の出力hexが不正です。' }
+    $evidence = Read-Session0User32ResourceLoadStartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = @([string]$evidence.Stage)
+    foreach ($property in @('Before','ResourcePreloaded','ResourceFlags','ResourceResult','ResourceGle','DatafileBit','ImageBit','Reused','ResourceKind','ResourceComplete','AfterResource','User32Preloaded','User32Result','User32Gle','User32Complete','After','Valid','Partial','Outcome')) {
+        $value=$evidence.$property
+        $values += $(if ($null -eq $value) { 'none' }
+            elseif ($property -cin @('ResourceFlags','ResourceGle','User32Gle')) { [string][Convert]::ToUInt32($value.Substring(2),16) }
+            elseif ($property -cin @('Before','After')) { @($value.State,$value.Units,$value.Hex,$value.User32,$value.Gdi32,$value.Win32u) -join ',' }
+            elseif ($property -ceq 'AfterResource') { @($value.User32,$value.Gdi32,$value.Win32u) -join ',' }
+            elseif ($property -cin @('ResourceComplete','User32Complete','Valid','Partial')) { [string][int]$value }
+            else { [string]$value })
+    }
+    return $values -join ';'
+}
+
+function Test-Session0User32ResourceLoadSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0User32ResourceLoadStartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0User32ResourceLoadGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.User32ResourceLoadProbe) { return $false }
+    $probe=$Record.User32ResourceLoadProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0User32ResourceLoadTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.User32ResourceLoadProbe -and ($Record.User32ResourceLoadProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0User32ResourceLoadRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0User32ResourceLoadProbe.exe')) { throw 'USER32リソース保持後ロード診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'USER32リソース保持後ロード診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw 'USER32リソース保持後ロード診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0User32ResourceLoadEvidence $run)) { throw 'USER32リソース保持後ロード診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'USER32リソース保持後ロード診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'USER32リソース保持後ロード診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Read-Session0User32MitigationStartupSnapshot([string]$Line, [string]$Phase) {
+    $pattern = '\ASBZ_USER32_MITIGATION_PROBE_V1 ' + $Phase + ' desktop=(null|empty|terminated|bounded|unreadable) units=(0|[1-9][0-9]{0,2}) hex=(-|[0-9a-f]+) user32=([01]) gdi32=([01]) win32u=([01])\z'
+    if ($Line -cnotmatch $pattern) { throw 'startup情報の固定表現が不正です。' }
+    $state, $units, $hex, $user32, $gdi32, $win32u = $matches[1], [int]$matches[2], $matches[3], [int]$matches[4], [int]$matches[5], [int]$matches[6]
+    if ($units -gt 128 -or ($units -eq 0 -and $hex -cne '-') -or
+        ($units -gt 0 -and ($hex.Length -ne 4 * $units -or $hex -ceq '-')) -or
+        ($state -cin @('null', 'empty') -and $units -ne 0) -or
+        ($state -ceq 'terminated' -and ($units -lt 1 -or $units -gt 127)) -or
+        ($state -ceq 'bounded' -and $units -ne 128) -or
+        ($state -ceq 'unreadable' -and $units -gt 127)) { throw 'startup情報の上限または状態が不正です。' }
+    for ($i = 0; $i -lt $units; ++$i) {
+        if ($hex.Substring($i * 4, 4) -ceq '0000') { throw 'startup情報のhexに終端が混在しています。' }
+    }
+    return [pscustomobject]@{ State = $state; Units = $units; Hex = $hex; User32 = $user32; Gdi32 = $gdi32; Win32u = $win32u }
+}
+
+# 完全なLF行の最終到達点を保持する。厳密な完了判定とは分離する。
+function Read-Session0User32MitigationPolicyResult([string]$Line, [string]$Phase) {
+    $prefix = '\ASBZ_USER32_MITIGATION_PROBE_V1 ' + $Phase + '_query_result='
+    if ($Line -cmatch ($prefix + '0 gle=0x([0-9a-f]{8}) flags=unavailable\z')) {
+        return [pscustomobject]@{ Result = 0; Gle = '0x' + $matches[1]; Flags = $null; Win32k = $null; Audit = $null; Unknown = $null }
+    }
+    if ($Line -cnotmatch ($prefix + '1 gle=0x([0-9a-f]{8}) flags=0x([0-9a-f]{8}) win32k=([01]) audit=([01]) unknown=0x([0-9a-f]{8})\z')) {
+        throw 'policy照会結果とflags取得状態の固定表現が不正です。'
+    }
+    $gle = '0x' + $matches[1]
+    $flags = [Convert]::ToUInt32($matches[2], 16)
+    $win32k = [int]$matches[3]
+    $audit = [int]$matches[4]
+    $unknown = [Convert]::ToUInt32($matches[5], 16)
+    if (($flags -band 1) -ne $win32k -or (($flags -shr 1) -band 1) -ne $audit -or ($flags -band [uint32]4294967292) -ne $unknown) {
+        throw '取得flagsとWin32k・audit・未知bitが一致しません。'
+    }
+    return [pscustomobject]@{ Result = 1; Gle = $gle; Flags = $flags; Win32k = $win32k; Audit = $audit; Unknown = $unknown }
+}
+
+function Read-Session0User32MitigationStartupProgress([byte[]]$Bytes, $ExitCode) {
+    if ($Bytes.Length -gt 2049) { throw '保持出力の上限が不正です。' }
+    $rows = [Text.Encoding]::Latin1.GetString($Bytes).Split("`n")
+    $result = [ordered]@{ Stage = 0; Before = $null; BeforePolicy = $null; User32Preloaded = $null; LoadFlags = $null
+        User32Result = $null; User32Gle = $null; User32Complete = $false; AfterPolicy = $null; After = $null
+        Complete = $false; Partial = ($rows[-1].Length -ne 0); Valid = ($Bytes.Length -le 2048); Outcome = 0 }
+    $prefix = 'SBZ_USER32_MITIGATION_PROBE_V1 '
+    for ($i = 0; $i -lt $rows.Length - 1; ++$i) {
+        $line = $rows[$i]
+        try {
+        if ($line -cmatch '[^\x00-\x7f]') { throw 'ASCII以外の列です。' }
+        switch ($result.Stage) {
+            0 { if ($line -cne ($prefix + 'entry')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 1 }
+            1 { $result.Before = Read-Session0User32MitigationStartupSnapshot $line 'before'; $result.Stage = 2 }
+            2 { if ($line -cne ($prefix + 'before_query_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 3 }
+            3 { $result.BeforePolicy = Read-Session0User32MitigationPolicyResult $line 'before'; $result.Stage = 4 }
+            4 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_preloaded=([01])\z')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Preloaded = [int]$matches[1]; $result.Stage = 5
+            }
+            5 {
+                if ($line -cne ($prefix + 'user32_load_begin flags=0x00000800')) { throw '固定段階列の順序が不正です。' }
+                $result.LoadFlags = '0x00000800'; $result.Stage = 6
+            }
+            6 {
+                if ($line -cnotmatch ('\A' + $prefix + 'user32_load_result=([01]) gle=0x([0-9a-f]{8})\z')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Result = [int]$matches[1]; $result.User32Gle = '0x' + $matches[2]; $result.Stage = 7
+            }
+            7 {
+                if ($line -cne ($prefix + 'user32_complete')) { throw '固定段階列の順序が不正です。' }
+                $result.User32Complete = $true; $result.Stage = 8
+            }
+            8 { if ($line -cne ($prefix + 'after_query_begin')) { throw '固定段階列の順序が不正です。' }; $result.Stage = 9 }
+            9 { $result.AfterPolicy = Read-Session0User32MitigationPolicyResult $line 'after'; $result.Stage = 10 }
+            10 { $result.After = Read-Session0User32MitigationStartupSnapshot $line 'after'; $result.Stage = 11 }
+            11 {
+                if ($line -cne ($prefix + 'complete')) { throw '固定段階列の順序が不正です。' }
+                $result.Complete = $true; $result.Stage = 12
+            }
+            default { throw '固定段階列の後ろに余分な列があります。' }
+        }
+        } catch { $result.Valid=$false; break }
+    }
+    foreach ($b in $Bytes) { if ($b -gt 127) { $result.Valid=$false; break } }
+    if ($result.Valid -and -not $result.Partial -and $result.Complete) {
+        $expected=if($result.BeforePolicy.Result -eq 0 -or $result.AfterPolicy.Result -eq 0){31}elseif($result.User32Result -eq 0){11}else{0}
+        if($null -ne $ExitCode -and $ExitCode -eq $expected){$result.Outcome=if($expected -eq 31){1}elseif($expected -eq 11){2}else{3}}
+    }
+    return [pscustomobject]$result
+}
+
+function Get-Session0User32MitigationEvidence($Run) {
+    # raw bytesを復元し、自己Win32k policy専用parserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,2049}\z') { throw '自己Win32k policy診断の出力hexが不正です。' }
+    $evidence = Read-Session0User32MitigationStartupProgress ([Convert]::FromHexString($Run.Stdout)) $Run.ChildExit
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = @([string]$evidence.Stage)
+    foreach ($property in @('Before','BeforePolicy','User32Preloaded','LoadFlags','User32Result','User32Gle','User32Complete','AfterPolicy','After','Valid','Partial','Outcome')) {
+        $value=$evidence.$property
+        $values += $(if ($null -eq $value) { 'none' }
+            elseif ($property -cin @('LoadFlags','User32Gle')) { [string][Convert]::ToUInt32($value.Substring(2),16) }
+            elseif ($property -cin @('Before','After')) { @($value.State,$value.Units,$value.Hex,$value.User32,$value.Gdi32,$value.Win32u) -join ',' }
+            elseif ($property -cin @('BeforePolicy','AfterPolicy')) {
+                @([string]$value.Result, [string][Convert]::ToUInt32($value.Gle.Substring(2),16),
+                    $(if($null -eq $value.Flags){'none'}else{[string]$value.Flags}),
+                    $(if($null -eq $value.Win32k){'none'}else{[string]$value.Win32k}),
+                    $(if($null -eq $value.Audit){'none'}else{[string]$value.Audit}),
+                    $(if($null -eq $value.Unknown){'none'}else{[string]$value.Unknown})) -join ','
+            }
+            elseif ($property -cin @('User32Complete','Valid','Partial')) { [string][int]$value }
+            else { [string]$value })
+    }
+    return $values -join ';'
+}
+
+function Test-Session0User32MitigationSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0User32MitigationStartupProgress ([Convert]::FromHexString($Probe.Run.Stdout)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0User32MitigationGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.User32MitigationProbe) { return $false }
+    $probe=$Record.User32MitigationProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0User32MitigationTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.User32MitigationProbe -and ($Record.User32MitigationProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0User32MitigationRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0User32MitigationProbe.exe')) { throw '自己Win32k policy診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw '自己Win32k policy診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ([Text.Encoding]::UTF8.GetByteCount($evidence) -gt 2048) { throw '自己Win32k policy診断の証拠長が不正です。' }
+    if ($evidence -cne (Get-Session0User32MitigationEvidence $run)) { throw '自己Win32k policy診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw '自己Win32k policy診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw '自己Win32k policy診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Get-Session0WindowsInitEvidence($Run) {
+    # raw bytesを復元し、旧Initと同じparserで段階/GLEを独立照合する。
+    if ($Run.Stdout -cnotmatch '\A(?:[0-9a-f]{2}){0,4097}\z' -or $Run.Stderr -cnotmatch '\A(?:[0-9a-f]{2}){0,4097}\z') { throw 'WINDOWS初期化診断の出力hexが不正です。' }
+    try { $evidence = Read-Session0InitProbeOutput ([Convert]::FromHexString($Run.Stdout)) ([Convert]::FromHexString($Run.Stderr)) $Run.ChildExit }
+    catch {
+        try { $evidence = Read-Session0InitProbeOutput ([Convert]::FromHexString($Run.Stdout)) ([byte[]]@()) $null }
+        catch { return 'invalid' }
+        $evidence.Outcome = 0
+    }
+    if ($Run.Lifecycle -ne 15 -or $Run.SpawnError.Length -ne 0) { $evidence.Outcome = 0 }
+    $values = foreach ($property in @('Stage','Preloaded','LoadResult','Gle','Outcome')) {
+        if ($null -eq $evidence.$property) { 'none' } else { [string]$evidence.$property }
+    }
+    return $values -join ','
+}
+
+function Test-Session0WindowsInitSequence($Probe) {
+    if ($null -eq $Probe) { return $false }
+    try {
+        $evidence = Read-Session0InitProbeOutput ([Convert]::FromHexString($Probe.Run.Stdout)) ([Convert]::FromHexString($Probe.Run.Stderr)) $Probe.Run.ChildExit
+        return $evidence.Outcome -ne 0
+    } catch { return $false }
+}
+
+function Test-Session0WindowsInitGates($Record) {
+    if ($null -eq $Record -or $null -eq $Record.WindowsInitProbe) { return $false }
+    $probe=$Record.WindowsInitProbe; $run=$probe.Run
+    return $Record.SessionId -eq 0 -and $Record.WorkerActionsSid.Length -gt 0 -and
+        $Record.StationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $Record.RequestedStationMask) -and
+        $Record.StationCleanup -ceq 'removed' -and $run.SpawnSucceeded -and $run.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $run.TargetDacl $run.TargetSacl $run.TargetAccess $run.Isolation $Record.RequestedStationMask) -and
+        $run.Stderr.Length -eq 0 -and $run.SpawnError.Length -eq 0 -and $probe.OutputEof -and $probe.DeadlineMet -and $null -ne $run.ChildExit
+}
+
+function Test-Session0WindowsInitTreeSafe([bool]$Requested, [bool]$StartAttempted, $Record) {
+    return -not $Requested -or -not $StartAttempted -or ($null -ne $Record -and $null -ne $Record.WindowsInitProbe -and ($Record.WindowsInitProbe.Run.Lifecycle -band 12) -eq 12)
+}
+
+function Read-Session0WindowsInitRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash, $PreviousRuns, [string]$ConsolePath) {
+    $path=Read-Session0Text $Bytes $Offset; $hash=Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    $parent=[IO.Path]::GetDirectoryName($ConsolePath)
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or $path -cne ($parent + '\SbzSession0WindowsInitProbe.exe')) { throw 'WINDOWS初期化診断の役割別path・hashが一致しません。' }
+    $run=Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if ((-not $run.SpawnSucceeded -and ($null -ne $run.ChildExit -or $run.Stdout.Length -ne 0 -or $run.Stderr.Length -ne 0)) -or
+        ($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station+'\sbz-'),[StringComparison]::Ordinal)) -or
+        ($run.TargetDesktop.Length -gt 0 -and @($PreviousRuns | Where-Object { $_.TargetDesktop -ceq $run.TargetDesktop }).Count -gt 0)) { throw 'WINDOWS初期化診断の実行契約・専用desktopが一致しません。' }
+    $evidence=Read-Session0Text $Bytes $Offset
+    if ($evidence -cne (Get-Session0WindowsInitEvidence $run)) { throw 'WINDOWS初期化診断の段階証拠が一致しません。' }
+    if ($Offset.Value+2 -gt $Bytes.Length -or $Bytes[$Offset.Value] -gt 1 -or $Bytes[$Offset.Value+1] -gt 1) { throw 'WINDOWS初期化診断のEOF・期限bitが不正です。' }
+    $outputEof=$Bytes[$Offset.Value] -eq 1; $deadlineMet=$Bytes[$Offset.Value+1] -eq 1; $Offset.Value+=2
+    if (($outputEof -and -not $run.SpawnSucceeded) -or ($deadlineMet -and (-not $run.SpawnSucceeded -or $null -eq $run.ChildExit))) { throw 'WINDOWS初期化診断のEOF・期限が矛盾しています。' }
+    return [pscustomobject]@{Path=$path;Sha256=$hash;Run=$run;Evidence=$evidence;OutputEof=$outputEof;DeadlineMet=$deadlineMet}
+}
+
+function Read-Session0InitRecord([byte[]]$Bytes, [ref]$Offset, [uint32]$Mask, [string]$Station,
+    [string]$ExpectedPath, [string]$ExpectedHash) {
+    if ($Offset.Value -ge $Bytes.Length -or $Bytes[$Offset.Value] -gt 1) { throw '追加診断の有無が不正です。' }
+    $present = $Bytes[$Offset.Value] -eq 1
+    $Offset.Value++
+    if (-not $present) {
+        if ($ExpectedPath.Length -ne 0 -or $ExpectedHash.Length -ne 0) { throw '要求した追加診断がありません。' }
+        return $null
+    }
+    $path = Read-Session0Text $Bytes $Offset
+    $hash = Read-Session0Text $Bytes $Offset
+    Assert-Session0InitProbeHash $hash
+    if ($path -cne $ExpectedPath -or $hash -cne $ExpectedHash -or
+        -not $path.EndsWith('\SbzSession0InitProbe.exe', [StringComparison]::Ordinal) -or
+        $path -cnotmatch '\A[A-Za-z]:\\[^\r\n]+\z' -or
+        @($path.Substring(3).Split('\') | Where-Object {
+            $_.Length -eq 0 -or $_.EndsWith('.') -or $_.EndsWith(' ') -or $_ -match '[\p{Cc}"<>|?*:/]'
+        }).Count -ne 0) {
+        throw '追加診断の固定path・hashが呼出側の期待値と一致しません。'
+    }
+    $run = Read-Session0DiagnosticRun $Bytes $Offset $Mask
+    if (($run.SpawnSucceeded -and ($run.JobUi -ne 0xfe -or $run.CreationFlags -ne 0x00080404 -or ($run.Lifecycle -band 1) -eq 0)) -or
+        (($run.Lifecycle -band 1) -ne 0 -and -not $run.TargetDesktop.StartsWith(($Station + '\sbz-'), [StringComparison]::Ordinal))) {
+        throw '追加診断のJob・製品flags・専用desktopが一致しません。'
+    }
+    $evidence = Read-Session0Text $Bytes $Offset
+    if ($evidence -cne (Get-Session0InitRunEvidence $run)) { throw '追加診断の段階証拠が出力と一致しません。' }
+    return [PSCustomObject]@{ Path=$path; Sha256=$hash; Run=$run; Evidence=$evidence }
+}
+
+function Read-Session0DiagnosticRecord([byte[]]$Bytes, [string]$Nonce, [uint32]$ExpectedMask,
+    [string]$ExpectedInitPath = '', [string]$ExpectedInitHash = '',
+    [string]$ExpectedEntryPath = '', [string]$ExpectedEntryHash = '',
+    [string]$ExpectedTerminatePath = '', [string]$ExpectedTerminateHash = '',
+    [string]$ExpectedConsolePath = '', [string]$ExpectedConsoleHash = '',
+    [string]$ExpectedWindowsPath = '', [string]$ExpectedWindowsHash = '',
+    [string]$ExpectedWindowsInitPath = '', [string]$ExpectedWindowsInitHash = '',
+    [string]$ExpectedWindowsStartupPath = '', [string]$ExpectedWindowsStartupHash = '',
+    [string]$ExpectedGdi32InitPath = '', [string]$ExpectedGdi32InitHash = '',
+    [string]$ExpectedWin32uInitPath = '', [string]$ExpectedWin32uInitHash = '',
+    [string]$ExpectedWin32uUser32Path = '', [string]$ExpectedWin32uUser32Hash = '',
+    [string]$ExpectedUser32ResourcePath = '', [string]$ExpectedUser32ResourceHash = '',
+    [string]$ExpectedUser32ResourceLoadPath = '', [string]$ExpectedUser32ResourceLoadHash = '',
+    [string]$ExpectedUser32MitigationPath = '', [string]$ExpectedUser32MitigationHash = '') {
+    Assert-Session0ProbeParameters $ExpectedInitPath $ExpectedInitHash $ExpectedEntryPath $ExpectedEntryHash $ExpectedTerminatePath $ExpectedTerminateHash $ExpectedConsolePath $ExpectedConsoleHash $ExpectedWindowsPath $ExpectedWindowsHash $ExpectedWindowsInitPath $ExpectedWindowsInitHash $ExpectedWindowsStartupPath $ExpectedWindowsStartupHash $ExpectedGdi32InitPath $ExpectedGdi32InitHash $ExpectedWin32uInitPath $ExpectedWin32uInitHash $ExpectedWin32uUser32Path $ExpectedWin32uUser32Hash $ExpectedUser32ResourcePath $ExpectedUser32ResourceHash $ExpectedUser32ResourceLoadPath $ExpectedUser32ResourceLoadHash $ExpectedUser32MitigationPath $ExpectedUser32MitigationHash
+    if ($ExpectedMask -ne 0x0002 -and $ExpectedMask -ne 0x0022) {
+        throw '呼出側の station mask が許容範囲外です。'
+    }
+    if ($Bytes.Length -lt 44 -or $Bytes.Length -gt 65580) {
+        throw '診断レコードの長さが許容範囲外です。'
+    }
+    $expectedVersion = if ($ExpectedUser32MitigationPath) { [uint32]20 } elseif ($ExpectedUser32ResourceLoadPath) { [uint32]19 } elseif ($ExpectedUser32ResourcePath) { [uint32]18 } elseif ($ExpectedWin32uUser32Path) { [uint32]17 } elseif ($ExpectedWin32uInitPath) { [uint32]16 } elseif ($ExpectedGdi32InitPath) { [uint32]15 } elseif ($ExpectedWindowsStartupPath) { [uint32]14 } elseif ($ExpectedWindowsInitPath) { [uint32]13 } elseif ($ExpectedConsolePath) { [uint32]12 } elseif ($ExpectedTerminatePath) { [uint32]11 } elseif ($ExpectedEntryPath) { [uint32]10 } else { [uint32]9 }
+    if ([BitConverter]::ToUInt32($Bytes, 0) -ne [uint32]0x53424434 -or
+        [BitConverter]::ToUInt32($Bytes, 4) -ne $expectedVersion) {
+        throw '診断レコードの magic または version が一致しません。'
+    }
+    if ($Nonce -cnotmatch '\A[0-9a-fA-F]{32}\z') { throw '診断の nonce の形式が不正です。' }
     $nonceBytes = [Text.Encoding]::ASCII.GetBytes($Nonce)
-    if ($nonceBytes.Length -ne 32) { throw 'Session 0 diagnostic nonce is malformed.' }
+    if ($nonceBytes.Length -ne 32) { throw '診断の nonce の形式が不正です。' }
     for ($index = 0; $index -lt 32; $index++) {
         if ($Bytes[8 + $index] -ne $nonceBytes[$index]) {
-            throw 'Session 0 diagnostic record nonce mismatch.'
+            throw '診断レコードの nonce が一致しません。'
         }
     }
     $payloadLength = [BitConverter]::ToUInt32($Bytes, 40)
     if ($payloadLength -ne $Bytes.Length - 44) {
-        throw 'Session 0 diagnostic payload length mismatch.'
+        throw '診断 payload の長さが一致しません。'
     }
     $offset = [ref]44
-    if ($offset.Value -ge $Bytes.Length) { throw 'Session 0 diagnostic markers are missing.' }
+    if ($offset.Value -ge $Bytes.Length) { throw '診断の進行マーカーがありません。' }
     $markers = $Bytes[$offset.Value]
     $offset.Value++
-    if ($offset.Value -ge $Bytes.Length) { throw 'Session 0 diagnostic classification is missing.' }
+    if ($offset.Value -ge $Bytes.Length) { throw '診断の分類がありません。' }
     $classification = $Bytes[$offset.Value]
     $offset.Value++
     $sessionId = Read-Session0U32 $Bytes $offset
-    $fields = [Collections.Generic.List[string]]::new()
-    for ($index = 0; $index -lt 10; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
-    $baseline = Read-Session0DiagnosticRun $Bytes $offset
-    $desktopRelaxed = Read-Session0DiagnosticRun $Bytes $offset
-    if ($offset.Value -ne $Bytes.Length) { throw 'Session 0 diagnostic record has trailing bytes.' }
-    return [PSCustomObject]@{
-        Markers = $markers; Classification = $classification; SessionId = $sessionId
-        Station = $fields[2]; Desktop = $fields[3]; StationAccess = $fields[6]
-        DesktopAccess = $fields[7]; Baseline = $baseline; DesktopRelaxed = $desktopRelaxed
+    $requestedMask = Read-Session0U32 $Bytes $offset
+    if ($requestedMask -ne $ExpectedMask) {
+        throw '要求 station mask が呼出側の期待値と一致しません。'
     }
+    $fields = [Collections.Generic.List[string]]::new()
+    for ($index = 0; $index -lt 14; $index++) { $fields.Add((Read-Session0Text $Bytes $offset)) }
+    $baseline = Read-Session0DiagnosticRun $Bytes $offset $requestedMask
+    $noWindow = Read-Session0DiagnosticRun $Bytes $offset $requestedMask
+    $workerActionsSid = Read-Session0Text $Bytes $offset
+    $stationAce = Read-Session0Text $Bytes $offset
+    $stationCleanup = Read-Session0Text $Bytes $offset
+    $initProbeRecord = Read-Session0InitRecord $Bytes $offset $requestedMask $fields[2] $ExpectedInitPath $ExpectedInitHash
+    $entryProbeRecord = $null
+    if ($ExpectedEntryPath) {
+        $entryProbeRecord = Read-Session0EntryRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedEntryPath $ExpectedEntryHash $initProbeRecord $baseline $noWindow
+    }
+    $terminateProbeRecord = $null
+    if ($ExpectedTerminatePath) {
+        $terminateProbeRecord = Read-Session0TerminateRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedTerminatePath $ExpectedTerminateHash $initProbeRecord $entryProbeRecord $baseline $noWindow
+    }
+    $consoleProbeRecord = $null
+    $windowsProbeRecord = $null
+    if ($ExpectedConsolePath) {
+        $consoleProbeRecord = Read-Session0SubsystemRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedConsolePath $ExpectedConsoleHash $initProbeRecord $entryProbeRecord $baseline $noWindow $terminateProbeRecord $null 'Console'
+        $windowsProbeRecord = Read-Session0SubsystemRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedWindowsPath $ExpectedWindowsHash $initProbeRecord $entryProbeRecord $baseline $noWindow $terminateProbeRecord $consoleProbeRecord 'Windows'
+    }
+    $windowsInitProbeRecord = $null
+    if ($ExpectedWindowsInitPath) {
+        $windowsInitProbeRecord = Read-Session0WindowsInitRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedWindowsInitPath $ExpectedWindowsInitHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    $windowsStartupProbeRecord = $null
+    if ($ExpectedWindowsStartupPath) {
+        $windowsStartupProbeRecord = Read-Session0WindowsStartupRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedWindowsStartupPath $ExpectedWindowsStartupHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    if ($ExpectedGdi32InitPath) {
+        $gdi32InitProbeRecord = Read-Session0Gdi32InitRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedGdi32InitPath $ExpectedGdi32InitHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    if ($ExpectedWin32uInitPath) {
+        $win32uInitProbeRecord = Read-Session0Win32uInitRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedWin32uInitPath $ExpectedWin32uInitHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run, $gdi32InitProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    if ($ExpectedWin32uUser32Path) {
+        $win32uUser32ProbeRecord = Read-Session0Win32uUser32Record $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedWin32uUser32Path $ExpectedWin32uUser32Hash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run, $gdi32InitProbeRecord.Run, $win32uInitProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    if ($ExpectedUser32ResourcePath) {
+        $user32ResourceProbeRecord = Read-Session0User32ResourceRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedUser32ResourcePath $ExpectedUser32ResourceHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run, $gdi32InitProbeRecord.Run, $win32uInitProbeRecord.Run, $win32uUser32ProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    if ($ExpectedUser32ResourceLoadPath) {
+        $user32ResourceLoadProbeRecord = Read-Session0User32ResourceLoadRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedUser32ResourceLoadPath $ExpectedUser32ResourceLoadHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run, $gdi32InitProbeRecord.Run, $win32uInitProbeRecord.Run, $win32uUser32ProbeRecord.Run, $user32ResourceProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    if ($ExpectedUser32MitigationPath) {
+        $user32MitigationProbeRecord = Read-Session0User32MitigationRecord $Bytes $offset $requestedMask $fields[2] `
+            $ExpectedUser32MitigationPath $ExpectedUser32MitigationHash @($baseline, $noWindow, $initProbeRecord.Run, $entryProbeRecord.Run, $terminateProbeRecord.Run, $consoleProbeRecord.Run, $windowsProbeRecord.Run, $windowsInitProbeRecord.Run, $windowsStartupProbeRecord.Run, $gdi32InitProbeRecord.Run, $win32uInitProbeRecord.Run, $win32uUser32ProbeRecord.Run, $user32ResourceProbeRecord.Run, $user32ResourceLoadProbeRecord.Run) $consoleProbeRecord.Path
+    }
+    if ($null -ne $initProbeRecord -and $initProbeRecord.Run.TargetDesktop.Length -ne 0 -and
+        ($initProbeRecord.Run.TargetDesktop -ceq $baseline.TargetDesktop -or $initProbeRecord.Run.TargetDesktop -ceq $noWindow.TargetDesktop)) {
+        throw '追加診断のdesktopがcmdと重複しています。'
+    }
+    $maskSeparator = $stationAce.LastIndexOf(';mask=0x', [StringComparison]::Ordinal)
+    if ($maskSeparator -ge 0 -and $stationAce.Substring($maskSeparator + 8) -cne ('{0:x8}' -f $requestedMask)) {
+        throw '実測した station ACE の mask が要求と一致しません。'
+    }
+    if ($offset.Value -ne $Bytes.Length) { throw '診断レコードに余分な末尾データがあります。' }
+    if (($markers -band 0xf8) -ne 0 -or ($markers -band 1) -eq 0) {
+        throw '診断の進行マーカーが不正です。'
+    }
+    if ($classification -lt 1 -or $classification -gt 4) {
+        throw '診断の分類が不正です。'
+    }
+    if ($fields[13] -cnotmatch '\A[0-9a-fA-F]{64}\z') {
+        throw '診断の環境ハッシュが不正です。'
+    }
+    if (($baseline.SpawnSucceeded -and ($baseline.JobUi -ne [uint32]0x000000fe -or
+            $baseline.CreationFlags -ne [uint32]0x00080404)) -or
+        ($noWindow.SpawnSucceeded -and ($noWindow.JobUi -ne [uint32]0x000000fe -or
+            $noWindow.CreationFlags -ne [uint32]0x08080404))) {
+        throw '診断の作成フラグまたは Job UI の契約に違反しています。'
+    }
+    $expectedClassification = 3
+    $isolationVerified = $workerActionsSid.Length -gt 0 -and
+        $stationAce -ceq ('count=1;flags=0;mask=0x{0:x8}' -f $requestedMask) -and $stationCleanup -ceq 'removed' -and
+        $baseline.Lifecycle -eq 15 -and $noWindow.Lifecycle -eq 15 -and
+        (Test-Session0TargetEvidence $baseline.TargetDacl $baseline.TargetSacl $baseline.TargetAccess $baseline.Isolation $requestedMask) -and
+        (Test-Session0TargetEvidence $noWindow.TargetDacl $noWindow.TargetSacl $noWindow.TargetAccess $noWindow.Isolation $requestedMask) -and
+        $baseline.SpawnError.Length -eq 0 -and $noWindow.SpawnError.Length -eq 0 -and
+        $baseline.TargetDesktop.StartsWith(($fields[2] + '\sbz-'), [StringComparison]::Ordinal) -and
+        $noWindow.TargetDesktop.StartsWith(($fields[2] + '\sbz-'), [StringComparison]::Ordinal)
+    if ($isolationVerified -and $markers -eq 7 -and $sessionId -eq 0 -and
+        $baseline.SpawnSucceeded -and $noWindow.SpawnSucceeded -and
+        $baseline.JobUi -eq [uint32]0x000000fe -and $noWindow.JobUi -eq [uint32]0x000000fe -and
+        $baseline.CreationFlags -eq [uint32]0x00080404 -and
+        $noWindow.CreationFlags -eq [uint32]0x08080404 -and
+        $null -ne $baseline.ChildExit -and $baseline.ChildExit -eq [uint32]0 -and
+        $null -ne $noWindow.ChildExit -and $noWindow.ChildExit -eq [uint32]0) {
+        # 両方の腕が起動した。Rust 側と同じく、ベースラインの失敗を前提とする分類より先に判定する。
+        $expectedClassification = 4
+    } elseif ($isolationVerified -and $markers -eq 7 -and $sessionId -eq 0 -and
+        $baseline.SpawnSucceeded -and $noWindow.SpawnSucceeded -and
+        $baseline.JobUi -eq [uint32]0x000000fe -and $noWindow.JobUi -eq [uint32]0x000000fe -and
+        $baseline.CreationFlags -eq [uint32]0x00080404 -and
+        $noWindow.CreationFlags -eq [uint32]0x08080404 -and
+        $baseline.ChildExit -eq [uint32]3221225794) { # 0xc0000142
+        if ($null -ne $noWindow.ChildExit -and $noWindow.ChildExit -eq [uint32]0) {
+            $expectedClassification = 1
+        } elseif ($noWindow.ChildExit -eq [uint32]3221225794) { # 0xc0000142
+            $expectedClassification = 2
+        }
+    }
+    if ($classification -ne $expectedClassification) {
+        throw '診断の分類が記録内容と一致しません。'
+    }
+    $result = [PSCustomObject]@{
+        Nonce = $Nonce; Markers = $markers; Classification = $classification; SessionId = $sessionId
+        RequestedStationMask = $requestedMask
+        Broker = $fields[0]; Action = $fields[1]; Station = $fields[2]; Desktop = $fields[3]
+        StationDacl = $fields[4]; StationSacl = $fields[5]; DesktopDacl = $fields[6]
+        DesktopSacl = $fields[7]; StationAccess = $fields[8]; DesktopAccess = $fields[9]
+        UiProbe = $fields[10]; ActionDesktop = $fields[11]; Cwd = $fields[12]
+        EnvironmentHash = $fields[13]
+        Baseline = $baseline; NoWindow = $noWindow; InitProbe = $initProbeRecord; EntryProbe = $entryProbeRecord; TerminateProbe = $terminateProbeRecord
+        ConsoleProbe = $consoleProbeRecord; WindowsProbe = $windowsProbeRecord; WindowsInitProbe = $windowsInitProbeRecord
+        WorkerActionsSid = $workerActionsSid; StationAce = $stationAce; StationCleanup = $stationCleanup
+    }
+    if ($ExpectedWindowsStartupPath) { $result | Add-Member NoteProperty WindowsStartupProbe $windowsStartupProbeRecord }
+    if ($ExpectedGdi32InitPath) { $result | Add-Member NoteProperty Gdi32InitProbe $gdi32InitProbeRecord }
+    if ($ExpectedWin32uInitPath) { $result | Add-Member NoteProperty Win32uInitProbe $win32uInitProbeRecord }
+    if ($ExpectedWin32uUser32Path) { $result | Add-Member NoteProperty Win32uUser32Probe $win32uUser32ProbeRecord }
+    if ($ExpectedUser32ResourcePath) { $result | Add-Member NoteProperty User32ResourceProbe $user32ResourceProbeRecord }
+    if ($ExpectedUser32ResourceLoadPath) { $result | Add-Member NoteProperty User32ResourceLoadProbe $user32ResourceLoadProbeRecord }
+    if ($ExpectedUser32MitigationPath) { $result | Add-Member NoteProperty User32MitigationProbe $user32MitigationProbeRecord }
+    return $result
 }
 
 function Format-BoundedDiagnosticText([string]$Value) {
     $normalized = $Value.Replace("`r", '\\r').Replace("`n", '\\n')
-    if ($normalized.Length -gt 512) { return $normalized.Substring(0, 512) + '...[truncated]' }
     return $normalized
 }
 
@@ -1081,6 +3048,19 @@ try {
     $sourceHash = Get-StreamSha256 $sourceStream
     if ($sourceHash -ne $ExpectedSha256) { throw 'artifact SHA-256 mismatch' }
     $sourceStream.Position = 0
+    if ($InitProbePath) { Open-Session0InitProbeSource $initProbe $InitProbePath $InitProbeSha256 }
+    if ($EntryProbePath) { Open-Session0InitProbeSource $entryProbe $EntryProbePath $EntryProbeSha256 'Entry' }
+    if ($TerminateProbePath) { Open-Session0InitProbeSource $terminateProbe $TerminateProbePath $TerminateProbeSha256 'Terminate' }
+    if ($ConsoleProbePath) { Open-Session0InitProbeSource $consoleProbe $ConsoleProbePath $ConsoleProbeSha256 'Console' }
+    if ($WindowsProbePath) { Open-Session0InitProbeSource $windowsProbe $WindowsProbePath $WindowsProbeSha256 'Windows' }
+    if ($WindowsInitProbePath) { Open-Session0InitProbeSource $windowsInitProbe $WindowsInitProbePath $WindowsInitProbeSha256 'WindowsInit' }
+    if ($WindowsStartupProbePath) { Open-Session0InitProbeSource $windowsStartupProbe $WindowsStartupProbePath $WindowsStartupProbeSha256 'WindowsStartup' }
+    if ($Gdi32InitProbePath) { Open-Session0InitProbeSource $gdi32InitProbe $Gdi32InitProbePath $Gdi32InitProbeSha256 'Gdi32Init' }
+    if ($Win32uInitProbePath) { Open-Session0InitProbeSource $win32uInitProbe $Win32uInitProbePath $Win32uInitProbeSha256 'Win32uInit' }
+    if ($Win32uUser32ProbePath) { Open-Session0InitProbeSource $win32uUser32Probe $Win32uUser32ProbePath $Win32uUser32ProbeSha256 'Win32uUser32' }
+    if ($User32ResourceProbePath) { Open-Session0InitProbeSource $user32ResourceProbe $User32ResourceProbePath $User32ResourceProbeSha256 'User32Resource' }
+    if ($User32ResourceLoadProbePath) { Open-Session0InitProbeSource $user32ResourceLoadProbe $User32ResourceLoadProbePath $User32ResourceLoadProbeSha256 'User32ResourceLoad' }
+    if ($User32MitigationProbePath) { Open-Session0InitProbeSource $user32MitigationProbe $User32MitigationProbePath $User32MitigationProbeSha256 'User32Mitigation' }
 
     $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
     if ([string]::IsNullOrWhiteSpace($programFiles)) { throw 'Program Files known folder is empty.' }
@@ -1121,6 +3101,19 @@ try {
         $targetHandle = [Sembazuru.WindowStationProbeNative]::CreateProtectedFile(
             $fixtureExe, 'O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
         )
+        if ($InitProbePath) { Copy-Session0InitProbe $initProbe $root }
+        if ($EntryProbePath) { Copy-Session0InitProbe $entryProbe $root }
+        if ($TerminateProbePath) { Copy-Session0InitProbe $terminateProbe $root }
+        if ($ConsoleProbePath) { Copy-Session0InitProbe $consoleProbe $root }
+        if ($WindowsProbePath) { Copy-Session0InitProbe $windowsProbe $root }
+        if ($WindowsInitProbePath) { Copy-Session0InitProbe $windowsInitProbe $root }
+        if ($WindowsStartupProbePath) { Copy-Session0InitProbe $windowsStartupProbe $root }
+        if ($Gdi32InitProbePath) { Copy-Session0InitProbe $gdi32InitProbe $root }
+        if ($Win32uInitProbePath) { Copy-Session0InitProbe $win32uInitProbe $root }
+        if ($Win32uUser32ProbePath) { Copy-Session0InitProbe $win32uUser32Probe $root }
+        if ($User32ResourceProbePath) { Copy-Session0InitProbe $user32ResourceProbe $root }
+        if ($User32ResourceLoadProbePath) { Copy-Session0InitProbe $user32ResourceLoadProbe $root }
+        if ($User32MitigationProbePath) { Copy-Session0InitProbe $user32MitigationProbe $root }
     }
     finally { $restore.Dispose() }
 
@@ -1160,9 +3153,39 @@ try {
     $sourceStream = $null
 
     $diagnosticRecordPath = Join-Path $root ($diagnosticNonce + '.session0.rec')
+    $fixtureArguments = @($fixtureExe, '--ignored', '--exact', $selector,
+        '--nocapture', '--test-threads=1', '--', $root, $root, $diagnosticNonce, $StationMask)
+    if ($InitProbePath) { $fixtureArguments += $initProbe.Hash }
+    if ($EntryProbePath) { $fixtureArguments += $entryProbe.Hash }
+    if ($TerminateProbePath) { $fixtureArguments += $terminateProbe.Hash }
+    if ($ConsoleProbePath) { $fixtureArguments += $consoleProbe.Hash }
+    if ($WindowsProbePath) { $fixtureArguments += $windowsProbe.Hash }
+    if ($WindowsInitProbePath) { $fixtureArguments += $windowsInitProbe.Hash }
+    if ($WindowsStartupProbePath) { $fixtureArguments += $windowsStartupProbe.Hash }
+    if ($Gdi32InitProbePath) { $fixtureArguments += $gdi32InitProbe.Hash }
+    if ($Win32uInitProbePath) { $fixtureArguments += $win32uInitProbe.Hash }
+    if ($Win32uUser32ProbePath) { $fixtureArguments += $win32uUser32Probe.Hash }
+    if ($User32ResourceProbePath) { $fixtureArguments += $user32ResourceProbe.Hash }
+    if ($User32ResourceLoadProbePath) { $fixtureArguments += $user32ResourceLoadProbe.Hash }
+    if ($User32MitigationProbePath) { $fixtureArguments += $user32MitigationProbe.Hash }
+    Assert-Session0FixtureArguments $fixtureArguments
+    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 24)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
-        $diagnosticNonce
+        $diagnosticNonce + ' ' + $StationMask
+    if ($InitProbePath) { $imagePath += ' ' + $initProbe.Hash }
+    if ($EntryProbePath) { $imagePath += ' ' + $entryProbe.Hash }
+    if ($TerminateProbePath) { $imagePath += ' ' + $terminateProbe.Hash }
+    if ($ConsoleProbePath) { $imagePath += ' ' + $consoleProbe.Hash }
+    if ($WindowsProbePath) { $imagePath += ' ' + $windowsProbe.Hash }
+    if ($WindowsInitProbePath) { $imagePath += ' ' + $windowsInitProbe.Hash }
+    if ($WindowsStartupProbePath) { $imagePath += ' ' + $windowsStartupProbe.Hash }
+    if ($Gdi32InitProbePath) { $imagePath += ' ' + $gdi32InitProbe.Hash }
+    if ($Win32uInitProbePath) { $imagePath += ' ' + $win32uInitProbe.Hash }
+    if ($Win32uUser32ProbePath) { $imagePath += ' ' + $win32uUser32Probe.Hash }
+    if ($User32ResourceProbePath) { $imagePath += ' ' + $user32ResourceProbe.Hash }
+    if ($User32ResourceLoadProbePath) { $imagePath += ' ' + $user32ResourceLoadProbe.Hash }
+    if ($User32MitigationProbePath) { $imagePath += ' ' + $user32MitigationProbe.Hash }
     $serviceAccount = 'NT SERVICE\' + $serviceName
     $serviceHandle = [Sembazuru.WindowStationProbeNative]::CreateProbeService(
         $serviceName, $imagePath, $serviceAccount
@@ -1174,8 +3197,8 @@ try {
     }
     $serviceSid = [Sembazuru.WindowStationProbeNative]::ServiceAccountSid($serviceName)
     if ([string]::IsNullOrWhiteSpace($serviceSid)) { throw 'throwaway service SID is unavailable.' }
-    # The long-lived identity handles intentionally lack WRITE_DAC. Mutate only through
-    # short-lived handles opened with that exact right after final-path/file-ID verification.
+    # 長期保持ハンドルには WRITE_DAC を付けず、最終 path と file ID を照合した
+    # 短命のハンドルだけで DACL を更新する。
     $rootAclHandle = [Sembazuru.WindowStationProbeNative]::OpenAclMutation($root, $true)
     try {
         $rootAclIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle(
@@ -1202,6 +3225,19 @@ try {
         )
     }
     finally { $targetAclHandle.Dispose() }
+    if ($InitProbePath) { Grant-Session0InitProbeRead $initProbe $serviceSid }
+    if ($EntryProbePath) { Grant-Session0InitProbeRead $entryProbe $serviceSid }
+    if ($TerminateProbePath) { Grant-Session0InitProbeRead $terminateProbe $serviceSid }
+    if ($ConsoleProbePath) { Grant-Session0InitProbeRead $consoleProbe $serviceSid }
+    if ($WindowsProbePath) { Grant-Session0InitProbeRead $windowsProbe $serviceSid }
+    if ($WindowsInitProbePath) { Grant-Session0InitProbeRead $windowsInitProbe $serviceSid }
+    if ($WindowsStartupProbePath) { Grant-Session0InitProbeRead $windowsStartupProbe $serviceSid }
+    if ($Gdi32InitProbePath) { Grant-Session0InitProbeRead $gdi32InitProbe $serviceSid }
+    if ($Win32uInitProbePath) { Grant-Session0InitProbeRead $win32uInitProbe $serviceSid }
+    if ($Win32uUser32ProbePath) { Grant-Session0InitProbeRead $win32uUser32Probe $serviceSid }
+    if ($User32ResourceProbePath) { Grant-Session0InitProbeRead $user32ResourceProbe $serviceSid }
+    if ($User32ResourceLoadProbePath) { Grant-Session0InitProbeRead $user32ResourceLoadProbe $serviceSid }
+    if ($User32MitigationProbePath) { Grant-Session0InitProbeRead $user32MitigationProbe $serviceSid }
     $serviceRootIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($rootHandle.Handle)
     $serviceExeIdentity = [Sembazuru.WindowStationProbeNative]::InspectHandle($targetLease.Handle)
     $leaseIdentity = $serviceExeIdentity
@@ -1217,6 +3253,7 @@ try {
         })
         if ($ace.Count -ne 1) { throw "$($check[2]) lacks the exact throwaway service SID right." }
     }
+    $serviceStartAttempted = $true
     try { [Sembazuru.WindowStationProbeNative]::StartWithoutArguments($serviceHandle) }
     catch {
         $nativeError = $null
@@ -1233,7 +3270,9 @@ try {
         throw
     }
 
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    # 旧形式の期限を保ち、追加runごとの終了確認時間を割り当てる。
+    $serviceDeadlineSeconds = Get-Session0ServiceDeadline ([bool]$InitProbePath) ([bool]$EntryProbePath) ([bool]$TerminateProbePath) ([bool]$ConsoleProbePath) ([bool]$WindowsInitProbePath) ([bool]$WindowsStartupProbePath) ([bool]$Gdi32InitProbePath) ([bool]$Win32uInitProbePath) ([bool]$Win32uUser32ProbePath) ([bool]$User32ResourceProbePath) ([bool]$User32ResourceLoadProbePath) ([bool]$User32MitigationProbePath)
+    $deadline = [DateTime]::UtcNow.AddSeconds($serviceDeadlineSeconds)
     $sawRunning = $false
     do {
         $status = [Sembazuru.WindowStationProbeNative]::QueryStatus($serviceHandle)
@@ -1247,13 +3286,14 @@ try {
         }
         if ($status.State -eq $serviceRunning) { $sawRunning = $true }
         if ($status.State -eq $serviceStopped) { break }
-        if ([DateTime]::UtcNow -ge $deadline) { throw 'SCM smoke did not stop in 30 seconds.' }
+        if ([DateTime]::UtcNow -ge $deadline) { throw ('SCM 診断が {0} 秒以内に停止しませんでした。' -f $serviceDeadlineSeconds) }
         Start-Sleep -Milliseconds 100
     } while ($true)
     if ($status.Win32ExitCode -ne $errorServiceSpecific -or
-        ($status.ServiceSpecificExitCode -ne $desktopCausalMagic -and
-         $status.ServiceSpecificExitCode -ne $desktopNotSufficientMagic -and
+        ($status.ServiceSpecificExitCode -ne $noWindowCausalMagic -and
+         $status.ServiceSpecificExitCode -ne $noWindowNotSufficientMagic -and
          $status.ServiceSpecificExitCode -ne $indeterminateMagic -and
+         $status.ServiceSpecificExitCode -ne $actionStartsMagic -and
          $status.ServiceSpecificExitCode -ne $brokerTokenFailureMagic -and
          $status.ServiceSpecificExitCode -ne $publishFailureMagic -and
          $status.ServiceSpecificExitCode -ne $scratchCleanupFailureMagic -and
@@ -1279,65 +3319,153 @@ try {
         $scratchCleanupFailureMagic = 'scratch-cleanup'
         $runtimeFailureMagic = 'runtime'
     }
-    if ($failureStages.ContainsKey($status.ServiceSpecificExitCode)) {
-        throw ('Session 0 diagnostic harness failure stage={0} service=0x{1:x8}' -f
-            $failureStages[$status.ServiceSpecificExitCode], $status.ServiceSpecificExitCode)
-    }
     if ($null -eq $diagnosticRecordPath -or -not [IO.File]::Exists($diagnosticRecordPath)) {
         throw 'Session 0 diagnostic record is missing.'
     }
     $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
-        $diagnosticNonce
+        $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash `
+        $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash $windowsInitProbe.Path $windowsInitProbe.Hash $windowsStartupProbe.Path $windowsStartupProbe.Hash $gdi32InitProbe.Path $gdi32InitProbe.Hash $win32uInitProbe.Path $win32uInitProbe.Hash $win32uUser32Probe.Path $win32uUser32Probe.Hash $user32ResourceProbe.Path $user32ResourceProbe.Hash $user32ResourceLoadProbe.Path $user32ResourceLoadProbe.Hash $user32MitigationProbe.Path $user32MitigationProbe.Hash
     $classificationMap = @{
-        1 = @{ Name = 'DESKTOP_CAUSAL'; Magic = $desktopCausalMagic }
-        2 = @{ Name = 'DESKTOP_NOT_SUFFICIENT'; Magic = $desktopNotSufficientMagic }
+        1 = @{ Name = 'NO_WINDOW_CAUSAL'; Magic = $noWindowCausalMagic }
+        2 = @{ Name = 'NO_WINDOW_NOT_SUFFICIENT'; Magic = $noWindowNotSufficientMagic }
         3 = @{ Name = 'INDETERMINATE'; Magic = $indeterminateMagic }
+        4 = @{ Name = 'ACTION_STARTS'; Magic = $actionStartsMagic }
     }
-    if (-not $classificationMap.ContainsKey([int]$record.Classification)) {
-        throw 'Session 0 diagnostic classification is invalid.'
+    if (-not $failureStages.ContainsKey($status.ServiceSpecificExitCode)) {
+        if (-not $classificationMap.ContainsKey([int]$record.Classification)) {
+            throw '診断の分類が不正です。'
+        }
+        $classification = $classificationMap[[int]$record.Classification]
+        if ($status.ServiceSpecificExitCode -ne $classification.Magic) {
+            throw 'SCM diagnostic outcome magic disagrees with the bounded record.'
+        }
+        $diagnosticClassification = $classification.Name
     }
-    $classification = $classificationMap[[int]$record.Classification]
-    if ($status.ServiceSpecificExitCode -ne $classification.Magic) {
-        throw 'SCM diagnostic outcome magic disagrees with the bounded record.'
+    $detail = [Collections.Generic.List[string]]::new()
+    $detail.Add(('RequestedStationMask=0x{0:x8}' -f $record.RequestedStationMask))
+    $detail.Add(('service=0x{0:x8} session={1} markers=0x{2:x2}' -f
+        $status.ServiceSpecificExitCode, $record.SessionId, $record.Markers))
+    foreach ($property in @(
+        'Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl',
+        'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe',
+        'ActionDesktop', 'Cwd', 'EnvironmentHash', 'WorkerActionsSid', 'StationAce', 'StationCleanup'
+    )) {
+        # 既存の Desktop 系測定は broker の Default。起動対象の証拠は各 run の Target*。
+        $label = if ($property -in @('Desktop', 'DesktopDacl', 'DesktopSacl', 'DesktopAccess', 'UiProbe')) {
+            'Broker' + $property
+        } else { $property }
+        $detail.Add(('{0}={1}' -f $label, (Format-BoundedDiagnosticText $record.$property)))
     }
-    if (($record.Markers -band [byte]0x07) -ne [byte]0x07) {
-        throw 'Session 0 diagnostic markers do not prove entry/pre-spawn/spawn-returned.'
+    foreach ($name in (@('Baseline', 'NoWindow', 'InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe') + $(if ($WindowsStartupProbePath) { @('WindowsStartupProbe') } else { @() }) + $(if ($Gdi32InitProbePath) { @('Gdi32InitProbe') } else { @() }) + $(if ($Win32uInitProbePath) { @('Win32uInitProbe') } else { @() }) + $(if ($Win32uUser32ProbePath) { @('Win32uUser32Probe') } else { @() }) + $(if ($User32ResourceProbePath) { @('User32ResourceProbe') } else { @() }) + $(if ($User32ResourceLoadProbePath) { @('User32ResourceLoadProbe') } else { @() }) + $(if ($User32MitigationProbePath) { @('User32MitigationProbe') } else { @() }))) {
+        if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe', 'WindowsStartupProbe', 'Gdi32InitProbe', 'Win32uInitProbe', 'Win32uUser32Probe', 'User32ResourceProbe', 'User32ResourceLoadProbe', 'User32MitigationProbe') -and $null -eq $record.$name) { continue }
+        $run = if ($name -in @('InitProbe', 'EntryProbe', 'TerminateProbe', 'ConsoleProbe', 'WindowsProbe', 'WindowsInitProbe', 'WindowsStartupProbe', 'Gdi32InitProbe', 'Win32uInitProbe', 'Win32uUser32Probe', 'User32ResourceProbe', 'User32ResourceLoadProbe', 'User32MitigationProbe')) { $record.$name.Run } else { $record.$name }
+        if ($name -in @('ConsoleProbe', 'WindowsProbe')) {
+            $probe = $record.$name
+            $kind = $name.Replace('Probe', '')
+            $detail.Add(('{0}Path={1} {0}Sha256={2} {0}EntryObserved={3} {0}OutputEof={4} {0}DeadlineMet={5} {0}GatesVerified={6}' -f
+                $name, $probe.Path, $probe.Sha256, $probe.EntryObserved, $probe.OutputEof, $probe.DeadlineMet, (Test-Session0SubsystemGates $record $kind)))
+        }
+        if ($name -eq 'TerminateProbe') {
+            $terminateOutcome = if ($record.TerminateProbe.EntryObserved) { 'entry-observed' } else { 'indeterminate' }
+            $detail.Add(('TerminateProbePath={0} TerminateProbeSha256={1} TerminateEntryObserved={2} TerminateProbeOutcome={3} TerminateProbeGatesVerified={4} TerminateProbeOutputEof={5} TerminateProbeDeadlineMet={6}' -f
+                $record.TerminateProbe.Path, $record.TerminateProbe.Sha256, $record.TerminateProbe.EntryObserved,
+                $terminateOutcome, (Test-Session0TerminateGates $record), $record.TerminateProbe.OutputEof, $record.TerminateProbe.DeadlineMet))
+        }
+        if ($name -eq 'EntryProbe') {
+            $entryOutcome = if ($record.EntryProbe.EntryObserved) { 'entry-observed' } else { 'indeterminate' }
+            $detail.Add(('EntryProbePath={0} EntryProbeSha256={1} EntryObserved={2} EntryProbeOutcome={3} EntryProbeGatesVerified={4}' -f
+                $record.EntryProbe.Path, $record.EntryProbe.Sha256, $record.EntryProbe.EntryObserved, $entryOutcome, (Test-Session0EntryGates $record)))
+        }
+        if ($name -eq 'WindowsInitProbe') {
+            $detail.Add(('WindowsInitProbePath={0} WindowsInitProbeSha256={1} WindowsInitProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.WindowsInitProbe.Path, $record.WindowsInitProbe.Sha256, $record.WindowsInitProbe.Evidence, $run.Stdout, $run.Stderr, $record.WindowsInitProbe.OutputEof, $record.WindowsInitProbe.DeadlineMet, (Test-Session0WindowsInitSequence $record.WindowsInitProbe)))
+        }
+        if ($name -eq 'WindowsStartupProbe') {
+            $detail.Add(('WindowsStartupProbePath={0} WindowsStartupProbeSha256={1} WindowsStartupProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.WindowsStartupProbe.Path, $record.WindowsStartupProbe.Sha256, $record.WindowsStartupProbe.Evidence, $run.Stdout, $run.Stderr, $record.WindowsStartupProbe.OutputEof, $record.WindowsStartupProbe.DeadlineMet, (Test-Session0WindowsStartupSequence $record.WindowsStartupProbe)))
+        }
+        if ($name -eq 'Gdi32InitProbe') {
+            $detail.Add(('Gdi32InitProbePath={0} Gdi32InitProbeSha256={1} Gdi32InitProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.Gdi32InitProbe.Path, $record.Gdi32InitProbe.Sha256, $record.Gdi32InitProbe.Evidence, $run.Stdout, $run.Stderr, $record.Gdi32InitProbe.OutputEof, $record.Gdi32InitProbe.DeadlineMet, (Test-Session0Gdi32InitSequence $record.Gdi32InitProbe)))
+        }
+        if ($name -eq 'Win32uInitProbe') {
+            $detail.Add(('Win32uInitProbePath={0} Win32uInitProbeSha256={1} Win32uInitProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.Win32uInitProbe.Path, $record.Win32uInitProbe.Sha256, $record.Win32uInitProbe.Evidence, $run.Stdout, $run.Stderr, $record.Win32uInitProbe.OutputEof, $record.Win32uInitProbe.DeadlineMet, (Test-Session0Win32uInitSequence $record.Win32uInitProbe)))
+        }
+        if ($name -eq 'Win32uUser32Probe') {
+            $detail.Add(('Win32uUser32ProbePath={0} Win32uUser32ProbeSha256={1} Win32uUser32ProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.Win32uUser32Probe.Path, $record.Win32uUser32Probe.Sha256, $record.Win32uUser32Probe.Evidence, $run.Stdout, $run.Stderr, $record.Win32uUser32Probe.OutputEof, $record.Win32uUser32Probe.DeadlineMet, (Test-Session0Win32uUser32Sequence $record.Win32uUser32Probe)))
+        }
+        if ($name -eq 'User32ResourceProbe') {
+            $detail.Add(('User32ResourceProbePath={0} User32ResourceProbeSha256={1} User32ResourceProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.User32ResourceProbe.Path, $record.User32ResourceProbe.Sha256, $record.User32ResourceProbe.Evidence, $run.Stdout, $run.Stderr, $record.User32ResourceProbe.OutputEof, $record.User32ResourceProbe.DeadlineMet, (Test-Session0User32ResourceSequence $record.User32ResourceProbe)))
+        }
+        if ($name -eq 'User32ResourceLoadProbe') {
+            $detail.Add(('User32ResourceLoadProbePath={0} User32ResourceLoadProbeSha256={1} User32ResourceLoadProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.User32ResourceLoadProbe.Path, $record.User32ResourceLoadProbe.Sha256, $record.User32ResourceLoadProbe.Evidence, $run.Stdout, $run.Stderr, $record.User32ResourceLoadProbe.OutputEof, $record.User32ResourceLoadProbe.DeadlineMet, (Test-Session0User32ResourceLoadSequence $record.User32ResourceLoadProbe)))
+        }
+        if ($name -eq 'User32MitigationProbe') {
+            $detail.Add(('User32MitigationProbePath={0} User32MitigationProbeSha256={1} User32MitigationProbeEvidence={2} OutputBytes={3} ErrorBytes={4} OutputEof={5} DeadlineMet={6} SequenceVerified={7}' -f $record.User32MitigationProbe.Path, $record.User32MitigationProbe.Sha256, $record.User32MitigationProbe.Evidence, $run.Stdout, $run.Stderr, $record.User32MitigationProbe.OutputEof, $record.User32MitigationProbe.DeadlineMet, (Test-Session0User32MitigationSequence $record.User32MitigationProbe)))
+        }
+        if ($name -eq 'InitProbe') {
+            $detail.Add(('InitProbePath={0} InitProbeSha256={1} InitProbeEvidence={2}' -f $record.InitProbe.Path, $record.InitProbe.Sha256, $record.InitProbe.Evidence))
+            $stage = $record.InitProbe.Evidence.Split(',')
+            $stageNames = @('entry-unobserved', 'entry', 'preloaded-observed', 'load-begin', 'load-result', 'complete')
+            $outcomeNames = @('indeterminate', 'already-loaded', 'load-failed', 'load-complete')
+            $gle = if ($stage[3] -ceq 'none') { 'none' } else { '0x{0:x8}' -f [uint32]$stage[3] }
+            $detail.Add(('InitProbeStage={0} InitProbePreloaded={1} InitProbeLoadResult={2} InitProbeGLE={3} InitProbeOutcome={4}' -f
+                $stageNames[[int]$stage[0]], $stage[1], $stage[2], $gle, $outcomeNames[[int]$stage[4]]))
+        }
+        $exitText = if ($null -eq $run.ChildExit) { 'none' } else { '0x{0:x8}' -f $run.ChildExit }
+        $detail.Add(('{0}JobUi=0x{1:x8} {0}CreationFlags=0x{2:x8} {0}SpawnSucceeded={3} {0}ChildExit={4}' -f
+            $name, $run.JobUi, $run.CreationFlags, $run.SpawnSucceeded, $exitText))
+        $initialization = if ($null -eq $run.ChildExit) { 'unobserved' }
+            elseif ($run.ChildExit -eq [uint32]3221225794) { 'dll-init-failed' }
+            elseif ($run.ChildExit -eq 0) { 'normal-exit' } else { 'other-exit' }
+        $detail.Add(('{0}DesktopCreated={1} {0}IsolationVerified={2} {0}TreeFinished={3} {0}DesktopRemoved={4} {0}Initialization={5}' -f
+            $name, (($run.Lifecycle -band 1) -ne 0), (($run.Lifecycle -band 2) -ne 0),
+            (($run.Lifecycle -band 4) -ne 0), (($run.Lifecycle -band 8) -ne 0), $initialization))
+        $detail.Add(('{0}JobUiLimits={1}'  -f $name, (Format-BoundedDiagnosticText $run.JobUiLimits)))
+        foreach ($property in @('SpawnError', 'Stdout', 'Stderr', 'TargetDesktop', 'TargetDacl', 'TargetSacl', 'TargetAccess', 'Isolation')) {
+            $detail.Add(('{0}{1}={2}' -f $name, $property, (Format-BoundedDiagnosticText $run.$property)))
+        }
     }
-    if ($record.Baseline.JobUi -ne [uint32]0x000000fe -or
-        $record.DesktopRelaxed.JobUi -ne [uint32]0x000000be -or
-        (($record.Baseline.JobUi -bxor $record.DesktopRelaxed.JobUi) -ne [uint32]0x00000040)) {
-        throw ('Session 0 A/B Job UI contract failed: baseline=0x{0:x8} variant=0x{1:x8}' -f
-            $record.Baseline.JobUi, $record.DesktopRelaxed.JobUi)
+    $diagnosticDetail = $detail -join ' '
+    if ($failureStages.ContainsKey($status.ServiceSpecificExitCode)) {
+        # 照合済みの有界raw・取得exitを、回収でrecordを消す前にログへ残す。
+        Write-Host "Session0FailureDetail: $diagnosticDetail"
+        throw ('Session 0 診断ハーネスが失敗しました: stage={0} service=0x{1:x8}' -f
+            $failureStages[$status.ServiceSpecificExitCode], $status.ServiceSpecificExitCode)
     }
-    $expectedClassification = 3
-    if ($record.Baseline.SpawnSucceeded -and $record.Baseline.ChildExit -eq [uint32]3221225794 -and # 0xc0000142
-        $record.DesktopRelaxed.SpawnSucceeded) {
-        if ($record.DesktopRelaxed.ChildExit -eq [uint32]0) { $expectedClassification = 1 }
-        elseif ($record.DesktopRelaxed.ChildExit -eq [uint32]3221225794) { $expectedClassification = 2 } # 0xc0000142
+    if ($EntryProbePath) { Assert-Session0EntryGates $record $diagnosticDetail }
+    if ($TerminateProbePath) { Assert-Session0TerminateGates $record $diagnosticDetail }
+    if ($ConsoleProbePath) { Assert-Session0SubsystemGates $record 'Console' $diagnosticDetail; Assert-Session0SubsystemGates $record 'Windows' $diagnosticDetail }
+    if ($WindowsInitProbePath) {
+        if (-not (Test-Session0WindowsInitSequence $record.WindowsInitProbe)) { throw "WINDOWS初期化診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0WindowsInitGates $record)) { throw "WINDOWS初期化診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
     }
-    if ($record.Classification -ne $expectedClassification) {
-        throw 'Session 0 A/B classification disagrees with its bounded run records.'
+    if ($WindowsStartupProbePath) {
+        if (-not (Test-Session0WindowsStartupSequence $record.WindowsStartupProbe)) { throw "WINDOWS起動情報診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0WindowsStartupGates $record)) { throw "WINDOWS起動情報診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
     }
-    $diagnosticClassification = $classification.Name
-    $baselineExitText = if ($null -eq $record.Baseline.ChildExit) {
-        'none'
-    } else { '0x{0:x8}' -f $record.Baseline.ChildExit }
-    $variantExitText = if ($null -eq $record.DesktopRelaxed.ChildExit) {
-        'none'
-    } else { '0x{0:x8}' -f $record.DesktopRelaxed.ChildExit }
-    $diagnosticDetail = ('path=plain-production service=0x{0:x8} session={1} station={2} desktop={3} ' +
-        'stationAccess={4} desktopAccess={5} baselineJobUi=0x{6:x8} baselineSpawnSucceeded={7} ' +
-        'baselineSpawnError={8} baselineChildExit={9} baselineStdout={10} baselineStderr={11} ' +
-        'variantJobUi=0x{12:x8} variantSpawnSucceeded={13} variantSpawnError={14} ' +
-        'variantChildExit={15} variantStdout={16} variantStderr={17}') -f $status.ServiceSpecificExitCode,
-        $record.SessionId, $record.Station, $record.Desktop, $record.StationAccess,
-        $record.DesktopAccess, $record.Baseline.JobUi, $record.Baseline.SpawnSucceeded,
-        $record.Baseline.SpawnError, $baselineExitText,
-        (Format-BoundedDiagnosticText $record.Baseline.Stdout),
-        (Format-BoundedDiagnosticText $record.Baseline.Stderr), $record.DesktopRelaxed.JobUi,
-        $record.DesktopRelaxed.SpawnSucceeded, $record.DesktopRelaxed.SpawnError, $variantExitText,
-        (Format-BoundedDiagnosticText $record.DesktopRelaxed.Stdout),
-        (Format-BoundedDiagnosticText $record.DesktopRelaxed.Stderr)
+    if ($Gdi32InitProbePath) {
+        if (-not (Test-Session0Gdi32InitSequence $record.Gdi32InitProbe)) { throw "GDI32初期化診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0Gdi32InitGates $record)) { throw "GDI32初期化診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
+    }
+    if ($Win32uInitProbePath) {
+        if (-not (Test-Session0Win32uInitSequence $record.Win32uInitProbe)) { throw "WIN32U初期化診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0Win32uInitGates $record)) { throw "WIN32U初期化診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
+    }
+    if ($Win32uUser32ProbePath) {
+        if (-not (Test-Session0Win32uUser32Sequence $record.Win32uUser32Probe)) { throw "WIN32U先行USER32診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0Win32uUser32Gates $record)) { throw "WIN32U先行USER32診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
+    }
+    if ($User32ResourceProbePath) {
+        if (-not (Test-Session0User32ResourceSequence $record.User32ResourceProbe)) { throw "USER32リソース診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0User32ResourceGates $record)) { throw "USER32リソース診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
+    }
+    if ($User32ResourceLoadProbePath) {
+        if (-not (Test-Session0User32ResourceLoadSequence $record.User32ResourceLoadProbe)) { throw "USER32リソース保持後ロード診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0User32ResourceLoadGates $record)) { throw "USER32リソース保持後ロード診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
+    }
+    if ($User32MitigationProbePath) {
+        if (-not (Test-Session0User32MitigationSequence $record.User32MitigationProbe)) { throw "自己Win32k policy診断の段階列・対応終了値が未達です: $diagnosticDetail" }
+        if (-not (Test-Session0User32MitigationGates $record)) { throw "自己Win32k policy診断のEOF・期限・隔離・回収が未達です: $diagnosticDetail" }
+    }
+
 }
 catch { $primaryError = $_.Exception }
 finally {
@@ -1412,8 +3540,34 @@ finally {
         }
     }
 
+    if ($WindowsStartupProbePath -and $serviceStartAttempted -and $null -eq $record -and
+        $null -ne $diagnosticRecordPath -and [IO.File]::Exists($diagnosticRecordPath)) {
+        try {
+            $record = Read-Session0DiagnosticRecord ([IO.File]::ReadAllBytes($diagnosticRecordPath)) `
+                $diagnosticNonce $requestedStationMask $initProbe.Path $initProbe.Hash $entryProbe.Path $entryProbe.Hash $terminateProbe.Path $terminateProbe.Hash `
+                $consoleProbe.Path $consoleProbe.Hash $windowsProbe.Path $windowsProbe.Hash $windowsInitProbe.Path $windowsInitProbe.Hash $windowsStartupProbe.Path $windowsStartupProbe.Hash $gdi32InitProbe.Path $gdi32InitProbe.Hash $win32uInitProbe.Path $win32uInitProbe.Hash $win32uUser32Probe.Path $win32uUser32Probe.Hash $user32ResourceProbe.Path $user32ResourceProbe.Hash $user32ResourceLoadProbe.Path $user32ResourceLoadProbe.Hash $user32MitigationProbe.Path $user32MitigationProbe.Hash
+        } catch { $cleanupErrors.Add("終了時の独立record照合: $($_.Exception.Message)") }
+    }
+    $initTreeSafe = Test-Session0InitTreeSafe ([bool]$InitProbePath) $serviceStartAttempted $record
+    $entryTreeSafe = Test-Session0EntryTreeSafe ([bool]$EntryProbePath) $serviceStartAttempted $record
+    $terminateTreeSafe = Test-Session0TerminateTreeSafe ([bool]$TerminateProbePath) $serviceStartAttempted $record
+    $subsystemTreeSafe = Test-Session0SubsystemTreeSafe ([bool]$ConsoleProbePath) $serviceStartAttempted $record
+    $windowsInitTreeSafe = Test-Session0WindowsInitTreeSafe ([bool]$WindowsInitProbePath) $serviceStartAttempted $record
+    $windowsStartupTreeSafe = Test-Session0WindowsStartupTreeSafe ([bool]$WindowsStartupProbePath) $serviceStartAttempted $record
+    $gdi32InitTreeSafe = Test-Session0Gdi32InitTreeSafe ([bool]$Gdi32InitProbePath) $serviceStartAttempted $record
+    $win32uInitTreeSafe = Test-Session0Win32uInitTreeSafe ([bool]$Win32uInitProbePath) $serviceStartAttempted $record
+    $win32uUser32TreeSafe = Test-Session0Win32uUser32TreeSafe ([bool]$Win32uUser32ProbePath) $serviceStartAttempted $record
+    $user32ResourceTreeSafe = Test-Session0User32ResourceTreeSafe ([bool]$User32ResourceProbePath) $serviceStartAttempted $record
+    $user32ResourceLoadTreeSafe = Test-Session0User32ResourceLoadTreeSafe ([bool]$User32ResourceLoadProbePath) $serviceStartAttempted $record
+    $user32MitigationTreeSafe = Test-Session0User32MitigationTreeSafe ([bool]$User32MitigationProbePath) $serviceStartAttempted $record
+    $probesTreeSafe = $user32MitigationTreeSafe -and $user32ResourceLoadTreeSafe -and $user32ResourceTreeSafe -and $win32uUser32TreeSafe -and $win32uInitTreeSafe -and $gdi32InitTreeSafe -and $windowsStartupTreeSafe -and $initTreeSafe -and $entryTreeSafe -and $terminateTreeSafe -and $subsystemTreeSafe -and $windowsInitTreeSafe
+    if ($WindowsInitProbePath -and $serviceStartAttempted) {
+        $probesTreeSafe = $probesTreeSafe -and $null -ne $record -and
+            ($record.Baseline.Lifecycle -band 12) -eq 12 -and ($record.NoWindow.Lifecycle -band 12) -eq 12
+    }
+    $retainSubsystem = [bool]$ConsoleProbePath -and (-not $probesTreeSafe -or -not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe)
     if ($ownedRoot) {
-        if (-not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe) {
+        if (-not $probesTreeSafe -or -not $serviceAbsent -or -not $stopSafe -or -not $absenceSafe) {
             $cleanupErrors.Add('fixture root preserved because SCM cleanup was not proven safe')
         }
         else {
@@ -1433,6 +3587,19 @@ finally {
                     try { [Sembazuru.WindowStationProbeNative]::MarkDelete($recordCleanup.Handle) }
                     finally { $recordCleanup.Dispose() }
                 }
+                Remove-Session0InitProbe $user32MitigationProbe
+                Remove-Session0InitProbe $user32ResourceLoadProbe
+                Remove-Session0InitProbe $user32ResourceProbe
+                Remove-Session0InitProbe $win32uUser32Probe
+                Remove-Session0InitProbe $win32uInitProbe
+                Remove-Session0InitProbe $gdi32InitProbe
+                Remove-Session0InitProbe $windowsStartupProbe
+                Remove-Session0InitProbe $windowsInitProbe
+                Remove-Session0InitProbe $windowsProbe
+                Remove-Session0InitProbe $consoleProbe
+                Remove-Session0InitProbe $terminateProbe
+                Remove-Session0InitProbe $entryProbe
+                Remove-Session0InitProbe $initProbe
                 if ($null -ne $targetLease) {
                     if ($null -eq $targetIdentity -or $null -eq $leaseIdentity) {
                         throw 'fixture executable lease identity is unavailable'
@@ -1471,6 +3638,24 @@ finally {
             }
             catch { $cleanupErrors.Add("fixture cleanup: $($_.Exception.Message)") }
         }
+    }
+    foreach ($probe in @($initProbe, $entryProbe, $terminateProbe, $consoleProbe, $windowsProbe, $windowsInitProbe, $windowsStartupProbe, $gdi32InitProbe, $win32uInitProbe, $win32uUser32Probe, $user32ResourceProbe, $user32ResourceLoadProbe, $user32MitigationProbe)) {
+        foreach ($name in @('Source', 'Target', 'Lease', 'ReadHold')) {
+            if ($retainSubsystem -or (-not $probesTreeSafe -and $name -ne 'Source')) { continue }
+            if ($null -ne $probe[$name]) {
+                try { $probe[$name].Dispose() }
+                catch { $cleanupErrors.Add("診断 $name のハンドル解放: $($_.Exception.Message)") }
+                $probe[$name] = $null
+            }
+        }
+    }
+    if (-not $probesTreeSafe -or $retainSubsystem) {
+        # ホスト終了まで保持する。確認不能を通常cleanupへ読み替えない。
+        $retained = Get-Variable -Name SembazuruSession0RetainedInitProbes -Scope Global -ErrorAction SilentlyContinue
+        if ($null -eq $retained) { $global:SembazuruSession0RetainedInitProbes = [Collections.Generic.List[object]]::new() }
+        $global:SembazuruSession0RetainedInitProbes.Add(@{ InitProbe=$initProbe; EntryProbe=$entryProbe; TerminateProbe=$terminateProbe; ConsoleProbe=$consoleProbe; WindowsProbe=$windowsProbe; WindowsInitProbe=$windowsInitProbe; WindowsStartupProbe=$windowsStartupProbe; Gdi32InitProbe=$gdi32InitProbe; Win32uInitProbe=$win32uInitProbe; Win32uUser32Probe=$win32uUser32Probe; User32ResourceProbe=$user32ResourceProbe; User32ResourceLoadProbe=$user32ResourceLoadProbe; User32MitigationProbe=$user32MitigationProbe; Root=$rootHandle; FixtureTarget=$(if ($retainSubsystem) { $targetHandle }); FixtureLease=$(if ($retainSubsystem) { $targetLease }) })
+        $rootHandle = $null
+        if ($retainSubsystem) { $targetHandle = $null; $targetLease = $null }
     }
     if ($null -ne $targetHandle) {
         try { $targetHandle.Dispose() }
@@ -1521,17 +3706,21 @@ if ($null -ne $primaryError -or $cleanupErrors.Count -ne 0) {
 
 if ($diagnosticClassification -eq 'INDETERMINATE') {
     [Console]::Error.WriteLine(
-        "INDETERMINATE: $diagnosticDetail; no cause is attributed; run the planned single-variable A/B."
+        "INDETERMINATE: $diagnosticDetail; 起動・隔離・後始末の判定に必要な観測が揃っていません。"
     )
     exit 1
 }
-if ($diagnosticClassification -eq 'DESKTOP_CAUSAL') {
-    Write-Host "DESKTOP_CAUSAL: $diagnosticDetail; only this Job desktop-limit A/B is attributed."
+if ($diagnosticClassification -eq 'ACTION_STARTS') {
+    Write-Host "ACTION_STARTS: $diagnosticDetail; 両方の起動が正常終了し、隔離と後始末を確認しました。権限の最小性は未判定です。"
     exit 0
 }
-if ($diagnosticClassification -eq 'DESKTOP_NOT_SUFFICIENT') {
-    Write-Host "DESKTOP_NOT_SUFFICIENT: $diagnosticDetail; no alternative cause is attributed."
+if ($diagnosticClassification -eq 'NO_WINDOW_CAUSAL') {
+    Write-Host "NO_WINDOW_CAUSAL: $diagnosticDetail; CREATE_NO_WINDOW の追加で終了値が 0xc0000142 から 0 に変わりました。"
     exit 0
 }
-[Console]::Error.WriteLine('INDETERMINATE: no bounded diagnostic classification was published.')
+if ($diagnosticClassification -eq 'NO_WINDOW_NOT_SUFFICIENT') {
+    Write-Host "NO_WINDOW_NOT_SUFFICIENT: $diagnosticDetail; 子は引き続き 0xc0000142 で終了しました。"
+    exit 0
+}
+[Console]::Error.WriteLine('INDETERMINATE: 診断の分類が公開されませんでした。')
 exit 1
