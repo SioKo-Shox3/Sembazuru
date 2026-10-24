@@ -3247,6 +3247,12 @@ mod tests {
             .chain(record.user32_resource_load_probe.iter().map(|v| &v.run))
             .chain(record.user32_mitigation_probe.iter().map(|v| &v.run))
             .chain(record.loader_notification_probe.iter().map(|v| &v.run))
+            .chain(
+                record
+                    .gdi32_loader_notification_probe
+                    .iter()
+                    .map(|v| &v.run),
+            )
         {
             fields.extend([
                 run.job_ui_restrictions.to_string(),
@@ -3377,6 +3383,15 @@ mod tests {
             fields.push(probe.sequence_verified().to_string());
             fields.push(probe.gates_verified(record).to_string());
         }
+        if let Some(probe) = &record.gdi32_loader_notification_probe {
+            fields.push(diagnostic_hex(probe.path.as_bytes()));
+            fields.push(probe.sha256.clone());
+            fields.push(probe.properties());
+            fields.push(probe.output_eof.to_string());
+            fields.push(probe.deadline_met.to_string());
+            fields.push(probe.sequence_verified().to_string());
+            fields.push(probe.gates_verified(record).to_string());
+        }
         fields.join("\t")
     }
 
@@ -3400,6 +3415,7 @@ mod tests {
         expected_user32_resource_load: Option<(String, String)>,
         expected_user32_mitigation: Option<(String, String)>,
         expected_loader_notification: Option<(String, String)>,
+        expected_gdi32_loader_notification: Option<(String, String)>,
     }
 
     fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
@@ -3417,6 +3433,7 @@ mod tests {
                 expected_user32_resource_load: None,
                 expected_user32_mitigation: None,
                 expected_loader_notification: None,
+                expected_gdi32_loader_notification: None,
                 expected_subsystem: None,
                 name,
                 bytes: record.encode().unwrap(),
@@ -3549,6 +3566,7 @@ mod tests {
                 expected_user32_resource_load: None,
                 expected_user32_mitigation: None,
                 expected_loader_notification: None,
+                expected_gdi32_loader_notification: None,
                 expected_subsystem: None,
                 name,
                 bytes,
@@ -3743,6 +3761,7 @@ mod tests {
             expected_user32_resource_load: None,
             expected_user32_mitigation: None,
             expected_loader_notification: None,
+            expected_gdi32_loader_notification: None,
             expected_subsystem: None,
             name: "payload-65537",
             bytes: oversized,
@@ -3780,6 +3799,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3828,6 +3848,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3900,6 +3921,7 @@ mod tests {
                         expected_user32_resource_load: None,
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
+                        expected_gdi32_loader_notification: None,
                         expected_subsystem: None,
                         name: "target-mask-mismatch-unverified-indeterminate",
                         bytes: forged.clone(),
@@ -3926,6 +3948,7 @@ mod tests {
         cases.extend(session0_user32_resource_load_record_corpus());
         cases.extend(session0_user32_mitigation_record_corpus());
         cases.extend(session0_loader_notification_record_corpus());
+        cases.extend(session0_gdi32_loader_notification_record_corpus());
         cases
     }
 
@@ -3996,6 +4019,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name: "init-stage-corpus",
                     bytes: init_record_bytes(&base, &init, summary),
@@ -4021,6 +4045,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4166,6 +4191,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name: "init-invalid-path-with-matching-caller",
                     bytes: init_record_bytes(
@@ -4217,6 +4243,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4238,6 +4265,7 @@ mod tests {
                 expected_user32_resource_load: None,
                 expected_user32_mitigation: None,
                 expected_loader_notification: None,
+                expected_gdi32_loader_notification: None,
                 expected_subsystem: None,
                 name: "init-unsolicited",
                 bytes: success_bytes,
@@ -4562,6 +4590,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4946,6 +4975,7 @@ mod tests {
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4983,6 +5013,7 @@ mod tests {
                         expected_user32_resource_load: None,
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
+                        expected_gdi32_loader_notification: None,
                         expected_subsystem: None,
                         name: "cmd-arms-terminate",
                         bytes: record.encode().unwrap(),
@@ -5366,6 +5397,7 @@ mod tests {
                         expected_user32_resource_load: None,
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
+                        expected_gdi32_loader_notification: None,
                         expected_subsystem: if name == "subsystem-unsolicited" {
                             None
                         } else {
@@ -7456,11 +7488,8 @@ mod tests {
                 config.gdi32_loader_notification_probe_sha256.as_deref(),
                 argv[25].to_str()
             );
-            // 全先行組が揃っても、未接続要求を設定登録前に拒否する。
-            assert_eq!(
-                require_connected_session0_request(&config),
-                Err("GDI32自己loader通知診断の実行・記録・回収は未接続です")
-            );
+            // 完全な26形式を接続し、先行14診断の欠落を個別に拒否する。
+            assert_eq!(require_connected_session0_request(&config), Ok(()));
             for index in 0..14 {
                 let mut candidate = config.clone();
                 let slots = [
@@ -8057,6 +8086,10 @@ mod tests {
                         .expected_loader_notification
                         .as_ref()
                         .map(|(p, h)| (p.as_str(), h.as_str())),
+                    gdi32_loader_notification: case
+                        .expected_gdi32_loader_notification
+                        .as_ref()
+                        .map(|(p, h)| (p.as_str(), h.as_str())),
                 },
             );
             match case.expected {
@@ -8320,7 +8353,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('Read-Session0LoaderNotificationStartupProgress', 'Get-Session0LoaderNotificationEvidence', 'Test-Session0LoaderNotificationSequence', 'Test-Session0LoaderNotificationGates', 'Test-Session0LoaderNotificationTreeSafe', 'Read-Session0LoaderNotificationRecord', 'Read-Session0User32MitigationPolicyResult', 'Read-Session0User32MitigationStartupSnapshot', 'Read-Session0User32MitigationStartupProgress', 'Get-Session0User32MitigationEvidence', 'Test-Session0User32MitigationSequence', 'Test-Session0User32MitigationGates', 'Test-Session0User32MitigationTreeSafe', 'Read-Session0User32MitigationRecord', 'Read-Session0User32ResourceLoadStartupSnapshot', 'Read-Session0User32ResourceLoadStartupProgress', 'Get-Session0User32ResourceLoadEvidence', 'Test-Session0User32ResourceLoadSequence', 'Test-Session0User32ResourceLoadGates', 'Test-Session0User32ResourceLoadTreeSafe', 'Read-Session0User32ResourceLoadRecord', 'Read-Session0User32ResourceStartupSnapshot', 'Read-Session0User32ResourceStartupProgress', 'Get-Session0User32ResourceEvidence', 'Test-Session0User32ResourceSequence', 'Test-Session0User32ResourceGates', 'Test-Session0User32ResourceTreeSafe', 'Read-Session0User32ResourceRecord', 'Read-Session0Win32uUser32StartupSnapshot', 'Read-Session0Win32uUser32StartupProgress', 'Get-Session0Win32uUser32Evidence', 'Test-Session0Win32uUser32Sequence', 'Test-Session0Win32uUser32Gates', 'Test-Session0Win32uUser32TreeSafe', 'Read-Session0Win32uUser32Record', 'Read-Session0Win32uStartupSnapshot', 'Read-Session0Win32uStartupProgress', 'Get-Session0Win32uInitEvidence', 'Test-Session0Win32uInitSequence', 'Test-Session0Win32uInitGates', 'Test-Session0Win32uInitTreeSafe', 'Read-Session0Win32uInitRecord', 'Read-Session0Gdi32StartupSnapshot', 'Read-Session0Gdi32StartupProgress', 'Get-Session0Gdi32InitEvidence', 'Test-Session0Gdi32InitSequence', 'Test-Session0Gdi32InitGates', 'Test-Session0Gdi32InitTreeSafe', 'Read-Session0Gdi32InitRecord', 'Read-Session0StartupSnapshot', 'Read-Session0StartupProgress', 'Get-Session0WindowsStartupEvidence', 'Test-Session0WindowsStartupSequence', 'Test-Session0WindowsStartupGates', 'Test-Session0WindowsStartupTreeSafe', 'Read-Session0WindowsStartupRecord', 'Read-Session0WindowsInitRecord', 'Get-Session0WindowsInitEvidence', 'Test-Session0WindowsInitSequence', 'Test-Session0WindowsInitGates', 'Test-Session0WindowsInitTreeSafe', 'Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('Read-Session0Gdi32LoaderNotificationStartupProgress', 'Get-Session0Gdi32LoaderNotificationEvidence', 'Test-Session0Gdi32LoaderNotificationSequence', 'Test-Session0Gdi32LoaderNotificationGates', 'Test-Session0Gdi32LoaderNotificationTreeSafe', 'Read-Session0Gdi32LoaderNotificationRecord', 'Read-Session0LoaderNotificationStartupProgress', 'Get-Session0LoaderNotificationEvidence', 'Test-Session0LoaderNotificationSequence', 'Test-Session0LoaderNotificationGates', 'Test-Session0LoaderNotificationTreeSafe', 'Read-Session0LoaderNotificationRecord', 'Read-Session0User32MitigationPolicyResult', 'Read-Session0User32MitigationStartupSnapshot', 'Read-Session0User32MitigationStartupProgress', 'Get-Session0User32MitigationEvidence', 'Test-Session0User32MitigationSequence', 'Test-Session0User32MitigationGates', 'Test-Session0User32MitigationTreeSafe', 'Read-Session0User32MitigationRecord', 'Read-Session0User32ResourceLoadStartupSnapshot', 'Read-Session0User32ResourceLoadStartupProgress', 'Get-Session0User32ResourceLoadEvidence', 'Test-Session0User32ResourceLoadSequence', 'Test-Session0User32ResourceLoadGates', 'Test-Session0User32ResourceLoadTreeSafe', 'Read-Session0User32ResourceLoadRecord', 'Read-Session0User32ResourceStartupSnapshot', 'Read-Session0User32ResourceStartupProgress', 'Get-Session0User32ResourceEvidence', 'Test-Session0User32ResourceSequence', 'Test-Session0User32ResourceGates', 'Test-Session0User32ResourceTreeSafe', 'Read-Session0User32ResourceRecord', 'Read-Session0Win32uUser32StartupSnapshot', 'Read-Session0Win32uUser32StartupProgress', 'Get-Session0Win32uUser32Evidence', 'Test-Session0Win32uUser32Sequence', 'Test-Session0Win32uUser32Gates', 'Test-Session0Win32uUser32TreeSafe', 'Read-Session0Win32uUser32Record', 'Read-Session0Win32uStartupSnapshot', 'Read-Session0Win32uStartupProgress', 'Get-Session0Win32uInitEvidence', 'Test-Session0Win32uInitSequence', 'Test-Session0Win32uInitGates', 'Test-Session0Win32uInitTreeSafe', 'Read-Session0Win32uInitRecord', 'Read-Session0Gdi32StartupSnapshot', 'Read-Session0Gdi32StartupProgress', 'Get-Session0Gdi32InitEvidence', 'Test-Session0Gdi32InitSequence', 'Test-Session0Gdi32InitGates', 'Test-Session0Gdi32InitTreeSafe', 'Read-Session0Gdi32InitRecord', 'Read-Session0StartupSnapshot', 'Read-Session0StartupProgress', 'Get-Session0WindowsStartupEvidence', 'Test-Session0WindowsStartupSequence', 'Test-Session0WindowsStartupGates', 'Test-Session0WindowsStartupTreeSafe', 'Read-Session0WindowsStartupRecord', 'Read-Session0WindowsInitRecord', 'Get-Session0WindowsInitEvidence', 'Test-Session0WindowsInitSequence', 'Test-Session0WindowsInitGates', 'Test-Session0WindowsInitTreeSafe', 'Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -8377,7 +8410,7 @@ $count = 0
 $argvCount = 0
 $initCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
-    $parts = $line.Split("`t", 34)
+    $parts = $line.Split("`t", 36)
     if ($parts[0] -ceq 'init') {
         $exit = if ($parts[3] -ceq 'none') { $null } else { [uint32]$parts[3] }
         $record = $null
@@ -8410,20 +8443,20 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $bytes = [Convert]::FromHexString($parts[2])
     $record = $null
     $rejected = $false
-    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[15]))) $parts[16] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[17]))) $parts[18] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[19]))) $parts[20] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[21]))) $parts[22] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[23]))) $parts[24] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[25]))) $parts[26] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[27]))) $parts[28] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[29]))) $parts[30] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[31]))) $parts[32] }
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[15]))) $parts[16] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[17]))) $parts[18] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[19]))) $parts[20] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[21]))) $parts[22] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[23]))) $parts[24] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[25]))) $parts[26] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[27]))) $parts[28] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[29]))) $parts[30] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[31]))) $parts[32] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[33]))) $parts[34] }
     catch { $rejected = $true }
     if ($parts[3] -ceq 'reject') {
         if (-not $rejected) { throw "不正な記録を受理しました: $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "正常な記録を拒否しました: $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne $(if ($parts[31]) {38} elseif ($parts[29]) {37} elseif ($parts[27]) {36} elseif ($parts[25]) {35} elseif ($parts[23]) {34} elseif ($parts[21]) {33} elseif ($parts[19]) {32} elseif ($parts[17]) {31} else {30})) { throw 'レコードのプロパティ数が一致しません。' }
+        if (@($record.PSObject.Properties).Count -ne $(if ($parts[33]) {39} elseif ($parts[31]) {38} elseif ($parts[29]) {37} elseif ($parts[27]) {36} elseif ($parts[25]) {35} elseif ($parts[23]) {34} elseif ($parts[21]) {33} elseif ($parts[19]) {32} elseif ($parts[17]) {31} else {30})) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId', 'RequestedStationMask')) { $values.Add([string]$record.$property) }
         foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }), $(if ($null -ne $record.WindowsInitProbe) { $record.WindowsInitProbe.Run }), $(if ($parts[17]) { $record.WindowsStartupProbe.Run }), $(if ($parts[19]) { $record.Gdi32InitProbe.Run }), $(if ($parts[21]) { $record.Win32uInitProbe.Run }), $(if ($parts[23]) { $record.Win32uUser32Probe.Run }), $(if ($parts[25]) { $record.User32ResourceProbe.Run }), $(if ($parts[27]) { $record.User32ResourceLoadProbe.Run }), $(if ($parts[29]) { $record.User32MitigationProbe.Run }), $(if ($parts[31]) { $record.LoaderNotificationProbe.Run }))) {
+        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }), $(if ($null -ne $record.WindowsInitProbe) { $record.WindowsInitProbe.Run }), $(if ($parts[17]) { $record.WindowsStartupProbe.Run }), $(if ($parts[19]) { $record.Gdi32InitProbe.Run }), $(if ($parts[21]) { $record.Win32uInitProbe.Run }), $(if ($parts[23]) { $record.Win32uUser32Probe.Run }), $(if ($parts[25]) { $record.User32ResourceProbe.Run }), $(if ($parts[27]) { $record.User32ResourceLoadProbe.Run }), $(if ($parts[29]) { $record.User32MitigationProbe.Run }), $(if ($parts[31]) { $record.LoaderNotificationProbe.Run }), $(if ($parts[33]) { $record.Gdi32LoaderNotificationProbe.Run }))) {
             if ($null -eq $run) { continue }
             if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
             $values.Add([string]$run.JobUi)
@@ -8550,7 +8583,15 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 $values.Add(([string]$value).ToLowerInvariant())
             }
         }
-        if (($values -join "`t") -cne $parts[33]) { throw "記録のプロパティが一致しません: $($parts[0])" }
+        if ($parts[33]) {
+            $probe = $record.Gdi32LoaderNotificationProbe
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($probe.Path)).ToLowerInvariant())
+            $values.Add($probe.Sha256); $values.Add($probe.Evidence)
+            foreach ($value in @($probe.OutputEof, $probe.DeadlineMet, (Test-Session0Gdi32LoaderNotificationSequence $probe), (Test-Session0Gdi32LoaderNotificationGates $record))) {
+                $values.Add(([string]$value).ToLowerInvariant())
+            }
+        }
+        if (($values -join "`t") -cne $parts[35]) { throw "記録のプロパティが一致しません: $($parts[0])" }
     }
     $count++
 }
@@ -8606,7 +8647,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         for case in &cases {
             let expected = case.expected.as_ref().map(diagnostic_properties);
             input.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.name,
                 case.nonce,
                 diagnostic_hex(&case.bytes),
@@ -8681,6 +8722,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 case.expected_user32_mitigation.as_ref().map_or("", |(_,h)|h),
                 diagnostic_hex(case.expected_loader_notification.as_ref().map_or("", |(p,_)|p).as_bytes()),
                 case.expected_loader_notification.as_ref().map_or("", |(_,h)|h),
+                diagnostic_hex(case.expected_gdi32_loader_notification.as_ref().map_or("", |(p,_)|p).as_bytes()),
+                case.expected_gdi32_loader_notification.as_ref().map_or("", |(_,h)|h),
                 expected.unwrap_or_default(),
             ));
         }
@@ -9789,6 +9832,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         user32_resource_load: Option<(&'a str, &'a str)>,
         user32_mitigation: Option<(&'a str, &'a str)>,
         loader_notification: Option<(&'a str, &'a str)>,
+        gdi32_loader_notification: Option<(&'a str, &'a str)>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15822,6 +15866,1065 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         );
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Gdi32LoaderNotificationEvidence {
+        stage: u8,
+        api: Option<[u8; 3]>,
+        register_status: Option<u32>,
+        cookie: Option<u8>,
+        load_flags: Option<u32>,
+        gdi32_result: Option<u8>,
+        gdi32_gle: Option<u32>,
+        unregister_status: Option<u32>,
+        slots: Option<String>,
+        flags: Option<u32>,
+        busy: Option<u8>,
+        complete: bool,
+        valid: bool,
+        partial: bool,
+        outcome: u8,
+    }
+
+    impl Gdi32LoaderNotificationEvidence {
+        fn properties(&self) -> String {
+            let number = |v: Option<u32>| v.map_or_else(|| "none".into(), |v| v.to_string());
+            let events = self.slots.as_ref().map_or_else(
+                || "none".into(),
+                |s| {
+                    s.bytes()
+                        .enumerate()
+                        .filter(|(_, c)| (b'1'..=b'6').contains(c))
+                        .map(|(i, c)| format!("{i},{},{}", 1 + (c - b'1') % 3, 1 + (c - b'1') / 3))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                },
+            );
+            let state = self.slots.as_ref().map_or(0, |s| {
+                if self.flags != Some(0) || self.busy != Some(0) || s.contains('?') {
+                    2
+                } else if s.bytes().any(|c| (b'1'..=b'6').contains(&c)) {
+                    1
+                } else {
+                    0
+                }
+            });
+            [
+                self.stage.to_string(),
+                self.api
+                    .map_or_else(|| "none".into(), |a| format!("{},{},{}", a[0], a[1], a[2])),
+                number(self.register_status),
+                number(self.cookie.map(u32::from)),
+                number(self.load_flags),
+                number(self.gdi32_result.map(u32::from)),
+                number(self.gdi32_gle),
+                number(self.unregister_status),
+                self.slots.clone().unwrap_or_else(|| "none".into()),
+                number(self.flags),
+                number(self.busy.map(u32::from)),
+                events,
+                state.to_string(),
+                u8::from(self.complete).to_string(),
+                u8::from(self.valid).to_string(),
+                u8::from(self.partial).to_string(),
+                self.outcome.to_string(),
+            ]
+            .join(";")
+        }
+    }
+
+    // 通知はdynamic linking前の観測として保持し、初期化成功へ読み替えない。
+    fn parse_gdi32_loader_notification_output(
+        bytes: &[u8],
+        exit: Option<u32>,
+    ) -> Gdi32LoaderNotificationEvidence {
+        let mut e = Gdi32LoaderNotificationEvidence {
+            stage: 0,
+            api: None,
+            register_status: None,
+            cookie: None,
+            load_flags: None,
+            gdi32_result: None,
+            gdi32_gle: None,
+            unregister_status: None,
+            slots: None,
+            flags: None,
+            busy: None,
+            complete: false,
+            valid: bytes.len() <= 2048,
+            partial: !bytes.is_empty() && !bytes.ends_with(b"\n"),
+            outcome: 0,
+        };
+        let bit = |s: &str| match s {
+            "0" => Some(0u8),
+            "1" => Some(1u8),
+            _ => None,
+        };
+        let hex = |s: &str| {
+            s.strip_prefix("0x")
+                .filter(|s| {
+                    s.len() == 8
+                        && s.bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                })
+                .and_then(|s| u32::from_str_radix(s, 16).ok())
+        };
+        let status = |s: &str| {
+            if s == "unavailable" {
+                Some(None)
+            } else {
+                hex(s).map(Some)
+            }
+        };
+        let mut rows = bytes.split(|b| *b == b'\n').peekable();
+        while let Some(row) = rows.next() {
+            if rows.peek().is_none() {
+                break;
+            }
+            let line = std::str::from_utf8(row)
+                .ok()
+                .filter(|s| s.bytes().all(|b| (32..=126).contains(&b)))
+                .and_then(|s| s.strip_prefix("SBZ_GDI32_LOADER_NOTIFICATION_PROBE_V1 "));
+            let valid = line.is_some_and(|line| match e.stage {
+                0 => line == "entry",
+                1 => {
+                    let v = line
+                        .strip_prefix("api ntdll=")
+                        .and_then(|v| v.split_once(" register="))
+                        .and_then(|(a, v)| v.split_once(" unregister=").map(|(b, c)| (a, b, c)))
+                        .and_then(|(a, b, c)| Some([bit(a)?, bit(b)?, bit(c)?]))
+                        .filter(|v| v[0] != 0 || (v[1] == 0 && v[2] == 0));
+                    if let Some(v) = v {
+                        e.api = Some(v);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                2 => {
+                    let v = line
+                        .strip_prefix("register status=")
+                        .and_then(|v| v.split_once(" cookie="))
+                        .and_then(|(s, c)| Some((status(s)?, bit(c)?)))
+                        .filter(|(s, c)| {
+                            (e.api.is_some_and(|a| a[1] == 1 && a[2] == 1)) == s.is_some()
+                                && (s.is_some() || *c == 0)
+                        });
+                    if let Some((s, c)) = v {
+                        e.register_status = s;
+                        e.cookie = Some(c);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                3 if line == "gdi32_load_begin flags=0x00000800" => {
+                    e.load_flags = Some(0x800);
+                    true
+                }
+                4 => {
+                    let v = line
+                        .strip_prefix("gdi32_load_result=")
+                        .and_then(|v| v.split_once(" gle="))
+                        .and_then(|(r, g)| Some((bit(r)?, hex(g)?)));
+                    if let Some((r, g)) = v {
+                        e.gdi32_result = Some(r);
+                        e.gdi32_gle = Some(g);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                5 => {
+                    let v = line
+                        .strip_prefix("unregister status=")
+                        .and_then(status)
+                        .filter(|s| {
+                            (e.register_status == Some(0) && e.cookie == Some(1)) == s.is_some()
+                        });
+                    if let Some(s) = v {
+                        e.unregister_status = s;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                6 => {
+                    let v = line
+                        .strip_prefix("snapshot slots=")
+                        .and_then(|v| v.split_once(" flags="))
+                        .and_then(|(s, v)| v.split_once(" busy=").map(|(f, b)| (s, f, b)))
+                        .and_then(|(s, f, b)| Some((s, hex(f)?, bit(b)?)))
+                        .filter(|(s, f, _)| {
+                            s.len() == 16 && s.bytes().all(|c| b"-?123456".contains(&c)) && *f <= 31
+                        });
+                    if let Some((s, f, b)) = v {
+                        e.slots = Some(s.into());
+                        e.flags = Some(f);
+                        e.busy = Some(b);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                7 if line == "complete" => {
+                    e.complete = true;
+                    true
+                }
+                _ => false,
+            });
+            if !valid {
+                e.valid = false;
+                break;
+            }
+            e.stage += 1;
+        }
+        if bytes.iter().any(|b| *b != 10 && !(32..=126).contains(b)) {
+            e.valid = false;
+        }
+        if e.valid && !e.partial && e.complete {
+            let expected = if e.register_status.is_none() {
+                31
+            } else if e.register_status != Some(0) || e.cookie != Some(1) {
+                32
+            } else if e.unregister_status != Some(0) {
+                33
+            } else if e.gdi32_result == Some(0) {
+                11
+            } else {
+                0
+            };
+            if exit == Some(expected) {
+                e.outcome = match expected {
+                    31 => 1,
+                    32 => 2,
+                    33 => 3,
+                    11 => 4,
+                    _ => 5,
+                };
+            }
+        }
+        e
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Session0Gdi32LoaderNotificationProbeRecord {
+        path: String,
+        sha256: String,
+        // この領域だけStdout/Stderrをraw bytesの小文字hexとして保存する。
+        run: Session0DiagnosticRun,
+        evidence: Option<Gdi32LoaderNotificationEvidence>,
+        output_eof: bool,
+        deadline_met: bool,
+    }
+
+    fn gdi32_loader_notification_bytes(text: &str) -> Result<Vec<u8>, String> {
+        if text.len() > 4098 || !text.len().is_multiple_of(2) {
+            return Err("GDI32自己loader通知診断の出力長が不正です".into());
+        }
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                if !pair
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+                {
+                    return Err("GDI32自己loader通知診断の出力hexが不正です".into());
+                }
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+
+    fn gdi32_loader_notification_run_evidence(
+        run: &Session0DiagnosticRun,
+    ) -> Option<Gdi32LoaderNotificationEvidence> {
+        let left = gdi32_loader_notification_bytes(&run.stdout).ok()?;
+        let right = gdi32_loader_notification_bytes(&run.stderr).ok()?;
+        let mut evidence = parse_gdi32_loader_notification_output(&left, run.child_exit);
+        // stderr・隔離・回収は列の成否とは独立したゲートにする。
+        let _ = right;
+        if run.lifecycle != 15 || !run.spawn_error.is_empty() {
+            evidence.outcome = 0;
+        }
+        Some(evidence)
+    }
+
+    impl Session0Gdi32LoaderNotificationProbeRecord {
+        fn properties(&self) -> String {
+            self.evidence.as_ref().map_or_else(
+                || "invalid".into(),
+                Gdi32LoaderNotificationEvidence::properties,
+            )
+        }
+
+        fn sequence_verified(&self) -> bool {
+            gdi32_loader_notification_bytes(&self.run.stdout).is_ok_and(|left| {
+                parse_gdi32_loader_notification_output(&left, self.run.child_exit).outcome != 0
+            })
+        }
+
+        fn gates_verified(&self, record: &Session0DiagnosticRecord) -> bool {
+            let run = &self.run;
+            record.session_id == 0
+                && !record.worker_actions_sid.is_empty()
+                && record.station_ace
+                    == format!(
+                        "count=1;flags=0;mask=0x{:08x}",
+                        record.requested_station_mask
+                    )
+                && record.station_cleanup == "removed"
+                && run.spawn_succeeded
+                && run.lifecycle == 15
+                && run.observations_verified(record.requested_station_mask)
+                && run.stderr.is_empty()
+                && run.spawn_error.is_empty()
+                && self.output_eof
+                && self.deadline_met
+                && run.child_exit.is_some()
+        }
+
+        fn validate(&self, record: &Session0DiagnosticRecord) -> Result<(), String> {
+            if record.loader_notification_probe.is_none() {
+                return Err(
+                    "GDI32自己loader通知診断には自己USER32 loader通知診断が必要です".into(),
+                );
+            }
+            let pair = record
+                .subsystem_probes
+                .as_ref()
+                .ok_or("GDI32自己loader通知診断にはsubsystem対照が必要です")?;
+            let parent = Path::new(&pair[0].path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            let run = &self.run;
+            if self.path
+                != format!(
+                    "{parent}\\{}",
+                    Session0ProbeKind::Gdi32LoaderNotification.basename()
+                )
+                || self.sha256.len() != 64
+                || !self
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                || (!run.spawn_succeeded
+                    && (run.child_exit.is_some()
+                        || !run.stdout.is_empty()
+                        || !run.stderr.is_empty()))
+                || (run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe
+                        || run.creation_flags != 0x0008_0404
+                        || run.lifecycle & 1 == 0))
+                || (run.lifecycle & 1 != 0
+                    && !run
+                        .target_desktop
+                        .starts_with(&format!("{}\\sbz-", record.station)))
+                || (!run.target_desktop.is_empty()
+                    && [&record.baseline, &record.no_window]
+                        .into_iter()
+                        .chain(record.init_probe.iter().map(|p| &p.run))
+                        .chain(record.entry_probe.iter().map(|p| &p.run))
+                        .chain(record.terminate_probe.iter().map(|p| &p.run))
+                        .chain(pair.iter().map(|p| &p.run))
+                        .chain(record.windows_init_probe.iter().map(|p| &p.run))
+                        .chain(record.windows_startup_probe.iter().map(|p| &p.run))
+                        .chain(record.gdi32_init_probe.iter().map(|p| &p.run))
+                        .chain(record.win32u_init_probe.iter().map(|p| &p.run))
+                        .chain(record.win32u_user32_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_resource_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_resource_load_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_mitigation_probe.iter().map(|p| &p.run))
+                        .chain(record.loader_notification_probe.iter().map(|p| &p.run))
+                        .any(|r| r.target_desktop == run.target_desktop))
+                || (self.output_eof && !run.spawn_succeeded)
+                || (self.deadline_met && (!run.spawn_succeeded || run.child_exit.is_none()))
+                || self.evidence != gdi32_loader_notification_run_evidence(run)
+            {
+                return Err(
+                    "GDI32自己loader通知診断の固定組・実行契約・段階証拠が一致しません".into(),
+                );
+            }
+            if self.properties().len() > 2048 {
+                return Err("GDI32自己loader通知診断の証拠長が不正です".into());
+            }
+            gdi32_loader_notification_bytes(&run.stdout)?;
+            gdi32_loader_notification_bytes(&run.stderr)?;
+            Ok(())
+        }
+
+        fn encode_into(&self, payload: &mut Writer, mask: u32) -> Result<(), String> {
+            write_text(payload, &self.path)?;
+            write_text(payload, &self.sha256)?;
+            self.run.encode_into(payload, mask)?;
+            write_text(payload, &self.properties())?;
+            payload.bool(self.output_eof);
+            payload.bool(self.deadline_met);
+            Ok(())
+        }
+    }
+
+    fn snapshot_gdi32_loader_notification_output(
+        probe: &mut Session0Gdi32LoaderNotificationProbeRecord,
+        left: &[u8],
+        right: &[u8],
+    ) {
+        probe.run.stdout = diagnostic_hex(left);
+        probe.run.stderr = diagnostic_hex(right);
+        probe.evidence = gdi32_loader_notification_run_evidence(&probe.run);
+    }
+
+    // 保存先を起動前に作り、途中の失敗でも先行runの観測を置き換えない。
+    fn collect_session0_gdi32_loader_notification_run(
+        record: &mut Session0DiagnosticRecord,
+        config: &Session0DiagnosticConfig,
+        command: &RestrictedCommand,
+        execute: impl FnOnce(
+            &mut Session0Gdi32LoaderNotificationProbeRecord,
+            &RestrictedCommand,
+        ) -> Result<(), String>,
+    ) -> Result<(), Session0DiagnosticFailureStage> {
+        let mut run = Session0DiagnosticRun::empty();
+        run.stdout.clear();
+        run.stderr.clear();
+        record.gdi32_loader_notification_probe = Some(Session0Gdi32LoaderNotificationProbeRecord {
+            path: config
+                .fixture_root
+                .join(Session0ProbeKind::Gdi32LoaderNotification.basename())
+                .to_string_lossy()
+                .into_owned(),
+            sha256: config
+                .gdi32_loader_notification_probe_sha256
+                .as_ref()
+                .unwrap()
+                .clone(),
+            evidence: gdi32_loader_notification_run_evidence(&run),
+            run,
+            output_eof: false,
+            deadline_met: false,
+        });
+        let probe = record.gdi32_loader_notification_probe.as_mut().unwrap();
+        let command = RestrictedCommand {
+            application: PathBuf::from(&probe.path),
+            arguments: Vec::new(),
+            cwd: command.cwd.clone(),
+            environment: command.environment.clone(),
+        };
+        if let Err(error) = execute(probe, &command) {
+            probe.run.spawn_error.push_str(&error);
+            probe.evidence = gdi32_loader_notification_run_evidence(&probe.run);
+            return Err(Session0DiagnosticFailureStage::Runtime);
+        }
+        Ok(())
+    }
+
+    fn run_session0_gdi32_loader_notification_child(
+        action: &ActionToken,
+        command: &RestrictedCommand,
+        probe: &mut Session0Gdi32LoaderNotificationProbeRecord,
+    ) -> Result<(), String> {
+        let mut process = match RestrictedProcess::spawn_for_session0_diagnostic(
+            action,
+            command,
+            TestCreationProfile::Production,
+            &mut probe.run,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                probe.run.spawn_error = format!("spawn: {error}");
+                probe.run.observe_desktop_release();
+                return Ok(());
+            }
+        };
+        probe.run.spawn_succeeded = true;
+        probe.run.job_ui_restrictions = process
+            .job()
+            .ui_restrictions_for_test()
+            .map_err(|e| format!("Job照会失敗: {e}"))?;
+        probe.run.job_ui_limits = describe_job_ui_limits(probe.run.job_ui_restrictions);
+        if probe.run.job_ui_restrictions != 0xfe {
+            return Err("GDI32自己loader通知診断のJob制限が一致しません".into());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let mut output = process
+            .take_output()
+            .ok()
+            .map(|(left, right)| (left.take(2049), right.take(2049)));
+        let start = std::time::Instant::now();
+        let observed = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    async {
+                        let exit = observe_session0_child_exit(&process).await?;
+                        probe.run.child_exit = Some(exit);
+                        probe.deadline_met = start.elapsed() <= std::time::Duration::from_secs(10);
+                        Ok::<(), io::Error>(())
+                    },
+                    async {
+                        if let Some((stdout, stderr)) = output.as_mut() {
+                            let result = tokio::join!(
+                                stdout.read_to_end(&mut left),
+                                stderr.read_to_end(&mut right)
+                            );
+                            probe.output_eof = matches!(result, (Ok(_), Ok(_)))
+                                && left.len() <= 2048
+                                && right.len() <= 2048;
+                        }
+                    }
+                )
+            })
+            .await
+        });
+        if !matches!(observed, Ok((Ok(()), ()))) {
+            probe
+                .run
+                .spawn_error
+                .push_str("wait: deadline-exceeded-or-query-failed");
+            process.terminate();
+        }
+        // 出力と終了値の保存は、失敗・キャンセルし得る回収awaitより先に行う。
+        snapshot_gdi32_loader_notification_output(probe, &left, &right);
+        let job = Arc::clone(&process.job);
+        let cleanup = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                preserve_session0_exit_before_cleanup(
+                    &mut probe.run,
+                    observe_session0_child_exit(&process),
+                    async move {
+                        tokio::task::spawn_blocking(move || job.terminate_and_wait())
+                            .await
+                            .map_err(|_| io::Error::other("診断のJob回収タスクが失敗しました"))?
+                    },
+                ),
+            )
+            .await
+        });
+        if matches!(cleanup, Ok(Ok(()))) {
+            process.tree_finished = true;
+            process.process.take();
+            probe.run.lifecycle |= 4;
+            if !probe.output_eof
+                && let Some((stdout, stderr)) = output.as_mut()
+            {
+                let result = runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        tokio::join!(
+                            stdout.read_to_end(&mut left),
+                            stderr.read_to_end(&mut right)
+                        )
+                    })
+                    .await
+                });
+                probe.output_eof = matches!(result, Ok((Ok(_), Ok(_))))
+                    && left.len() <= 2048
+                    && right.len() <= 2048;
+            }
+        } else {
+            probe
+                .run
+                .spawn_error
+                .push_str(&format!(";tree_cleanup:{cleanup:?}"));
+        }
+        if !probe.output_eof {
+            probe.run.spawn_error.push_str(";output_eof_unconfirmed");
+        }
+        drop(output);
+        drop(process);
+        probe.run.observe_desktop_release();
+        snapshot_gdi32_loader_notification_output(probe, &left, &right);
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        Ok(())
+    }
+
+    fn gdi32_loader_notification_valid_output(
+        api: &str,
+        register: &str,
+        cookie: u8,
+        loaded: bool,
+        unregister: &str,
+        slots: &str,
+        snapshot: (u32, u8),
+    ) -> String {
+        let (flags, busy) = snapshot;
+        let p = "SBZ_GDI32_LOADER_NOTIFICATION_PROBE_V1 ";
+        format!(
+            "{p}entry\n{p}api {api}\n{p}register status={register} cookie={cookie}\n{p}gdi32_load_begin flags=0x00000800\n{p}gdi32_load_result={} gle=0x12345678\n{p}unregister status={unregister}\n{p}snapshot slots={slots} flags=0x{flags:08x} busy={busy}\n{p}complete\n",
+            u8::from(loaded)
+        )
+    }
+
+    fn session0_gdi32_loader_notification_record_corpus() -> Vec<Session0DiagnosticCase> {
+        let mut cases = Vec::new();
+        for base_case in session0_loader_notification_record_corpus()
+            .into_iter()
+            .filter(|c| c.name == "loader-notification-wire" && c.expected.is_some())
+        {
+            let base = base_case.expected.as_ref().unwrap();
+            let text = gdi32_loader_notification_valid_output(
+                "ntdll=1 register=1 unregister=1",
+                "0x00000000",
+                1,
+                true,
+                "0x00000000",
+                "321-------------",
+                (0, 0),
+            );
+            let mut run = base.loader_notification_probe.as_ref().unwrap().run.clone();
+            run.target_desktop = format!("{}\\sbz-gdi32-loader-notification", base.station);
+            run.stdout = diagnostic_hex(text.as_bytes());
+            run.stderr.clear();
+            run.child_exit = Some(0);
+            let probe = Session0Gdi32LoaderNotificationProbeRecord {
+                path: r"C:\fixture\SbzSession0Gdi32LoaderNotificationProbe.exe".into(),
+                sha256: "e".repeat(64),
+                evidence: gdi32_loader_notification_run_evidence(&run),
+                run,
+                output_eof: true,
+                deadline_met: true,
+            };
+            let mut push = |name,
+                            mut changed: Session0Gdi32LoaderNotificationProbeRecord,
+                            alter: usize| {
+                changed.evidence = gdi32_loader_notification_run_evidence(&changed.run);
+                let mut parent = base.clone();
+                parent.gdi32_loader_notification_probe = Some(changed.clone());
+                let mut case = base_case.clone();
+                case.name = name;
+                case.expected_gdi32_loader_notification =
+                    Some((changed.path.clone(), changed.sha256.clone()));
+                let mut bytes = parent.encode().unwrap();
+                let replace = |bytes: &mut Vec<u8>, old: &str, new: &str| {
+                    let pos = bytes
+                        .windows(old.len())
+                        .rposition(|v| v == old.as_bytes())
+                        .unwrap();
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[pos - 4..pos].try_into().unwrap()) as usize,
+                        old.len()
+                    );
+                    bytes.splice(pos..pos + old.len(), new.bytes());
+                    bytes[pos - 4..pos].copy_from_slice(&(new.len() as u32).to_le_bytes());
+                };
+                match alter {
+                    1 => case.nonce = "f".repeat(32),
+                    2 => case.expected_mask = if case.expected_mask == 2 { 34 } else { 2 },
+                    3 => {
+                        case.expected_gdi32_loader_notification.as_mut().unwrap().0 =
+                            changed.path.to_uppercase()
+                    }
+                    4 => {
+                        case.expected_gdi32_loader_notification.as_mut().unwrap().1 = "a".repeat(64)
+                    }
+                    5 => case.expected_gdi32_loader_notification = None,
+                    6 => bytes[4..8].copy_from_slice(&21u32.to_le_bytes()),
+                    7 => {
+                        let n = bytes.len();
+                        bytes[n - 1] = 2
+                    }
+                    8 => bytes.push(0),
+                    9 => replace(&mut bytes, &changed.properties(), "forged"),
+                    10 => replace(
+                        &mut bytes,
+                        &changed.run.target_desktop,
+                        &base
+                            .user32_mitigation_probe
+                            .as_ref()
+                            .unwrap()
+                            .run
+                            .target_desktop,
+                    ),
+                    11 => replace(
+                        &mut bytes,
+                        &changed.run.target_desktop,
+                        &format!("{}\\Default", base.station),
+                    ),
+                    12 => replace(&mut bytes, &changed.run.stdout, &"ab".repeat(2050)),
+                    13 => replace(
+                        &mut bytes,
+                        &changed.path,
+                        &base.loader_notification_probe.as_ref().unwrap().path,
+                    ),
+                    14 => case.expected_loader_notification = None,
+                    _ => (),
+                }
+                let length = (bytes.len() - 44) as u32;
+                bytes[40..44].copy_from_slice(&length.to_le_bytes());
+                case.bytes = bytes;
+                case.expected = (alter == 0).then_some(parent);
+                cases.push(case);
+            };
+            for alter in 0..15 {
+                push("gdi32-loader-notification-wire", probe.clone(), alter)
+            }
+            // 未取得・失敗status・通知なし・全容量・競合・未知reasonは補完せず保持する。
+            for (api, register, cookie, loaded, unregister, slots, flags, busy, exit, outcome) in [
+                (
+                    "ntdll=0 register=0 unregister=0",
+                    "unavailable",
+                    0,
+                    true,
+                    "unavailable",
+                    "----------------",
+                    0,
+                    0,
+                    31,
+                    1,
+                ),
+                (
+                    "ntdll=1 register=0 unregister=1",
+                    "unavailable",
+                    0,
+                    false,
+                    "unavailable",
+                    "----------------",
+                    0,
+                    0,
+                    31,
+                    1,
+                ),
+                (
+                    "ntdll=1 register=1 unregister=1",
+                    "0xc0000001",
+                    0,
+                    true,
+                    "unavailable",
+                    "----------------",
+                    0,
+                    0,
+                    32,
+                    2,
+                ),
+                (
+                    "ntdll=1 register=1 unregister=1",
+                    "0x00000000",
+                    0,
+                    false,
+                    "unavailable",
+                    "----------------",
+                    0,
+                    0,
+                    32,
+                    2,
+                ),
+                (
+                    "ntdll=1 register=1 unregister=1",
+                    "0x00000000",
+                    1,
+                    true,
+                    "0xc0000001",
+                    "1234561234561234",
+                    1,
+                    0,
+                    33,
+                    3,
+                ),
+                (
+                    "ntdll=1 register=1 unregister=1",
+                    "0x00000000",
+                    1,
+                    false,
+                    "0x00000000",
+                    "?--1--6---------",
+                    30,
+                    1,
+                    11,
+                    4,
+                ),
+                (
+                    "ntdll=1 register=1 unregister=1",
+                    "0x00000000",
+                    1,
+                    true,
+                    "0x00000000",
+                    "----------------",
+                    0,
+                    0,
+                    0,
+                    5,
+                ),
+            ] {
+                let raw = gdi32_loader_notification_valid_output(
+                    api,
+                    register,
+                    cookie,
+                    loaded,
+                    unregister,
+                    slots,
+                    (flags, busy),
+                );
+                let e = parse_gdi32_loader_notification_output(raw.as_bytes(), Some(exit));
+                assert_eq!(e.stage, 8);
+                assert_eq!(e.outcome, outcome);
+                assert_eq!(e.slots.as_deref(), Some(slots));
+                assert_eq!(e.flags, Some(flags));
+                assert_eq!(e.busy, Some(busy));
+                assert_eq!(e.gdi32_gle, Some(0x12345678));
+                assert_eq!(e.register_status.is_none(), register == "unavailable");
+                assert_eq!(e.unregister_status.is_none(), unregister == "unavailable");
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(raw.as_bytes());
+                changed.run.child_exit = Some(exit);
+                push("gdi32-loader-notification-status-slots", changed, 0);
+            }
+            let rows = text.split_inclusive('\n').collect::<Vec<_>>();
+            assert_eq!(rows.len(), 8);
+            for stage in 0..=8 {
+                for exit in [
+                    None,
+                    Some(13),
+                    Some(0xc0000142),
+                    Some(0),
+                    Some(11),
+                    Some(31),
+                    Some(32),
+                    Some(33),
+                ] {
+                    let raw = rows[..stage].concat();
+                    let e = parse_gdi32_loader_notification_output(raw.as_bytes(), exit);
+                    assert_eq!(e.stage, stage as u8);
+                    assert_eq!(e.outcome, if stage == 8 && exit == Some(0) { 5 } else { 0 });
+                    let mut changed = probe.clone();
+                    changed.run.stdout = diagnostic_hex(raw.as_bytes());
+                    changed.run.child_exit = exit;
+                    if exit.is_none() {
+                        changed.deadline_met = false
+                    }
+                    push("gdi32-loader-notification-prefix-exit", changed, 0);
+                }
+            }
+            for raw in [
+                format!(
+                    "{}SBZ_GDI32_LOADER_NOTIFICATION_PROBE_V1 snapshot sl",
+                    rows[..6].concat()
+                ),
+                text.replace("flags=0x00000000 busy=0", "flags=0x00000020 busy=0"),
+                text.replace("ntdll=1 register=1", "ntdll=0 register=1"),
+                text.replace("status=0x00000000 cookie=1", "status=unavailable cookie=1"),
+                text.replace(
+                    "unregister status=0x00000000",
+                    "unregister status=unavailable",
+                ),
+                text.replace("321-------------", "321------------"),
+                text.replace("321-------------", "721-------------"),
+                text.replace("0x00000800", "0x00000000"),
+                text.replace("\n", "\r\n"),
+                format!("{text}extra\n"),
+            ] {
+                assert_eq!(
+                    parse_gdi32_loader_notification_output(raw.as_bytes(), Some(0)).outcome,
+                    0
+                );
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(raw.as_bytes());
+                push("gdi32-loader-notification-incomplete-invalid", changed, 0);
+            }
+            for raw in [
+                vec![b'a'; 2049],
+                vec![0xff],
+                [text.as_bytes(), &[0xff]].concat(),
+            ] {
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(&raw);
+                assert_eq!(
+                    parse_gdi32_loader_notification_output(&raw, Some(0)).outcome,
+                    0
+                );
+                push("gdi32-loader-notification-bounded-raw", changed, 0);
+            }
+            for gate in 0..6 {
+                let mut changed = probe.clone();
+                match gate {
+                    0 => changed.output_eof = false,
+                    1 => changed.deadline_met = false,
+                    2 => changed.run.stderr = "61".into(),
+                    3 => changed.run.lifecycle = 3,
+                    4 => changed.run.spawn_error = "回収未確認".into(),
+                    _ => {
+                        changed.run.isolation = "unconfirmed".into();
+                        changed.run.lifecycle &= !2;
+                    }
+                }
+                let mut parent = base.clone();
+                parent.gdi32_loader_notification_probe = Some(changed.clone());
+                assert!(changed.sequence_verified());
+                assert!(!changed.gates_verified(&parent));
+                push("gdi32-loader-notification-operational", changed, 0);
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn session0_gdi32_loader_notification_observation_and_retention() {
+        for case in session0_gdi32_loader_notification_record_corpus()
+            .into_iter()
+            .filter(|c| c.name == "gdi32-loader-notification-wire" && c.expected.is_some())
+        {
+            let mut record = case.expected.unwrap();
+            assert!(
+                record
+                    .gdi32_loader_notification_probe
+                    .as_ref()
+                    .unwrap()
+                    .sequence_verified()
+            );
+            assert!(
+                record
+                    .gdi32_loader_notification_probe
+                    .as_ref()
+                    .unwrap()
+                    .gates_verified(&record)
+            );
+            let mut argv = session0_argv_corpus()
+                .into_iter()
+                .find(|(a, ok)| a.len() == 16 && *ok)
+                .unwrap()
+                .0;
+            argv.extend((6..16).map(|n| format!("{n:x}").repeat(64).into()));
+            let config = validate_window_station_scm_process_argv(&argv).unwrap();
+            for bits in [3, 7, 15] {
+                let mut changed = record.clone();
+                changed
+                    .gdi32_loader_notification_probe
+                    .as_mut()
+                    .unwrap()
+                    .run
+                    .lifecycle = bits;
+                eprintln!(
+                    "GDI32_LOADER_NOTIFICATION_ACTUAL_SELECTION mask={} lifecycle={bits} release={}",
+                    case.expected_mask,
+                    session0_requested_resources_finished(&config, &changed)
+                );
+            }
+            for i in 0..17 {
+                for bits in 0..16 {
+                    let mut changed = record.clone();
+                    let run = match i {
+                        0 => &mut changed.baseline,
+                        1 => &mut changed.no_window,
+                        2 => &mut changed.init_probe.as_mut().unwrap().run,
+                        3 => &mut changed.entry_probe.as_mut().unwrap().run,
+                        4 => &mut changed.terminate_probe.as_mut().unwrap().run,
+                        5 | 6 => &mut changed.subsystem_probes.as_mut().unwrap()[i - 5].run,
+                        7 => &mut changed.windows_init_probe.as_mut().unwrap().run,
+                        8 => &mut changed.windows_startup_probe.as_mut().unwrap().run,
+                        9 => &mut changed.gdi32_init_probe.as_mut().unwrap().run,
+                        10 => &mut changed.win32u_init_probe.as_mut().unwrap().run,
+                        11 => &mut changed.win32u_user32_probe.as_mut().unwrap().run,
+                        12 => &mut changed.user32_resource_probe.as_mut().unwrap().run,
+                        13 => &mut changed.user32_resource_load_probe.as_mut().unwrap().run,
+                        14 => &mut changed.user32_mitigation_probe.as_mut().unwrap().run,
+                        15 => &mut changed.loader_notification_probe.as_mut().unwrap().run,
+                        _ => {
+                            &mut changed
+                                .gdi32_loader_notification_probe
+                                .as_mut()
+                                .unwrap()
+                                .run
+                        }
+                    };
+                    run.lifecycle = bits;
+                    let confirmed = session0_requested_resources_finished(&config, &changed);
+                    assert_eq!(confirmed, bits & 12 == 12);
+                    let owned = Arc::new(());
+                    let mut held = Session0RetainedResources(Some(Arc::clone(&owned)));
+                    held.release_if_confirmed(confirmed);
+                    drop(held);
+                    assert_eq!(Arc::strong_count(&owned), if confirmed { 1 } else { 2 });
+                }
+            }
+            let before = record.clone();
+            let result = collect_session0_gdi32_loader_notification_run(
+                &mut record,
+                &config,
+                &RestrictedCommand::new("unused.exe", r"C:\fixture"),
+                |p, c| {
+                    assert_eq!(
+                        c.application,
+                        config
+                            .fixture_root
+                            .join(Session0ProbeKind::Gdi32LoaderNotification.basename())
+                    );
+                    assert!(c.arguments.is_empty());
+                    p.run = before
+                        .gdi32_loader_notification_probe
+                        .as_ref()
+                        .unwrap()
+                        .run
+                        .clone();
+                    p.run.lifecycle = 3;
+                    p.run.child_exit = Some(31);
+                    let raw = gdi32_loader_notification_valid_output(
+                        "ntdll=1 register=1 unregister=0",
+                        "unavailable",
+                        0,
+                        false,
+                        "unavailable",
+                        "?123456---------",
+                        (31, 1),
+                    );
+                    snapshot_gdi32_loader_notification_output(p, raw.as_bytes(), &[]);
+                    assert_eq!(p.evidence.as_ref().unwrap().stage, 8);
+                    Err("保存後回収失敗".into())
+                },
+            );
+            assert!(result.is_err());
+            let mut earlier = record.clone();
+            earlier.gdi32_loader_notification_probe =
+                before.gdi32_loader_notification_probe.clone();
+            assert_eq!(earlier, before);
+            let p = record.gdi32_loader_notification_probe.as_mut().unwrap();
+            let evidence = p.evidence.clone();
+            let raw = p.run.stdout.clone();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            assert!(
+                runtime
+                    .block_on(preserve_session0_exit_before_cleanup(
+                        &mut p.run,
+                        async { panic!("取得済みexitを再照会") },
+                        async { Err(io::Error::other("回収失敗")) }
+                    ))
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .block_on(async {
+                        tokio::time::timeout(
+                            std::time::Duration::from_millis(1),
+                            preserve_session0_exit_before_cleanup(
+                                &mut p.run,
+                                async { panic!("取得済みexitを再照会") },
+                                std::future::pending::<io::Result<()>>(),
+                            ),
+                        )
+                        .await
+                    })
+                    .is_err()
+            );
+            assert_eq!(p.run.child_exit, Some(31));
+            assert_eq!(p.run.stdout, raw);
+            assert_eq!(p.evidence, evidence);
+            assert_eq!(p.evidence.as_ref().unwrap().register_status, None);
+            assert_eq!(p.evidence.as_ref().unwrap().unregister_status, None);
+        }
+        eprintln!(
+            "GDI32_LOADER_NOTIFICATION_BOTH_MASKS=True ALL_17_RUNS_RETAINED=True PREFIX_RAW_EXIT_BEFORE_CLEANUP=True EARLIER_16_RUNS_PRESERVED=True"
+        );
+    }
+
     fn startup_valid_output(snapshot: &str, loaded: bool, preloaded: bool) -> String {
         let p = "SBZ_WINDOWS_STARTUP_PROBE_V1 ";
         if preloaded {
@@ -15974,6 +17077,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected: accepted.then_some(parent),
                 });
             };
@@ -16427,6 +17531,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                         expected_user32_resource_load: None,
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
+                        expected_gdi32_loader_notification: None,
                         expected_windows_startup: base_case.expected_windows_startup.clone(),
                         expected: accepted.then_some(parent),
                     });
@@ -16915,6 +18020,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                         expected_user32_resource_load: None,
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
+                        expected_gdi32_loader_notification: None,
                         expected_gdi32_init: base_case.expected_gdi32_init.clone(),
                         expected_windows_startup: base_case.expected_windows_startup.clone(),
                         expected: accepted.then_some(parent),
@@ -17414,6 +18520,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
                     expected_gdi32_init: base_case.expected_gdi32_init.clone(),
                     expected_windows_startup: base_case.expected_windows_startup.clone(),
@@ -17937,6 +19044,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_win32u_user32: base_case.expected_win32u_user32.clone(),
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
                     expected_gdi32_init: base_case.expected_gdi32_init.clone(),
@@ -18489,6 +19597,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_resource_load: if alter == 14 { None } else { Some(expected) },
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected_user32_resource: base_case.expected_user32_resource.clone(),
                     expected_win32u_user32: base_case.expected_win32u_user32.clone(),
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
@@ -18926,6 +20035,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected: Some(record),
                 });
             }
@@ -19114,6 +20224,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_resource_load: None,
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
+                    expected_gdi32_loader_notification: None,
                     expected: accepted.then_some(parent),
                 });
             }
@@ -19385,11 +20496,23 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 .is_some_and(|p| p.run.lifecycle & 12 == 12)
     }
 
+    fn session0_gdi32_loader_notification_resources_finished(
+        record: &Session0DiagnosticRecord,
+    ) -> bool {
+        session0_loader_notification_resources_finished(record)
+            && record
+                .gdi32_loader_notification_probe
+                .as_ref()
+                .is_some_and(|p| p.run.lifecycle & 12 == 12)
+    }
+
     fn session0_requested_resources_finished(
         config: &Session0DiagnosticConfig,
         record: &Session0DiagnosticRecord,
     ) -> bool {
-        if config.loader_notification_probe_sha256.is_some() {
+        if config.gdi32_loader_notification_probe_sha256.is_some() {
+            session0_gdi32_loader_notification_resources_finished(record)
+        } else if config.loader_notification_probe_sha256.is_some() {
             session0_loader_notification_resources_finished(record)
         } else if config.user32_mitigation_probe_sha256.is_some() {
             session0_user32_mitigation_resources_finished(record)
@@ -19604,6 +20727,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         user32_resource_load_probe: Option<Session0User32ResourceLoadProbeRecord>,
         user32_mitigation_probe: Option<Session0User32MitigationProbeRecord>,
         loader_notification_probe: Option<Session0LoaderNotificationProbeRecord>,
+        gdi32_loader_notification_probe: Option<Session0Gdi32LoaderNotificationProbeRecord>,
     }
 
     impl Session0DiagnosticRecord {
@@ -19687,6 +20811,7 @@ user32_resource_probe: None,
 user32_resource_load_probe: None,
 user32_mitigation_probe: None,
 loader_notification_probe: None,
+gdi32_loader_notification_probe: None,
             }
         }
 
@@ -19863,13 +20988,19 @@ loader_notification_probe: None,
                 probe.validate(self)?;
                 probe.encode_into(&mut payload, self.requested_station_mask)?;
             }
+            if let Some(probe) = &self.gdi32_loader_notification_probe {
+                probe.validate(self)?;
+                probe.encode_into(&mut payload, self.requested_station_mask)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
             let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
-            let version = if self.loader_notification_probe.is_some() {
+            let version = if self.gdi32_loader_notification_probe.is_some() {
+                22
+            } else if self.loader_notification_probe.is_some() {
                 21
             } else if self.user32_mitigation_probe.is_some() {
                 20
@@ -19923,6 +21054,7 @@ loader_notification_probe: None,
                 user32_resource_load: expected_user32_resource_load,
                 user32_mitigation: expected_user32_mitigation,
                 loader_notification: expected_loader_notification,
+                gdi32_loader_notification: expected_gdi32_loader_notification,
             } = expected_probes;
             validate_nonce(expected_nonce)?;
             diagnostic_station_profile(expected_mask)?;
@@ -19934,7 +21066,9 @@ loader_notification_probe: None,
             };
             if u32_at(0) != SESSION0_DIAGNOSTIC_MAGIC
                 || u32_at(4)
-                    != if expected_loader_notification.is_some() {
+                    != if expected_gdi32_loader_notification.is_some() {
+                        22
+                    } else if expected_loader_notification.is_some() {
                         21
                     } else if expected_user32_mitigation.is_some() {
                         20
@@ -20309,6 +21443,33 @@ loader_notification_probe: None,
                 } else {
                     None
                 };
+            let gdi32_loader_notification_probe = if let Some((expected_path, expected_hash)) =
+                expected_gdi32_loader_notification
+            {
+                let path = read_text(&mut reader)?;
+                let sha256 = read_text(&mut reader)?;
+                if path != expected_path || sha256 != expected_hash {
+                    return Err(
+                        "GDI32自己loader通知診断のpath・hashが呼出側の期待値と一致しません".into(),
+                    );
+                }
+                let run = Session0DiagnosticRun::decode_from(&mut reader)?;
+                let properties = read_text(&mut reader)?;
+                let probe = Session0Gdi32LoaderNotificationProbeRecord {
+                    path,
+                    sha256,
+                    evidence: gdi32_loader_notification_run_evidence(&run),
+                    run,
+                    output_eof: read_strict_bool(&mut reader)?,
+                    deadline_met: read_strict_bool(&mut reader)?,
+                };
+                if properties != probe.properties() {
+                    return Err("GDI32自己loader通知診断の段階証拠が出力と一致しません".into());
+                }
+                Some(probe)
+            } else {
+                None
+            };
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -20348,6 +21509,7 @@ loader_notification_probe: None,
                 user32_resource_load_probe,
                 user32_mitigation_probe,
                 loader_notification_probe,
+                gdi32_loader_notification_probe,
             };
             record.encode().map(|_| record)
         }
@@ -20466,10 +21628,6 @@ loader_notification_probe: None,
                 || config.loader_notification_probe_sha256.is_none())
         {
             return Err("GDI32自己loader通知診断には先行14診断が必要です");
-        }
-        if config.gdi32_loader_notification_probe_sha256.is_some() {
-            // 実行・独立記録・回収が揃うまで、設定登録とdispatcherより前に拒否する。
-            return Err("GDI32自己loader通知診断の実行・記録・回収は未接続です");
         }
         if config.loader_notification_probe_sha256.is_some()
             && (config.init_probe_sha256.is_none()
@@ -21392,6 +22550,7 @@ privileges={privileges:?}{restricted}",
             user32_resource_load_probe: None,
             user32_mitigation_probe: None,
             loader_notification_probe: None,
+            gdi32_loader_notification_probe: None,
         };
         let lease = match ActionStationLease::acquire_for_diagnostic(config.station_profile) {
             Ok(lease) => Arc::new(lease),
@@ -21565,6 +22724,7 @@ privileges={privileges:?}{restricted}",
                 Session0ProbeKind::User32ResourceLoad,
                 Session0ProbeKind::User32Mitigation,
                 Session0ProbeKind::LoaderNotification,
+                Session0ProbeKind::Gdi32LoaderNotification,
             ] {
                 if kind.expected_hash(config).is_none() {
                     continue;
@@ -21783,6 +22943,16 @@ privileges={privileges:?}{restricted}",
                     &command,
                     |probe, command| {
                         run_session0_loader_notification_child(&action, command, probe)
+                    },
+                )?;
+            }
+            if config.gdi32_loader_notification_probe_sha256.is_some() {
+                collect_session0_gdi32_loader_notification_run(
+                    record,
+                    config,
+                    &command,
+                    |probe, command| {
+                        run_session0_gdi32_loader_notification_child(&action, command, probe)
                     },
                 )?;
             }
