@@ -27,7 +27,9 @@ param(
     [string]$User32ResourceLoadProbePath,
     [string]$User32ResourceLoadProbeSha256,
     [string]$User32MitigationProbePath,
-    [string]$User32MitigationProbeSha256
+    [string]$User32MitigationProbeSha256,
+    [string]$LoaderNotificationProbePath,
+    [string]$LoaderNotificationProbeSha256
 )
 
 function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [string]$EntryPath, [string]$EntryHash,
@@ -40,7 +42,8 @@ function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [s
     [string]$Win32uUser32Path = '', [string]$Win32uUser32Hash = '',
     [string]$User32ResourcePath = '', [string]$User32ResourceHash = '',
     [string]$User32ResourceLoadPath = '', [string]$User32ResourceLoadHash = '',
-    [string]$User32MitigationPath = '', [string]$User32MitigationHash = '') {
+    [string]$User32MitigationPath = '', [string]$User32MitigationHash = '',
+    [string]$LoaderNotificationPath = '', [string]$LoaderNotificationHash = '') {
     if ([string]::IsNullOrEmpty($InitPath) -ne [string]::IsNullOrEmpty($InitHash) -or
         [string]::IsNullOrEmpty($EntryPath) -ne [string]::IsNullOrEmpty($EntryHash) -or
         [string]::IsNullOrEmpty($TerminatePath) -ne [string]::IsNullOrEmpty($TerminateHash) -or
@@ -53,12 +56,17 @@ function Assert-Session0ProbeParameters([string]$InitPath, [string]$InitHash, [s
         [string]::IsNullOrEmpty($Win32uUser32Path) -ne [string]::IsNullOrEmpty($Win32uUser32Hash) -or
         [string]::IsNullOrEmpty($User32ResourcePath) -ne [string]::IsNullOrEmpty($User32ResourceHash) -or
         [string]::IsNullOrEmpty($User32ResourceLoadPath) -ne [string]::IsNullOrEmpty($User32ResourceLoadHash) -or
-        [string]::IsNullOrEmpty($User32MitigationPath) -ne [string]::IsNullOrEmpty($User32MitigationHash)) {
+        [string]::IsNullOrEmpty($User32MitigationPath) -ne [string]::IsNullOrEmpty($User32MitigationHash) -or
+        [string]::IsNullOrEmpty($LoaderNotificationPath) -ne [string]::IsNullOrEmpty($LoaderNotificationHash)) {
         throw '診断EXEのパスとSHA-256は組で指定してください。'
     }
     if ($EntryPath -and -not $InitPath) { throw '固定終了値診断にはInitProbeの指定が必要です。' }
     if ($TerminatePath -and (-not $InitPath -or -not $EntryPath)) {
         throw '固定自己終了診断にはInitProbeとEntryProbeの指定が必要です。'
+    }
+    if ($LoaderNotificationPath -and
+        (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath -or -not $Win32uInitPath -or -not $Win32uUser32Path -or -not $User32ResourcePath -or -not $User32ResourceLoadPath -or -not $User32MitigationPath)) {
+        throw '自己loader通知診断には先行13診断の指定が必要です。'
     }
     if ($User32MitigationPath -and
         (-not $InitPath -or -not $EntryPath -or -not $TerminatePath -or -not $ConsolePath -or -not $WindowsPath -or -not $WindowsInitPath -or -not $WindowsStartupPath -or -not $Gdi32InitPath -or -not $Win32uInitPath -or -not $Win32uUser32Path -or -not $User32ResourcePath -or -not $User32ResourceLoadPath)) {
@@ -168,13 +176,13 @@ function ConvertFrom-Session0StationMask([string]$Value) {
 }
 
 # 実行・独立記録・保持回収が揃った固定要求だけを受け付ける。
-function Assert-Session0ConnectedRequest([bool]$User32MitigationRequested) {
-    # 固定組検査後に、実行・独立v20・全保持回収へ進む。
-    $null = $User32MitigationRequested
+function Assert-Session0ConnectedRequest([bool]$LoaderNotificationRequested) {
+    # 実行・独立記録・全保持回収が揃うまで、配置やサービス登録へ進めない。
+    if ($LoaderNotificationRequested) { throw '自己loader通知診断の実行・記録・回収は未接続です。' }
 }
 
 function Assert-Session0FixtureArguments([string[]]$Arguments) {
-    if ($Arguments.Count -notin @(11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24)) { throw 'SCM 診断の引数数が一致しません。' }
+    if ($Arguments.Count -notin @(11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25)) { throw 'SCM 診断の引数数が一致しません。' }
     $fixed = @('--ignored', '--exact', 'sandbox::tests::window_station_scm_dispatcher_smoke_role',
         '--nocapture', '--test-threads=1', '--')
     if ([IO.Path]::GetFileName($Arguments[0]) -cne 'SbzWindowStationScmSmoke.exe') {
@@ -190,7 +198,8 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
     }
     $null = ConvertFrom-Session0StationMask $Arguments[10]
     if ($Arguments.Count -ge 12) {
-        if ($Arguments.Count -eq 24) { Assert-Session0InitProbeHash $Arguments[23] }
+        if ($Arguments.Count -eq 25) { Assert-Session0InitProbeHash $Arguments[24] }
+        if ($Arguments.Count -ge 24) { Assert-Session0InitProbeHash $Arguments[23] }
         if ($Arguments.Count -ge 23) { Assert-Session0InitProbeHash $Arguments[22] }
         if ($Arguments.Count -ge 22) { Assert-Session0InitProbeHash $Arguments[21] }
         if ($Arguments.Count -ge 21) { Assert-Session0InitProbeHash $Arguments[20] }
@@ -217,9 +226,9 @@ function Assert-Session0FixtureArguments([string[]]$Arguments) {
 }
 
 # 組と先行診断の不足は、環境変更や保護配置より前に拒否する。
-Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256 $ConsoleProbePath $ConsoleProbeSha256 $WindowsProbePath $WindowsProbeSha256 $WindowsInitProbePath $WindowsInitProbeSha256 $WindowsStartupProbePath $WindowsStartupProbeSha256 $Gdi32InitProbePath $Gdi32InitProbeSha256 $Win32uInitProbePath $Win32uInitProbeSha256 $Win32uUser32ProbePath $Win32uUser32ProbeSha256 $User32ResourceProbePath $User32ResourceProbeSha256 $User32ResourceLoadProbePath $User32ResourceLoadProbeSha256 $User32MitigationProbePath $User32MitigationProbeSha256
-Assert-Session0ConnectedRequest ([bool]$User32MitigationProbePath)
-if ($args.Count -ne 0) { throw '指定できる引数はArtifactPath、ExpectedSha256、StationMaskとInit/Entry/Terminate/Console/Windows/WindowsInit/WindowsStartup/Gdi32Init/Win32uInit/Win32uUser32/User32Resource/User32ResourceLoad/User32MitigationのProbePath・ProbeSha256だけです。' }
+Assert-Session0ProbeParameters $InitProbePath $InitProbeSha256 $EntryProbePath $EntryProbeSha256 $TerminateProbePath $TerminateProbeSha256 $ConsoleProbePath $ConsoleProbeSha256 $WindowsProbePath $WindowsProbeSha256 $WindowsInitProbePath $WindowsInitProbeSha256 $WindowsStartupProbePath $WindowsStartupProbeSha256 $Gdi32InitProbePath $Gdi32InitProbeSha256 $Win32uInitProbePath $Win32uInitProbeSha256 $Win32uUser32ProbePath $Win32uUser32ProbeSha256 $User32ResourceProbePath $User32ResourceProbeSha256 $User32ResourceLoadProbePath $User32ResourceLoadProbeSha256 $User32MitigationProbePath $User32MitigationProbeSha256 $LoaderNotificationProbePath $LoaderNotificationProbeSha256
+Assert-Session0ConnectedRequest ([bool]$LoaderNotificationProbePath)
+if ($args.Count -ne 0) { throw '指定できる引数はArtifactPath、ExpectedSha256、StationMaskとInit/Entry/Terminate/Console/Windows/WindowsInit/WindowsStartup/Gdi32Init/Win32uInit/Win32uUser32/User32Resource/User32ResourceLoad/User32Mitigation/LoaderNotificationのProbePath・ProbeSha256だけです。' }
 
 $record = $null
 $requestedStationMask = ConvertFrom-Session0StationMask $StationMask
@@ -1263,6 +1272,7 @@ function Get-Session0ProbeBasename([string]$Kind, [bool]$Source) {
         'User32Resource' { if ($Source) { return 'session0_user32_resource_probe.exe' }; return 'SbzSession0User32ResourceProbe.exe' }
         'User32ResourceLoad' { if ($Source) { return 'session0_user32_resource_load_probe.exe' }; return 'SbzSession0User32ResourceLoadProbe.exe' }
         'User32Mitigation' { if ($Source) { return 'session0_user32_mitigation_probe.exe' }; return 'SbzSession0User32MitigationProbe.exe' }
+        'LoaderNotification' { if ($Source) { return 'session0_loader_notification_probe.exe' }; return 'SbzSession0LoaderNotificationProbe.exe' }
         default { throw '追加診断 EXE の種別が不正です。' }
     }
 }
@@ -1274,7 +1284,7 @@ function Get-Session0ProbeSourcePath([string]$Path, [string]$Kind) {
     if ([IO.Path]::GetFileName($canonical) -cne $basename) {
         throw '追加診断 EXE の source 名が一致しません。'
     }
-    if ($Kind -cin @('WindowsInit', 'WindowsStartup', 'Gdi32Init', 'Win32uInit', 'Win32uUser32', 'User32Resource', 'User32ResourceLoad', 'User32Mitigation') -and $Path -cne $canonical) {
+    if ($Kind -cin @('WindowsInit', 'WindowsStartup', 'Gdi32Init', 'Win32uInit', 'Win32uUser32', 'User32Resource', 'User32ResourceLoad', 'User32Mitigation', 'LoaderNotification') -and $Path -cne $canonical) {
         throw 'WINDOWS診断のsourceは正規の固定pathが必要です。'
     }
     if ($Kind -cin @('Console', 'Windows')) {
@@ -3169,7 +3179,7 @@ try {
     if ($User32ResourceLoadProbePath) { $fixtureArguments += $user32ResourceLoadProbe.Hash }
     if ($User32MitigationProbePath) { $fixtureArguments += $user32MitigationProbe.Hash }
     Assert-Session0FixtureArguments $fixtureArguments
-    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 24)
+    Assert-Session0ConnectedRequest ($fixtureArguments.Count -eq 25)
     $imagePath = '"' + $fixtureExe + '" --ignored --exact ' + $selector +
         ' --nocapture --test-threads=1 -- "' + $root + '" "' + $root + '" ' +
         $diagnosticNonce + ' ' + $StationMask
