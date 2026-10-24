@@ -172,6 +172,17 @@ jobs:
           )
           $expectedUser32MitigationBuildSha256 = (Get-FileHash -LiteralPath $user32MitigationBuildPath -Algorithm SHA256).Hash
           $expectedUser32MitigationSourceSha256 = (Get-FileHash -LiteralPath $user32MitigationSourcePath -Algorithm SHA256).Hash
+          $loaderNotificationBuildPath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_loader_notification_probe.ps1')
+          )
+          $loaderNotificationSourcePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_loader_notification_probe.cpp')
+          )
+          $loaderNotificationProbePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE '.harness/T-011-N60-loader-notification-probe/session0_loader_notification_probe.exe')
+          )
+          $expectedLoaderNotificationBuildSha256 = (Get-FileHash -LiteralPath $loaderNotificationBuildPath -Algorithm SHA256).Hash
+          $expectedLoaderNotificationSourceSha256 = (Get-FileHash -LiteralPath $loaderNotificationSourcePath -Algorithm SHA256).Hash
           & rustup toolchain install 1.97.0 --profile minimal
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain の導入に失敗しました。' }
           $artifacts = @(& cargo +1.97.0 test -p sembazuru-worker --lib --locked --no-run --message-format=json)
@@ -276,6 +287,8 @@ jobs:
           $user32ResourceLoadSourceInput = $null
           $user32MitigationBuildInput = $null
           $user32MitigationSourceInput = $null
+          $loaderNotificationBuildInput = $null
+          $loaderNotificationSourceInput = $null
           try {
               $probeInput = Open-VerifiedInput $probePath $expectedProbeSha256
               $initBuildInput = Open-VerifiedInput $initBuildPath $expectedInitBuildSha256
@@ -300,6 +313,8 @@ jobs:
               $user32ResourceLoadSourceInput = Open-VerifiedInput $user32ResourceLoadSourcePath $expectedUser32ResourceLoadSourceSha256
               $user32MitigationBuildInput = Open-VerifiedInput $user32MitigationBuildPath $expectedUser32MitigationBuildSha256
               $user32MitigationSourceInput = Open-VerifiedInput $user32MitigationSourcePath $expectedUser32MitigationSourceSha256
+              $loaderNotificationBuildInput = Open-VerifiedInput $loaderNotificationBuildPath $expectedLoaderNotificationBuildSha256
+              $loaderNotificationSourceInput = Open-VerifiedInput $loaderNotificationSourcePath $expectedLoaderNotificationSourceSha256
               $initBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($initBuildInput.Bytes)
               $tokens = $null
               $parseErrors = $null
@@ -431,6 +446,19 @@ jobs:
               & ($user32MitigationBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw '自己Win32k policy診断 EXE のビルドに失敗しました。' }
               $expectedUser32MitigationProbeSha256 = (Get-FileHash -LiteralPath $user32MitigationProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              # 自己loader通知診断は保持済みの専用 C++ と PS バイト列から生成する。
+              $loaderNotificationBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($loaderNotificationBuildInput.Bytes)
+              $tokens = $null
+              $parseErrors = $null
+              $loaderNotificationBuildAst = [Management.Automation.Language.Parser]::ParseInput(
+                  $loaderNotificationBuildText, $loaderNotificationBuildPath, [ref]$tokens, [ref]$parseErrors
+              )
+              if ($parseErrors.Count -ne 0) { throw '自己loader通知診断のビルドスクリプトに構文エラーがあります。' }
+              & ($loaderNotificationBuildAst.GetScriptBlock()) -BuildOnly
+              if ($LASTEXITCODE -ne 0) { throw '自己loader通知診断 EXE のビルドに失敗しました。' }
+              $expectedLoaderNotificationProbeSha256 = (Get-FileHash -LiteralPath $loaderNotificationProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              Write-Host ('commit={0} requested_station_mask={1} verified_loader_notification_build_sha256={2} verified_loader_notification_source_sha256={3}' -f
+                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $loaderNotificationBuildInput.Sha256, $loaderNotificationSourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_user32_mitigation_build_sha256={2} verified_user32_mitigation_source_sha256={3}' -f
                   $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $user32MitigationBuildInput.Sha256, $user32MitigationSourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_user32_resource_load_build_sha256={2} verified_user32_resource_load_source_sha256={3}' -f
@@ -474,7 +502,8 @@ jobs:
                   @('win32u_user32_probe', $win32uUser32ProbePath, $expectedWin32uUser32ProbeSha256),
                   @('user32_resource_probe', $user32ResourceProbePath, $expectedUser32ResourceProbeSha256),
                   @('user32_resource_load_probe', $user32ResourceLoadProbePath, $expectedUser32ResourceLoadProbeSha256),
-                  @('user32_mitigation_probe', $user32MitigationProbePath, $expectedUser32MitigationProbeSha256)
+                  @('user32_mitigation_probe', $user32MitigationProbePath, $expectedUser32MitigationProbeSha256),
+                  @('loader_notification_probe', $loaderNotificationProbePath, $expectedLoaderNotificationProbeSha256)
               )) {
                   Write-Host ('commit={0} requested_station_mask={1} {2}_path={3} {2}_sha256={4}' -f
                       $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $executable[0], $executable[1], $executable[2])
@@ -494,10 +523,11 @@ jobs:
                   -Win32uUser32ProbePath $win32uUser32ProbePath -Win32uUser32ProbeSha256 $expectedWin32uUser32ProbeSha256 `
                   -User32ResourceProbePath $user32ResourceProbePath -User32ResourceProbeSha256 $expectedUser32ResourceProbeSha256 `
                   -User32ResourceLoadProbePath $user32ResourceLoadProbePath -User32ResourceLoadProbeSha256 $expectedUser32ResourceLoadProbeSha256 `
-                  -User32MitigationProbePath $user32MitigationProbePath -User32MitigationProbeSha256 $expectedUser32MitigationProbeSha256
+                  -User32MitigationProbePath $user32MitigationProbePath -User32MitigationProbeSha256 $expectedUser32MitigationProbeSha256 `
+                  -LoaderNotificationProbePath $loaderNotificationProbePath -LoaderNotificationProbeSha256 $expectedLoaderNotificationProbeSha256
               if ($LASTEXITCODE -ne 0) { throw 'Session 0 診断に失敗しました。' }
           } finally {
-              foreach ($inputFile in @($user32MitigationSourceInput, $user32MitigationBuildInput, $user32ResourceLoadSourceInput, $user32ResourceLoadBuildInput, $user32ResourceSourceInput, $user32ResourceBuildInput, $win32uUser32SourceInput, $win32uUser32BuildInput, $win32uInitSourceInput, $win32uInitBuildInput, $gdi32InitSourceInput, $gdi32InitBuildInput, $windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
+              foreach ($inputFile in @($loaderNotificationSourceInput, $loaderNotificationBuildInput, $user32MitigationSourceInput, $user32MitigationBuildInput, $user32ResourceLoadSourceInput, $user32ResourceLoadBuildInput, $user32ResourceSourceInput, $user32ResourceBuildInput, $win32uUser32SourceInput, $win32uUser32BuildInput, $win32uInitSourceInput, $win32uInitBuildInput, $gdi32InitSourceInput, $gdi32InitBuildInput, $windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
                   if ($null -ne $inputFile) { $inputFile.Stream.Dispose() }
               }
           }
