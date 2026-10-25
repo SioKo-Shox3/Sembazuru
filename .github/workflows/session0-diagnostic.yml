@@ -150,6 +150,17 @@ jobs:
           )
           $expectedUser32ResourceBuildSha256 = (Get-FileHash -LiteralPath $user32ResourceBuildPath -Algorithm SHA256).Hash
           $expectedUser32ResourceSourceSha256 = (Get-FileHash -LiteralPath $user32ResourceSourcePath -Algorithm SHA256).Hash
+          $gdi32ResourceBuildPath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_gdi32_resource_probe.ps1')
+          )
+          $gdi32ResourceSourcePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_gdi32_resource_probe.cpp')
+          )
+          $gdi32ResourceProbePath = [IO.Path]::GetFullPath(
+              (Join-Path $env:GITHUB_WORKSPACE '.harness/T-011-N70-gdi32-resource-probe/session0_gdi32_resource_probe.exe')
+          )
+          $expectedGdi32ResourceBuildSha256 = (Get-FileHash -LiteralPath $gdi32ResourceBuildPath -Algorithm SHA256).Hash
+          $expectedGdi32ResourceSourceSha256 = (Get-FileHash -LiteralPath $gdi32ResourceSourcePath -Algorithm SHA256).Hash
           $user32ResourceLoadBuildPath = [IO.Path]::GetFullPath(
               (Join-Path $env:GITHUB_WORKSPACE 'hooks/test/session0_user32_resource_load_probe.ps1')
           )
@@ -302,6 +313,8 @@ jobs:
           $loaderNotificationSourceInput = $null
           $gdi32LoaderNotificationBuildInput = $null
           $gdi32LoaderNotificationSourceInput = $null
+          $gdi32ResourceBuildInput = $null
+          $gdi32ResourceSourceInput = $null
           try {
               $probeInput = Open-VerifiedInput $probePath $expectedProbeSha256
               $initBuildInput = Open-VerifiedInput $initBuildPath $expectedInitBuildSha256
@@ -330,6 +343,8 @@ jobs:
               $loaderNotificationSourceInput = Open-VerifiedInput $loaderNotificationSourcePath $expectedLoaderNotificationSourceSha256
               $gdi32LoaderNotificationBuildInput = Open-VerifiedInput $gdi32LoaderNotificationBuildPath $expectedGdi32LoaderNotificationBuildSha256
               $gdi32LoaderNotificationSourceInput = Open-VerifiedInput $gdi32LoaderNotificationSourcePath $expectedGdi32LoaderNotificationSourceSha256
+              $gdi32ResourceBuildInput = Open-VerifiedInput $gdi32ResourceBuildPath $expectedGdi32ResourceBuildSha256
+              $gdi32ResourceSourceInput = Open-VerifiedInput $gdi32ResourceSourcePath $expectedGdi32ResourceSourceSha256
               $initBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($initBuildInput.Bytes)
               $tokens = $null
               $parseErrors = $null
@@ -439,6 +454,17 @@ jobs:
               & ($user32ResourceBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw 'USER32 リソースマッピング診断 EXE のビルドに失敗しました。' }
               $expectedUser32ResourceProbeSha256 = (Get-FileHash -LiteralPath $user32ResourceProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              # GDI32 リソースマッピング診断は保持済みの専用 C++ と PS バイト列から生成する。
+              $gdi32ResourceBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($gdi32ResourceBuildInput.Bytes)
+              $tokens = $null
+              $parseErrors = $null
+              $gdi32ResourceBuildAst = [Management.Automation.Language.Parser]::ParseInput(
+                  $gdi32ResourceBuildText, $gdi32ResourceBuildPath, [ref]$tokens, [ref]$parseErrors
+              )
+              if ($parseErrors.Count -ne 0) { throw 'GDI32 リソースマッピング診断のビルドスクリプトに構文エラーがあります。' }
+              & ($gdi32ResourceBuildAst.GetScriptBlock()) -BuildOnly
+              if ($LASTEXITCODE -ne 0) { throw 'GDI32 リソースマッピング診断 EXE のビルドに失敗しました。' }
+              $expectedGdi32ResourceProbeSha256 = (Get-FileHash -LiteralPath $gdi32ResourceProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
               # USER32 リソース保持後ロード診断は保持済みの専用 C++ と PS バイト列から生成する。
               $user32ResourceLoadBuildText = [Text.UTF8Encoding]::new($false, $true).GetString($user32ResourceLoadBuildInput.Bytes)
               $tokens = $null
@@ -483,6 +509,8 @@ jobs:
               & ($gdi32LoaderNotificationBuildAst.GetScriptBlock()) -BuildOnly
               if ($LASTEXITCODE -ne 0) { throw '固定GDI32自己loader通知診断 EXE のビルドに失敗しました。' }
               $expectedGdi32LoaderNotificationProbeSha256 = (Get-FileHash -LiteralPath $gdi32LoaderNotificationProbePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              Write-Host ('commit={0} requested_station_mask={1} verified_gdi32_resource_build_sha256={2} verified_gdi32_resource_source_sha256={3}' -f
+                  $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $gdi32ResourceBuildInput.Sha256, $gdi32ResourceSourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_gdi32_loader_notification_build_sha256={2} verified_gdi32_loader_notification_source_sha256={3}' -f
                   $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $gdi32LoaderNotificationBuildInput.Sha256, $gdi32LoaderNotificationSourceInput.Sha256)
               Write-Host ('commit={0} requested_station_mask={1} verified_loader_notification_build_sha256={2} verified_loader_notification_source_sha256={3}' -f
@@ -532,7 +560,8 @@ jobs:
                   @('user32_resource_load_probe', $user32ResourceLoadProbePath, $expectedUser32ResourceLoadProbeSha256),
                   @('user32_mitigation_probe', $user32MitigationProbePath, $expectedUser32MitigationProbeSha256),
                   @('loader_notification_probe', $loaderNotificationProbePath, $expectedLoaderNotificationProbeSha256),
-                  @('gdi32_loader_notification_probe', $gdi32LoaderNotificationProbePath, $expectedGdi32LoaderNotificationProbeSha256)
+                  @('gdi32_loader_notification_probe', $gdi32LoaderNotificationProbePath, $expectedGdi32LoaderNotificationProbeSha256),
+                  @('gdi32_resource_probe', $gdi32ResourceProbePath, $expectedGdi32ResourceProbeSha256)
               )) {
                   Write-Host ('commit={0} requested_station_mask={1} {2}_path={3} {2}_sha256={4}' -f
                       $checkoutSha, $env:SBZ_DIAGNOSTIC_STATION_MASK, $executable[0], $executable[1], $executable[2])
@@ -554,10 +583,11 @@ jobs:
                   -User32ResourceLoadProbePath $user32ResourceLoadProbePath -User32ResourceLoadProbeSha256 $expectedUser32ResourceLoadProbeSha256 `
                   -User32MitigationProbePath $user32MitigationProbePath -User32MitigationProbeSha256 $expectedUser32MitigationProbeSha256 `
                   -LoaderNotificationProbePath $loaderNotificationProbePath -LoaderNotificationProbeSha256 $expectedLoaderNotificationProbeSha256 `
-                  -Gdi32LoaderNotificationProbePath $gdi32LoaderNotificationProbePath -Gdi32LoaderNotificationProbeSha256 $expectedGdi32LoaderNotificationProbeSha256
+                  -Gdi32LoaderNotificationProbePath $gdi32LoaderNotificationProbePath -Gdi32LoaderNotificationProbeSha256 $expectedGdi32LoaderNotificationProbeSha256 `
+                  -Gdi32ResourceProbePath $gdi32ResourceProbePath -Gdi32ResourceProbeSha256 $expectedGdi32ResourceProbeSha256
               if ($LASTEXITCODE -ne 0) { throw 'Session 0 診断に失敗しました。' }
           } finally {
-              foreach ($inputFile in @($gdi32LoaderNotificationSourceInput, $gdi32LoaderNotificationBuildInput, $loaderNotificationSourceInput, $loaderNotificationBuildInput, $user32MitigationSourceInput, $user32MitigationBuildInput, $user32ResourceLoadSourceInput, $user32ResourceLoadBuildInput, $user32ResourceSourceInput, $user32ResourceBuildInput, $win32uUser32SourceInput, $win32uUser32BuildInput, $win32uInitSourceInput, $win32uInitBuildInput, $gdi32InitSourceInput, $gdi32InitBuildInput, $windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
+              foreach ($inputFile in @($gdi32ResourceSourceInput, $gdi32ResourceBuildInput, $gdi32LoaderNotificationSourceInput, $gdi32LoaderNotificationBuildInput, $loaderNotificationSourceInput, $loaderNotificationBuildInput, $user32MitigationSourceInput, $user32MitigationBuildInput, $user32ResourceLoadSourceInput, $user32ResourceLoadBuildInput, $user32ResourceSourceInput, $user32ResourceBuildInput, $win32uUser32SourceInput, $win32uUser32BuildInput, $win32uInitSourceInput, $win32uInitBuildInput, $gdi32InitSourceInput, $gdi32InitBuildInput, $windowsStartupSourceInput, $windowsStartupBuildInput, $windowsInitBuildInput, $subsystemBuildInput, $terminateSourceInput, $terminateBuildInput, $entrySourceInput, $entryBuildInput, $initSourceInput, $initBuildInput, $probeInput)) {
                   if ($null -ne $inputFile) { $inputFile.Stream.Dispose() }
               }
           }
