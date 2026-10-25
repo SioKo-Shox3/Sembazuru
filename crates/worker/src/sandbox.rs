@@ -3270,6 +3270,7 @@ mod tests {
                     .iter()
                     .map(|v| &v.run),
             )
+            .chain(record.gdi32_resource_probe.iter().map(|v| &v.run))
         {
             fields.extend([
                 run.job_ui_restrictions.to_string(),
@@ -3409,6 +3410,15 @@ mod tests {
             fields.push(probe.sequence_verified().to_string());
             fields.push(probe.gates_verified(record).to_string());
         }
+        if let Some(probe) = &record.gdi32_resource_probe {
+            fields.push(diagnostic_hex(probe.path.as_bytes()));
+            fields.push(probe.sha256.clone());
+            fields.push(probe.properties());
+            fields.push(probe.output_eof.to_string());
+            fields.push(probe.deadline_met.to_string());
+            fields.push(probe.sequence_verified().to_string());
+            fields.push(probe.gates_verified(record).to_string());
+        }
         fields.join("\t")
     }
 
@@ -3433,6 +3443,7 @@ mod tests {
         expected_user32_mitigation: Option<(String, String)>,
         expected_loader_notification: Option<(String, String)>,
         expected_gdi32_loader_notification: Option<(String, String)>,
+        expected_gdi32_resource: Option<(String, String)>,
     }
 
     fn session0_diagnostic_corpus() -> Vec<Session0DiagnosticCase> {
@@ -3451,6 +3462,7 @@ mod tests {
                 expected_user32_mitigation: None,
                 expected_loader_notification: None,
                 expected_gdi32_loader_notification: None,
+                expected_gdi32_resource: None,
                 expected_subsystem: None,
                 name,
                 bytes: record.encode().unwrap(),
@@ -3584,6 +3596,7 @@ mod tests {
                 expected_user32_mitigation: None,
                 expected_loader_notification: None,
                 expected_gdi32_loader_notification: None,
+                expected_gdi32_resource: None,
                 expected_subsystem: None,
                 name,
                 bytes,
@@ -3779,6 +3792,7 @@ mod tests {
             expected_user32_mitigation: None,
             expected_loader_notification: None,
             expected_gdi32_loader_notification: None,
+            expected_gdi32_resource: None,
             expected_subsystem: None,
             name: "payload-65537",
             bytes: oversized,
@@ -3817,6 +3831,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3866,6 +3881,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name: case.name,
                     bytes,
@@ -3939,6 +3955,7 @@ mod tests {
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
                         expected_gdi32_loader_notification: None,
+                        expected_gdi32_resource: None,
                         expected_subsystem: None,
                         name: "target-mask-mismatch-unverified-indeterminate",
                         bytes: forged.clone(),
@@ -3966,6 +3983,7 @@ mod tests {
         cases.extend(session0_user32_mitigation_record_corpus());
         cases.extend(session0_loader_notification_record_corpus());
         cases.extend(session0_gdi32_loader_notification_record_corpus());
+        cases.extend(session0_gdi32_resource_record_corpus());
         cases
     }
 
@@ -4037,6 +4055,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name: "init-stage-corpus",
                     bytes: init_record_bytes(&base, &init, summary),
@@ -4063,6 +4082,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4209,6 +4229,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name: "init-invalid-path-with-matching-caller",
                     bytes: init_record_bytes(
@@ -4261,6 +4282,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4283,6 +4305,7 @@ mod tests {
                 expected_user32_mitigation: None,
                 expected_loader_notification: None,
                 expected_gdi32_loader_notification: None,
+                expected_gdi32_resource: None,
                 expected_subsystem: None,
                 name: "init-unsolicited",
                 bytes: success_bytes,
@@ -4608,6 +4631,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -4993,6 +5017,7 @@ mod tests {
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_subsystem: None,
                     name,
                     bytes,
@@ -5031,6 +5056,7 @@ mod tests {
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
                         expected_gdi32_loader_notification: None,
+                        expected_gdi32_resource: None,
                         expected_subsystem: None,
                         name: "cmd-arms-terminate",
                         bytes: record.encode().unwrap(),
@@ -5415,6 +5441,7 @@ mod tests {
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
                         expected_gdi32_loader_notification: None,
+                        expected_gdi32_resource: None,
                         expected_subsystem: if name == "subsystem-unsolicited" {
                             None
                         } else {
@@ -7714,11 +7741,8 @@ mod tests {
                 config.gdi32_resource_probe_sha256.as_deref(),
                 argv[26].to_str()
             );
-            // 全先行組が揃っても、未接続要求を設定登録前に拒否する。
-            assert_eq!(
-                require_connected_session0_request(&config),
-                Err("GDI32リソース診断の実行・記録・回収は未接続です")
-            );
+            // 完全な27形式を接続し、先行15診断の欠落を個別に拒否する。
+            assert_eq!(require_connected_session0_request(&config), Ok(()));
             for index in 0..15 {
                 let mut candidate = config.clone();
                 let slots = [
@@ -8321,6 +8345,10 @@ mod tests {
                         .expected_gdi32_loader_notification
                         .as_ref()
                         .map(|(p, h)| (p.as_str(), h.as_str())),
+                    gdi32_resource: case
+                        .expected_gdi32_resource
+                        .as_ref()
+                        .map(|(p, h)| (p.as_str(), h.as_str())),
                 },
             );
             match case.expected {
@@ -8584,7 +8612,7 @@ $tokens = $null
 $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw '診断 PowerShell の構文エラーです。' }
-foreach ($name in @('Read-Session0Gdi32LoaderNotificationStartupProgress', 'Get-Session0Gdi32LoaderNotificationEvidence', 'Test-Session0Gdi32LoaderNotificationSequence', 'Test-Session0Gdi32LoaderNotificationGates', 'Test-Session0Gdi32LoaderNotificationTreeSafe', 'Read-Session0Gdi32LoaderNotificationRecord', 'Read-Session0LoaderNotificationStartupProgress', 'Get-Session0LoaderNotificationEvidence', 'Test-Session0LoaderNotificationSequence', 'Test-Session0LoaderNotificationGates', 'Test-Session0LoaderNotificationTreeSafe', 'Read-Session0LoaderNotificationRecord', 'Read-Session0User32MitigationPolicyResult', 'Read-Session0User32MitigationStartupSnapshot', 'Read-Session0User32MitigationStartupProgress', 'Get-Session0User32MitigationEvidence', 'Test-Session0User32MitigationSequence', 'Test-Session0User32MitigationGates', 'Test-Session0User32MitigationTreeSafe', 'Read-Session0User32MitigationRecord', 'Read-Session0User32ResourceLoadStartupSnapshot', 'Read-Session0User32ResourceLoadStartupProgress', 'Get-Session0User32ResourceLoadEvidence', 'Test-Session0User32ResourceLoadSequence', 'Test-Session0User32ResourceLoadGates', 'Test-Session0User32ResourceLoadTreeSafe', 'Read-Session0User32ResourceLoadRecord', 'Read-Session0User32ResourceStartupSnapshot', 'Read-Session0User32ResourceStartupProgress', 'Get-Session0User32ResourceEvidence', 'Test-Session0User32ResourceSequence', 'Test-Session0User32ResourceGates', 'Test-Session0User32ResourceTreeSafe', 'Read-Session0User32ResourceRecord', 'Read-Session0Win32uUser32StartupSnapshot', 'Read-Session0Win32uUser32StartupProgress', 'Get-Session0Win32uUser32Evidence', 'Test-Session0Win32uUser32Sequence', 'Test-Session0Win32uUser32Gates', 'Test-Session0Win32uUser32TreeSafe', 'Read-Session0Win32uUser32Record', 'Read-Session0Win32uStartupSnapshot', 'Read-Session0Win32uStartupProgress', 'Get-Session0Win32uInitEvidence', 'Test-Session0Win32uInitSequence', 'Test-Session0Win32uInitGates', 'Test-Session0Win32uInitTreeSafe', 'Read-Session0Win32uInitRecord', 'Read-Session0Gdi32StartupSnapshot', 'Read-Session0Gdi32StartupProgress', 'Get-Session0Gdi32InitEvidence', 'Test-Session0Gdi32InitSequence', 'Test-Session0Gdi32InitGates', 'Test-Session0Gdi32InitTreeSafe', 'Read-Session0Gdi32InitRecord', 'Read-Session0StartupSnapshot', 'Read-Session0StartupProgress', 'Get-Session0WindowsStartupEvidence', 'Test-Session0WindowsStartupSequence', 'Test-Session0WindowsStartupGates', 'Test-Session0WindowsStartupTreeSafe', 'Read-Session0WindowsStartupRecord', 'Read-Session0WindowsInitRecord', 'Get-Session0WindowsInitEvidence', 'Test-Session0WindowsInitSequence', 'Test-Session0WindowsInitGates', 'Test-Session0WindowsInitTreeSafe', 'Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
+foreach ($name in @('Read-Session0Gdi32ResourceStartupSnapshot', 'Read-Session0Gdi32ResourceStartupProgress', 'Get-Session0Gdi32ResourceEvidence', 'Test-Session0Gdi32ResourceSequence', 'Test-Session0Gdi32ResourceGates', 'Test-Session0Gdi32ResourceTreeSafe', 'Read-Session0Gdi32ResourceRecord', 'Read-Session0Gdi32LoaderNotificationStartupProgress', 'Get-Session0Gdi32LoaderNotificationEvidence', 'Test-Session0Gdi32LoaderNotificationSequence', 'Test-Session0Gdi32LoaderNotificationGates', 'Test-Session0Gdi32LoaderNotificationTreeSafe', 'Read-Session0Gdi32LoaderNotificationRecord', 'Read-Session0LoaderNotificationStartupProgress', 'Get-Session0LoaderNotificationEvidence', 'Test-Session0LoaderNotificationSequence', 'Test-Session0LoaderNotificationGates', 'Test-Session0LoaderNotificationTreeSafe', 'Read-Session0LoaderNotificationRecord', 'Read-Session0User32MitigationPolicyResult', 'Read-Session0User32MitigationStartupSnapshot', 'Read-Session0User32MitigationStartupProgress', 'Get-Session0User32MitigationEvidence', 'Test-Session0User32MitigationSequence', 'Test-Session0User32MitigationGates', 'Test-Session0User32MitigationTreeSafe', 'Read-Session0User32MitigationRecord', 'Read-Session0User32ResourceLoadStartupSnapshot', 'Read-Session0User32ResourceLoadStartupProgress', 'Get-Session0User32ResourceLoadEvidence', 'Test-Session0User32ResourceLoadSequence', 'Test-Session0User32ResourceLoadGates', 'Test-Session0User32ResourceLoadTreeSafe', 'Read-Session0User32ResourceLoadRecord', 'Read-Session0User32ResourceStartupSnapshot', 'Read-Session0User32ResourceStartupProgress', 'Get-Session0User32ResourceEvidence', 'Test-Session0User32ResourceSequence', 'Test-Session0User32ResourceGates', 'Test-Session0User32ResourceTreeSafe', 'Read-Session0User32ResourceRecord', 'Read-Session0Win32uUser32StartupSnapshot', 'Read-Session0Win32uUser32StartupProgress', 'Get-Session0Win32uUser32Evidence', 'Test-Session0Win32uUser32Sequence', 'Test-Session0Win32uUser32Gates', 'Test-Session0Win32uUser32TreeSafe', 'Read-Session0Win32uUser32Record', 'Read-Session0Win32uStartupSnapshot', 'Read-Session0Win32uStartupProgress', 'Get-Session0Win32uInitEvidence', 'Test-Session0Win32uInitSequence', 'Test-Session0Win32uInitGates', 'Test-Session0Win32uInitTreeSafe', 'Read-Session0Win32uInitRecord', 'Read-Session0Gdi32StartupSnapshot', 'Read-Session0Gdi32StartupProgress', 'Get-Session0Gdi32InitEvidence', 'Test-Session0Gdi32InitSequence', 'Test-Session0Gdi32InitGates', 'Test-Session0Gdi32InitTreeSafe', 'Read-Session0Gdi32InitRecord', 'Read-Session0StartupSnapshot', 'Read-Session0StartupProgress', 'Get-Session0WindowsStartupEvidence', 'Test-Session0WindowsStartupSequence', 'Test-Session0WindowsStartupGates', 'Test-Session0WindowsStartupTreeSafe', 'Read-Session0WindowsStartupRecord', 'Read-Session0WindowsInitRecord', 'Get-Session0WindowsInitEvidence', 'Test-Session0WindowsInitSequence', 'Test-Session0WindowsInitGates', 'Test-Session0WindowsInitTreeSafe', 'Read-Session0SubsystemRecord', 'Test-Session0SubsystemTreeSafe', 'Test-Session0SubsystemGates', 'Assert-Session0SubsystemGates', 'Get-Session0ProbeBasename', 'Get-Session0TerminateObserved', 'Test-Session0TerminateTreeSafe', 'Test-Session0TerminateGates', 'Assert-Session0TerminateGates', 'Read-Session0TerminateRecord', 'Assert-Session0ProbeParameters', 'Get-Session0ServiceDeadline', 'Get-Session0EntryObserved', 'Test-Session0EntryTreeSafe', 'Test-Session0EntryGates', 'Assert-Session0EntryGates', 'Read-Session0EntryRecord', 'ConvertFrom-Session0StationMask', 'Assert-Session0InitProbeHash', 'Assert-Session0FixtureArguments', 'Read-Session0InitProbeOutput', 'Read-Session0U32', 'Read-Session0Text', 'Expand-Session0JobUi', 'Test-Session0TargetEvidence', 'Read-Session0DiagnosticRun', 'Test-Session0InitTreeSafe', 'Get-Session0InitRunEvidence', 'Read-Session0InitRecord', 'Read-Session0DiagnosticRecord')) {
     $definitions = @($ast.FindAll({ param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
     }, $true))
@@ -8641,7 +8669,7 @@ $count = 0
 $argvCount = 0
 $initCount = 0
 while ($null -ne ($line = [Console]::In.ReadLine())) {
-    $parts = $line.Split("`t", 36)
+    $parts = $line.Split("`t", 38)
     if ($parts[0] -ceq 'init') {
         $exit = if ($parts[3] -ceq 'none') { $null } else { [uint32]$parts[3] }
         $record = $null
@@ -8674,20 +8702,20 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $bytes = [Convert]::FromHexString($parts[2])
     $record = $null
     $rejected = $false
-    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[15]))) $parts[16] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[17]))) $parts[18] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[19]))) $parts[20] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[21]))) $parts[22] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[23]))) $parts[24] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[25]))) $parts[26] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[27]))) $parts[28] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[29]))) $parts[30] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[31]))) $parts[32] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[33]))) $parts[34] }
+    try { $record = Read-Session0DiagnosticRecord $bytes $parts[1] ([uint32]$parts[4]) ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[5]))) $parts[6] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[7]))) $parts[8] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[9]))) $parts[10] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[11]))) $parts[12] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[13]))) $parts[14] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[15]))) $parts[16] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[17]))) $parts[18] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[19]))) $parts[20] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[21]))) $parts[22] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[23]))) $parts[24] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[25]))) $parts[26] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[27]))) $parts[28] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[29]))) $parts[30] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[31]))) $parts[32] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[33]))) $parts[34] ([Text.Encoding]::UTF8.GetString([Convert]::FromHexString($parts[35]))) $parts[36] }
     catch { $rejected = $true }
     if ($parts[3] -ceq 'reject') {
         if (-not $rejected) { throw "不正な記録を受理しました: $($parts[0])" }
     } else {
         if ($rejected -or $null -eq $record) { throw "正常な記録を拒否しました: $($parts[0])" }
-        if (@($record.PSObject.Properties).Count -ne $(if ($parts[33]) {39} elseif ($parts[31]) {38} elseif ($parts[29]) {37} elseif ($parts[27]) {36} elseif ($parts[25]) {35} elseif ($parts[23]) {34} elseif ($parts[21]) {33} elseif ($parts[19]) {32} elseif ($parts[17]) {31} else {30})) { throw 'レコードのプロパティ数が一致しません。' }
+        if (@($record.PSObject.Properties).Count -ne $(if ($parts[35]) {40} elseif ($parts[33]) {39} elseif ($parts[31]) {38} elseif ($parts[29]) {37} elseif ($parts[27]) {36} elseif ($parts[25]) {35} elseif ($parts[23]) {34} elseif ($parts[21]) {33} elseif ($parts[19]) {32} elseif ($parts[17]) {31} else {30})) { throw 'レコードのプロパティ数が一致しません。' }
         $values = [Collections.Generic.List[string]]::new()
         $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.Nonce)).ToLowerInvariant())
         foreach ($property in @('Markers', 'Classification', 'SessionId', 'RequestedStationMask')) { $values.Add([string]$record.$property) }
         foreach ($property in @('Broker', 'Action', 'Station', 'Desktop', 'StationDacl', 'StationSacl', 'DesktopDacl', 'DesktopSacl', 'StationAccess', 'DesktopAccess', 'UiProbe', 'ActionDesktop', 'Cwd', 'EnvironmentHash')) {
             $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($record.$property)).ToLowerInvariant())
         }
-        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }), $(if ($null -ne $record.WindowsInitProbe) { $record.WindowsInitProbe.Run }), $(if ($parts[17]) { $record.WindowsStartupProbe.Run }), $(if ($parts[19]) { $record.Gdi32InitProbe.Run }), $(if ($parts[21]) { $record.Win32uInitProbe.Run }), $(if ($parts[23]) { $record.Win32uUser32Probe.Run }), $(if ($parts[25]) { $record.User32ResourceProbe.Run }), $(if ($parts[27]) { $record.User32ResourceLoadProbe.Run }), $(if ($parts[29]) { $record.User32MitigationProbe.Run }), $(if ($parts[31]) { $record.LoaderNotificationProbe.Run }), $(if ($parts[33]) { $record.Gdi32LoaderNotificationProbe.Run }))) {
+        foreach ($run in @($record.Baseline, $record.NoWindow) + @($(if ($null -ne $record.InitProbe) { $record.InitProbe.Run }), $(if ($null -ne $record.EntryProbe) { $record.EntryProbe.Run }), $(if ($null -ne $record.TerminateProbe) { $record.TerminateProbe.Run }), $(if ($null -ne $record.ConsoleProbe) { $record.ConsoleProbe.Run }), $(if ($null -ne $record.WindowsProbe) { $record.WindowsProbe.Run }), $(if ($null -ne $record.WindowsInitProbe) { $record.WindowsInitProbe.Run }), $(if ($parts[17]) { $record.WindowsStartupProbe.Run }), $(if ($parts[19]) { $record.Gdi32InitProbe.Run }), $(if ($parts[21]) { $record.Win32uInitProbe.Run }), $(if ($parts[23]) { $record.Win32uUser32Probe.Run }), $(if ($parts[25]) { $record.User32ResourceProbe.Run }), $(if ($parts[27]) { $record.User32ResourceLoadProbe.Run }), $(if ($parts[29]) { $record.User32MitigationProbe.Run }), $(if ($parts[31]) { $record.LoaderNotificationProbe.Run }), $(if ($parts[33]) { $record.Gdi32LoaderNotificationProbe.Run }), $(if ($parts[35]) { $record.Gdi32ResourceProbe.Run }))) {
             if ($null -eq $run) { continue }
             if (@($run.PSObject.Properties).Count -ne 14) { throw '起動記録のプロパティ数が一致しません。' }
             $values.Add([string]$run.JobUi)
@@ -8822,7 +8850,15 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 $values.Add(([string]$value).ToLowerInvariant())
             }
         }
-        if (($values -join "`t") -cne $parts[35]) { throw "記録のプロパティが一致しません: $($parts[0])" }
+        if ($parts[35]) {
+            $probe = $record.Gdi32ResourceProbe
+            $values.Add([Convert]::ToHexString([Text.Encoding]::UTF8.GetBytes($probe.Path)).ToLowerInvariant())
+            $values.Add($probe.Sha256); $values.Add($probe.Evidence)
+            foreach ($value in @($probe.OutputEof, $probe.DeadlineMet, (Test-Session0Gdi32ResourceSequence $probe), (Test-Session0Gdi32ResourceGates $record))) {
+                $values.Add(([string]$value).ToLowerInvariant())
+            }
+        }
+        if (($values -join "`t") -cne $parts[37]) { throw "記録のプロパティが一致しません: $($parts[0])" }
     }
     $count++
 }
@@ -8878,7 +8914,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
         for case in &cases {
             let expected = case.expected.as_ref().map(diagnostic_properties);
             input.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 case.name,
                 case.nonce,
                 diagnostic_hex(&case.bytes),
@@ -8955,6 +8991,8 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
                 case.expected_loader_notification.as_ref().map_or("", |(_,h)|h),
                 diagnostic_hex(case.expected_gdi32_loader_notification.as_ref().map_or("", |(p,_)|p).as_bytes()),
                 case.expected_gdi32_loader_notification.as_ref().map_or("", |(_,h)|h),
+                diagnostic_hex(case.expected_gdi32_resource.as_ref().map_or("", |(p,_)|p).as_bytes()),
+                case.expected_gdi32_resource.as_ref().map_or("", |(_,h)|h),
                 expected.unwrap_or_default(),
             ));
         }
@@ -10064,6 +10102,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         user32_mitigation: Option<(&'a str, &'a str)>,
         loader_notification: Option<(&'a str, &'a str)>,
         gdi32_loader_notification: Option<(&'a str, &'a str)>,
+        gdi32_resource: Option<(&'a str, &'a str)>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13264,6 +13303,613 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         drop(process);
         probe.run.observe_desktop_release();
         snapshot_user32_resource_output(probe, &left, &right);
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        Ok(())
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Gdi32ResourceStartupSnapshot {
+        state: String,
+        units: usize,
+        hex: String,
+        modules: [u8; 3],
+    }
+
+    impl Gdi32ResourceStartupSnapshot {
+        fn parse(line: &str, phase: &str) -> Option<Self> {
+            let tail =
+                line.strip_prefix(&format!("SBZ_GDI32_RESOURCE_PROBE_V1 {phase} desktop="))?;
+            let cols: Vec<_> = tail.split(' ').collect();
+            if cols.len() != 6 {
+                return None;
+            }
+            let state = cols[0];
+            let n = cols[1].strip_prefix("units=")?;
+            let units: usize = n.parse().ok()?;
+            if units > 128 || n != units.to_string() {
+                return None;
+            }
+            let hex = cols[2].strip_prefix("hex=")?;
+            if units == 0 {
+                if hex != "-" {
+                    return None;
+                }
+            } else if hex.len() != units * 4
+                || !hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                || hex
+                    .as_bytes()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .any(|u| u == b"0000")
+            {
+                return None;
+            }
+            let valid = match state {
+                "null" | "empty" => units == 0,
+                "terminated" => (1..128).contains(&units),
+                "bounded" => units == 128,
+                "unreadable" => units < 128,
+                _ => false,
+            };
+            if !valid {
+                return None;
+            }
+            let mut modules = [0; 3];
+            for (i, name) in ["user32=", "gdi32=", "win32u="].into_iter().enumerate() {
+                modules[i] = match cols[i + 3].strip_prefix(name)? {
+                    "0" => 0,
+                    "1" => 1,
+                    _ => return None,
+                };
+            }
+            Some(Self {
+                state: state.into(),
+                units,
+                hex: hex.into(),
+                modules,
+            })
+        }
+
+        fn properties(&self) -> String {
+            format!(
+                "{},{},{},{},{},{}",
+                self.state, self.units, self.hex, self.modules[0], self.modules[1], self.modules[2]
+            )
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Gdi32ResourceEvidence {
+        stage: u8,
+        preloaded: Option<u8>,
+        flags: Option<u32>,
+        result: Option<u8>,
+        gle: Option<u32>,
+        datafile_bit: Option<u8>,
+        image_bit: Option<u8>,
+        reused: Option<u8>,
+        before: Option<Gdi32ResourceStartupSnapshot>,
+        after: Option<Gdi32ResourceStartupSnapshot>,
+        valid: bool,
+        partial: bool,
+        outcome: u8,
+    }
+
+    impl Gdi32ResourceEvidence {
+        fn properties(&self) -> String {
+            let value = |v: Option<u32>| v.map_or_else(|| "none".into(), |v| v.to_string());
+            [
+                self.stage.to_string(),
+                value(self.preloaded.map(u32::from)),
+                value(self.flags),
+                value(self.result.map(u32::from)),
+                value(self.gle),
+                value(self.datafile_bit.map(u32::from)),
+                value(self.image_bit.map(u32::from)),
+                value(self.reused.map(u32::from)),
+                self.before
+                    .as_ref()
+                    .map_or_else(|| "none".into(), Gdi32ResourceStartupSnapshot::properties),
+                self.after
+                    .as_ref()
+                    .map_or_else(|| "none".into(), Gdi32ResourceStartupSnapshot::properties),
+                u8::from(self.valid).to_string(),
+                u8::from(self.partial).to_string(),
+                self.outcome.to_string(),
+            ]
+            .join(";")
+        }
+    }
+
+    // 完全行の到達点を保持し、識別bitと対応exitを運用ゲートから分離する。
+    fn parse_gdi32_resource_output(bytes: &[u8], exit: Option<u32>) -> Gdi32ResourceEvidence {
+        let mut e = Gdi32ResourceEvidence {
+            stage: 0,
+            preloaded: None,
+            flags: None,
+            result: None,
+            gle: None,
+            datafile_bit: None,
+            image_bit: None,
+            reused: None,
+            before: None,
+            after: None,
+            valid: bytes.len() <= 2048,
+            partial: !bytes.is_empty() && !bytes.ends_with(b"\n"),
+            outcome: 0,
+        };
+        let prefix = "SBZ_GDI32_RESOURCE_PROBE_V1 ";
+        let mut rows = bytes.split(|b| *b == b'\n').peekable();
+        while let Some(row) = rows.next() {
+            if rows.peek().is_none() {
+                break;
+            }
+            let line = match std::str::from_utf8(row) {
+                Ok(s) if s.is_ascii() => s,
+                _ => {
+                    e.valid = false;
+                    break;
+                }
+            };
+            let valid = match e.stage {
+                0 if line == format!("{prefix}entry") => {
+                    e.stage = 1;
+                    true
+                }
+                1 | 7 => match Gdi32ResourceStartupSnapshot::parse(
+                    line,
+                    if e.stage == 1 { "before" } else { "after" },
+                ) {
+                    Some(s) => {
+                        if e.stage == 1 {
+                            e.before = Some(s);
+                        } else {
+                            e.after = Some(s);
+                        }
+                        e.stage += 1;
+                        true
+                    }
+                    None => false,
+                },
+                2 => match line.strip_prefix(&format!("{prefix}gdi32_preloaded=")) {
+                    Some("0") => {
+                        e.preloaded = Some(0);
+                        e.stage = 3;
+                        true
+                    }
+                    Some("1") => {
+                        e.preloaded = Some(1);
+                        e.stage = 3;
+                        true
+                    }
+                    _ => false,
+                },
+                3 if line == format!("{prefix}flags=0x00000860") => {
+                    e.flags = Some(0x860);
+                    e.stage = 4;
+                    true
+                }
+                4 if line == format!("{prefix}gdi32_map_begin") => {
+                    e.stage = 5;
+                    true
+                }
+                5 => {
+                    let pair = line
+                        .strip_prefix(&format!("{prefix}gdi32_map_result="))
+                        .and_then(|s| s.split_once(" gle=0x"))
+                        .filter(|(r, g)| {
+                            matches!(*r, "0" | "1")
+                                && g.len() == 8
+                                && g.bytes()
+                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                        })
+                        .and_then(|(r, g)| {
+                            Some((r.parse().ok()?, u32::from_str_radix(g, 16).ok()?))
+                        });
+                    if let Some((r, g)) = pair {
+                        e.result = Some(r);
+                        e.gle = Some(g);
+                        e.stage = 6;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                6 => {
+                    let bits = line
+                        .strip_prefix(&format!("{prefix}handle datafile_bit="))
+                        .and_then(|s| s.split_once(" image_bit="))
+                        .and_then(|(d, s)| s.split_once(" reused=").map(|(i, r)| (d, i, r)))
+                        .filter(|(d, i, r)| {
+                            matches!(*d, "0" | "1")
+                                && matches!(*i, "0" | "2")
+                                && matches!(*r, "0" | "1")
+                        })
+                        .and_then(|(d, i, r)| {
+                            Some((
+                                d.parse::<u8>().ok()?,
+                                i.parse::<u8>().ok()?,
+                                r.parse::<u8>().ok()?,
+                            ))
+                        });
+                    if let Some((d, i, r)) = bits {
+                        // 構文上取得できた値は、矛盾を拒否する場合も到達点と分けて保持する。
+                        e.datafile_bit = Some(d);
+                        e.image_bit = Some(i);
+                        e.reused = Some(r);
+                        if (e.result == Some(0) && (d != 0 || i != 0 || r != 0))
+                            || (r == 1 && (e.preloaded != Some(1) || d != 0 || i != 0))
+                        {
+                            false
+                        } else {
+                            e.stage = 7;
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                }
+                8 if line == format!("{prefix}complete") => {
+                    e.stage = 9;
+                    true
+                }
+                _ => false,
+            };
+            if !valid {
+                e.valid = false;
+                break;
+            }
+        }
+        if !bytes.is_ascii() {
+            e.valid = false;
+        }
+        if e.valid && !e.partial && e.stage == 9 {
+            let (expected, outcome) = if e.result == Some(0) {
+                (11, 1)
+            } else if e.datafile_bit == Some(1) || e.image_bit == Some(2) {
+                (0, 2)
+            } else if e.reused == Some(1) {
+                (12, 3)
+            } else {
+                (14, 4)
+            };
+            if exit == Some(expected) {
+                e.outcome = outcome;
+            }
+        }
+        e
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Session0Gdi32ResourceProbeRecord {
+        path: String,
+        sha256: String,
+        // この領域だけStdout/Stderrをraw bytesの小文字hexとして保存する。
+        run: Session0DiagnosticRun,
+        evidence: Option<Gdi32ResourceEvidence>,
+        output_eof: bool,
+        deadline_met: bool,
+    }
+
+    fn gdi32_resource_bytes(text: &str) -> Result<Vec<u8>, String> {
+        if text.len() > 4098 || !text.len().is_multiple_of(2) {
+            return Err("GDI32リソース診断の出力長が不正です".into());
+        }
+        text.as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                if !pair
+                    .iter()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+                {
+                    return Err("GDI32リソース診断の出力hexが不正です".into());
+                }
+                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16)
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+
+    fn gdi32_resource_run_evidence(run: &Session0DiagnosticRun) -> Option<Gdi32ResourceEvidence> {
+        let left = gdi32_resource_bytes(&run.stdout).ok()?;
+        let right = gdi32_resource_bytes(&run.stderr).ok()?;
+        let mut evidence = parse_gdi32_resource_output(&left, run.child_exit);
+        // stderr・隔離・回収は列の成否とは独立したゲートにする。
+        let _ = right;
+        if run.lifecycle != 15 || !run.spawn_error.is_empty() {
+            evidence.outcome = 0;
+        }
+        Some(evidence)
+    }
+
+    impl Session0Gdi32ResourceProbeRecord {
+        fn properties(&self) -> String {
+            self.evidence
+                .as_ref()
+                .map_or_else(|| "invalid".into(), Gdi32ResourceEvidence::properties)
+        }
+
+        fn sequence_verified(&self) -> bool {
+            gdi32_resource_bytes(&self.run.stdout).is_ok_and(|left| {
+                parse_gdi32_resource_output(&left, self.run.child_exit).outcome != 0
+            })
+        }
+
+        fn gates_verified(&self, record: &Session0DiagnosticRecord) -> bool {
+            let run = &self.run;
+            record.session_id == 0
+                && !record.worker_actions_sid.is_empty()
+                && record.station_ace
+                    == format!(
+                        "count=1;flags=0;mask=0x{:08x}",
+                        record.requested_station_mask
+                    )
+                && record.station_cleanup == "removed"
+                && run.spawn_succeeded
+                && run.lifecycle == 15
+                && run.observations_verified(record.requested_station_mask)
+                && run.stderr.is_empty()
+                && run.spawn_error.is_empty()
+                && self.output_eof
+                && self.deadline_met
+                && run.child_exit.is_some()
+        }
+
+        fn validate(&self, record: &Session0DiagnosticRecord) -> Result<(), String> {
+            if record.gdi32_loader_notification_probe.is_none() {
+                return Err("GDI32リソース診断にはGDI32自己loader通知診断が必要です".into());
+            }
+            let pair = record
+                .subsystem_probes
+                .as_ref()
+                .ok_or("GDI32リソース診断にはsubsystem対照が必要です")?;
+            let parent = Path::new(&pair[0].path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            let run = &self.run;
+            if self.path != format!("{parent}\\{}", Session0ProbeKind::Gdi32Resource.basename())
+                || self.sha256.len() != 64
+                || !self
+                    .sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                || (!run.spawn_succeeded
+                    && (run.child_exit.is_some()
+                        || !run.stdout.is_empty()
+                        || !run.stderr.is_empty()))
+                || (run.spawn_succeeded
+                    && (run.job_ui_restrictions != 0xfe
+                        || run.creation_flags != 0x0008_0404
+                        || run.lifecycle & 1 == 0))
+                || (run.lifecycle & 1 != 0
+                    && !run
+                        .target_desktop
+                        .starts_with(&format!("{}\\sbz-", record.station)))
+                || (!run.target_desktop.is_empty()
+                    && [&record.baseline, &record.no_window]
+                        .into_iter()
+                        .chain(record.init_probe.iter().map(|p| &p.run))
+                        .chain(record.entry_probe.iter().map(|p| &p.run))
+                        .chain(record.terminate_probe.iter().map(|p| &p.run))
+                        .chain(pair.iter().map(|p| &p.run))
+                        .chain(record.windows_init_probe.iter().map(|p| &p.run))
+                        .chain(record.windows_startup_probe.iter().map(|p| &p.run))
+                        .chain(record.gdi32_init_probe.iter().map(|p| &p.run))
+                        .chain(record.win32u_init_probe.iter().map(|p| &p.run))
+                        .chain(record.win32u_user32_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_resource_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_resource_load_probe.iter().map(|p| &p.run))
+                        .chain(record.user32_mitigation_probe.iter().map(|p| &p.run))
+                        .chain(record.loader_notification_probe.iter().map(|p| &p.run))
+                        .chain(
+                            record
+                                .gdi32_loader_notification_probe
+                                .iter()
+                                .map(|p| &p.run),
+                        )
+                        .any(|r| r.target_desktop == run.target_desktop))
+                || (self.output_eof && !run.spawn_succeeded)
+                || (self.deadline_met && (!run.spawn_succeeded || run.child_exit.is_none()))
+                || self.evidence != gdi32_resource_run_evidence(run)
+            {
+                return Err("GDI32リソース診断の固定組・実行契約・段階証拠が一致しません".into());
+            }
+            if self.properties().len() > 2048 {
+                return Err("GDI32リソース診断の証拠長が不正です".into());
+            }
+            gdi32_resource_bytes(&run.stdout)?;
+            gdi32_resource_bytes(&run.stderr)?;
+            Ok(())
+        }
+
+        fn encode_into(&self, payload: &mut Writer, mask: u32) -> Result<(), String> {
+            write_text(payload, &self.path)?;
+            write_text(payload, &self.sha256)?;
+            self.run.encode_into(payload, mask)?;
+            write_text(payload, &self.properties())?;
+            payload.bool(self.output_eof);
+            payload.bool(self.deadline_met);
+            Ok(())
+        }
+    }
+
+    fn snapshot_gdi32_resource_output(
+        probe: &mut Session0Gdi32ResourceProbeRecord,
+        left: &[u8],
+        right: &[u8],
+    ) {
+        probe.run.stdout = diagnostic_hex(left);
+        probe.run.stderr = diagnostic_hex(right);
+        probe.evidence = gdi32_resource_run_evidence(&probe.run);
+    }
+
+    // 保存先を起動前に作り、途中の失敗でも先行runの観測を置き換えない。
+    fn collect_session0_gdi32_resource_run(
+        record: &mut Session0DiagnosticRecord,
+        config: &Session0DiagnosticConfig,
+        command: &RestrictedCommand,
+        execute: impl FnOnce(
+            &mut Session0Gdi32ResourceProbeRecord,
+            &RestrictedCommand,
+        ) -> Result<(), String>,
+    ) -> Result<(), Session0DiagnosticFailureStage> {
+        let mut run = Session0DiagnosticRun::empty();
+        run.stdout.clear();
+        run.stderr.clear();
+        record.gdi32_resource_probe = Some(Session0Gdi32ResourceProbeRecord {
+            path: config
+                .fixture_root
+                .join(Session0ProbeKind::Gdi32Resource.basename())
+                .to_string_lossy()
+                .into_owned(),
+            sha256: config.gdi32_resource_probe_sha256.as_ref().unwrap().clone(),
+            evidence: gdi32_resource_run_evidence(&run),
+            run,
+            output_eof: false,
+            deadline_met: false,
+        });
+        let probe = record.gdi32_resource_probe.as_mut().unwrap();
+        let command = RestrictedCommand {
+            application: PathBuf::from(&probe.path),
+            arguments: Vec::new(),
+            cwd: command.cwd.clone(),
+            environment: command.environment.clone(),
+        };
+        if let Err(error) = execute(probe, &command) {
+            probe.run.spawn_error.push_str(&error);
+            probe.evidence = gdi32_resource_run_evidence(&probe.run);
+            return Err(Session0DiagnosticFailureStage::Runtime);
+        }
+        Ok(())
+    }
+
+    fn run_session0_gdi32_resource_child(
+        action: &ActionToken,
+        command: &RestrictedCommand,
+        probe: &mut Session0Gdi32ResourceProbeRecord,
+    ) -> Result<(), String> {
+        let mut process = match RestrictedProcess::spawn_for_session0_diagnostic(
+            action,
+            command,
+            TestCreationProfile::Production,
+            &mut probe.run,
+        ) {
+            Ok(process) => process,
+            Err(error) => {
+                probe.run.spawn_error = format!("spawn: {error}");
+                probe.run.observe_desktop_release();
+                return Ok(());
+            }
+        };
+        probe.run.spawn_succeeded = true;
+        probe.run.job_ui_restrictions = process
+            .job()
+            .ui_restrictions_for_test()
+            .map_err(|e| format!("Job照会失敗: {e}"))?;
+        probe.run.job_ui_limits = describe_job_ui_limits(probe.run.job_ui_restrictions);
+        if probe.run.job_ui_restrictions != 0xfe {
+            return Err("GDI32リソース診断のJob制限が一致しません".into());
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("runtime: {e}"))?;
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let mut output = process
+            .take_output()
+            .ok()
+            .map(|(left, right)| (left.take(2049), right.take(2049)));
+        let start = std::time::Instant::now();
+        let observed = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(
+                    async {
+                        let exit = observe_session0_child_exit(&process).await?;
+                        probe.run.child_exit = Some(exit);
+                        probe.deadline_met = start.elapsed() <= std::time::Duration::from_secs(10);
+                        Ok::<(), io::Error>(())
+                    },
+                    async {
+                        if let Some((stdout, stderr)) = output.as_mut() {
+                            let result = tokio::join!(
+                                stdout.read_to_end(&mut left),
+                                stderr.read_to_end(&mut right)
+                            );
+                            probe.output_eof = matches!(result, (Ok(_), Ok(_)))
+                                && left.len() <= 2048
+                                && right.len() <= 2048;
+                        }
+                    }
+                )
+            })
+            .await
+        });
+        if !matches!(observed, Ok((Ok(()), ()))) {
+            probe
+                .run
+                .spawn_error
+                .push_str("wait: deadline-exceeded-or-query-failed");
+            process.terminate();
+        }
+        // 出力と終了値の保存は、失敗・キャンセルし得る回収awaitより先に行う。
+        snapshot_gdi32_resource_output(probe, &left, &right);
+        let job = Arc::clone(&process.job);
+        let cleanup = runtime.block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                preserve_session0_exit_before_cleanup(
+                    &mut probe.run,
+                    observe_session0_child_exit(&process),
+                    async move {
+                        tokio::task::spawn_blocking(move || job.terminate_and_wait())
+                            .await
+                            .map_err(|_| io::Error::other("診断のJob回収タスクが失敗しました"))?
+                    },
+                ),
+            )
+            .await
+        });
+        if matches!(cleanup, Ok(Ok(()))) {
+            process.tree_finished = true;
+            process.process.take();
+            probe.run.lifecycle |= 4;
+            if !probe.output_eof
+                && let Some((stdout, stderr)) = output.as_mut()
+            {
+                let result = runtime.block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        tokio::join!(
+                            stdout.read_to_end(&mut left),
+                            stderr.read_to_end(&mut right)
+                        )
+                    })
+                    .await
+                });
+                probe.output_eof = matches!(result, Ok((Ok(_), Ok(_))))
+                    && left.len() <= 2048
+                    && right.len() <= 2048;
+            }
+        } else {
+            probe
+                .run
+                .spawn_error
+                .push_str(&format!(";tree_cleanup:{cleanup:?}"));
+        }
+        if !probe.output_eof {
+            probe.run.spawn_error.push_str(";output_eof_unconfirmed");
+        }
+        drop(output);
+        drop(process);
+        probe.run.observe_desktop_release();
+        snapshot_gdi32_resource_output(probe, &left, &right);
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
         Ok(())
     }
@@ -17309,6 +17955,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected: accepted.then_some(parent),
                 });
             };
@@ -17763,6 +18410,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
                         expected_gdi32_loader_notification: None,
+                        expected_gdi32_resource: None,
                         expected_windows_startup: base_case.expected_windows_startup.clone(),
                         expected: accepted.then_some(parent),
                     });
@@ -18252,6 +18900,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                         expected_user32_mitigation: None,
                         expected_loader_notification: None,
                         expected_gdi32_loader_notification: None,
+                        expected_gdi32_resource: None,
                         expected_gdi32_init: base_case.expected_gdi32_init.clone(),
                         expected_windows_startup: base_case.expected_windows_startup.clone(),
                         expected: accepted.then_some(parent),
@@ -18752,6 +19401,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
                     expected_gdi32_init: base_case.expected_gdi32_init.clone(),
                     expected_windows_startup: base_case.expected_windows_startup.clone(),
@@ -19276,6 +19926,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_win32u_user32: base_case.expected_win32u_user32.clone(),
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
                     expected_gdi32_init: base_case.expected_gdi32_init.clone(),
@@ -19660,6 +20311,604 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         );
     }
 
+    fn gdi32_resource_valid_output(
+        snapshot: &str,
+        result: u8,
+        preloaded: u8,
+        datafile: u8,
+        image: u8,
+        reused: u8,
+    ) -> String {
+        let p = "SBZ_GDI32_RESOURCE_PROBE_V1 ";
+        format!(
+            "{p}entry\n{p}before {snapshot}\n{p}gdi32_preloaded={preloaded}\n{p}flags=0x00000860\n{p}gdi32_map_begin\n{p}gdi32_map_result={result} gle=0x12345678\n{p}handle datafile_bit={datafile} image_bit={image} reused={reused}\n{p}after {snapshot}\n{p}complete\n"
+        )
+    }
+
+    fn session0_gdi32_resource_record_corpus() -> Vec<Session0DiagnosticCase> {
+        let mut cases = Vec::new();
+        for base_case in session0_gdi32_loader_notification_record_corpus()
+            .into_iter()
+            .filter(|c| c.name == "gdi32-loader-notification-wire" && c.expected.is_some())
+        {
+            let base = base_case.expected.as_ref().unwrap();
+            let text = gdi32_resource_valid_output(
+                "desktop=null units=0 hex=- user32=0 gdi32=0 win32u=0",
+                1,
+                0,
+                0,
+                2,
+                0,
+            );
+            let mut run = base
+                .gdi32_loader_notification_probe
+                .as_ref()
+                .unwrap()
+                .run
+                .clone();
+            run.target_desktop = format!("{}\\sbz-gdi32-resource", base.station);
+            run.stdout = diagnostic_hex(text.as_bytes());
+            run.stderr.clear();
+            run.child_exit = Some(0);
+            let probe = Session0Gdi32ResourceProbeRecord {
+                path: r"C:\fixture\SbzSession0Gdi32ResourceProbe.exe".into(),
+                sha256: "b".repeat(64),
+                evidence: gdi32_resource_run_evidence(&run),
+                run,
+                output_eof: true,
+                deadline_met: true,
+            };
+            let mut push = |name,
+                            mut changed: Session0Gdi32ResourceProbeRecord,
+                            accepted: bool,
+                            alter: usize| {
+                let mut parent = base.clone();
+                changed.evidence = gdi32_resource_run_evidence(&changed.run);
+                parent.gdi32_resource_probe = Some(changed.clone());
+                if name == "gdi32-resource-station" {
+                    parent.station_cleanup = "unconfirmed".into();
+                    parent.classification = parent.expected_classification();
+                }
+                if matches!(
+                    name,
+                    "gdi32-resource-operational" | "gdi32-resource-station"
+                ) {
+                    assert!(!changed.gates_verified(&parent));
+                    assert_eq!(
+                        changed.sequence_verified(),
+                        changed.run.child_exit == Some(0)
+                    );
+                }
+                let mut expected = (changed.path.clone(), changed.sha256.clone());
+                let mut nonce = base.nonce.clone();
+                let mut mask = base.requested_station_mask;
+                match alter {
+                    1 => nonce = "f".repeat(32),
+                    2 => mask = if mask == 2 { 34 } else { 2 },
+                    3 => expected.0 = expected.0.to_uppercase(),
+                    4 => expected.1 = "c".repeat(64),
+                    _ => (),
+                }
+                let mut bytes = parent.encode().unwrap();
+                let replace_text = |bytes: &mut Vec<u8>, old: &str, new: &str| {
+                    let pos = bytes
+                        .windows(old.len())
+                        .rposition(|v| v == old.as_bytes())
+                        .unwrap();
+                    assert_eq!(
+                        u32::from_le_bytes(bytes[pos - 4..pos].try_into().unwrap()) as usize,
+                        old.len()
+                    );
+                    bytes.splice(pos..pos + old.len(), new.bytes());
+                    bytes[pos - 4..pos].copy_from_slice(&(new.len() as u32).to_le_bytes());
+                };
+                match alter {
+                    5 => {
+                        let n = bytes.len();
+                        bytes[n - 1] = 2;
+                    }
+                    6 => {
+                        bytes.push(0);
+                        let n = (bytes.len() - 44) as u32;
+                        bytes[40..44].copy_from_slice(&n.to_le_bytes());
+                    }
+                    7 => {
+                        bytes[4..8].copy_from_slice(&22u32.to_le_bytes());
+                    }
+                    8 => replace_text(
+                        &mut bytes,
+                        &changed.run.target_desktop,
+                        &base
+                            .gdi32_loader_notification_probe
+                            .as_ref()
+                            .unwrap()
+                            .run
+                            .target_desktop,
+                    ),
+                    9 => replace_text(
+                        &mut bytes,
+                        &changed.run.target_desktop,
+                        &format!("{}\\Default", base.station),
+                    ),
+                    10 => {
+                        expected.0 = base
+                            .gdi32_loader_notification_probe
+                            .as_ref()
+                            .unwrap()
+                            .path
+                            .clone();
+                        replace_text(&mut bytes, &changed.path, &expected.0);
+                    }
+                    11 => replace_text(&mut bytes, &changed.run.stdout, &"ab".repeat(2050)),
+                    12 => replace_text(
+                        &mut bytes,
+                        &changed.properties(),
+                        &changed.properties().replace("null,0,-", "empty,0,-"),
+                    ),
+                    13 => {
+                        let pos = bytes
+                            .windows(changed.path.len())
+                            .rposition(|v| v == changed.path.as_bytes())
+                            .unwrap();
+                        bytes.truncate(pos - 4);
+                    }
+                    15 => replace_text(
+                        &mut bytes,
+                        &changed.run.stdout,
+                        &changed.run.stdout.to_uppercase(),
+                    ),
+                    16 => replace_text(&mut bytes, &changed.run.stdout, &"ab".repeat(2049)),
+                    17 => {
+                        bytes.resize(65581, 0);
+                    }
+                    _ => (),
+                }
+                let length = (bytes.len() - 44) as u32;
+                bytes[40..44].copy_from_slice(&length.to_le_bytes());
+                cases.push(Session0DiagnosticCase {
+                    name,
+                    bytes,
+                    nonce,
+                    expected_mask: mask,
+                    expected_init: base_case.expected_init.clone(),
+                    expected_entry: base_case.expected_entry.clone(),
+                    expected_terminate: base_case.expected_terminate.clone(),
+                    expected_subsystem: base_case.expected_subsystem.clone(),
+                    expected_windows_init: base_case.expected_windows_init.clone(),
+                    expected_user32_resource: base_case.expected_user32_resource.clone(),
+                    expected_gdi32_resource: if alter == 14 { None } else { Some(expected) },
+                    expected_user32_resource_load: base_case.expected_user32_resource_load.clone(),
+                    expected_user32_mitigation: base_case.expected_user32_mitigation.clone(),
+                    expected_loader_notification: base_case.expected_loader_notification.clone(),
+                    expected_gdi32_loader_notification: base_case
+                        .expected_gdi32_loader_notification
+                        .clone(),
+                    expected_win32u_user32: base_case.expected_win32u_user32.clone(),
+                    expected_win32u_init: base_case.expected_win32u_init.clone(),
+                    expected_gdi32_init: base_case.expected_gdi32_init.clone(),
+                    expected_windows_startup: base_case.expected_windows_startup.clone(),
+                    expected: accepted.then_some(parent),
+                });
+            };
+            for alter in 0..18 {
+                push("gdi32-resource-wire", probe.clone(), alter == 0, alter);
+            }
+            for (state, units, hex) in [
+                ("null", 0, "-".into()),
+                ("empty", 0, "-".into()),
+                ("terminated", 1, "d800".into()),
+                ("terminated", 127, "ffff".repeat(127)),
+                ("bounded", 128, "dc00".repeat(128)),
+                ("unreadable", 0, "-".into()),
+                ("unreadable", 127, "0061".repeat(127)),
+            ] {
+                for (result, preloaded, datafile, image, reused, exit, outcome) in [
+                    (0, 0, 0, 0, 0, 11, 1),
+                    (1, 0, 1, 0, 0, 0, 2),
+                    (1, 0, 0, 2, 0, 0, 2),
+                    (1, 1, 0, 0, 1, 12, 3),
+                    (1, 0, 0, 0, 0, 14, 4),
+                ] {
+                    let snapshot = format!(
+                        "desktop={state} units={units} hex={hex} user32=0 gdi32=1 win32u=0"
+                    );
+                    let output = gdi32_resource_valid_output(
+                        &snapshot, result, preloaded, datafile, image, reused,
+                    );
+                    let e = parse_gdi32_resource_output(output.as_bytes(), Some(exit));
+                    assert_eq!(e.outcome, outcome);
+                    assert_eq!(e.stage, 9);
+                    assert_eq!(e.flags, Some(0x860));
+                    assert_eq!(e.before.as_ref().unwrap().state, state);
+                    assert_eq!(e.before.as_ref().unwrap().hex, hex);
+                    assert_eq!(e.after, e.before);
+                    assert_eq!(e.gle, Some(0x12345678));
+                    assert_eq!(e.preloaded, Some(preloaded));
+                    assert_eq!(
+                        (e.result, e.datafile_bit, e.image_bit, e.reused),
+                        (Some(result), Some(datafile), Some(image), Some(reused))
+                    );
+                    let lines: Vec<_> = output.split_inclusive('\n').collect();
+                    for i in (0..=lines.len()).filter(|_| state == "null") {
+                        for observed in [
+                            None,
+                            Some(0),
+                            Some(11),
+                            Some(12),
+                            Some(14),
+                            Some(13),
+                            Some(0xc0000142),
+                            Some(0xc0000005),
+                        ] {
+                            let prefix = lines[..i].concat();
+                            let e = parse_gdi32_resource_output(prefix.as_bytes(), observed);
+                            assert_eq!(e.outcome != 0, i == lines.len() && observed == Some(exit));
+                            assert_eq!(e.stage, i as u8);
+                            let mut changed = probe.clone();
+                            changed.run.stdout = diagnostic_hex(prefix.as_bytes());
+                            changed.run.child_exit = observed;
+                            changed.deadline_met = observed.is_some();
+                            push("gdi32-resource-prefix-exit", changed, true, 0);
+                        }
+                    }
+                    let mut changed = probe.clone();
+                    changed.run.stdout = diagnostic_hex(output.as_bytes());
+                    changed.run.child_exit = Some(exit);
+                    push("gdi32-resource-snapshot", changed, true, 0);
+                }
+            }
+            for malformed in [
+                "desktop=null units=1 hex=0061 user32=0 gdi32=0 win32u=0".to_string(),
+                "desktop=empty units=00 hex=- user32=0 gdi32=0 win32u=0".into(),
+                "desktop=terminated units=0 hex=- user32=0 gdi32=0 win32u=0".into(),
+                "desktop=terminated units=1 hex=0000 user32=0 gdi32=0 win32u=0".into(),
+                "desktop=terminated units=1 hex=D800 user32=0 gdi32=0 win32u=0".into(),
+                "desktop=terminated units=1 hex=00610062 user32=0 gdi32=0 win32u=0".into(),
+                "desktop=bounded units=127 hex=- user32=0 gdi32=0 win32u=0".into(),
+                format!(
+                    "desktop=unreadable units=128 hex={} user32=0 gdi32=0 win32u=0",
+                    "0061".repeat(128)
+                ),
+                "desktop=other units=0 hex=- user32=0 gdi32=0 win32u=0".into(),
+                "desktop=null units=0 hex=- user32=2 gdi32=0 win32u=0".into(),
+            ] {
+                let output = gdi32_resource_valid_output(&malformed, 1, 0, 0, 2, 0);
+                let e = parse_gdi32_resource_output(output.as_bytes(), Some(0));
+                assert!(!e.valid);
+                assert_eq!(e.stage, 1);
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(output.as_bytes());
+                push("gdi32-resource-malformed", changed, true, 0);
+            }
+            let lines: Vec<_> = text.split_inclusive('\n').collect();
+            for i in 0..lines.len() {
+                let mut output = lines.clone();
+                output[i] = "SBZ_GDI32_RESOURCE_PROBE_V1 invalid\n";
+                let output = output.concat();
+                let e = parse_gdi32_resource_output(output.as_bytes(), Some(0));
+                assert!(!e.valid);
+                assert_eq!(e.stage, i as u8);
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(output.as_bytes());
+                push("gdi32-resource-order", changed, true, 0);
+            }
+            for output in [
+                format!("{text}extra\n"),
+                text.replace('\n', "\r\n"),
+                text.replace("gle=0x12345678", "gle=0x1234ABCD"),
+                text.replace("flags=0x00000860", "flags=0x00000800"),
+                text.replace("image_bit=2", "image_bit=1"),
+                text.replace(
+                    "datafile_bit=0 image_bit=2 reused=0",
+                    "datafile_bit=0 image_bit=0 reused=1",
+                ),
+                text.replace("gdi32_map_result=1", "gdi32_map_result=0"),
+            ] {
+                let e = parse_gdi32_resource_output(output.as_bytes(), Some(0));
+                assert!(!e.valid);
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(output.as_bytes());
+                push("gdi32-resource-order", changed, true, 0);
+            }
+            for (name, raw) in [
+                (
+                    "gdi32-resource-partial",
+                    format!(
+                        "{}SBZ_GDI32_RESOURCE_PROBE_V1 gdi32_map_",
+                        lines[..5].concat()
+                    )
+                    .into_bytes(),
+                ),
+                ("gdi32-resource-boundary", vec![b'x'; 2048]),
+                ("gdi32-resource-overlimit", vec![b'x'; 2049]),
+                ("gdi32-resource-raw", vec![255, 10]),
+            ] {
+                let mut changed = probe.clone();
+                changed.run.stdout = diagnostic_hex(&raw);
+                changed.run.child_exit = Some(13);
+                push(name, changed, true, 0);
+            }
+            for name in [
+                "timeout", "cleanup", "desktop", "station", "stderr", "eof", "exit",
+            ] {
+                let mut changed = probe.clone();
+                match name {
+                    "timeout" => {
+                        changed.deadline_met = false;
+                        changed.run.lifecycle = 3;
+                        changed.run.spawn_error = "wait: deadline-exceeded".into();
+                    }
+                    "cleanup" => {
+                        changed.run.lifecycle = 3;
+                        changed.run.spawn_error = "tree_cleanup".into();
+                    }
+                    "desktop" => changed.run.lifecycle = 7,
+                    "stderr" => changed.run.stderr = "ff".into(),
+                    "eof" => changed.output_eof = false,
+                    "exit" => {
+                        changed.run.child_exit = None;
+                        changed.deadline_met = false;
+                    }
+                    _ => (),
+                }
+                push(
+                    if name == "station" {
+                        "gdi32-resource-station"
+                    } else {
+                        "gdi32-resource-operational"
+                    },
+                    changed,
+                    true,
+                    0,
+                );
+            }
+        }
+        // callerが期待する全16組のpath/hashを、それぞれ独立に照合する。
+        let accepted: Vec<_> = cases
+            .iter()
+            .filter(|c| c.name == "gdi32-resource-wire" && c.expected.is_some())
+            .cloned()
+            .collect();
+        for base in accepted {
+            for role in 0..16 {
+                for hash in [false, true] {
+                    let mut changed = base.clone();
+                    changed.name = "gdi32-resource-caller-expectation";
+                    changed.expected = None;
+                    let pair = match role {
+                        0 => changed.expected_init.as_mut().unwrap(),
+                        1 => changed.expected_entry.as_mut().unwrap(),
+                        2 => changed.expected_terminate.as_mut().unwrap(),
+                        3 | 4 => &mut changed.expected_subsystem.as_mut().unwrap()[role - 3],
+                        5 => changed.expected_windows_init.as_mut().unwrap(),
+                        6 => changed.expected_windows_startup.as_mut().unwrap(),
+                        7 => changed.expected_gdi32_init.as_mut().unwrap(),
+                        8 => changed.expected_win32u_init.as_mut().unwrap(),
+                        9 => changed.expected_win32u_user32.as_mut().unwrap(),
+                        10 => changed.expected_user32_resource.as_mut().unwrap(),
+                        11 => changed.expected_user32_resource_load.as_mut().unwrap(),
+                        12 => changed.expected_user32_mitigation.as_mut().unwrap(),
+                        13 => changed.expected_loader_notification.as_mut().unwrap(),
+                        14 => changed.expected_gdi32_loader_notification.as_mut().unwrap(),
+                        _ => changed.expected_gdi32_resource.as_mut().unwrap(),
+                    };
+                    if hash {
+                        pair.1 = "f".repeat(64);
+                    } else {
+                        pair.0.push('x');
+                    }
+                    cases.push(changed);
+                }
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn session0_gdi32_resource_observation_and_retention() {
+        for case in session0_gdi32_resource_record_corpus()
+            .into_iter()
+            .filter(|c| c.name == "gdi32-resource-wire" && c.expected.is_some())
+        {
+            let mut record = case.expected.unwrap();
+            let probe = record.gdi32_resource_probe.as_ref().unwrap();
+            assert!(probe.sequence_verified());
+            assert!(probe.gates_verified(&record));
+            for kind in [
+                Session0ProbeKind::Init,
+                Session0ProbeKind::Entry,
+                Session0ProbeKind::Terminate,
+                Session0ProbeKind::Console,
+                Session0ProbeKind::Windows,
+                Session0ProbeKind::WindowsInit,
+                Session0ProbeKind::WindowsStartup,
+                Session0ProbeKind::Gdi32Init,
+                Session0ProbeKind::Win32uInit,
+                Session0ProbeKind::Win32uUser32,
+                Session0ProbeKind::User32Resource,
+                Session0ProbeKind::User32ResourceLoad,
+                Session0ProbeKind::User32Mitigation,
+                Session0ProbeKind::LoaderNotification,
+                Session0ProbeKind::Gdi32LoaderNotification,
+            ] {
+                let mut changed = record.clone();
+                changed.gdi32_resource_probe.as_mut().unwrap().path =
+                    format!("C:\\fixture\\{}", kind.basename());
+                assert!(changed.encode().is_err());
+            }
+            for bad in ["ABC".to_string(), "ab".repeat(2050)] {
+                let mut changed = record.clone();
+                changed.gdi32_resource_probe.as_mut().unwrap().run.stdout = bad;
+                assert!(changed.encode().is_err());
+            }
+            let mut argv = session0_argv_corpus()
+                .into_iter()
+                .find(|(a, ok)| a.len() == 16 && *ok)
+                .unwrap()
+                .0;
+            argv.extend([
+                "6".repeat(64).into(),
+                "7".repeat(64).into(),
+                "8".repeat(64).into(),
+                "9".repeat(64).into(),
+                "a".repeat(64).into(),
+                "b".repeat(64).into(),
+                "c".repeat(64).into(),
+                "d".repeat(64).into(),
+                "e".repeat(64).into(),
+                "f".repeat(64).into(),
+                "0".repeat(64).into(),
+            ]);
+            let config = validate_window_station_scm_process_argv(&argv).unwrap();
+            for i in 0..18 {
+                for bits in 0..16 {
+                    let mut changed = record.clone();
+                    let run = match i {
+                        0 => &mut changed.baseline,
+                        1 => &mut changed.no_window,
+                        2 => &mut changed.init_probe.as_mut().unwrap().run,
+                        3 => &mut changed.entry_probe.as_mut().unwrap().run,
+                        4 => &mut changed.terminate_probe.as_mut().unwrap().run,
+                        5 | 6 => &mut changed.subsystem_probes.as_mut().unwrap()[i - 5].run,
+                        7 => &mut changed.windows_init_probe.as_mut().unwrap().run,
+                        8 => &mut changed.windows_startup_probe.as_mut().unwrap().run,
+                        9 => &mut changed.gdi32_init_probe.as_mut().unwrap().run,
+                        10 => &mut changed.win32u_init_probe.as_mut().unwrap().run,
+                        11 => &mut changed.win32u_user32_probe.as_mut().unwrap().run,
+                        12 => &mut changed.user32_resource_probe.as_mut().unwrap().run,
+                        13 => &mut changed.user32_resource_load_probe.as_mut().unwrap().run,
+                        14 => &mut changed.user32_mitigation_probe.as_mut().unwrap().run,
+                        15 => &mut changed.loader_notification_probe.as_mut().unwrap().run,
+                        16 => {
+                            &mut changed
+                                .gdi32_loader_notification_probe
+                                .as_mut()
+                                .unwrap()
+                                .run
+                        }
+                        _ => &mut changed.gdi32_resource_probe.as_mut().unwrap().run,
+                    };
+                    run.lifecycle = bits;
+                    let confirmed = session0_gdi32_resource_resources_finished(&changed);
+                    assert_eq!(
+                        session0_requested_resources_finished(&config, &changed),
+                        confirmed
+                    );
+                    assert_eq!(confirmed, bits & 12 == 12);
+                    let owned = Arc::new(());
+                    let mut held = Session0RetainedResources(Some(Arc::clone(&owned)));
+                    held.release_if_confirmed(confirmed);
+                    drop(held);
+                    assert_eq!(Arc::strong_count(&owned), if confirmed { 1 } else { 2 });
+                }
+            }
+            let before = record.clone();
+            let result = collect_session0_gdi32_resource_run(
+                &mut record,
+                &config,
+                &RestrictedCommand::new("unused.exe", r"C:\fixture"),
+                |p, c| {
+                    assert_eq!(
+                        c.application,
+                        config
+                            .fixture_root
+                            .join(Session0ProbeKind::Gdi32Resource.basename())
+                    );
+                    assert!(c.arguments.is_empty());
+                    p.run = before.gdi32_resource_probe.as_ref().unwrap().run.clone();
+                    p.run.child_exit = Some(11);
+                    p.run.lifecycle = 3;
+                    let output = gdi32_resource_valid_output(
+                        "desktop=empty units=0 hex=- user32=0 gdi32=0 win32u=0",
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    snapshot_gdi32_resource_output(p, output.as_bytes(), &[]);
+                    assert_eq!(p.evidence.as_ref().unwrap().stage, 9);
+                    assert_eq!(p.evidence.as_ref().unwrap().gle, Some(0x12345678));
+                    Err("回収失敗".into())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(record.baseline, before.baseline);
+            assert_eq!(record.no_window, before.no_window);
+            assert_eq!(record.init_probe, before.init_probe);
+            assert_eq!(record.entry_probe, before.entry_probe);
+            assert_eq!(record.terminate_probe, before.terminate_probe);
+            assert_eq!(record.subsystem_probes, before.subsystem_probes);
+            assert_eq!(record.windows_init_probe, before.windows_init_probe);
+            assert_eq!(record.windows_startup_probe, before.windows_startup_probe);
+            assert_eq!(record.gdi32_init_probe, before.gdi32_init_probe);
+            assert_eq!(record.win32u_init_probe, before.win32u_init_probe);
+            assert_eq!(record.win32u_user32_probe, before.win32u_user32_probe);
+            assert_eq!(
+                record.gdi32_loader_notification_probe,
+                before.gdi32_loader_notification_probe
+            );
+            assert_eq!(
+                record.loader_notification_probe,
+                before.loader_notification_probe
+            );
+            assert_eq!(
+                record.user32_mitigation_probe,
+                before.user32_mitigation_probe
+            );
+            assert_eq!(
+                record.user32_resource_load_probe,
+                before.user32_resource_load_probe
+            );
+            assert_eq!(record.user32_resource_probe, before.user32_resource_probe);
+            assert_eq!(
+                record.gdi32_resource_probe.as_ref().unwrap().run.child_exit,
+                Some(11)
+            );
+            assert_eq!(
+                record
+                    .gdi32_resource_probe
+                    .as_ref()
+                    .unwrap()
+                    .evidence
+                    .as_ref()
+                    .unwrap()
+                    .stage,
+                9
+            );
+            let p = record.gdi32_resource_probe.as_mut().unwrap();
+            let prior = p.evidence.clone();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let failed = runtime.block_on(preserve_session0_exit_before_cleanup(
+                &mut p.run,
+                async { panic!("取得済み終了値の再照会は禁止") },
+                async { Err(io::Error::other("回収失敗")) },
+            ));
+            assert!(failed.is_err());
+            assert_eq!(p.run.child_exit, Some(11));
+            assert_eq!(p.evidence, prior);
+            let timed = runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(1),
+                    preserve_session0_exit_before_cleanup(
+                        &mut p.run,
+                        async { panic!("取得済み終了値の再照会は禁止") },
+                        std::future::pending::<io::Result<()>>(),
+                    ),
+                )
+                .await
+            });
+            assert!(timed.is_err());
+            assert_eq!(p.run.child_exit, Some(11));
+        }
+        eprintln!(
+            "GDI32_RESOURCE_BOTH_MASKS=True ALL_18_RUNS_RETAINED=True PREFIX_EXIT_BEFORE_CLEANUP=True EARLIER_17_RUNS_PRESERVED=True"
+        );
+    }
+
     // 二段階の固定列を生成し、resource失敗時は第2未到達の列にする。
     fn user32_resource_load_valid_output(
         snapshot: &str,
@@ -19829,6 +21078,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected_user32_resource: base_case.expected_user32_resource.clone(),
                     expected_win32u_user32: base_case.expected_win32u_user32.clone(),
                     expected_win32u_init: base_case.expected_win32u_init.clone(),
@@ -20267,6 +21517,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected: Some(record),
                 });
             }
@@ -20456,6 +21707,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     expected_user32_mitigation: None,
                     expected_loader_notification: None,
                     expected_gdi32_loader_notification: None,
+                    expected_gdi32_resource: None,
                     expected: accepted.then_some(parent),
                 });
             }
@@ -20737,11 +21989,21 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 .is_some_and(|p| p.run.lifecycle & 12 == 12)
     }
 
+    fn session0_gdi32_resource_resources_finished(record: &Session0DiagnosticRecord) -> bool {
+        session0_gdi32_loader_notification_resources_finished(record)
+            && record
+                .gdi32_resource_probe
+                .as_ref()
+                .is_some_and(|p| p.run.lifecycle & 12 == 12)
+    }
+
     fn session0_requested_resources_finished(
         config: &Session0DiagnosticConfig,
         record: &Session0DiagnosticRecord,
     ) -> bool {
-        if config.gdi32_loader_notification_probe_sha256.is_some() {
+        if config.gdi32_resource_probe_sha256.is_some() {
+            session0_gdi32_resource_resources_finished(record)
+        } else if config.gdi32_loader_notification_probe_sha256.is_some() {
             session0_gdi32_loader_notification_resources_finished(record)
         } else if config.loader_notification_probe_sha256.is_some() {
             session0_loader_notification_resources_finished(record)
@@ -20962,6 +22224,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         user32_mitigation_probe: Option<Session0User32MitigationProbeRecord>,
         loader_notification_probe: Option<Session0LoaderNotificationProbeRecord>,
         gdi32_loader_notification_probe: Option<Session0Gdi32LoaderNotificationProbeRecord>,
+        gdi32_resource_probe: Option<Session0Gdi32ResourceProbeRecord>,
     }
 
     impl Session0DiagnosticRecord {
@@ -21046,6 +22309,7 @@ user32_resource_load_probe: None,
 user32_mitigation_probe: None,
 loader_notification_probe: None,
 gdi32_loader_notification_probe: None,
+gdi32_resource_probe: None,
             }
         }
 
@@ -21226,13 +22490,19 @@ gdi32_loader_notification_probe: None,
                 probe.validate(self)?;
                 probe.encode_into(&mut payload, self.requested_station_mask)?;
             }
+            if let Some(probe) = &self.gdi32_resource_probe {
+                probe.validate(self)?;
+                probe.encode_into(&mut payload, self.requested_station_mask)?;
+            }
             let payload = payload.into_bytes();
             if payload.len() > Self::MAX_BYTES {
                 return Err("diagnostic record too large".into());
             }
             let mut bytes = Vec::with_capacity(44 + payload.len());
             bytes.extend_from_slice(&SESSION0_DIAGNOSTIC_MAGIC.to_le_bytes());
-            let version = if self.gdi32_loader_notification_probe.is_some() {
+            let version = if self.gdi32_resource_probe.is_some() {
+                23
+            } else if self.gdi32_loader_notification_probe.is_some() {
                 22
             } else if self.loader_notification_probe.is_some() {
                 21
@@ -21289,6 +22559,7 @@ gdi32_loader_notification_probe: None,
                 user32_mitigation: expected_user32_mitigation,
                 loader_notification: expected_loader_notification,
                 gdi32_loader_notification: expected_gdi32_loader_notification,
+                gdi32_resource: expected_gdi32_resource,
             } = expected_probes;
             validate_nonce(expected_nonce)?;
             diagnostic_station_profile(expected_mask)?;
@@ -21300,7 +22571,9 @@ gdi32_loader_notification_probe: None,
             };
             if u32_at(0) != SESSION0_DIAGNOSTIC_MAGIC
                 || u32_at(4)
-                    != if expected_gdi32_loader_notification.is_some() {
+                    != if expected_gdi32_resource.is_some() {
+                        23
+                    } else if expected_gdi32_loader_notification.is_some() {
                         22
                     } else if expected_loader_notification.is_some() {
                         21
@@ -21704,6 +22977,32 @@ gdi32_loader_notification_probe: None,
             } else {
                 None
             };
+            let gdi32_resource_probe =
+                if let Some((expected_path, expected_hash)) = expected_gdi32_resource {
+                    let path = read_text(&mut reader)?;
+                    let sha256 = read_text(&mut reader)?;
+                    if path != expected_path || sha256 != expected_hash {
+                        return Err(
+                            "GDI32リソース診断のpath・hashが呼出側の期待値と一致しません".into(),
+                        );
+                    }
+                    let run = Session0DiagnosticRun::decode_from(&mut reader)?;
+                    let properties = read_text(&mut reader)?;
+                    let probe = Session0Gdi32ResourceProbeRecord {
+                        path,
+                        sha256,
+                        evidence: gdi32_resource_run_evidence(&run),
+                        run,
+                        output_eof: read_strict_bool(&mut reader)?,
+                        deadline_met: read_strict_bool(&mut reader)?,
+                    };
+                    if properties != probe.properties() {
+                        return Err("GDI32リソース診断の段階証拠が出力と一致しません".into());
+                    }
+                    Some(probe)
+                } else {
+                    None
+                };
             reader.finish().map_err(|_| "diagnostic trailing")?;
             let record = Self {
                 nonce,
@@ -21744,6 +23043,7 @@ gdi32_loader_notification_probe: None,
                 user32_mitigation_probe,
                 loader_notification_probe,
                 gdi32_loader_notification_probe,
+                gdi32_resource_probe,
             };
             record.encode().map(|_| record)
         }
@@ -21863,10 +23163,6 @@ gdi32_loader_notification_probe: None,
                 || config.gdi32_loader_notification_probe_sha256.is_none())
         {
             return Err("GDI32リソース診断には先行15診断が必要です");
-        }
-        if config.gdi32_resource_probe_sha256.is_some() {
-            // 実行・独立記録・回収が揃うまで、設定登録とdispatcherより前に拒否する。
-            return Err("GDI32リソース診断の実行・記録・回収は未接続です");
         }
         if config.gdi32_loader_notification_probe_sha256.is_some()
             && (config.init_probe_sha256.is_none()
@@ -22808,6 +24104,7 @@ privileges={privileges:?}{restricted}",
             user32_mitigation_probe: None,
             loader_notification_probe: None,
             gdi32_loader_notification_probe: None,
+            gdi32_resource_probe: None,
         };
         let lease = match ActionStationLease::acquire_for_diagnostic(config.station_profile) {
             Ok(lease) => Arc::new(lease),
@@ -22982,6 +24279,7 @@ privileges={privileges:?}{restricted}",
                 Session0ProbeKind::User32Mitigation,
                 Session0ProbeKind::LoaderNotification,
                 Session0ProbeKind::Gdi32LoaderNotification,
+                Session0ProbeKind::Gdi32Resource,
             ] {
                 if kind.expected_hash(config).is_none() {
                     continue;
@@ -23212,6 +24510,11 @@ privileges={privileges:?}{restricted}",
                         run_session0_gdi32_loader_notification_child(&action, command, probe)
                     },
                 )?;
+            }
+            if config.gdi32_resource_probe_sha256.is_some() {
+                collect_session0_gdi32_resource_run(record, config, &command, |probe, command| {
+                    run_session0_gdi32_resource_child(&action, command, probe)
+                })?;
             }
             Ok(())
         })();
