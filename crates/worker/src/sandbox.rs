@@ -2457,6 +2457,7 @@ mod tests {
         loader_notification_probe_sha256: Option<String>,
         gdi32_loader_notification_probe_sha256: Option<String>,
         gdi32_resource_probe_sha256: Option<String>,
+        gdi32_resource_load_probe_sha256: Option<String>,
     }
 
     static SESSION0_DIAGNOSTIC_CONFIG: OnceLock<Session0DiagnosticConfig> = OnceLock::new();
@@ -2566,7 +2567,7 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ];
-        if !matches!(argv.len(), 11..=14 | 16..=27) {
+        if !matches!(argv.len(), 11..=14 | 16..=28) {
             return Err("process argv cardinality");
         }
         if Path::new(&argv[0]).file_name() != Some(OsStr::new(WINDOW_STATION_SCM_SMOKE_BASENAME)) {
@@ -2837,6 +2838,21 @@ mod tests {
         } else {
             None
         };
+        let gdi32_resource_load_probe_sha256 = if let Some(value) = argv.get(27) {
+            let hash = value
+                .to_str()
+                .ok_or("GDI32リソース保持後ロード診断のhashはUTF-8が必要です")?;
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("GDI32リソース保持後ロード診断のhashは小文字16進64桁が必要です");
+            }
+            Some(hash.to_owned())
+        } else {
+            None
+        };
         Ok(Session0DiagnosticConfig {
             fixture_root,
             record_directory,
@@ -2858,6 +2874,7 @@ mod tests {
             loader_notification_probe_sha256,
             gdi32_loader_notification_probe_sha256,
             gdi32_resource_probe_sha256,
+            gdi32_resource_load_probe_sha256,
         })
     }
 
@@ -5718,6 +5735,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
             init_probe_sha256: Some(
                 "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             ),
@@ -5776,6 +5794,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         // InitProbeが同じ内容でも、別名の実体からEntryProbeの証拠を得ない。
         std::fs::write(root.join(SESSION0_INIT_BASENAME), b"abc").unwrap();
@@ -5869,6 +5888,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         // 旧2種類とsource名が存在しても、固定した保護先以外は採用しない。
         let other_names = [
@@ -6038,6 +6058,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::WindowsInit;
         assert_eq!(kind.basename(), "SbzSession0WindowsInitProbe.exe");
@@ -6203,6 +6224,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::WindowsStartup;
         assert_eq!(kind.basename(), "SbzSession0WindowsStartupProbe.exe");
@@ -6371,6 +6393,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::Gdi32Init;
         assert_eq!(kind.basename(), "SbzSession0Gdi32InitProbe.exe");
@@ -6545,6 +6568,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::Win32uInit;
         assert_eq!(kind.basename(), "SbzSession0Win32uInitProbe.exe");
@@ -6722,6 +6746,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::Win32uUser32;
         assert_eq!(kind.basename(), "SbzSession0Win32uUser32Probe.exe");
@@ -6902,6 +6927,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::User32Resource;
         assert_eq!(kind.basename(), "SbzSession0User32ResourceProbe.exe");
@@ -7085,6 +7111,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::User32ResourceLoad;
         assert_eq!(kind.basename(), "SbzSession0User32ResourceLoadProbe.exe");
@@ -7271,6 +7298,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::User32Mitigation;
         assert_eq!(kind.basename(), "SbzSession0User32MitigationProbe.exe");
@@ -7460,6 +7488,7 @@ mod tests {
             loader_notification_probe_sha256: Some(hash.into()),
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::LoaderNotification;
         assert_eq!(kind.basename(), "SbzSession0LoaderNotificationProbe.exe");
@@ -7652,6 +7681,7 @@ mod tests {
             loader_notification_probe_sha256: Some("d".repeat(64)),
             gdi32_loader_notification_probe_sha256: Some(hash.into()),
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::Gdi32LoaderNotification;
         assert_eq!(
@@ -7850,6 +7880,7 @@ mod tests {
             loader_notification_probe_sha256: Some("d".repeat(64)),
             gdi32_loader_notification_probe_sha256: Some("e".repeat(64)),
             gdi32_resource_probe_sha256: Some(hash.into()),
+            gdi32_resource_load_probe_sha256: None,
         };
         let kind = Session0ProbeKind::Gdi32Resource;
         assert_eq!(kind.basename(), "SbzSession0Gdi32ResourceProbe.exe");
@@ -7909,6 +7940,209 @@ mod tests {
         assert!(!root.exists());
         eprintln!(
             "GDI32_RESOURCE_REAL_HOLD=True FIXED_TARGET=True CANDIDATE_CONFUSION_REJECTED=True CLEANED=True"
+        );
+    }
+
+    #[test]
+    fn session0_gdi32_resource_load_arguments_require_predecessors() {
+        let mut argv = session0_argv_corpus()
+            .into_iter()
+            .find(|(argv, accepted)| argv.len() == 16 && *accepted)
+            .unwrap()
+            .0;
+        argv.push("5".repeat(64).into());
+        argv.push("6".repeat(64).into());
+        argv.push("7".repeat(64).into());
+        argv.push("8".repeat(64).into());
+        argv.push("9".repeat(64).into());
+        argv.push("a".repeat(64).into());
+        argv.push("b".repeat(64).into());
+        argv.push("c".repeat(64).into());
+        argv.push("d".repeat(64).into());
+        argv.push("e".repeat(64).into());
+        argv.push("f".repeat(64).into());
+        argv.push("0".repeat(64).into());
+        for mask in ["0x0002", "0x0022"] {
+            argv[10] = mask.into();
+            let config = validate_window_station_scm_process_argv(&argv).unwrap();
+            assert_eq!(
+                config.gdi32_resource_load_probe_sha256.as_deref(),
+                argv[27].to_str()
+            );
+            // 全先行組が揃っても、未接続要求を設定登録前に拒否する。
+            assert_eq!(
+                require_connected_session0_request(&config),
+                Err("GDI32リソース保持後ロード診断の実行・記録・回収は未接続です")
+            );
+            for index in 0..16 {
+                let mut candidate = config.clone();
+                let slots = [
+                    &mut candidate.init_probe_sha256,
+                    &mut candidate.entry_probe_sha256,
+                    &mut candidate.terminate_probe_sha256,
+                    &mut candidate.console_probe_sha256,
+                    &mut candidate.windows_probe_sha256,
+                    &mut candidate.windows_init_probe_sha256,
+                    &mut candidate.windows_startup_probe_sha256,
+                    &mut candidate.gdi32_init_probe_sha256,
+                    &mut candidate.win32u_init_probe_sha256,
+                    &mut candidate.user32_resource_probe_sha256,
+                    &mut candidate.user32_resource_load_probe_sha256,
+                    &mut candidate.user32_mitigation_probe_sha256,
+                    &mut candidate.loader_notification_probe_sha256,
+                    &mut candidate.gdi32_resource_probe_sha256,
+                    &mut candidate.gdi32_loader_notification_probe_sha256,
+                    &mut candidate.win32u_user32_probe_sha256,
+                ];
+                *slots.into_iter().nth(index).unwrap() = None;
+                assert_eq!(
+                    require_connected_session0_request(&candidate),
+                    Err("GDI32リソース保持後ロード診断には先行16診断が必要です")
+                );
+            }
+            for index in 11..28 {
+                for hash in [
+                    String::new(),
+                    "a".repeat(63),
+                    "a".repeat(65),
+                    "A".repeat(64),
+                    "g".repeat(64),
+                    "C:\\other.exe".into(),
+                    format!("{} ", "a".repeat(64)),
+                ] {
+                    let mut changed = argv.clone();
+                    changed[index] = hash.into();
+                    assert!(validate_window_station_scm_process_argv(&changed).is_err());
+                }
+            }
+            for index in 1..11 {
+                let mut changed = argv.clone();
+                changed.swap(index, 27);
+                assert!(validate_window_station_scm_process_argv(&changed).is_err());
+            }
+            for (index, value) in [
+                (0, "C:\\other\\SbzWindowStationScmSmoke.exe"),
+                (8, "C:\\other"),
+                (9, "bad-nonce"),
+                (10, "0x0020"),
+                (10, "0X0002"),
+            ] {
+                let mut changed = argv.clone();
+                changed[index] = value.into();
+                assert!(validate_window_station_scm_process_argv(&changed).is_err());
+            }
+            assert!(
+                validate_window_station_scm_process_argv(
+                    &[argv.clone(), vec!["extra".into()]].concat()
+                )
+                .is_err()
+            );
+        }
+        assert!(SESSION0_DIAGNOSTIC_CONFIG.get().is_none());
+        eprintln!(
+            "GDI32_RESOURCE_LOAD_ARGV=28 BOTH_MASKS=True PREDECESSORS_REQUIRED=True CONFIG_UNREGISTERED=True"
+        );
+    }
+
+    #[test]
+    fn session0_gdi32_resource_load_hold_rejects_candidate_confusion_and_cleanup() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.harness/T-011-N76-files")
+            .join(format!(
+                "rust-{}-{}",
+                std::process::id(),
+                NEXT_FILE.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = PathBuf::from(
+            std::fs::canonicalize(root)
+                .unwrap()
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\"),
+        );
+        let hash = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let mut config = Session0DiagnosticConfig {
+            fixture_root: root.clone(),
+            record_directory: root.clone(),
+            nonce: "0123456789abcdef0123456789abcdef".into(),
+            station_profile: StationAccessProfile::ReadAttributes,
+            init_probe_sha256: Some("0".repeat(64)),
+            entry_probe_sha256: Some("1".repeat(64)),
+            terminate_probe_sha256: Some("2".repeat(64)),
+            console_probe_sha256: Some("3".repeat(64)),
+            windows_probe_sha256: Some("4".repeat(64)),
+            windows_init_probe_sha256: Some("5".repeat(64)),
+            windows_startup_probe_sha256: Some("6".repeat(64)),
+            gdi32_init_probe_sha256: Some("7".repeat(64)),
+            win32u_init_probe_sha256: Some("8".repeat(64)),
+            win32u_user32_probe_sha256: Some("9".repeat(64)),
+            user32_resource_probe_sha256: Some("a".repeat(64)),
+            user32_resource_load_probe_sha256: Some("b".repeat(64)),
+            user32_mitigation_probe_sha256: Some("c".repeat(64)),
+            loader_notification_probe_sha256: Some("d".repeat(64)),
+            gdi32_loader_notification_probe_sha256: Some("e".repeat(64)),
+            gdi32_resource_probe_sha256: Some("f".repeat(64)),
+            gdi32_resource_load_probe_sha256: Some(hash.into()),
+        };
+        let kind = Session0ProbeKind::Gdi32ResourceLoad;
+        assert_eq!(kind.basename(), "SbzSession0Gdi32ResourceLoadProbe.exe");
+        let path = root.join(kind.basename());
+        let wrong_names = [
+            "session0_gdi32_resource_load_probe.exe",
+            "SbzSession0InitProbe.exe",
+            "SbzSession0WindowsProbe.exe",
+            "SbzSession0WindowsInitProbe.exe",
+            "SbzSession0WindowsStartupProbe.exe",
+            "SbzSession0Gdi32InitProbe.exe",
+            "SbzSession0Win32uInitProbe.exe",
+            "SbzSession0User32ResourceProbe.exe",
+            "SbzSession0User32ResourceLoadProbe.exe",
+            "SbzSession0User32MitigationProbe.exe",
+            "SbzSession0LoaderNotificationProbe.exe",
+            "SbzSession0Gdi32ResourceProbe.exe",
+            "SbzSession0Gdi32LoaderNotificationProbe.exe",
+            "SbzSession0Win32uUser32Probe.exe",
+        ];
+        for name in wrong_names {
+            std::fs::write(root.join(name), b"abc").unwrap();
+            assert!(hold_session0_probe(&config, kind).is_err());
+        }
+        std::fs::write(&path, b"abc").unwrap();
+        let (held, actual) = hold_session0_probe(&config, kind).unwrap();
+        assert_eq!(actual, hash);
+        assert!(std::fs::OpenOptions::new().write(true).open(&path).is_err());
+        assert!(std::fs::remove_file(&path).is_err());
+        assert!(std::fs::rename(&path, root.join("replacement.exe")).is_err());
+        for expected in [
+            None,
+            Some("0".repeat(64)),
+            Some("4".repeat(64)),
+            Some(hash.to_uppercase()),
+        ] {
+            config.gdi32_resource_load_probe_sha256 = expected;
+            assert!(hold_session0_probe(&config, kind).is_err());
+        }
+        config.gdi32_resource_load_probe_sha256 = Some(hash.into());
+        config.fixture_root = root.join(".");
+        assert!(hold_session0_probe(&config, kind).is_err());
+        config.fixture_root = root.clone();
+        drop(held);
+        let alias = root.join("alias.exe");
+        std::fs::hard_link(&path, &alias).unwrap();
+        assert!(hold_session0_probe(&config, kind).is_err());
+        std::fs::remove_file(alias).unwrap();
+        for content in [Vec::new(), vec![0; 1024 * 1024 + 1], b"tampered".to_vec()] {
+            std::fs::write(&path, content).unwrap();
+            assert!(hold_session0_probe(&config, kind).is_err());
+        }
+        std::fs::remove_file(&path).unwrap();
+        for name in wrong_names {
+            std::fs::remove_file(root.join(name)).unwrap();
+        }
+        std::fs::remove_dir(&root).unwrap();
+        assert!(!root.exists());
+        eprintln!(
+            "GDI32_RESOURCE_LOAD_REAL_HOLD=True FIXED_TARGET=True CANDIDATE_CONFUSION_REJECTED=True CLEANED=True"
         );
     }
 
@@ -7988,6 +8222,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
         };
         let kinds = [Session0ProbeKind::Console, Session0ProbeKind::Windows];
         for (index, kind) in kinds.into_iter().enumerate() {
@@ -8146,6 +8381,7 @@ mod tests {
             loader_notification_probe_sha256: None,
             gdi32_loader_notification_probe_sha256: None,
             gdi32_resource_probe_sha256: None,
+            gdi32_resource_load_probe_sha256: None,
             init_probe_sha256: Some(
                 std::env::var("SEMBAZURU_TEST_INIT_SHA256").expect("ビルド済みEXEの独立hash"),
             ),
@@ -22064,6 +22300,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
         LoaderNotification,
         Gdi32LoaderNotification,
         Gdi32Resource,
+        Gdi32ResourceLoad,
     }
 
     impl Session0ProbeKind {
@@ -22085,6 +22322,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                 Self::LoaderNotification => "SbzSession0LoaderNotificationProbe.exe",
                 Self::Gdi32LoaderNotification => "SbzSession0Gdi32LoaderNotificationProbe.exe",
                 Self::Gdi32Resource => "SbzSession0Gdi32ResourceProbe.exe",
+                Self::Gdi32ResourceLoad => "SbzSession0Gdi32ResourceLoadProbe.exe",
             }
         }
 
@@ -22108,6 +22346,7 @@ globalatoms=0;desktop=0;exitwindows=0;unknown=0x00000000"
                     config.gdi32_loader_notification_probe_sha256.as_deref()
                 }
                 Self::Gdi32Resource => config.gdi32_resource_probe_sha256.as_deref(),
+                Self::Gdi32ResourceLoad => config.gdi32_resource_load_probe_sha256.as_deref(),
             }
         }
     }
@@ -23145,6 +23384,30 @@ gdi32_resource_probe: None,
     fn require_connected_session0_request(
         config: &Session0DiagnosticConfig,
     ) -> Result<(), &'static str> {
+        if config.gdi32_resource_load_probe_sha256.is_some()
+            && (config.init_probe_sha256.is_none()
+                || config.entry_probe_sha256.is_none()
+                || config.terminate_probe_sha256.is_none()
+                || config.console_probe_sha256.is_none()
+                || config.windows_probe_sha256.is_none()
+                || config.windows_init_probe_sha256.is_none()
+                || config.windows_startup_probe_sha256.is_none()
+                || config.gdi32_init_probe_sha256.is_none()
+                || config.win32u_init_probe_sha256.is_none()
+                || config.win32u_user32_probe_sha256.is_none()
+                || config.user32_resource_probe_sha256.is_none()
+                || config.user32_resource_load_probe_sha256.is_none()
+                || config.user32_mitigation_probe_sha256.is_none()
+                || config.loader_notification_probe_sha256.is_none()
+                || config.gdi32_loader_notification_probe_sha256.is_none()
+                || config.gdi32_resource_probe_sha256.is_none())
+        {
+            return Err("GDI32リソース保持後ロード診断には先行16診断が必要です");
+        }
+        if config.gdi32_resource_load_probe_sha256.is_some() {
+            // 実行・独立記録・回収が揃うまで、設定登録とdispatcherより前に拒否する。
+            return Err("GDI32リソース保持後ロード診断の実行・記録・回収は未接続です");
+        }
         if config.gdi32_resource_probe_sha256.is_some()
             && (config.init_probe_sha256.is_none()
                 || config.entry_probe_sha256.is_none()
