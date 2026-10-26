@@ -8,6 +8,16 @@ use zeroize::Zeroizing;
 /// Maximum UTF-8 byte length accepted for a fixed machine cluster token.
 pub const MAX_MACHINE_CLUSTER_TOKEN_BYTES: usize = 64 * 1024;
 
+/// Maximum byte length accepted for one fixed machine configuration body.
+pub const MAX_MACHINE_CONFIG_BYTES: usize = 1024 * 1024;
+
+mod join;
+
+pub use join::{
+    JOIN_PAYLOAD_MAGIC, JOIN_PAYLOAD_VERSION, JoinField, JoinPayload, JoinPayloadError,
+    MAX_JOIN_PAYLOAD_BYTES,
+};
+
 #[cfg(windows)]
 mod windows;
 
@@ -246,6 +256,29 @@ pub fn apply_or_resume_machine_cluster_token_update(
     guard: &mut MachineTokenUpdateGuard,
 ) -> Result<(), MachineStoreError> {
     platform::apply_token_update(&mut guard.inner)
+}
+
+/// Applies one complete join transaction as a single machine cluster-token update.
+///
+/// The three targets travel together because the journal accepts them as one transaction; a join
+/// that changed only some of them would leave the machine in a state no single authorization covers.
+pub fn apply_machine_join_payload(
+    guard: &mut MachineTokenUpdateGuard,
+    payload: &JoinPayload,
+) -> Result<MachineTokenMaintenanceResult, MachineStoreError> {
+    // A join that died between preparing and applying leaves a journal behind. The store then
+    // refuses both a new preparation and a service start, so the pending transaction is finished
+    // first; resuming it is what the journal exists for.
+    if machine_cluster_token_update_pending(guard)? {
+        apply_or_resume_machine_cluster_token_update(guard)?;
+    }
+    match prepare_machine_cluster_token_update(guard, payload.update())? {
+        MachineTokenUpdatePreparation::NoChange => Ok(MachineTokenMaintenanceResult::Unchanged),
+        MachineTokenUpdatePreparation::JournalReady => {
+            apply_or_resume_machine_cluster_token_update(guard)?;
+            Ok(MachineTokenMaintenanceResult::Changed)
+        }
+    }
 }
 
 /// Outcome of one fixed machine cluster-token maintenance operation.

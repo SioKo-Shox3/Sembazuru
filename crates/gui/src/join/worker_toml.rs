@@ -27,6 +27,9 @@ pub enum JoinError {
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkerJoin {
     pub agent: String,
+    /// Never serialized. The machine store keeps the token as a DPAPI secret, so it travels in the
+    /// join payload's own field; a copy in `worker.toml` would be a second, weaker home for it.
+    #[serde(skip)]
     pub cluster_token: String,
     pub listen_addr: String,
     pub advertise: String,

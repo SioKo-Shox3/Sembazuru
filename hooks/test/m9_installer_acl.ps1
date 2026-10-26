@@ -142,10 +142,36 @@ function Assert-StaticLifecycleSource {
         $found = @($document.SelectNodes($query, $namespaces))
         if ($found.Count -ne 0) { $failures.Add("legacy ProgramData authoring remains: $query") }
     }
-    $externalStoreCtl = @($document.SelectNodes(
+    # storectl is installed under Program Files as the elevated join helper (ADR 0018), AND stays
+    # an embedded Binary stream for the lifecycle actions. Both are required, and the installed copy
+    # has to be exactly one file, in the Binaries group, with no PATH entry or shortcut of its own.
+    $installedStoreCtl = @($document.SelectNodes(
         "//w:File[contains(@Source, 'storectl') or contains(@Id, 'StoreCtl')]", $namespaces))
-    if ($externalStoreCtl.Count -ne 0) {
-        $failures.Add('storectl must remain an embedded Binary stream, not an installed File')
+    if ($installedStoreCtl.Count -ne 1) {
+        $failures.Add("storectl must be installed exactly once as a File (found $($installedStoreCtl.Count))")
+    }
+    else {
+        $file = $installedStoreCtl[0]
+        if ($file.GetAttribute('Id') -cne 'StoreCtlExeFile' -or
+            $file.GetAttribute('Source') -cne '$(var.RustTarget)\sembazuru-storectl.exe' -or
+            $file.GetAttribute('KeyPath') -cne 'yes') {
+            $failures.Add('the installed storectl File must be StoreCtlExeFile keyed from $(var.RustTarget)')
+        }
+        $component = $file.ParentNode
+        if ($component.LocalName -cne 'Component' -or
+            $component.GetAttribute('Id') -cne 'StoreCtlExe' -or
+            $component.ParentNode.GetAttribute('Id') -cne 'Binaries' -or
+            $component.ParentNode.GetAttribute('Directory') -cne 'INSTALLFOLDER') {
+            $failures.Add('the installed storectl must sit in the Binaries group under INSTALLFOLDER')
+        }
+        if (@($component.SelectNodes('.//w:Environment | .//w:Shortcut', $namespaces)).Count -ne 0) {
+            $failures.Add('the installed storectl must not add a PATH entry or a shortcut')
+        }
+    }
+    $embeddedStoreCtl = @($document.SelectNodes(
+        "//w:Binary[@Id='MachineStoreCtlBinary']", $namespaces))
+    if ($embeddedStoreCtl.Count -ne 1) {
+        $failures.Add('the lifecycle actions must keep their embedded storectl Binary stream')
     }
 
     $projectPath = Join-Path (Split-Path $Path -Parent) 'Package.wixproj'
@@ -372,7 +398,9 @@ function Assert-MsiLifecycleTables {
             [pscustomobject]@{ Table = 'Directory'; Column = 'Directory'; Values = @('DataFolder', 'ScratchFolder', 'CasFolder') },
             [pscustomobject]@{ Table = 'Component'; Column = 'Component'; Values = @('DataFolderComp', 'ScratchFolderComp', 'CasFolderComp') },
             [pscustomobject]@{ Table = 'CustomAction'; Column = 'Action'; Values = @('WixRemoveFoldersEx', 'MsiLockPermissionsEx') },
-            [pscustomobject]@{ Table = 'File'; Column = 'File'; Values = @('MachineStoreCtlBinary', 'StoreCtlExeFile') })) {
+            # The embedded stream must never become a File row; the installed helper is checked
+            # separately below, because it is now required rather than forbidden.
+            [pscustomobject]@{ Table = 'File'; Column = 'File'; Values = @('MachineStoreCtlBinary') })) {
             foreach ($value in $legacy.Values) {
                 $rows = @(Invoke-MsiQuery -Database $database -Columns 1 -Sql `
                     "SELECT ``$($legacy.Column)`` FROM ``$($legacy.Table)`` WHERE ``$($legacy.Column)``='$value'")
@@ -383,11 +411,17 @@ function Assert-MsiLifecycleTables {
         }
         $fileRows = @(Invoke-MsiQuery -Database $database -Columns 2 -Sql `
             'SELECT `File`, `FileName` FROM `File`')
-        foreach ($row in $fileRows) {
-            if ([string]$row[0] -match '(?i)storectl' -or
-                [string]$row[1] -match '(?i)storectl') {
-                $failures.Add("storectl escaped into File table: File=$($row[0]) FileName=$($row[1])")
-            }
+        $storeCtlRows = @($fileRows | Where-Object {
+            [string]$_[0] -match '(?i)storectl' -or [string]$_[1] -match '(?i)storectl'
+        })
+        # Exactly one storectl file ships, and it is the join helper. Any other row carrying that
+        # name is something nobody authored on purpose.
+        if ($storeCtlRows.Count -ne 1) {
+            $failures.Add("expected exactly one storectl File row, found $($storeCtlRows.Count)")
+        }
+        elseif ([string]$storeCtlRows[0][0] -cne 'StoreCtlExeFile' -or
+            [string]$storeCtlRows[0][1] -notmatch '(?i)sembazuru-storectl\.exe$') {
+            $failures.Add("unexpected storectl File row: File=$($storeCtlRows[0][0]) FileName=$($storeCtlRows[0][1])")
         }
 
         if ($failures.Count -ne 0) {

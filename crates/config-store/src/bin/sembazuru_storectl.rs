@@ -3,8 +3,9 @@ use std::fmt;
 use std::io::{self, IsTerminal, Read};
 
 use sembazuru_config_store::{
-    MAX_MACHINE_CLUSTER_TOKEN_BYTES, MachineStoreError, MachineStoreErrorClass,
-    MachineTokenMaintenanceResult, MachineTokenUpdateGuard, begin_machine_token_update,
+    JoinPayload, JoinPayloadError, MAX_JOIN_PAYLOAD_BYTES, MAX_MACHINE_CLUSTER_TOKEN_BYTES,
+    MachineStoreError, MachineStoreErrorClass, MachineTokenMaintenanceResult,
+    MachineTokenUpdateGuard, apply_machine_join_payload, begin_machine_token_update,
     clear_machine_cluster_token_storage, commit_machine_store_provision,
     migrate_machine_cluster_token_storage, provision_fresh_machine_store,
     rollback_machine_store_provision, rotate_machine_cluster_token_storage,
@@ -21,6 +22,7 @@ enum Verb {
     MigrateToken,
     RotateToken,
     ClearToken,
+    Join,
 }
 
 impl Verb {
@@ -33,13 +35,14 @@ impl Verb {
             Self::MigrateToken => "migrate-token",
             Self::RotateToken => "rotate-token",
             Self::ClearToken => "clear-token",
+            Self::Join => "join",
         }
     }
 
     const fn is_token_maintenance(self) -> bool {
         matches!(
             self,
-            Self::MigrateToken | Self::RotateToken | Self::ClearToken
+            Self::MigrateToken | Self::RotateToken | Self::ClearToken | Self::Join
         )
     }
 }
@@ -82,6 +85,8 @@ enum CliError {
     Unsupported,
     Lifecycle(MachineStoreErrorClass),
     TokenMaintenance(MachineStoreErrorClass),
+    /// The join was written, but the services did not come back on the new configuration.
+    JoinNotApplied,
 }
 
 impl CliError {
@@ -112,6 +117,7 @@ impl CliError {
             Self::TokenMaintenance(MachineStoreErrorClass::Busy) => "token-update-busy",
             Self::TokenMaintenance(MachineStoreErrorClass::InvalidInput) => "invalid-token-input",
             Self::TokenMaintenance(MachineStoreErrorClass::Io) => "token-io-failed",
+            Self::JoinNotApplied => "join-saved-not-applied",
         }
     }
 
@@ -124,6 +130,7 @@ impl CliError {
             Self::Unsupported => 5,
             Self::Lifecycle(_) => 10,
             Self::TokenMaintenance(_) => 11,
+            Self::JoinNotApplied => 12,
         }
     }
 }
@@ -134,7 +141,56 @@ const fn token_success(verb: Verb, result: MachineTokenMaintenanceResult) -> Opt
         (Verb::MigrateToken, MachineTokenMaintenanceResult::Changed) => Some("token-migrated"),
         (Verb::RotateToken, MachineTokenMaintenanceResult::Changed) => Some("token-rotated"),
         (Verb::ClearToken, MachineTokenMaintenanceResult::Changed) => Some("token-cleared"),
+        (Verb::Join, MachineTokenMaintenanceResult::Changed) => Some("join-applied"),
         _ => None,
+    }
+}
+
+/// The name of the one-shot pipe the join payload arrives on. It is not a secret: the transport's
+/// protection is the pipe's own security descriptor and the peer check, never the name's obscurity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PipeName(String);
+
+impl PipeName {
+    const PREFIX: &'static str = r"\\.\pipe\";
+    const MAX_COMPONENT_BYTES: usize = 200;
+
+    fn parse(value: &std::ffi::OsStr) -> Result<Self, CliError> {
+        let value = value.to_str().ok_or(CliError::InvalidArguments)?;
+        let component = value
+            .strip_prefix(Self::PREFIX)
+            .ok_or(CliError::InvalidArguments)?;
+        // One component of the local pipe namespace, so a name can never redirect this read at a
+        // remote server or at another kind of object.
+        if component.is_empty()
+            || component.len() > Self::MAX_COMPONENT_BYTES
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(CliError::InvalidArguments);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The one input a verb may carry. A verb never accepts the other kind.
+enum VerbInput<'a> {
+    None,
+    Secret(&'a SecretInput),
+    Join(&'a JoinPayload),
+}
+
+impl VerbInput<'_> {
+    const fn matches(&self, verb: Verb) -> bool {
+        matches!(
+            (verb, self),
+            (Verb::RotateToken, Self::Secret(_)) | (Verb::Join, Self::Join(_))
+        ) || (!matches!(verb, Verb::RotateToken | Verb::Join) && matches!(self, Self::None))
     }
 }
 
@@ -181,6 +237,15 @@ trait StoreActions {
     fn migrate_token(&mut self, update: &mut Self::Update) -> TokenResult;
     fn rotate_token(&mut self, update: &mut Self::Update, secret: &SecretInput) -> TokenResult;
     fn clear_token(&mut self, update: &mut Self::Update) -> TokenResult;
+    fn join(&mut self, update: &mut Self::Update, payload: &JoinPayload) -> TokenResult;
+    /// Takes the machine-wide exclusion that covers one whole stop-update-start sequence.
+    ///
+    /// The update lease alone cannot do this: it is released before the services are started, and
+    /// two joins interleaving their stops and starts would otherwise be free to cross.
+    fn begin_join_exclusion(&mut self) -> StoreResult<()>;
+    fn end_join_exclusion(&mut self);
+    fn stop_services(&mut self) -> StoreResult<()>;
+    fn start_services(&mut self) -> StoreResult<()>;
 }
 
 type StoreResult<T> = Result<T, MachineStoreErrorClass>;
@@ -208,7 +273,232 @@ fn classify_backend_error(
     error.classification()
 }
 
-struct MachineStoreLifecycle;
+/// The machine-wide exclusion that covers one whole join sequence.
+#[cfg(windows)]
+mod join_exclusion {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{
+        GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    /// One name for the whole machine: joins from different sessions have to exclude each other.
+    const NAME: &str = r"Global\SembazuruJoinSequence";
+
+    /// A join stops services, writes, and starts them again; this only bounds a true hang.
+    const TIMEOUT_MS: u32 = 120_000;
+
+    /// One held join exclusion. Dropping the handle without releasing would leave the mutex
+    /// abandoned, so the release is explicit and the handle is closed after it.
+    pub(super) struct Exclusion(OwnedHandle);
+
+    pub(super) fn acquire(slot: &mut Option<Exclusion>) -> StoreResult<()> {
+        if slot.is_some() {
+            // A second acquire in one process would deadlock on a non-recursive wait.
+            return Err(MachineStoreErrorClass::Busy);
+        }
+        let name: Vec<u16> = NAME.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: the name is NUL-terminated and live for the call; ownership is taken below.
+        let handle = unsafe { CreateMutexW(null_mut(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            // SAFETY: GetLastError is read immediately after the failing call.
+            let _ = unsafe { GetLastError() };
+            return Err(MachineStoreErrorClass::Io);
+        }
+        // SAFETY: CreateMutexW returned one owned kernel handle.
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        // SAFETY: the handle is a live mutex handle.
+        match unsafe { WaitForSingleObject(handle.as_raw_handle() as _, TIMEOUT_MS) } {
+            // An abandoned mutex means a previous join died holding it. Its own transaction is
+            // either journalled or absent, so this join may proceed and the store decides.
+            WAIT_OBJECT_0 | WAIT_ABANDONED => {
+                *slot = Some(Exclusion(handle));
+                Ok(())
+            }
+            WAIT_TIMEOUT => Err(MachineStoreErrorClass::Busy),
+            _ => Err(MachineStoreErrorClass::Io),
+        }
+    }
+
+    pub(super) fn release(slot: &mut Option<Exclusion>) {
+        if let Some(exclusion) = slot.take() {
+            // SAFETY: this process owns the mutex; releasing before the handle closes keeps the
+            // next join from seeing it abandoned.
+            unsafe { ReleaseMutex(exclusion.0.as_raw_handle() as _) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod join_exclusion {
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    pub(super) struct Exclusion;
+
+    pub(super) fn acquire(_slot: &mut Option<Exclusion>) -> StoreResult<()> {
+        Err(MachineStoreErrorClass::Unsupported)
+    }
+
+    pub(super) fn release(_slot: &mut Option<Exclusion>) {}
+}
+
+/// Stopping and starting exactly the two Sembazuru services, in the order their leases allow.
+#[cfg(windows)]
+mod service_control {
+    use std::ffi::OsStr;
+    use std::time::{Duration, Instant};
+
+    use windows_service::service::{Service, ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    /// The two fixed names, nothing free-form. The worker runs the actions the daemon hands it, so
+    /// it stops first and starts last.
+    const STOP_ORDER: [&str; 2] = ["SembazuruWorker", "SembazuruDaemon"];
+    const START_ORDER: [&str; 2] = ["SembazuruDaemon", "SembazuruWorker"];
+
+    /// A service settles well inside this; the bound only keeps a stuck service from hanging a join.
+    const SETTLE: Duration = Duration::from_secs(30);
+
+    /// How long a started service has to stay `Running` before the join treats it as reflected.
+    ///
+    /// This is a dwell, not a readiness signal, and it is worth being exact about what it buys.
+    /// Both services report `Running` before they are serving: the daemon at
+    /// `crates/agent/src/service.rs:188`, before its run loop, and the worker at
+    /// `crates/worker/src/service.rs:198`, before `crates/worker/src/run.rs:53` binds its listener.
+    /// A service that fails during that initialisation — a taken port, a bad configuration — leaves
+    /// `Running` inside this window and is caught. One that fails later is outside what this
+    /// sequence claims to have checked, and the join does not claim otherwise.
+    const RUNNING_DWELL: Duration = Duration::from_secs(5);
+
+    /// How often the dwell samples the service's state.
+    const SAMPLE: Duration = Duration::from_millis(200);
+
+    /// Reads a dwell's samples. An empty run proves nothing, and anything but `Running` is a fall.
+    pub(super) fn dwell_verdict(samples: &[ServiceState]) -> StoreResult<()> {
+        if samples.is_empty() || samples.iter().any(|state| *state != ServiceState::Running) {
+            return Err(MachineStoreErrorClass::Io);
+        }
+        Ok(())
+    }
+
+    /// Waits for `Running`, then keeps watching for the dwell.
+    fn confirm_running(service: &Service) -> StoreResult<()> {
+        settle(service, |state| state == ServiceState::Running)?;
+        let until = Instant::now() + RUNNING_DWELL;
+        let mut samples = Vec::new();
+        while Instant::now() < until {
+            std::thread::sleep(SAMPLE);
+            samples.push(
+                service
+                    .query_status()
+                    .map_err(|_| MachineStoreErrorClass::Io)?
+                    .current_state,
+            );
+        }
+        dwell_verdict(&samples)
+    }
+
+    fn manager() -> StoreResult<ServiceManager> {
+        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+            .map_err(|_| MachineStoreErrorClass::Io)
+    }
+
+    /// Opens one service, or reports that it is not installed on this machine.
+    fn open(name: &str, access: ServiceAccess) -> StoreResult<Option<Service>> {
+        match manager()?.open_service(name, access) {
+            Ok(service) => Ok(Some(service)),
+            // A machine that never installed this service has nothing to stop or start, which is
+            // not a join failure. Every other open failure is.
+            Err(windows_service::Error::Winapi(error)) if error.raw_os_error() == Some(1060) => {
+                Ok(None)
+            }
+            Err(_) => Err(MachineStoreErrorClass::Io),
+        }
+    }
+
+    fn settle(service: &Service, done: impl Fn(ServiceState) -> bool) -> StoreResult<()> {
+        let deadline = Instant::now() + SETTLE;
+        loop {
+            let state = service
+                .query_status()
+                .map_err(|_| MachineStoreErrorClass::Io)?
+                .current_state;
+            if done(state) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                // An unsettled service is reported, never assumed: the whole point of stopping is
+                // that nothing keeps running on the configuration being replaced.
+                return Err(MachineStoreErrorClass::Busy);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    pub(super) fn stop_all() -> StoreResult<()> {
+        for name in STOP_ORDER {
+            let Some(service) = open(name, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)?
+            else {
+                continue;
+            };
+            if service
+                .query_status()
+                .map_err(|_| MachineStoreErrorClass::Io)?
+                .current_state
+                != ServiceState::Stopped
+            {
+                service.stop().map_err(|_| MachineStoreErrorClass::Io)?;
+            }
+            settle(&service, |state| state == ServiceState::Stopped)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn start_all() -> StoreResult<()> {
+        for name in START_ORDER {
+            let Some(service) = open(name, ServiceAccess::START | ServiceAccess::QUERY_STATUS)?
+            else {
+                continue;
+            };
+            if service
+                .query_status()
+                .map_err(|_| MachineStoreErrorClass::Io)?
+                .current_state
+                == ServiceState::Stopped
+            {
+                service
+                    .start(&[] as &[&OsStr])
+                    .map_err(|_| MachineStoreErrorClass::Io)?;
+            }
+            confirm_running(&service)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+mod service_control {
+    use super::{MachineStoreErrorClass, StoreResult};
+
+    pub(super) fn stop_all() -> StoreResult<()> {
+        Err(MachineStoreErrorClass::Unsupported)
+    }
+
+    pub(super) fn start_all() -> StoreResult<()> {
+        Err(MachineStoreErrorClass::Unsupported)
+    }
+}
+
+#[derive(Default)]
+struct MachineStoreLifecycle {
+    exclusion: Option<join_exclusion::Exclusion>,
+}
 
 impl StoreActions for MachineStoreLifecycle {
     type Update = MachineTokenUpdateGuard;
@@ -243,29 +533,64 @@ impl StoreActions for MachineStoreLifecycle {
         clear_machine_cluster_token_storage(update)
             .map_err(|error| classify_backend_error("clear-token", error))
     }
+
+    fn join(&mut self, update: &mut Self::Update, payload: &JoinPayload) -> TokenResult {
+        apply_machine_join_payload(update, payload)
+            .map_err(|error| classify_backend_error("join", error))
+    }
+
+    fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+        join_exclusion::acquire(&mut self.exclusion)
+    }
+
+    fn end_join_exclusion(&mut self) {
+        join_exclusion::release(&mut self.exclusion);
+    }
+
+    fn stop_services(&mut self) -> StoreResult<()> {
+        service_control::stop_all()
+    }
+
+    fn start_services(&mut self) -> StoreResult<()> {
+        service_control::start_all()
+    }
 }
 
-fn parse_args<I>(args: I) -> Result<Verb, CliError>
+fn parse_args<I>(args: I) -> Result<(Verb, Option<PipeName>), CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
     let mut args = args.into_iter();
     args.next().ok_or(CliError::InvalidArguments)?;
     let verb = args.next().ok_or(CliError::InvalidArguments)?;
+
+    let verb = match verb.to_str() {
+        Some("provision") => Verb::Provision,
+        Some("rollback-provision") => Verb::RollbackProvision,
+        Some("commit-provision") => Verb::CommitProvision,
+        Some("uninstall") => Verb::Uninstall,
+        Some("migrate-token") => Verb::MigrateToken,
+        Some("rotate-token") => Verb::RotateToken,
+        Some("clear-token") => Verb::ClearToken,
+        Some("join") => Verb::Join,
+        _ => return Err(CliError::InvalidArguments),
+    };
+
+    let pipe = if verb == Verb::Join {
+        let flag = args.next().ok_or(CliError::InvalidArguments)?;
+        if flag.to_str() != Some("--pipe") {
+            return Err(CliError::InvalidArguments);
+        }
+        Some(PipeName::parse(
+            &args.next().ok_or(CliError::InvalidArguments)?,
+        )?)
+    } else {
+        None
+    };
     if args.next().is_some() {
         return Err(CliError::InvalidArguments);
     }
-
-    match verb.to_str() {
-        Some("provision") => Ok(Verb::Provision),
-        Some("rollback-provision") => Ok(Verb::RollbackProvision),
-        Some("commit-provision") => Ok(Verb::CommitProvision),
-        Some("uninstall") => Ok(Verb::Uninstall),
-        Some("migrate-token") => Ok(Verb::MigrateToken),
-        Some("rotate-token") => Ok(Verb::RotateToken),
-        Some("clear-token") => Ok(Verb::ClearToken),
-        _ => Err(CliError::InvalidArguments),
-    }
+    Ok((verb, pipe))
 }
 
 fn authorize(verb: Verb, identity: IdentityFacts) -> Result<(), CliError> {
@@ -280,7 +605,7 @@ fn authorize(verb: Verb, identity: IdentityFacts) -> Result<(), CliError> {
 
 fn dispatch<A: StoreActions>(
     verb: Verb,
-    secret: Option<&SecretInput>,
+    input: VerbInput<'_>,
     actions: &mut A,
 ) -> Result<Option<&'static str>, CliError> {
     if !verb.is_token_maintenance() {
@@ -289,37 +614,110 @@ fn dispatch<A: StoreActions>(
             .map(|()| None)
             .map_err(CliError::Lifecycle);
     }
-    if (verb == Verb::RotateToken) != secret.is_some() {
+    if !input.matches(verb) {
         return Err(CliError::InvalidArguments);
     }
+    if let (Verb::Join, VerbInput::Join(payload)) = (verb, &input) {
+        return join_sequence(payload, actions);
+    }
     let mut update = actions.begin_update().map_err(CliError::TokenMaintenance)?;
-    let result = match verb {
-        Verb::MigrateToken => actions.migrate_token(&mut update),
-        Verb::RotateToken => actions.rotate_token(&mut update, secret.unwrap()),
-        Verb::ClearToken => actions.clear_token(&mut update),
+    let result = match (verb, input) {
+        (Verb::MigrateToken, _) => actions.migrate_token(&mut update),
+        (Verb::RotateToken, VerbInput::Secret(secret)) => actions.rotate_token(&mut update, secret),
+        (Verb::ClearToken, _) => actions.clear_token(&mut update),
+        (Verb::Join, VerbInput::Join(_)) => {
+            unreachable!("join runs its own stop-update-start sequence")
+        }
         _ => unreachable!("lifecycle verb was handled above"),
     }
     .map_err(CliError::TokenMaintenance)?;
     Ok(token_success(verb, result))
 }
 
-fn execute_authorized<A, F>(
+/// Runs one join as stop, update, release, start.
+///
+/// The order is forced by the store: a running service holds its own lease on the root, and the
+/// update takes an exclusive one, so the write cannot happen while the services run. The reverse is
+/// equally forced — the services cannot take their lease while the update guard is still held — so
+/// the guard has to be dropped before anything is started.
+///
+/// Writing the configuration and running on it are reported separately. A join whose services did
+/// not come back is not a successful join, even though the bytes are safely stored.
+fn join_sequence<A: StoreActions>(
+    payload: &JoinPayload,
+    actions: &mut A,
+) -> Result<Option<&'static str>, CliError> {
+    actions
+        .begin_join_exclusion()
+        .map_err(CliError::TokenMaintenance)?;
+    let outcome = join_under_exclusion(payload, actions);
+    actions.end_join_exclusion();
+    outcome
+}
+
+fn join_under_exclusion<A: StoreActions>(
+    payload: &JoinPayload,
+    actions: &mut A,
+) -> Result<Option<&'static str>, CliError> {
+    // A stop that fails partway has already taken something down, so it joins the recovery path.
+    if let Err(error) = actions.stop_services() {
+        let _ = actions.start_services();
+        return Err(CliError::TokenMaintenance(error));
+    }
+    let saved = match save_while_stopped(payload, actions) {
+        Ok(saved) => saved,
+        Err(error) => {
+            // Every failure from here back to the stop leaves the machine as it was found. Taking
+            // the update lease can fail on its own — a service that has just reported Stopped may
+            // still be releasing its own lease — and that must not leave the machine down.
+            let _ = actions.start_services();
+            return Err(error);
+        }
+    };
+    actions
+        .start_services()
+        .map_err(|_| CliError::JoinNotApplied)?;
+    Ok(token_success(Verb::Join, saved))
+}
+
+/// Takes the update lease, writes, and releases the lease again, all while the services are down.
+fn save_while_stopped<A: StoreActions>(
+    payload: &JoinPayload,
+    actions: &mut A,
+) -> Result<MachineTokenMaintenanceResult, CliError> {
+    let mut update = actions.begin_update().map_err(CliError::TokenMaintenance)?;
+    actions
+        .join(&mut update, payload)
+        .map_err(CliError::TokenMaintenance)
+    // The update guard is released here, before the caller starts anything.
+}
+
+fn execute_authorized<A, F, G>(
     verb: Verb,
     identity: IdentityFacts,
     mut read_rotate: F,
+    mut read_join: G,
     actions: &mut A,
 ) -> Result<Option<&'static str>, CliError>
 where
     A: StoreActions,
     F: FnMut() -> Result<SecretInput, CliError>,
+    G: FnMut() -> Result<JoinPayload, CliError>,
 {
+    // Authorization precedes every read, so an unauthorized caller never makes this process touch
+    // the pipe or the terminal.
     authorize(verb, identity)?;
-    let secret = if verb == Verb::RotateToken {
-        Some(read_rotate()?)
-    } else {
-        None
-    };
-    dispatch(verb, secret.as_ref(), actions)
+    match verb {
+        Verb::RotateToken => {
+            let secret = read_rotate()?;
+            dispatch(verb, VerbInput::Secret(&secret), actions)
+        }
+        Verb::Join => {
+            let payload = read_join()?;
+            dispatch(verb, VerbInput::Join(&payload), actions)
+        }
+        _ => dispatch(verb, VerbInput::None, actions),
+    }
 }
 
 #[cfg(windows)]
@@ -510,8 +908,74 @@ fn effective_identity(_verb: Verb) -> Result<IdentityFacts, CliError> {
     Err(CliError::Unsupported)
 }
 
+fn invalid_join_input(reason: &'static str) -> CliError {
+    eprintln!("sembazuru-storectl: join envelope refused; reason={reason}");
+    CliError::TokenMaintenance(MachineStoreErrorClass::InvalidInput)
+}
+
+/// Reads one whole envelope from the one-shot pipe the caller named.
+///
+/// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` caps what a server may do with this elevated
+/// token to identification, so a process that took the name first cannot impersonate this one.
+#[cfg(windows)]
+fn read_join_payload(pipe: &PipeName) -> Result<JoinPayload, CliError> {
+    use std::fs::File;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_GENERIC_READ, OPEN_EXISTING, SECURITY_IDENTIFICATION,
+        SECURITY_SQOS_PRESENT,
+    };
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(pipe.as_str())
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: the name is NUL-terminated and live for the call; no attributes are inherited.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            0,
+            null_mut(),
+            OPEN_EXISTING,
+            SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return Err(CliError::TokenMaintenance(MachineStoreErrorClass::Io));
+    }
+    // SAFETY: CreateFileW returned one owned kernel handle.
+    let file = File::from(unsafe { OwnedHandle::from_raw_handle(handle.cast()) });
+    read_join_envelope(file)
+}
+
+#[cfg(not(windows))]
+fn read_join_payload(_pipe: &PipeName) -> Result<JoinPayload, CliError> {
+    Err(CliError::Unsupported)
+}
+
+/// Decodes one envelope from a reader that is expected to end after exactly one.
+fn read_join_envelope<R: Read>(reader: R) -> Result<JoinPayload, CliError> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    // One byte past the bound is enough to tell "at the limit" from "over it" without ever holding
+    // an unbounded amount of a peer's output.
+    reader
+        .take((MAX_JOIN_PAYLOAD_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| CliError::TokenMaintenance(MachineStoreErrorClass::Io))?;
+    if bytes.len() > MAX_JOIN_PAYLOAD_BYTES {
+        return Err(invalid_join_input(JoinPayloadError::Length.reason()));
+    }
+    JoinPayload::decode(&bytes).map_err(|error| invalid_join_input(error.reason()))
+}
+
 fn run() -> Result<Option<&'static str>, CliError> {
-    let verb = parse_args(std::env::args_os())?;
+    let (verb, pipe) = parse_args(std::env::args_os())?;
     let identity = effective_identity(verb)?;
     execute_authorized(
         verb,
@@ -520,7 +984,11 @@ fn run() -> Result<Option<&'static str>, CliError> {
             let stdin = io::stdin();
             read_rotate_token(stdin.is_terminal(), stdin.lock())
         },
-        &mut MachineStoreLifecycle,
+        || {
+            let pipe = pipe.as_ref().ok_or(CliError::InvalidArguments)?;
+            read_join_payload(pipe)
+        },
+        &mut MachineStoreLifecycle::default(),
     )
 }
 
@@ -542,6 +1010,8 @@ fn main() {
 mod tests {
     use std::ffi::OsString;
     use std::io::{Cursor, Read};
+
+    use sembazuru_config_store::JoinField;
 
     use super::*;
 
@@ -578,6 +1048,25 @@ mod tests {
             Ok(MachineTokenMaintenanceResult::Changed)
         }
         token_action!(clear_token, "clear");
+        fn join(&mut self, update: &mut u8, _payload: &JoinPayload) -> TokenResult {
+            self.calls.push(Call("join", *update));
+            Ok(MachineTokenMaintenanceResult::Changed)
+        }
+        fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+            self.calls.push(Call("exclude", 0));
+            Ok(())
+        }
+        fn end_join_exclusion(&mut self) {
+            self.calls.push(Call("release-exclusion", 0));
+        }
+        fn stop_services(&mut self) -> StoreResult<()> {
+            self.calls.push(Call("stop", 0));
+            Ok(())
+        }
+        fn start_services(&mut self) -> StoreResult<()> {
+            self.calls.push(Call("start", 0));
+            Ok(())
+        }
     }
 
     struct Counter(Cursor<Vec<u8>>, usize);
@@ -598,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn parser_accepts_only_the_seven_fixed_verbs() {
+    fn parser_accepts_only_the_eight_fixed_verbs() {
         for (text, expected) in [
             ("provision", Verb::Provision),
             ("rollback-provision", Verb::RollbackProvision),
@@ -610,9 +1099,117 @@ mod tests {
         ] {
             assert_eq!(
                 parse_args(args(&["sembazuru-storectl", text])),
-                Ok(expected)
+                Ok((expected, None))
             );
         }
+        assert_eq!(
+            parse_args(args(&[
+                "sembazuru-storectl",
+                "join",
+                "--pipe",
+                r"\\.\pipe\sembazuru-join-0123456789abcdef"
+            ])),
+            Ok((
+                Verb::Join,
+                Some(PipeName(
+                    r"\\.\pipe\sembazuru-join-0123456789abcdef".to_owned()
+                ))
+            ))
+        );
+    }
+
+    #[test]
+    fn the_join_pipe_name_stays_one_local_pipe_component() {
+        for rejected in [
+            "join",
+            r"\\.\pipe\",
+            r"\\server\pipe\sembazuru-join",
+            r"\\.\pipe\nested\name",
+            r"\\.\pipe\sembazuru join",
+            r"\\.\PIPE\sembazuru-join",
+            r"C:\pipe\sembazuru-join",
+            r"\\.\pipe\..\elsewhere",
+        ] {
+            assert_eq!(
+                PipeName::parse(std::ffi::OsStr::new(rejected)),
+                Err(CliError::InvalidArguments),
+                "accepted {rejected}"
+            );
+        }
+        let oversized = format!(
+            r"\\.\pipe\{}",
+            "n".repeat(PipeName::MAX_COMPONENT_BYTES + 1)
+        );
+        assert_eq!(
+            PipeName::parse(std::ffi::OsStr::new(&oversized)),
+            Err(CliError::InvalidArguments)
+        );
+        let longest = format!(r"\\.\pipe\{}", "n".repeat(PipeName::MAX_COMPONENT_BYTES));
+        assert!(PipeName::parse(std::ffi::OsStr::new(&longest)).is_ok());
+    }
+
+    #[test]
+    fn the_join_verb_requires_its_pipe_and_nothing_else() {
+        for rejected in [
+            vec!["sembazuru-storectl", "join"],
+            vec!["sembazuru-storectl", "join", "--pipe"],
+            vec!["sembazuru-storectl", "join", r"\\.\pipe\sembazuru-join"],
+            vec![
+                "sembazuru-storectl",
+                "join",
+                "--file",
+                r"\\.\pipe\sembazuru-join",
+            ],
+            vec![
+                "sembazuru-storectl",
+                "join",
+                "--pipe",
+                r"\\.\pipe\sembazuru-join",
+                "extra",
+            ],
+            vec![
+                "sembazuru-storectl",
+                "rotate-token",
+                "--pipe",
+                r"\\.\pipe\sembazuru-join",
+            ],
+        ] {
+            assert_eq!(
+                parse_args(args(&rejected)),
+                Err(CliError::InvalidArguments),
+                "accepted {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_join_envelope_reader_is_bounded_and_refuses_anything_else() {
+        let payload = JoinPayload::new(
+            JoinField::replace(b"cluster-token"),
+            JoinField::Preserve,
+            JoinField::Remove,
+        )
+        .expect("fixture payload");
+        let bytes = payload.encode().expect("encode");
+        assert!(read_join_envelope(Cursor::new(bytes.to_vec())).is_ok());
+
+        let mut trailing = bytes.to_vec();
+        trailing.push(0);
+        for refused in [Vec::new(), vec![0u8; 8], trailing] {
+            assert_eq!(
+                read_join_envelope(Cursor::new(refused))
+                    .map(|_| ())
+                    .unwrap_err(),
+                invalid_token_input()
+            );
+        }
+
+        let mut bounded = Counter(Cursor::new(vec![b'x'; MAX_JOIN_PAYLOAD_BYTES + 99]), 0);
+        assert_eq!(
+            read_join_envelope(&mut bounded).map(|_| ()).unwrap_err(),
+            invalid_token_input()
+        );
+        assert_eq!(bounded.1, MAX_JOIN_PAYLOAD_BYTES + 1);
     }
 
     #[test]
@@ -656,7 +1253,12 @@ mod tests {
             ] {
                 assert_eq!(authorize(verb, identity).is_ok(), lifecycle);
             }
-            for verb in [Verb::MigrateToken, Verb::RotateToken, Verb::ClearToken] {
+            for verb in [
+                Verb::MigrateToken,
+                Verb::RotateToken,
+                Verb::ClearToken,
+                Verb::Join,
+            ] {
                 assert_eq!(authorize(verb, identity).is_ok(), token);
             }
         }
@@ -694,26 +1296,303 @@ mod tests {
         assert_eq!(bounded.1, MAX_MACHINE_CLUSTER_TOKEN_BYTES + 3);
     }
 
+    /// A fake whose update guard records its own release, so the order of the join sequence is
+    /// observable rather than assumed.
+    #[derive(Clone, Default)]
+    struct SequenceLog(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+
+    impl SequenceLog {
+        fn push(&self, step: &'static str) {
+            self.0.borrow_mut().push(step);
+        }
+
+        fn steps(&self) -> Vec<&'static str> {
+            self.0.borrow().clone()
+        }
+    }
+
+    struct SequenceGuard(SequenceLog);
+
+    impl Drop for SequenceGuard {
+        fn drop(&mut self) {
+            self.0.push("guard-released");
+        }
+    }
+
+    #[derive(Default)]
+    struct SequenceActions {
+        log: SequenceLog,
+        stop_fails: bool,
+        begin_fails: bool,
+        join_fails: bool,
+        start_fails: bool,
+    }
+
+    impl StoreActions for SequenceActions {
+        type Update = SequenceGuard;
+
+        fn lifecycle(&mut self, _verb: Verb) -> StoreResult<()> {
+            unreachable!("the join sequence never reaches a lifecycle verb")
+        }
+
+        fn begin_update(&mut self) -> StoreResult<SequenceGuard> {
+            self.log.push("begin");
+            if self.begin_fails {
+                return Err(MachineStoreErrorClass::Busy);
+            }
+            Ok(SequenceGuard(self.log.clone()))
+        }
+
+        fn migrate_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+            unreachable!("not part of the join sequence")
+        }
+
+        fn rotate_token(
+            &mut self,
+            _update: &mut SequenceGuard,
+            _secret: &SecretInput,
+        ) -> TokenResult {
+            unreachable!("not part of the join sequence")
+        }
+
+        fn clear_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+            unreachable!("not part of the join sequence")
+        }
+
+        fn join(&mut self, _update: &mut SequenceGuard, _payload: &JoinPayload) -> TokenResult {
+            self.log.push("join");
+            if self.join_fails {
+                return Err(MachineStoreErrorClass::Io);
+            }
+            Ok(MachineTokenMaintenanceResult::Changed)
+        }
+
+        fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+            self.log.push("exclude");
+            Ok(())
+        }
+
+        fn end_join_exclusion(&mut self) {
+            self.log.push("release-exclusion");
+        }
+
+        fn stop_services(&mut self) -> StoreResult<()> {
+            self.log.push("stop");
+            if self.stop_fails {
+                return Err(MachineStoreErrorClass::Busy);
+            }
+            Ok(())
+        }
+
+        fn start_services(&mut self) -> StoreResult<()> {
+            self.log.push("start");
+            if self.start_fails {
+                return Err(MachineStoreErrorClass::Io);
+            }
+            Ok(())
+        }
+    }
+
+    fn sequence_payload() -> JoinPayload {
+        JoinPayload::new(
+            JoinField::replace(b"cluster-token"),
+            JoinField::Preserve,
+            JoinField::Preserve,
+        )
+        .expect("fixture payload")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_service_that_leaves_running_during_the_dwell_is_not_reflected() {
+        use windows_service::service::ServiceState;
+
+        assert!(service_control::dwell_verdict(&[ServiceState::Running; 3]).is_ok());
+        for fallen in [
+            vec![],
+            vec![ServiceState::Running, ServiceState::StopPending],
+            vec![ServiceState::Running, ServiceState::Stopped],
+            vec![ServiceState::StartPending, ServiceState::Running],
+        ] {
+            assert_eq!(
+                service_control::dwell_verdict(&fallen),
+                Err(MachineStoreErrorClass::Io),
+                "accepted {fallen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_join_releases_its_update_guard_before_anything_is_started() {
+        let mut actions = SequenceActions::default();
+        let log = actions.log.clone();
+        let result = join_sequence(&sequence_payload(), &mut actions);
+        assert_eq!(result, Ok(Some("join-applied")));
+        assert_eq!(
+            log.steps(),
+            vec![
+                "exclude",
+                "stop",
+                "begin",
+                "join",
+                "guard-released",
+                "start",
+                "release-exclusion"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_machine_running_as_it_was_found() {
+        let mut actions = SequenceActions {
+            join_fails: true,
+            ..SequenceActions::default()
+        };
+        let log = actions.log.clone();
+        let result = join_sequence(&sequence_payload(), &mut actions);
+        assert_eq!(
+            result,
+            Err(CliError::TokenMaintenance(MachineStoreErrorClass::Io))
+        );
+        // The services are started again, and the exclusion is still given back.
+        assert_eq!(
+            log.steps(),
+            vec![
+                "exclude",
+                "stop",
+                "begin",
+                "join",
+                "guard-released",
+                "start",
+                "release-exclusion"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_failure_after_the_stop_puts_the_services_back() {
+        // Taking the update lease can fail on its own: a service that has just reported Stopped may
+        // still be releasing its own lease. Failing there must not leave the machine down.
+        for (actions, expected) in [
+            (
+                SequenceActions {
+                    begin_fails: true,
+                    ..SequenceActions::default()
+                },
+                // No guard was taken, so there is none to release.
+                vec!["exclude", "stop", "begin", "start", "release-exclusion"],
+            ),
+            (
+                SequenceActions {
+                    stop_fails: true,
+                    ..SequenceActions::default()
+                },
+                vec!["exclude", "stop", "start", "release-exclusion"],
+            ),
+        ] {
+            let mut actions = actions;
+            let log = actions.log.clone();
+            assert_eq!(
+                join_sequence(&sequence_payload(), &mut actions),
+                Err(CliError::TokenMaintenance(MachineStoreErrorClass::Busy))
+            );
+            assert_eq!(log.steps(), expected);
+        }
+    }
+
+    #[test]
+    fn a_saved_join_whose_services_stay_down_is_not_a_successful_join() {
+        let mut actions = SequenceActions {
+            start_fails: true,
+            ..SequenceActions::default()
+        };
+        let log = actions.log.clone();
+        let result = join_sequence(&sequence_payload(), &mut actions);
+        assert_eq!(result, Err(CliError::JoinNotApplied));
+        assert_eq!(CliError::JoinNotApplied.code(), "join-saved-not-applied");
+        assert_ne!(CliError::JoinNotApplied.exit_code(), 0);
+        assert_eq!(*log.steps().last().expect("a step"), "release-exclusion");
+    }
+
+    #[test]
+    fn a_join_that_cannot_take_the_exclusion_touches_nothing() {
+        struct RefusingActions(SequenceLog);
+
+        impl StoreActions for RefusingActions {
+            type Update = SequenceGuard;
+            fn lifecycle(&mut self, _verb: Verb) -> StoreResult<()> {
+                unreachable!("nothing runs")
+            }
+            fn begin_update(&mut self) -> StoreResult<SequenceGuard> {
+                unreachable!("nothing runs")
+            }
+            fn migrate_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn rotate_token(
+                &mut self,
+                _update: &mut SequenceGuard,
+                _secret: &SecretInput,
+            ) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn clear_token(&mut self, _update: &mut SequenceGuard) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn join(&mut self, _update: &mut SequenceGuard, _payload: &JoinPayload) -> TokenResult {
+                unreachable!("nothing runs")
+            }
+            fn begin_join_exclusion(&mut self) -> StoreResult<()> {
+                self.0.push("exclude-refused");
+                Err(MachineStoreErrorClass::Busy)
+            }
+            fn end_join_exclusion(&mut self) {
+                unreachable!("an exclusion that was never taken is not given back")
+            }
+            fn stop_services(&mut self) -> StoreResult<()> {
+                unreachable!("nothing runs")
+            }
+            fn start_services(&mut self) -> StoreResult<()> {
+                unreachable!("nothing runs")
+            }
+        }
+
+        let log = SequenceLog::default();
+        let mut actions = RefusingActions(log.clone());
+        assert_eq!(
+            join_sequence(&sequence_payload(), &mut actions),
+            Err(CliError::TokenMaintenance(MachineStoreErrorClass::Busy))
+        );
+        assert_eq!(log.steps(), vec!["exclude-refused"]);
+    }
+
     #[test]
     fn authorization_precedes_input_and_exact_backend_dispatch() {
         for identity in [
             IdentityFacts::user(true, false),
             IdentityFacts::user(false, false),
         ] {
-            let (mut reads, mut actions) = (0, RecordingActions::default());
-            let result = execute_authorized(
-                Verb::RotateToken,
-                identity,
-                || {
-                    reads += 1;
-                    Ok(SecretInput::new("unreachable".to_owned()))
-                },
-                &mut actions,
-            );
-            assert_eq!(
-                (result, reads, actions.calls.len()),
-                (Err(CliError::Unauthorized), 0, 0)
-            );
+            for verb in [Verb::RotateToken, Verb::Join] {
+                let (mut reads, mut joins) = (0, 0);
+                let mut actions = RecordingActions::default();
+                let result = execute_authorized(
+                    verb,
+                    identity,
+                    || {
+                        reads += 1;
+                        Ok(SecretInput::new("unreachable".to_owned()))
+                    },
+                    || {
+                        joins += 1;
+                        unreachable!("an unauthorized join must not touch the pipe")
+                    },
+                    &mut actions,
+                );
+                assert_eq!(
+                    (result, reads, joins, actions.calls.len()),
+                    (Err(CliError::Unauthorized), 0, 0, 0)
+                );
+            }
         }
         for (verb, expected) in [
             (Verb::Provision, vec![Call("lifecycle", 0)]),
@@ -729,8 +1608,19 @@ mod tests {
                 vec![Call("begin", 0), Call("rotate", 73)],
             ),
             (Verb::ClearToken, vec![Call("begin", 0), Call("clear", 73)]),
+            (
+                Verb::Join,
+                vec![
+                    Call("exclude", 0),
+                    Call("stop", 0),
+                    Call("begin", 0),
+                    Call("join", 73),
+                    Call("start", 0),
+                    Call("release-exclusion", 0),
+                ],
+            ),
         ] {
-            let (mut reads, mut actions) = (0, RecordingActions::default());
+            let (mut reads, mut joins, mut actions) = (0, 0, RecordingActions::default());
             execute_authorized(
                 verb,
                 IdentityFacts::SYSTEM,
@@ -738,12 +1628,25 @@ mod tests {
                     reads += 1;
                     Ok(SecretInput::new("test-input".to_owned()))
                 },
+                || {
+                    joins += 1;
+                    JoinPayload::new(
+                        JoinField::replace(b"cluster-token"),
+                        JoinField::Preserve,
+                        JoinField::Preserve,
+                    )
+                    .map_err(|error| invalid_join_input(error.reason()))
+                },
                 &mut actions,
             )
             .unwrap();
             assert_eq!(
-                (reads, actions.calls),
-                (usize::from(verb == Verb::RotateToken), expected)
+                (reads, joins, actions.calls),
+                (
+                    usize::from(verb == Verb::RotateToken),
+                    usize::from(verb == Verb::Join),
+                    expected
+                )
             );
         }
     }
@@ -754,22 +1657,50 @@ mod tests {
 
         let secret = SecretInput::new("cli-secret-sentinel-91827".to_owned());
         let mut actions = RecordingActions::default();
-        let error = dispatch(Verb::RotateToken, None, &mut actions).unwrap_err();
-        assert_eq!(error, CliError::InvalidArguments);
-        dispatch(Verb::RotateToken, Some(&secret), &mut actions).unwrap();
+        let payload = JoinPayload::new(
+            JoinField::replace(b"cluster-token"),
+            JoinField::Preserve,
+            JoinField::Preserve,
+        )
+        .expect("fixture payload");
+        // A verb never accepts the other verb's input, and never runs without its own.
+        for (verb, input) in [
+            (Verb::RotateToken, VerbInput::None),
+            (Verb::RotateToken, VerbInput::Join(&payload)),
+            (Verb::Join, VerbInput::None),
+            (Verb::Join, VerbInput::Secret(&secret)),
+            (Verb::MigrateToken, VerbInput::Secret(&secret)),
+            (Verb::ClearToken, VerbInput::Join(&payload)),
+        ] {
+            assert_eq!(
+                dispatch(verb, input, &mut actions).unwrap_err(),
+                CliError::InvalidArguments
+            );
+        }
+        dispatch(Verb::RotateToken, VerbInput::Secret(&secret), &mut actions).unwrap();
+        dispatch(Verb::Join, VerbInput::Join(&payload), &mut actions).unwrap();
+        assert!(!format!("{payload:?}").contains("cluster-token"));
         assert!(!format!("{secret:?}{:?}", actions.calls).contains(secret.expose()));
         for (verb, changed) in [
             (Verb::MigrateToken, "token-migrated"),
             (Verb::RotateToken, "token-rotated"),
             (Verb::ClearToken, "token-cleared"),
+            (Verb::Join, "join-applied"),
         ] {
             assert_eq!(token_success(verb, Changed), Some(changed));
         }
         assert_eq!(
+            token_success(Verb::Join, Unchanged).unwrap(),
+            "token-unchanged"
+        );
+        assert_eq!(
             token_success(Verb::MigrateToken, Unchanged).unwrap(),
             "token-unchanged"
         );
-        assert_eq!(dispatch(Verb::Provision, None, &mut actions), Ok(None));
+        assert_eq!(
+            dispatch(Verb::Provision, VerbInput::None, &mut actions),
+            Ok(None)
+        );
     }
 
     #[test]

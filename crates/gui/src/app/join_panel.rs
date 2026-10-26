@@ -1,17 +1,18 @@
-//! Join-a-cluster wizard panel (M11): collects worker settings, previews the
-//! validated worker.toml, and asks the configured writer to persist it before
-//! restarting the local worker service.
+//! Join-a-cluster wizard panel (M11): collects worker settings, previews the validated
+//! worker.toml, and hands the whole join to an elevated helper as one transaction.
+//!
+//! The panel does not restart anything itself. Stopping the services, writing the three targets,
+//! and starting them again all belong to the one transaction the helper runs (ADR 0018), because
+//! the store refuses a write while the services hold their own lease on it.
 
 use eframe::egui;
 
+use std::sync::Arc;
+use std::sync::mpsc::Receiver;
+
+use crate::join::submit::{JoinSubmitter, PipeJoinSubmitter, outcome_notice, payload_for};
+use crate::join::transport::TransportError;
 use crate::join::worker_toml::{JoinError, JoinInput, render_worker_toml, validate};
-use crate::join::writer::{ConfigWriter, StubConfigWriter, WriteError, WriteTarget};
-use crate::svcctl::Service;
-
-use super::services::RestartOutcome;
-
-const CONFIG_WRITE_UNCONFIGURED: &str = "config-write mechanism not configured (roadmap §2.0, owner-managed); cannot persist config from the GUI yet";
-const CONFIG_WRITE_DOC_LABEL: &str = "docs/superpowers/plans/2026-07-02-gui-completion.md §2.0";
 
 pub struct JoinPanel {
     agent: String,
@@ -23,9 +24,11 @@ pub struct JoinPanel {
     detected: bool,
     lan_ips: Vec<String>,
     detected_lan_ip: Option<String>,
-    writer: Box<dyn ConfigWriter>,
+    submitter: Arc<dyn JoinSubmitter>,
     notice: String,
-    show_write_docs_link: bool,
+    /// Set while a join runs on its own thread. The panel keeps drawing meanwhile.
+    busy: bool,
+    result_rx: Option<Receiver<Result<(), TransportError>>>,
 }
 
 impl Default for JoinPanel {
@@ -40,9 +43,10 @@ impl Default for JoinPanel {
             detected: false,
             lan_ips: Vec::new(),
             detected_lan_ip: None,
-            writer: Box::new(StubConfigWriter),
+            submitter: Arc::new(PipeJoinSubmitter),
             notice: String::new(),
-            show_write_docs_link: false,
+            busy: false,
+            result_rx: None,
         }
     }
 }
@@ -71,8 +75,9 @@ impl JoinPanel {
         self.lan_ips = ip.into_iter().collect();
     }
 
-    pub fn preview_toml(&self) -> Result<String, JoinError> {
-        let input = JoinInput {
+    /// The wizard's current answers, in the shape validation accepts.
+    fn input(&self) -> JoinInput {
+        JoinInput {
             agent: self.agent.clone(),
             cluster_token: self.cluster_token.clone(),
             listen_addr: self.listen_addr.clone(),
@@ -80,16 +85,15 @@ impl JoinPanel {
             detected_lan_ip: self.detected_lan_ip_for_input(),
             participation_mode: self.participation_mode.clone(),
             allow_insecure_lan: self.allow_insecure_lan,
-        };
-        validate(input).map(|join| render_worker_toml(&join))
+        }
     }
 
-    pub fn render(
-        &mut self,
-        ui: &mut egui::Ui,
-        services: &mut super::services::ServicesPanel,
-        ctx: &egui::Context,
-    ) {
+    pub fn preview_toml(&self) -> Result<String, JoinError> {
+        validate(self.input()).map(|join| render_worker_toml(&join))
+    }
+
+    pub fn render(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.poll_result();
         self.detect_lan_ips_once();
 
         ui.heading("Join a cluster as a worker");
@@ -171,22 +175,31 @@ impl JoinPanel {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Preview worker.toml").clicked() {
-                self.show_write_docs_link = false;
                 self.notice = self
                     .preview_toml()
                     .unwrap_or_else(|e| format!("Invalid join settings: {e:?}"));
             }
-            if ui.button("Apply & restart worker").clicked() {
-                self.apply(services, ctx);
+            let join = ui
+                .add_enabled(!self.busy, egui::Button::new("Join (asks for elevation)"))
+                .on_hover_text(
+                    "Saves the token and the worker configuration together, then restarts the \
+                     daemon and the worker on them. Windows asks for administrator approval.",
+                );
+            if join.clicked() {
+                let ctx = ctx.clone();
+                self.apply(move || ctx.request_repaint());
             }
         });
 
+        if self.busy {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("The join is running. The services restart as part of it.");
+            });
+        }
         if !self.notice.is_empty() {
             ui.separator();
             ui.label(&self.notice);
-            if self.show_write_docs_link {
-                ui.hyperlink_to(CONFIG_WRITE_DOC_LABEL, CONFIG_WRITE_DOC_LABEL);
-            }
         }
     }
 
@@ -210,36 +223,70 @@ impl JoinPanel {
             .or_else(|| self.lan_ips.first().cloned())
     }
 
-    fn apply(&mut self, services: &mut super::services::ServicesPanel, ctx: &egui::Context) {
-        self.show_write_docs_link = false;
-        let toml = match self.preview_toml() {
-            Ok(toml) => toml,
+    /// Validates, builds the one transaction, and starts handing it over.
+    ///
+    /// The hand-over runs on its own thread. A join waits for a person to answer an elevation
+    /// prompt and then for two services to stop and start, which is minutes in the worst case; on
+    /// the drawing thread that would be a frozen window. `repaint` wakes the UI when the result
+    /// lands — a closure rather than the egui context, so this logic stays testable without one.
+    pub fn apply(&mut self, repaint: impl Fn() + Send + 'static) {
+        if self.busy {
+            return;
+        }
+        let join = match validate(self.input()) {
+            Ok(join) => join,
             Err(err) => {
                 self.notice = format!("Invalid join settings: {err:?}");
                 return;
             }
         };
-
-        match self.writer.write(WriteTarget::WorkerToml, &toml) {
-            Ok(()) => match services.restart(Service::Worker, ctx) {
-                RestartOutcome::Started => {
-                    self.notice = "worker.toml saved; restarting Worker service…".to_string();
-                }
-                RestartOutcome::Busy => {
-                    self.notice = "worker.toml saved; Worker restart did not start because another service action is running. Use the Services tab to retry.".to_string();
-                }
-                RestartOutcome::NoAction => {
-                    self.notice = "worker.toml saved; Worker restart did not start because the service is not installed or its state is unknown. Use the Services tab to inspect it.".to_string();
-                }
-            },
-            Err(WriteError::MechanismUnconfigured) => {
-                self.notice = CONFIG_WRITE_UNCONFIGURED.to_string();
-                self.show_write_docs_link = true;
-            }
+        let payload = match payload_for(&join) {
+            Ok(payload) => payload,
             Err(err) => {
-                self.notice = format!("Write failed: {err}");
+                // The envelope refuses what the store would refuse anyway, so say which field.
+                self.notice = format!("Invalid join settings: {err}");
+                return;
             }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let submitter = Arc::clone(&self.submitter);
+        self.busy = true;
+        self.result_rx = Some(rx);
+        self.notice = "Joining. Windows will ask for administrator approval…".to_owned();
+        std::thread::spawn(move || {
+            let result = submitter.submit(&payload);
+            // The receiver is gone only if the panel itself is gone, and then nobody is waiting.
+            let _ = tx.send(result);
+            repaint();
+        });
+    }
+
+    /// Takes the result of a finished join, if one has landed. Never blocks.
+    fn poll_result(&mut self) {
+        if let Some(result) = self.result_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.busy = false;
+            self.result_rx = None;
+            self.notice = outcome_notice(result);
         }
+    }
+
+    /// Replaces the elevation-backed submitter. Only tests stand in for the helper.
+    pub fn set_submitter_for_test(&mut self, submitter: Arc<dyn JoinSubmitter>) {
+        self.submitter = submitter;
+    }
+
+    /// Blocks until a started join reports back. Tests only; the panel polls instead.
+    pub fn wait_for_result_for_test(&mut self) {
+        if let Some(rx) = self.result_rx.take() {
+            let result = rx.recv().expect("the join thread reports its result");
+            self.busy = false;
+            self.notice = outcome_notice(result);
+        }
+    }
+
+    /// The line the operator is currently shown.
+    pub fn notice_for_test(&self) -> &str {
+        &self.notice
     }
 }
 
